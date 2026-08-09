@@ -47,7 +47,7 @@ const HDR_CAPTURE_OPTION_ENABLED: bool = false;
 fn tensorrt_option_visible(availability: &TensorRtAvailability) -> bool {
     availability.available
 }
-const BUILD_ID: &str = "20260809-v343f-gpu-path-diagnostics-source-hide-restored";
+const BUILD_ID: &str = "20260809-v343g-portable-pointer-backup";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -3875,8 +3875,7 @@ impl App {
         );
 
         if self.panel_hwnd != 0
-            && (!win32::is_window_valid(self.panel_hwnd)
-                || !win32::is_own_window(self.panel_hwnd))
+            && (!win32::is_window_valid(self.panel_hwnd) || !win32::is_own_window(self.panel_hwnd))
         {
             self.panel_hwnd = 0;
             self.panel_state_sent = None;
