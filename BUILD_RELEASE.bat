@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo ================================================
-echo  cHiDeScaler-Neo v343f Release Build
+echo  cHiDeScaler-Neo v343g Release Build
 echo ================================================
 echo.
 
