@@ -1,0 +1,583 @@
+{
+  "active": "Anime4K Restore S",
+  "presets": [
+    {
+      "name": "Anime4K Restore S",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_S.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K Restore L",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "FSRCNNX",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K R+U  S",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_S.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_S.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K R+U  M",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K R+U  L",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K R+U  VL",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_VL.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_VL.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K U+R  S  [720p]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_S.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_S.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K U+R  M  [720p]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K U+R  L  [720p]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K U+R  VL  [720p]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_VL.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_VL.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Anime4K NSC  L  [1080p]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Denoise/FSRCNNX_x1_16_0_4_1_anime_distort.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "umzi mahou  [HD Anime]",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/umzi/2x_umzi_mahou_rtmosr_fp16_op17.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "AnimeJaNai HD V3",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3_SuperUltraCompact_5k-fp16.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "AnimeJaNai HD V3 Sharp",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3Sharp1_SuperUltraCompact_25k-fp16.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "AniSD+ [SD Anime]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Ani/AniSD_ArtCNN_C4F32_i4.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/aWarpSharp3_RT.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "W2xEX  [SD Anime]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/ESRGAN/W2xEX_AnimeVideo_Mini_x2.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "SD Anime V2NR",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/AnimeJaNai/the_database_AnimeJaNaiV2L1_x2_fp16_opset14.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Denoise/FSRCNNX_x1_16_0_4_1_anime_distort.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Thin_HQ.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "SD Anime ***∞***",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3Sharp1_SuperUltraCompact_25k-fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_VL.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/aWarpSharp3_RT.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "SD Anime *Σ*",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_SD_V1beta34_Compact_93k-fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Thin_HQ.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "SD Anime **Ω**  [Cel]",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/ToHeart_35mm/ToHeart_35mm_Compact_V1_1_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "LosOdy360  [X360/PS3]",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/LosOdy_X360/LosOdy_X360_UltraCompact_V_1-fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Film [1080p]  @FHD",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/adaptive_sharpen.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/aWarpSharp3_RT.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Filmgrain/filmgrain.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Film [1080p]  @4K",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/GEGL_unsharp_mask_RT.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/aWarpSharp3_RT.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/adaptive_sharpen.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Filmgrain/filmgrain.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite S  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite   FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "DRBA v2  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite S + QCOM  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/QCOM/QCOM_quicksrnet_small_x2.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite + QCOM  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/QCOM/QCOM_quicksrnet_small_x2.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite S + Anime4K  [720p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Resize/Spline16_Neo.glsl",
+          "enabled": true,
+          "params": {
+            "RESIZE_SCALE": 0.9
+          }
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "DRBA + Anime4K  [720p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite + Anime4K  [720p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite S + Anime4K  [1080p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "DRBA + Anime4K  [1080p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "RIFE Lite + Anime4K  [1080p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

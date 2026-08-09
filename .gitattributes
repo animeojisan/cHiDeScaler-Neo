@@ -1,0 +1,8 @@
+*.dll binary
+*.onnx binary
+*.png binary
+*.ico binary
+*.glsl text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.json text eol=lf

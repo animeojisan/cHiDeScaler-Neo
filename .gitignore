@@ -1,0 +1,29 @@
+# Build output
+/target/
+*.pdb
+
+# Local application state
+/settings.json
+/*.log
+/logs/
+cache/
+caches/
+_diagnostics/
+
+# Generated/local binaries
+/cHiDeScaler-Neo.exe
+/cHiDeScaler-Neo_previous.exe
+
+# TensorRT local backend pack and generated engines
+/backends/tensorrt/*.dll
+/backends/tensorrt/*.lib
+/backends/tensorrt/*.engine
+/backends/tensorrt/cache/
+/backends/tensorrt/_diagnostics/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+{
+  "backend_api": 1,
+  "name": "Neo TensorRT Backend",
+  "architecture": "x86_64",
+  "onnxruntime": "1.24.4",
+  "tensor_rt": "<exact-version>",
+  "cuda_major": 12,
+  "provider": "TensorRT+CUDA",
+  "required_files": [
+    "onnxruntime_providers_tensorrt.dll",
+    "onnxruntime_providers_cuda.dll"
+  ],
+  "onnxruntime_sha256": "<sha256-of-neo-unified-onnxruntime.dll>",
+  "file_sha256": {
+    "onnxruntime_providers_tensorrt.dll": "<sha256>",
+    "onnxruntime_providers_cuda.dll": "<sha256>"
+  }
+}

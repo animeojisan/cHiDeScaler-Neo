@@ -1,0 +1,42 @@
+cHiDeScaler-Neo Source License 1.0
+
+Copyright (c) 2026 cHiDeScaler-Neo author.
+All rights reserved except as expressly granted below.
+
+Permission is granted, free of charge, to any person obtaining a copy of the
+original cHiDeScaler-Neo project code to use, inspect, compile, and modify it.
+
+Redistribution of the original or modified cHiDeScaler-Neo source code or
+binaries is permitted on a non-commercial basis, provided that:
+
+1. This license and the copyright notice are retained.
+2. Modified versions are clearly identified as modified and must not be
+   represented as an official release of cHiDeScaler-Neo.
+3. Existing third-party copyright, license, attribution, and notice files are
+   retained.
+4. The cHiDeScaler-Neo name, logo, or author identity must not be used to imply
+   endorsement of a modified or redistributed version.
+
+Commercial sale, paid redistribution, or distribution of cHiDeScaler-Neo as a
+substantial part of a paid product or paid service requires prior permission
+from the copyright holder.
+
+Use of cHiDeScaler-Neo itself, including use in personal, educational,
+research, organizational, or business environments, does not by itself require
+separate permission. The restriction above applies to monetizing the software
+or its redistribution, not merely to using it.
+
+This license applies only to original cHiDeScaler-Neo project code.
+Third-party source code, libraries, shaders, models, runtimes, and other
+components remain subject to their respective copyright and license terms.
+Nothing in this license grants rights that the cHiDeScaler-Neo author does not
+own or have authority to grant.
+
+No trademark rights are granted by this license.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT
+OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

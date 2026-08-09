@@ -1,0 +1,6885 @@
+//! Seamless cursor mapping: operate the (hidden) source window through the
+//! magnified overlay.
+//!
+//! Cursor-routing invariants:
+//! - The overlay remains click-through while the real cursor is confined to the
+//!   source client rect and a mapped sprite cursor is drawn over the output.
+//! - Hardware movement entering the visible content engages source control.
+//! - Pushing against a source edge disengages and returns the cursor to the
+//!   matching content edge.
+//! - Injected low-level mouse events are ignored to prevent feedback loops from
+//!   internal SetCursorPos calls.
+//! - The floating panel and GUI can receive redirected input without moving the
+//!   confined real cursor away from the source.
+//! - Every stop path releases cursor confinement.
+
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, INPUT, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, SendInput, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, mouse_event,
+};
+use windows::Win32::UI::Magnification::{MagInitialize, MagShowSystemCursor, MagUninitialize};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+const ENTER_MARGIN_PX: i32 = 8;
+// Native UI routing is exact. Invisible click margins and post-hover grace
+// can make the GUI/panel keep ownership after the visible pointer has
+// already crossed the boundary.
+const UI_CLICK_MARGIN_PX: i32 = 0;
+const EXIT_PLACE_MARGIN_PX: i32 = 6;
+const EXIT_WINDOW_MARGIN_PX: i32 = 6;
+/// After a windowed edge exit, refuse to re-engage until the cursor either
+/// clearly leaves the content region or deliberately returns far enough inside
+/// the source. This hysteresis prevents a small post-exit drift from immediately
+/// re-engaging and moving the cursor back into the magnified view.
+const POST_ESCAPE_SRC_MARGIN_PX: i32 = ENTER_MARGIN_PX;
+/// Hysteresis dead-band in source space. Re-engagement requires the mapped
+/// source position to move clearly inside the source while edge escape still
+/// fires at the boundary, creating a stable gap between the two transitions.
+const ENGAGE_SRC_MARGIN_PX: i32 = 4;
+const REENTER_COOLDOWN_MS: u64 = 200;
+/// Accumulated outward travel required before a windowed edge releases the
+/// cursor. A brief touch remains clipped at the edge; sustained outward motion
+/// crosses the threshold. Fullscreen mode never exits through this path.
+const EXIT_TRAVEL_PX: f64 = 1.0;
+pub const PANEL_ACTION_STOP: u32 = 1 << 0;
+pub const PANEL_ACTION_COLLAPSE: u32 = 1 << 1;
+pub const PANEL_ACTION_EXPAND: u32 = 1 << 2;
+pub const PANEL_ACTION_SCREENSHOT: u32 = 1 << 3;
+pub const PANEL_ACTION_GUI_TOPMOST: u32 = 1 << 4;
+static PANEL_ACTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Engagement is committed synchronously inside the hook. A hardware move that
+/// was queued before the cursor warp can still arrive with stale screen-space
+/// coordinates, so edge-exit detection is briefly suppressed after engagement.
+const ENGAGE_GRACE_MS: u64 = 60;
+/// Post-engage settle: an event is FRESH when its hook pt agrees with the
+/// OS-clipped cursor (GetCursorPos) within this radius — after the engage
+/// teleport the real cursor sits at the target, so stale pre-teleport events
+/// (screen coords from the queue backlog) diverge by hundreds of px while
+/// genuine moves diverge by at most one event's delta. We cannot wait for the
+/// injected SetCursorPos event itself: the hook ignores LLMHF_INJECTED, so it
+/// never arrives; waiting for it would keep the swallow active until timeout.
+const TELEPORT_SETTLE_PX: i32 = 64;
+/// Hard cap on the settle swallow. Under heavy GPU load (4K FSRCNNX ~190ms
+/// frames) the stale backlog outlived the 60ms engage grace; a fresh event
+/// always ends the swallow early, so this only bounds pathological cases.
+const TELEPORT_SETTLE_TIMEOUT_MS: u64 = 250;
+// Even after the first post-warp event agrees with GetCursorPos, older
+// screen-space hook moves may still drain behind it under a saturated GPU.
+// Keep a short commit-relative firewall so those late events can never be
+// interpreted as source-space and fling the virtual cursor to a screen corner.
+const POST_COMMIT_STALE_GUARD_MS: u64 = 250;
+const POST_COMMIT_RAW_DIVERGENCE_PX: i32 = 96;
+const OSC_SHORT_MS: u64 = 250;
+const OSC_MAX: u32 = 6;
+/// Kept public for source compatibility with older diagnostic binaries.
+/// The panel hit/no-engage surface is exact: the visible panel
+/// rectangle is the only panel surface that may block or own the cursor.
+pub const PANEL_NO_ENGAGE_HALO_PX: i32 = 0;
+const BTN_LEFT: u8 = 0x01;
+const BTN_RIGHT: u8 = 0x02;
+const BTN_MIDDLE: u8 = 0x04;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Rect {
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NoEngageRect {
+    pub rect: Rect,
+    pub land: Rect,
+    /// Top-level window this zone belongs to (control panel / GUI). When set,
+    /// clicks over this zone are handed to that window instead of leaking
+    /// through to the source.
+    pub hwnd: isize,
+    /// Explicit role flag. Older builds inferred "panel" from rect != land,
+    /// which coupled panel identity to an invisible 24px halo and made that
+    /// halo leak into ownership/clamping logic.
+    pub panel: bool,
+}
+
+impl NoEngageRect {
+    pub fn new(rect: Rect) -> Self {
+        Self {
+            rect,
+            land: rect,
+            hwnd: 0,
+            panel: false,
+        }
+    }
+
+    pub fn with_land(rect: Rect, land: Rect) -> Self {
+        Self {
+            rect,
+            land,
+            hwnd: 0,
+            panel: false,
+        }
+    }
+
+    pub fn with_hwnd(mut self, hwnd: isize) -> Self {
+        self.hwnd = hwnd;
+        self
+    }
+
+    pub fn as_panel(mut self) -> Self {
+        self.panel = true;
+        self
+    }
+
+    pub fn contains(&self, px: i32, py: i32) -> bool {
+        self.rect.contains(px, py)
+    }
+
+    pub fn landing_point(&self, px: i32, py: i32) -> (i32, i32) {
+        clamp_point_inside(self.land, px, py)
+    }
+}
+
+fn clamp_point_inside(rect: Rect, px: i32, py: i32) -> (i32, i32) {
+    if rect.w <= 0 || rect.h <= 0 {
+        return (rect.x, rect.y);
+    }
+    (
+        px.clamp(rect.x, rect.x + rect.w - 1),
+        py.clamp(rect.y, rect.y + rect.h - 1),
+    )
+}
+
+pub fn panel_no_engage_rect(panel: Rect) -> NoEngageRect {
+    // Exact visible panel only. No invisible halo is allowed to block source
+    // ownership or clamp virtual motion; panel identity is explicit now.
+    NoEngageRect::new(panel).as_panel()
+}
+
+fn is_panel_hit(hit: NoEngageRect) -> bool {
+    hit.panel
+}
+
+fn ui_landing_point(hit: NoEngageRect, px: i32, py: i32) -> (i32, i32) {
+    // Ownership is exact: never magnetize a visible cursor event to an inset or
+    // edge of GUI/panel geometry. The click/hover point is the point the user
+    // actually sees. HWND identity, not cached geometry, established ownership.
+    let _ = hit;
+    (px, py)
+}
+
+/// Resolve a tracked role from the HWND Win32 already chose. Vector order is
+/// deliberately irrelevant; this helper exists so overlap priority can be
+/// stress-tested without any native calls.
+fn tracked_ui_for_top_hwnd(no_engage: &[NoEngageRect], top_hwnd: isize) -> Option<NoEngageRect> {
+    if top_hwnd == 0 {
+        return None;
+    }
+    no_engage.iter().copied().find(|r| r.hwnd == top_hwnd)
+}
+
+/// Authoritative cursor ownership hit-test.
+///
+/// The single source of truth is Win32's top-level window at the VISIBLE screen
+/// point. Geometry/list order is never allowed to decide between overlapping
+/// GUI/panel/native windows. This matters because the main GUI, floating panel
+/// and transparent overlay are all topmost siblings and their rectangles can
+/// overlap while the GUI is moved or the panel expands/collapses.
+///
+/// IMPORTANT: this function is read-only. It must not raise/reorder a window;
+/// changing Z-order while deciding Z-order makes ownership self-modifying and
+/// was one of the sources of enter/exit oscillation.
+fn hit_ui_for_cursor_ownership(no_engage: &[NoEngageRect], x: i32, y: i32) -> Option<NoEngageRect> {
+    // Unit/synthetic geometry has no live HWND at all. Resolve that case before
+    // WindowFromPoint so desktop/test-runner windows cannot accidentally become
+    // the authority for fake coordinates. Production Neo zones have live HWNDs.
+    let has_live_tracked_hwnd = no_engage
+        .iter()
+        .any(|r| r.hwnd != 0 && crate::platform::win32::is_window_valid(r.hwnd));
+    if !has_live_tracked_hwnd {
+        return no_engage.iter().copied().find(|r| r.land.contains(x, y));
+    }
+
+    // In production, Win32 Z-order at the visible point is the ONLY authority.
+    // Rectangle order, previous owner, hover history and panel role must never
+    // overrule the actual top-level window under this point.
+    let top = crate::platform::win32::direct_top_level_window_at_point(x, y);
+    if top == 0 {
+        return None;
+    }
+    let tracked = tracked_ui_for_top_hwnd(no_engage, top);
+
+    // A GUI/panel HWND can briefly outrun the latest coalesced geometry sample
+    // during resize/mode/language changes. If Win32 says the top interactive
+    // window is one of Neo's own real windows, keep native ownership instead of
+    // dropping to source ownership for one event. Transparent overlay/sprite
+    // helpers are filtered by direct_top_level_window_at_point().
+    if tracked.is_none() && !crate::platform::win32::is_own_window(top) {
+        return None;
+    }
+
+    let fallback_land = tracked.map(|r| r.land).unwrap_or(Rect { x, y, w: 1, h: 1 });
+    let live = crate::platform::win32::window_rect(top)
+        .map(|(rx, ry, rw, rh)| Rect {
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+        })
+        .filter(|r| r.w > 0 && r.h > 0)
+        .unwrap_or(fallback_land);
+    Some(match tracked {
+        Some(r) if r.panel => panel_no_engage_rect(live).with_hwnd(top),
+        _ => NoEngageRect::new(live).with_hwnd(top),
+    })
+}
+
+/// While source ownership is active, the real cursor physically lives in the
+/// source rectangle. If the topmost Neo GUI overlaps that rectangle, Windows
+/// would otherwise hover/click the GUI at the hidden source point even though
+/// the visible virtual cursor is elsewhere. Keep Neo's main GUI click-through
+/// during source ownership and use its live geometry for the visible pointer.
+fn own_main_gui_at_visible_point(
+    no_engage: &[NoEngageRect],
+    x: i32,
+    y: i32,
+) -> Option<NoEngageRect> {
+    no_engage.iter().copied().find_map(|zone| {
+        if zone.panel
+            || zone.hwnd == 0
+            || !crate::platform::win32::is_own_window(zone.hwnd)
+            || !crate::platform::win32::is_window_valid(zone.hwnd)
+        {
+            return None;
+        }
+        let live = crate::platform::win32::window_rect(zone.hwnd)
+            .map(|(rx, ry, rw, rh)| Rect {
+                x: rx,
+                y: ry,
+                w: rw,
+                h: rh,
+            })
+            .filter(|r| r.w > 0 && r.h > 0)
+            .unwrap_or(zone.land);
+        live.contains(x, y)
+            .then(|| NoEngageRect::new(live).with_hwnd(zone.hwnd))
+    })
+}
+
+fn hit_ui_for_visible_cursor(g: &State, x: i32, y: i32) -> Option<NoEngageRect> {
+    if g.engaged {
+        if let Some(gui) = own_main_gui_at_visible_point(&g.no_engage, x, y) {
+            return Some(gui);
+        }
+    }
+    hit_ui_for_cursor_ownership(&g.no_engage, x, y)
+}
+
+fn route_clock_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn publish_main_gui_passthrough(hwnd: isize, passthrough: bool, reason: &str) {
+    let previous = MAIN_GUI_MOUSE_PASSTHROUGH.swap(passthrough, Ordering::AcqRel);
+    let previous_hwnd = MAIN_GUI_HWND.swap(hwnd, Ordering::AcqRel);
+    let changed = previous != passthrough || previous_hwnd != hwnd;
+    let native_mismatch = crate::platform::win32::window_input_passthrough(hwnd) != passthrough;
+    if changed || native_mismatch {
+        MAIN_GUI_ROUTE_REPAIR_UNTIL_MS.store(route_clock_ms() + 250, Ordering::Release);
+        crate::platform::win32::set_window_input_passthrough(hwnd, passthrough);
+        log::info!(
+            "gui-input-route: hwnd={hwnd:#x} passthrough={passthrough} reason={reason} changed={changed} native_mismatch={native_mismatch}"
+        );
+    }
+}
+
+fn set_own_main_gui_passthrough(g: &State, passthrough: bool, reason: &str) {
+    for zone in &g.no_engage {
+        if !zone.panel
+            && zone.hwnd != 0
+            && crate::platform::win32::is_own_window(zone.hwnd)
+            && crate::platform::win32::is_window_valid(zone.hwnd)
+        {
+            publish_main_gui_passthrough(zone.hwnd, passthrough, reason);
+        }
+    }
+}
+
+fn repair_main_gui_passthrough_if_needed() {
+    let hwnd = MAIN_GUI_HWND.load(Ordering::Acquire);
+    if hwnd == 0 || !crate::platform::win32::is_window_valid(hwnd) {
+        return;
+    }
+    let wanted = MAIN_GUI_MOUSE_PASSTHROUGH.load(Ordering::Acquire);
+    // Passthrough=true is a short-lived source-ownership state, so its race
+    // repair remains bounded. Interactive=false is the safe/idle state: never
+    // time-limit that repair. If a stale queued viewport command makes the GUI
+    // click-through after Stop, the next physical move OR button edge must be
+    // able to recover it even several seconds later.
+    if wanted && route_clock_ms() > MAIN_GUI_ROUTE_REPAIR_UNTIL_MS.load(Ordering::Acquire) {
+        return;
+    }
+    if crate::platform::win32::window_input_passthrough(hwnd) != wanted {
+        crate::platform::win32::set_window_input_passthrough(hwnd, wanted);
+        log::warn!(
+            "gui-input-route race repaired: hwnd={hwnd:#x} passthrough={wanted}"
+        );
+    }
+}
+
+fn contains_for_engage(rect: Rect, px: i32, py: i32) -> bool {
+    if rect.w <= ENTER_MARGIN_PX * 2 + 1 || rect.h <= ENTER_MARGIN_PX * 2 + 1 {
+        return rect.contains(px, py);
+    }
+    px >= rect.x + ENTER_MARGIN_PX
+        && px < rect.x + rect.w - ENTER_MARGIN_PX
+        && py >= rect.y + ENTER_MARGIN_PX
+        && py < rect.y + rect.h - ENTER_MARGIN_PX
+}
+
+#[cfg(test)]
+fn exit_point_for_virtual(content: Rect, vx: f64, vy: f64) -> (i32, i32) {
+    let left = content.x;
+    let right = content.x + content.w - 1;
+    let top = content.y;
+    let bottom = content.y + content.h - 1;
+    let x = if vx < left as f64 {
+        content.x - EXIT_PLACE_MARGIN_PX
+    } else if vx > right as f64 {
+        content.x + content.w + EXIT_PLACE_MARGIN_PX
+    } else {
+        (vx.round() as i32).clamp(left, right)
+    };
+    let y = if vy < top as f64 {
+        content.y - EXIT_PLACE_MARGIN_PX
+    } else if vy > bottom as f64 {
+        content.y + content.h + EXIT_PLACE_MARGIN_PX
+    } else {
+        (vy.round() as i32).clamp(top, bottom)
+    };
+    (x, y)
+}
+
+fn reenter_cooldown(now: std::time::Instant, oscillations: u32) -> std::time::Instant {
+    let mult = 1 + oscillations.min(OSC_MAX) as u64;
+    now + std::time::Duration::from_millis(REENTER_COOLDOWN_MS * mult)
+}
+
+fn map_content_to_source(content: Rect, src: Rect, vx: f64, vy: f64) -> (i32, i32) {
+    if content.w <= 1 || content.h <= 1 || src.w <= 1 || src.h <= 1 {
+        return (src.x, src.y);
+    }
+    let fx = ((vx - content.x as f64 + 0.5) / content.w as f64).clamp(0.0, 1.0);
+    let fy = ((vy - content.y as f64 + 0.5) / content.h as f64).clamp(0.0, 1.0);
+    let tx = (src.x as f64 + fx * src.w as f64 - 0.5).round() as i32;
+    let ty = (src.y as f64 + fy * src.h as f64 - 0.5).round() as i32;
+    (
+        tx.clamp(src.x, src.x + src.w - 1),
+        ty.clamp(src.y, src.y + src.h - 1),
+    )
+}
+
+fn map_source_to_content(content: Rect, src: Rect, sx: f64, sy: f64) -> (f64, f64) {
+    if content.w <= 1 || content.h <= 1 || src.w <= 1 || src.h <= 1 {
+        return (content.x as f64, content.y as f64);
+    }
+    let fx = ((sx - src.x as f64 + 0.5) / src.w as f64).clamp(0.0, 1.0);
+    let fy = ((sy - src.y as f64 + 0.5) / src.h as f64).clamp(0.0, 1.0);
+    (
+        content.x as f64 + fx * content.w as f64 - 0.5,
+        content.y as f64 + fy * content.h as f64 - 0.5,
+    )
+}
+
+/// Like `map_source_to_content` but WITHOUT clamping the fraction to [0,1], so a
+/// source position OUTSIDE the source rect (a pre-clip hook pt past the edge)
+/// maps to a content position OUTSIDE the content rect. Used for the SPRITE
+/// position so that, as the hand pushes past the source edge, the visible
+/// cursor keeps travelling toward/past the content edge instead of being pulled
+/// back to the clamped source-edge mapping.
+fn map_source_to_content_unclamped(content: Rect, src: Rect, sx: f64, sy: f64) -> (f64, f64) {
+    if content.w <= 1 || content.h <= 1 || src.w <= 1 || src.h <= 1 {
+        return (content.x as f64, content.y as f64);
+    }
+    let fx = (sx - src.x as f64 + 0.5) / src.w as f64;
+    let fy = (sy - src.y as f64 + 0.5) / src.h as f64;
+    (
+        content.x as f64 + fx * content.w as f64 - 0.5,
+        content.y as f64 + fy * content.h as f64 - 0.5,
+    )
+}
+
+fn content_per_source_px(content: Rect, src: Rect) -> (f64, f64) {
+    if content.w <= 1 || content.h <= 1 || src.w <= 1 || src.h <= 1 {
+        return (1.0, 1.0);
+    }
+    (
+        content.w as f64 / src.w as f64,
+        content.h as f64 / src.h as f64,
+    )
+}
+
+fn clamp_virtual_point(content: Rect, vx: f64, vy: f64, margin: f64) -> (f64, f64) {
+    (
+        vx.clamp(
+            content.x as f64 - margin,
+            (content.x + content.w) as f64 + margin,
+        ),
+        vy.clamp(
+            content.y as f64 - margin,
+            (content.y + content.h) as f64 + margin,
+        ),
+    )
+}
+
+fn remap_virtual_between_content(
+    old_content: Rect,
+    new_content: Rect,
+    vx: f64,
+    vy: f64,
+) -> (f64, f64) {
+    let margin = EXIT_PLACE_MARGIN_PX as f64;
+    if old_content.w <= 1 || old_content.h <= 1 || new_content.w <= 1 || new_content.h <= 1 {
+        let dx = (new_content.x - old_content.x) as f64;
+        let dy = (new_content.y - old_content.y) as f64;
+        return clamp_virtual_point(new_content, vx + dx, vy + dy, margin);
+    }
+    let fx = (vx - old_content.x as f64) / old_content.w as f64;
+    let fy = (vy - old_content.y as f64) / old_content.h as f64;
+    clamp_virtual_point(
+        new_content,
+        new_content.x as f64 + fx * new_content.w as f64,
+        new_content.y as f64 + fy * new_content.h as f64,
+        margin,
+    )
+}
+
+fn edge_out_amount(src: Rect, px: i32, py: i32) -> i32 {
+    let right = src.x + src.w;
+    let bottom = src.y + src.h;
+    [src.x - px, px - right, src.y - py, py - bottom, 0]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EdgeSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn edge_out_side(src: Rect, px: i32, py: i32) -> Option<EdgeSide> {
+    let right = src.x + src.w;
+    let bottom = src.y + src.h;
+    let candidates = [
+        (EdgeSide::Left, src.x - px),
+        (EdgeSide::Right, px - right),
+        (EdgeSide::Top, src.y - py),
+        (EdgeSide::Bottom, py - bottom),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, out)| *out > 0)
+        .max_by_key(|(_, out)| *out)
+        .map(|(side, _)| side)
+}
+
+fn fullscreen_ui_target_for_edge(g: &State, side: EdgeSide) -> Option<Rect> {
+    let c = g.content;
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    // Ask Win32 which REAL top-level window owns the adjacent screen point.
+    // This preserves access to a GUI in letterbox space while preventing list
+    // order or a stale/expanded panel rectangle from inventing an edge target.
+    let sample = match side {
+        EdgeSide::Left => (c.x - 1, vy),
+        EdgeSide::Right => (c.x + c.w, vy),
+        EdgeSide::Top => (vx, c.y - 1),
+        EdgeSide::Bottom => (vx, c.y + c.h),
+    };
+    hit_ui_for_cursor_ownership(&g.no_engage, sample.0, sample.1).map(|h| h.land)
+}
+
+fn extend_fullscreen_virtual_into_ui(g: &mut State, side: EdgeSide, out: i32) -> bool {
+    let Some(target) = fullscreen_ui_target_for_edge(g, side) else {
+        return false;
+    };
+    let c = g.content;
+    let (scale_x, scale_y) = content_per_source_px(c, g.src);
+    let step = match side {
+        EdgeSide::Left | EdgeSide::Right => scale_x,
+        EdgeSide::Top | EdgeSide::Bottom => scale_y,
+    }
+    .max(1.0);
+    g.edge_out_accum += out as f64 * step;
+    let travel = g.edge_out_accum;
+    let right = (c.x + c.w - 1) as f64;
+    let bottom = (c.y + c.h - 1) as f64;
+    g.virt = match side {
+        EdgeSide::Left => (
+            (c.x as f64 - travel).clamp(target.x as f64, c.x as f64),
+            g.virt.1,
+        ),
+        EdgeSide::Right => (
+            (right + travel).clamp(right, (target.x + target.w - 1) as f64),
+            g.virt.1,
+        ),
+        EdgeSide::Top => (
+            g.virt.0,
+            (c.y as f64 - travel).clamp(target.y as f64, c.y as f64),
+        ),
+        EdgeSide::Bottom => (
+            g.virt.0,
+            (bottom + travel).clamp(bottom, (target.y + target.h - 1) as f64),
+        ),
+    };
+    true
+}
+
+fn virtual_over_ui(g: &State) -> bool {
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    hit_ui_for_visible_cursor(g, vx, vy).is_some()
+}
+
+fn note_ui_hover(g: &mut State, _now: std::time::Instant) -> Option<UiHover> {
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    let hit = hit_ui_for_visible_cursor(g, vx, vy)?;
+    let hover = UiHover {
+        hit,
+        pos: ui_landing_point(hit, vx, vy),
+    };
+    g.last_ui_hover = Some(hover);
+    Some(hover)
+}
+
+fn ui_target_at(
+    g: &mut State,
+    x: i32,
+    y: i32,
+    margin: i32,
+    _now: std::time::Instant,
+) -> Option<UiHover> {
+    debug_assert_eq!(margin, 0, "native UI routing must be exact");
+    let hit = hit_ui_for_cursor_ownership(&g.no_engage, x, y)?;
+    let hover = UiHover {
+        hit,
+        pos: ui_landing_point(hit, x, y),
+    };
+    g.last_ui_hover = Some(hover);
+    Some(hover)
+}
+
+fn invalidate_stale_ui_hover_after_no_engage_change(
+    g: &mut State,
+) -> Option<(NoEngageRect, Option<NoEngageRect>)> {
+    let last = g.last_ui_hover?;
+    if g.no_engage.iter().any(|r| *r == last.hit) {
+        return None;
+    }
+    let replacement = g
+        .no_engage
+        .iter()
+        .find(|r| r.hwnd != 0 && r.hwnd == last.hit.hwnd)
+        .copied();
+    g.last_ui_hover = None;
+    g.last_ui_post = None;
+    g.ui_hover_active = false;
+    Some((last.hit, replacement))
+}
+
+/// Refresh Neo's ordinary GUI exclusion rectangles directly from Win32 on the
+/// low-level mouse path. The GUI thread publishes geometry latest-only, but a
+/// very heavy render frame can still delay the render thread from consuming
+/// that latest sample for a few hundred milliseconds. During a native title-bar
+/// drag that delay is enough for the old rect to say "content", causing an
+/// engage warp that Windows then interprets as part of the window drag.
+///
+/// This is intentionally dimension/language/DPI agnostic: the HWND is the
+/// identity and GetWindowRect is the source of truth. Main GUI and control
+/// panel are refreshed identically; panel identity is explicit, not inferred
+/// from an expanded geometry halo.
+fn refresh_live_own_no_engage_geometry(g: &mut State, now: std::time::Instant) -> bool {
+    let mut changed = false;
+    for hit in &mut g.no_engage {
+        if hit.hwnd == 0 || !crate::platform::win32::is_own_window(hit.hwnd) {
+            continue;
+        }
+        unsafe {
+            let mut wr = RECT::default();
+            if GetWindowRect(HWND(hit.hwnd as *mut _), &mut wr).is_ok() {
+                let live = Rect {
+                    x: wr.left,
+                    y: wr.top,
+                    w: wr.right - wr.left,
+                    h: wr.bottom - wr.top,
+                };
+                if live.w > 0 && live.h > 0 && (hit.rect != live || hit.land != live) {
+                    hit.rect = live;
+                    hit.land = live;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        g.no_engage_moved_at = Some(now);
+        // A native drag owns its gesture until button-up. Do not churn hover
+        // state merely because the owned window rectangle moves underneath it.
+        if g.native_ui_hold_bits == 0 {
+            let _ = invalidate_stale_ui_hover_after_no_engage_change(g);
+        }
+    }
+    changed
+}
+
+fn ui_click_target_from_virtual(g: &mut State, now: std::time::Instant) -> Option<UiHover> {
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    // Clicks follow the window currently under the visible cursor. Never use a
+    // previous-frame hover or an invisible margin after the cursor has left.
+    ui_target_at(g, vx, vy, UI_CLICK_MARGIN_PX, now)
+}
+
+fn ui_click_target_for_event(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    now: std::time::Instant,
+) -> Option<UiHover> {
+    if g.engaged {
+        // While engaged the real cursor is hidden/clipped in SOURCE coordinates.
+        // Reinterpreting that hidden raw coordinate as a screen-space UI hit was
+        // another source of phantom GUI/panel ownership.
+        ui_click_target_from_virtual(g, now)
+    } else {
+        ui_target_at(g, px, py, UI_CLICK_MARGIN_PX, now)
+    }
+}
+
+fn post_mouse_move_to_hwnd(hwnd: isize, sx: i32, sy: i32) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let mut pt = POINT { x: sx, y: sy };
+        let _ = ScreenToClient(h, &mut pt);
+        let lp = (((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF)) as isize;
+        let _ = PostMessageW(Some(h), WM_MOUSEMOVE, WPARAM(0), LPARAM(lp));
+    }
+}
+
+fn post_mouse_button_to_hwnd(hwnd: isize, sx: i32, sy: i32, bit: u8) {
+    if hwnd == 0 {
+        return;
+    }
+    let (down_msg, up_msg, mk) = match bit {
+        BTN_LEFT => (WM_LBUTTONDOWN, WM_LBUTTONUP, 0x0001usize),
+        BTN_RIGHT => (WM_RBUTTONDOWN, WM_RBUTTONUP, 0x0002usize),
+        BTN_MIDDLE => (WM_MBUTTONDOWN, WM_MBUTTONUP, 0x0010usize),
+        _ => return,
+    };
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let mut pt = POINT { x: sx, y: sy };
+        let _ = ScreenToClient(h, &mut pt);
+        let lp = (((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF)) as isize;
+        let _ = PostMessageW(Some(h), WM_MOUSEMOVE, WPARAM(0), LPARAM(lp));
+        let _ = PostMessageW(Some(h), down_msg, WPARAM(mk), LPARAM(lp));
+        let _ = PostMessageW(Some(h), up_msg, WPARAM(0), LPARAM(lp));
+    }
+}
+
+fn queue_panel_action(hover: UiHover, bit: u8) {
+    if bit != BTN_LEFT || !is_panel_hit(hover.hit) {
+        return;
+    }
+    let land = hover.hit.land;
+    let rel_x = hover.pos.0 - land.x;
+    let action = panel_action_for_relative_x(land.w, rel_x);
+    let Some(action) = action else { return };
+    PANEL_ACTIONS.fetch_or(action, Ordering::Release);
+    log::info!(
+        "panel direct action queued: action={} hwnd={:#x} pos=({},{}) land={:?}",
+        match action {
+            PANEL_ACTION_STOP => "stop",
+            PANEL_ACTION_COLLAPSE => "collapse",
+            PANEL_ACTION_EXPAND => "expand",
+            PANEL_ACTION_SCREENSHOT => "screenshot",
+            PANEL_ACTION_GUI_TOPMOST => "gui-topmost",
+            _ => "unknown",
+        },
+        hover.hit.hwnd,
+        hover.pos.0,
+        hover.pos.1,
+        land
+    );
+}
+
+/// Hit-test the fixed [stop][fps][camera][GUI][collapse] panel layout. Boundaries
+/// sit in the middle of each 3pt visual gap, so direct hook actions and the
+/// painted controls cannot disagree near an edge.
+pub fn panel_action_for_relative_x(width: i32, relative_x: i32) -> Option<u32> {
+    if width <= 0 || relative_x < 0 || relative_x >= width {
+        return None;
+    }
+    if width <= 60 {
+        return Some(PANEL_ACTION_EXPAND);
+    }
+    const LAYOUT_UNITS: i32 = 270;
+    const STOP_END: i32 = 84;
+    const FPS_END: i32 = 155;
+    const CAMERA_END: i32 = 192;
+    const GUI_END: i32 = 229;
+    let scaled = relative_x.saturating_mul(LAYOUT_UNITS) / width;
+    if scaled < STOP_END {
+        Some(PANEL_ACTION_STOP)
+    } else if scaled < FPS_END {
+        None
+    } else if scaled < CAMERA_END {
+        Some(PANEL_ACTION_SCREENSHOT)
+    } else if scaled < GUI_END {
+        Some(PANEL_ACTION_GUI_TOPMOST)
+    } else {
+        Some(PANEL_ACTION_COLLAPSE)
+    }
+}
+
+pub fn take_panel_actions() -> u32 {
+    PANEL_ACTIONS.swap(0, Ordering::AcqRel)
+}
+
+/// Returns true when this move handed ownership to a native GUI and moved the
+/// real cursor there. The hook must consume that triggering source-space event,
+/// or Windows will apply its old source coordinate after the handoff.
+fn post_ui_hover_from_state(g: &mut State, now: std::time::Instant) -> bool {
+    if let Some(hover) = note_ui_hover(g, now) {
+        if hover.hit.hwnd != 0 {
+            if is_panel_hit(hover.hit) {
+                // The floating control panel keeps the sprite treatment:
+                // hover posts for highlight, clicks redirected explicitly.
+                let should_post = match g.last_ui_post {
+                    Some((hwnd, pos, at)) => {
+                        hwnd != hover.hit.hwnd
+                            || pos != hover.pos
+                            || now.duration_since(at) >= std::time::Duration::from_millis(8)
+                    }
+                    None => true,
+                };
+                if should_post {
+                    post_mouse_move_to_hwnd(hover.hit.hwnd, hover.pos.0, hover.pos.1);
+                    g.last_ui_post = Some((hover.hit.hwnd, hover.pos, now));
+                }
+                g.hidden_by_idle = false;
+                g.ui_hover_active = true;
+                sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+                keep_cursor_sprite_on_top();
+            } else {
+                // The GUI is our own window; the moment
+                // the virtual cursor enters it, switch to the plain system
+                // cursor entirely (disengage + real cursor at the sprite
+                // position + activate). No sprite/synthetic-hover hybrid: that
+                // hybrid is what flickered until a real click activated the
+                // window. Inside the GUI everything is ordinary Windows;
+                // leaving it is classified immediately by the live HWND edge.
+                if handoff_to_gui(g, hover, now) {
+                    log::info!(
+                        "{} entry handoff to hwnd={:#x} at ({},{})",
+                        if crate::platform::win32::is_own_window(hover.hit.hwnd) {
+                            "gui"
+                        } else {
+                            "external-native-window"
+                        },
+                        hover.hit.hwnd,
+                        hover.pos.0,
+                        hover.pos.1
+                    );
+                    return true;
+                }
+                log::warn!(
+                    "native UI entry deferred after unverified warp: hwnd={:#x} at ({},{})",
+                    hover.hit.hwnd,
+                    hover.pos.0,
+                    hover.pos.1
+                );
+            }
+        } else {
+            post_mouse_move_to_hwnd(hover.hit.hwnd, hover.pos.0, hover.pos.1);
+            // UI hover is never an idle-hidden state. A topmost GUI can be
+            // raised above the cursor sprite after we enter it, so keep the
+            // sprite visible and reassert its z-order while the virtual cursor
+            // is over UI.
+            g.hidden_by_idle = false;
+            g.ui_hover_active = true;
+            sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+            keep_cursor_sprite_on_top();
+        }
+    } else {
+        g.ui_hover_active = false;
+    }
+    false
+}
+
+fn fullscreen_ui_virtual_move(
+    g: &mut State,
+    old_virt: (f64, f64),
+    _raw: (i32, i32),
+    raw_delta: (i32, i32),
+) -> bool {
+    if !g.fullscreen || g.buttons_down != 0 {
+        return false;
+    }
+
+    let ox = old_virt.0.round() as i32;
+    let oy = old_virt.1.round() as i32;
+    let Some(old_hit) = hit_ui_for_cursor_ownership(&g.no_engage, ox, oy) else {
+        return false;
+    };
+
+    // The floating panel lives inside fullscreen content. It must behave like a
+    // transparent waypoint for cursor motion: normal source->content mapping
+    // already moves the sprite through it smoothly. Never switch to a special
+    // panel coordinate mode and never clamp into the panel rectangle.
+    if is_panel_hit(old_hit) {
+        return false;
+    }
+
+    // A non-panel native window can briefly remain in virtual mode during an
+    // edge/letterbox handoff. Continue the visible cursor by physical delta but
+    // never clamp it back into the old window. The next exact WindowFromPoint
+    // result decides ownership; leaving the window is therefore immediate.
+    let (scale_x, scale_y) = content_per_source_px(g.content, g.src);
+    let next = (
+        old_virt.0 + raw_delta.0 as f64 * scale_x.max(1.0),
+        old_virt.1 + raw_delta.1 as f64 * scale_y.max(1.0),
+    );
+    g.virt = next;
+    hit_ui_for_cursor_ownership(&g.no_engage, next.0.round() as i32, next.1.round() as i32)
+        .is_some()
+}
+
+fn should_hide_cursor_for_idle(g: &State, now: std::time::Instant) -> bool {
+    if !g.engaged || g.hidden_by_idle || g.autohide_secs <= 0.0 || virtual_over_ui(g) {
+        return false;
+    }
+    g.last_move
+        .map(|t| now.duration_since(t).as_secs_f32() > g.autohide_secs)
+        .unwrap_or(false)
+}
+
+fn log_fullscreen_ui_edge_miss(
+    g: &State,
+    side: EdgeSide,
+    px: i32,
+    py: i32,
+    old_virt: (f64, f64),
+    mapped: (f64, f64),
+) {
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if g.no_engage.is_empty() || COUNT.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    log::info!(
+        "fullscreen-ui edge miss: side={side:?} raw=({px},{py}) old_virt=({:.1},{:.1}) mapped=({:.1},{:.1}) content={:?} no_engage={:?}",
+        old_virt.0,
+        old_virt.1,
+        mapped.0,
+        mapped.1,
+        g.content,
+        g.no_engage
+    );
+}
+
+fn on_or_past_source_edge(src: Rect, px: i32, py: i32) -> bool {
+    px <= src.x || px >= src.x + src.w - 1 || py <= src.y || py >= src.y + src.h - 1
+}
+
+/// Max px the exit placement may sit outside the content — clamps a stale/huge
+/// pre-clip sprite position so a bad event can't fling the cursor across the
+/// screen on exit.
+#[cfg(test)]
+const EXIT_OVERSHOOT_MAX_PX: i32 = 300;
+
+/// Place the exit cursor exactly where the sprite (raw-driven `virt`) already
+/// is, when that is OUTSIDE the content — so revealing the system cursor there
+/// is seamless (no jump between sprite and cursor). None if still inside.
+#[cfg(test)]
+fn exit_place_from_virt(c: Rect, virt: (f64, f64)) -> Option<(i32, i32)> {
+    let x = virt.0.round() as i32;
+    let y = virt.1.round() as i32;
+    if x >= c.x && x < c.x + c.w && y >= c.y && y < c.y + c.h {
+        return None;
+    }
+    let m = EXIT_OVERSHOOT_MAX_PX;
+    Some((
+        x.clamp(c.x - m, c.x + c.w + m),
+        y.clamp(c.y - m, c.y + c.h + m),
+    ))
+}
+
+#[cfg(test)]
+fn exit_point_for_source_edge(content: Rect, src: Rect, px: i32, py: i32) -> (i32, i32) {
+    let (sx, sy) = content_per_source_px(content, src);
+    let mut vx = content.x as f64 + (px - src.x) as f64 * sx;
+    let mut vy = content.y as f64 + (py - src.y) as f64 * sy;
+    if px < src.x {
+        vx = (content.x - EXIT_PLACE_MARGIN_PX) as f64;
+    } else if px >= src.x + src.w {
+        vx = (content.x + content.w + EXIT_PLACE_MARGIN_PX) as f64;
+    }
+    if py < src.y {
+        vy = (content.y - EXIT_PLACE_MARGIN_PX) as f64;
+    } else if py >= src.y + src.h {
+        vy = (content.y + content.h + EXIT_PLACE_MARGIN_PX) as f64;
+    }
+    (
+        (vx.round() as i32).clamp(
+            content.x - EXIT_PLACE_MARGIN_PX,
+            content.x + content.w + EXIT_PLACE_MARGIN_PX,
+        ),
+        (vy.round() as i32).clamp(
+            content.y - EXIT_PLACE_MARGIN_PX,
+            content.y + content.h + EXIT_PLACE_MARGIN_PX,
+        ),
+    )
+}
+
+fn escape_rect(g: &State) -> Rect {
+    if !g.fullscreen && g.overlay.w > 0 && g.overlay.h > 0 {
+        g.overlay
+    } else {
+        g.content
+    }
+}
+
+fn exit_point_for_escape(g: &State, px: i32, py: i32) -> (i32, i32) {
+    let r = escape_rect(g);
+    let c = g.content;
+    let s = g.src;
+    let virt = g.virt;
+    let margin = if g.fullscreen {
+        EXIT_PLACE_MARGIN_PX
+    } else {
+        EXIT_WINDOW_MARGIN_PX
+    };
+    let left = px < s.x || virt.0 < c.x as f64;
+    let right = px >= s.x + s.w || virt.0 >= (c.x + c.w) as f64;
+    let top = py < s.y || virt.1 < c.y as f64;
+    let bottom = py >= s.y + s.h || virt.1 >= (c.y + c.h) as f64;
+    let x = if left {
+        r.x - margin
+    } else if right {
+        r.x + r.w + margin
+    } else {
+        (virt.0.round() as i32).clamp(r.x, r.x + r.w - 1)
+    };
+    let y = if top {
+        r.y - margin
+    } else if bottom {
+        r.y + r.h + margin
+    } else {
+        (virt.1.round() as i32).clamp(r.y, r.y + r.h - 1)
+    };
+    (x, y)
+}
+
+fn clip_rect(src: Rect) -> RECT {
+    RECT {
+        left: src.x,
+        top: src.y,
+        right: src.x + src.w,
+        bottom: src.y + src.h,
+    }
+}
+
+/// Restore process-wide cursor/clip/speed state without injecting any mouse
+/// button event. This is the only recovery routine that may run at startup.
+/// Injecting an unconditional RIGHTUP here can be interpreted by Explorer as
+/// a completed right-click and opened its context menu before Neo appeared.
+pub fn startup_recover_input_state() {
+    // ask the render-engine thread (Mag owner) to reveal the cursor if it is
+    // still alive; also do a best-effort local reveal for the standalone rescue
+    // exe (where no engine thread exists — the OS restores the cursor on the
+    // hidden process's exit anyway, so a residual no-op here is harmless).
+    WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+    CURSOR_HIDE_APPLIED.store(false, Ordering::Release);
+    MAG_REINIT_REQUESTED.store(true, Ordering::Release);
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    cancel_cursor_reveal();
+    sprite_hide();
+    restore_configured_system_cursors();
+    unsafe {
+        let _ = ClipCursor(None);
+    }
+    restore_mouse_speed();
+    heal_leftover_mouse_speed();
+}
+
+/// Stop/panic recovery. Button release is allowed only on an active teardown;
+/// startup paths must call startup_recover_input_state instead.
+pub fn emergency_release_all() {
+    startup_recover_input_state();
+    // The GUI can currently be click-through while source ownership is armed.
+    // Restoring it must not depend on acquiring the input-state mutex: Stop can
+    // race a high-rate LL-hook move which briefly owns that lock. Previously a
+    // single failed try_lock left WS_EX_TRANSPARENT set after capture stopped,
+    // making the GUI visible but neither clickable nor draggable.
+    let gui_hwnd = MAIN_GUI_HWND.load(Ordering::Acquire);
+    if gui_hwnd != 0 && crate::platform::win32::is_window_valid(gui_hwnd) {
+        publish_main_gui_passthrough(gui_hwnd, false, "emergency-release");
+        // A leftover WS_EX_TRANSPARENT bit can be repaired, but a later queued
+        // winit/egui passthrough command could still land after that check.
+        // Reassert the native interactive route even when the bit was already
+        // clear, which also forces a SWP_FRAMECHANGED hit-test refresh.
+        crate::platform::win32::set_window_input_passthrough(gui_hwnd, false);
+    }
+    // Release only state that Neo itself is tracking. Never synthesize a
+    // process-wide UP merely because the physical button happens to be held.
+    for attempt in 1..=8 {
+        if let Ok(mut g) = state().try_lock() {
+            release_locked(&mut g);
+            g.active = false;
+            g.buttons_down = 0;
+            g.native_ui_hold_bits = 0;
+            log::info!("emergency-input-state-release: result=complete attempt={attempt}");
+            return;
+        }
+        if attempt < 8 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    log::error!(
+        "emergency-input-state-release: result=state-lock-timeout gui_passthrough_recovered=true"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingEngage {
+    origin: (i32, i32),
+    target: (i32, i32),
+    sprite: (i32, i32),
+    src: Rect,
+    requested_at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeGuiSettle {
+    target: (i32, i32),
+    source_origin: (i32, i32),
+    until: std::time::Instant,
+    reasserted: bool,
+}
+
+#[derive(Default)]
+struct State {
+    active: bool,
+    /// fullscreen (Auto) mode: the magnified view IS the whole screen, so an
+    /// edge push must NOT slip the cursor out (there is nowhere to go and the
+    /// control panel lives at the top edge). Matches the cursor-routing design, where the
+    /// fullscreen/"clip" policy keeps the cursor confined and only the optional
+    /// peek reveals the desktop. Windowed (Fixed) mode still exits on a push.
+    fullscreen: bool,
+    overlay: Rect,
+    content: Rect, // on-screen rect where the source image is displayed
+    src: Rect,     // source client rect on screen
+    src_hwnd: isize,
+    no_engage: Vec<NoEngageRect>,
+    engaged: bool,
+    /// GUI -> magnified-content handoff waiting for the Magnification owner
+    /// thread to confirm that the native cursor is hidden. Until committed we
+    /// consume movement without warping the visible cursor into source space.
+    pending_engage: Option<PendingEngage>,
+    /// Updated by the render engine on every geometry/configuration tick.
+    /// Mouse-hook events use it as a last-resort escape if rendering stalls.
+    last_configure_at: Option<std::time::Instant>,
+    /// Provider/session transitions may intentionally pause the render heartbeat
+    /// for many seconds (notably a cold TensorRT engine build). During that
+    /// window input ownership is released and the hook must not report a stale
+    /// mapping failure or re-engage against old geometry.
+    transition_suspended: bool,
+    cursor_hidden: bool,
+    /// virtual cursor in CONTENT (screen) space — the user's hand moves this
+    /// at natural 1:1 speed; the real cursor is teleported to the mapped
+    /// source position (sub-pixel accurate)
+    virt: (f64, f64),
+    /// last source position we injected (hardware pt = this + raw delta)
+    last_set: (i32, i32),
+    /// last hardware pt seen (stale queued events continue from this base)
+    last_hw: (i32, i32),
+    /// re-engage cooldown after a disengage (prevents instant suck-back)
+    cooldown_until: Option<std::time::Instant>,
+    /// last hardware-move time (cursor auto-hide)
+    last_move: Option<std::time::Instant>,
+    hidden_by_idle: bool,
+    /// auto-hide seconds (0 = disabled)
+    autohide_secs: f32,
+    /// when true, slow the OS pointer by 1/zoom while engaged so the sprite
+    /// tracks the hand 1:1 (matches the disengaged speed → seamless edge
+    /// crossing. Driven by the cursor-speed compensation option.
+    adjust_speed: bool,
+    /// Mouse buttons currently held according to the hardware hook. While a
+    /// button is held, movement is a source drag and must not trigger edge
+    /// escape.
+    buttons_down: u8,
+    /// Physical button gestures that STARTED on Neo's native main GUI while
+    /// source ownership was disengaged. These are ordinary Windows move/resize/
+    /// control gestures, not the synthetic engaged->GUI `ui_hold_bits` path.
+    /// While set, source engage is forbidden so SetCursorPos can never warp a
+    /// live native window drag.
+    native_ui_hold_bits: u8,
+    /// Buttons whose hardware UP must be swallowed because their DOWN was
+    /// redirected to the panel as a synthetic full click (bit per button).
+    swallow_up: u8,
+    /// Buttons currently handed to a real GUI/control-panel window. While set,
+    /// the magnifier must not re-engage: the user is dragging/clicking UI.
+    ui_hold_bits: u8,
+    /// Short post-release guard so the engine has a tick to refresh the moving
+    /// Last physical/redirected button edge. The 50ms watchdog uses this to
+    /// distinguish a genuinely held button from a lost UP event.
+    last_button_event: Option<std::time::Instant>,
+    /// last time the no-engage rect set CHANGED (GUI window being dragged)
+    no_engage_moved_at: Option<std::time::Instant>,
+    edge_out_accum: f64,
+    last_engage_at: Option<std::time::Instant>,
+    /// Engage teleports the real cursor with SetCursorPos; LL-hook events
+    /// queued BEFORE that teleport still carry pre-teleport SCREEN coordinates
+    /// but arrive AFTER, where they'd be mapped as SOURCE coordinates and
+    /// fling the sprite (often into a topmost GUI => instant handoff bounce).
+    /// Until the injected teleport event itself (pt == this target) is seen,
+    /// swallow moves entirely — don't let them touch `virt`.
+    expect_teleport: Option<(i32, i32)>,
+    /// Commit-relative stale-event firewall. A saturated render thread can let
+    /// the SetCursorPos-consistent event overtake older screen-space moves; the
+    /// latter must remain quarantined briefly even after expect_teleport clears.
+    teleport_guard_until: Option<std::time::Instant>,
+    oscillations: u32,
+    /// Set after a windowed edge exit: suppress re-engage while the cursor still
+    /// lingers in the edge band, so it cannot immediately snap back in.
+    must_leave_content: bool,
+    /// Last GUI/control-panel hover from the virtual cursor. Used as a short
+    /// click grace so a one-frame edge clamp cannot send an intended GUI click
+    /// through to the source.
+    last_ui_hover: Option<UiHover>,
+    /// Coalesce synthetic hover messages from high-polling mice. The action
+    /// routing remains synchronous, while visual hover updates are capped at
+    /// 125Hz so the panel cannot flood its viewport message queue.
+    last_ui_post: Option<(isize, (i32, i32), std::time::Instant)>,
+    ui_hover_active: bool,
+    /// Native main-GUI ownership is independent from hover/cache state.
+    /// Geometry refreshes may invalidate `last_ui_hover` while the physical
+    /// cursor is still inside the same HWND; they must not retrigger entry.
+    native_gui_owner_hwnd: isize,
+    /// Quarantines source-coordinate mouse moves already queued when ownership
+    /// is handed to the real GUI cursor.
+    native_gui_settle: Option<NativeGuiSettle>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UiHover {
+    hit: NoEngageRect,
+    pos: (i32, i32),
+}
+
+static STATE: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
+static SPRITE_HWND: OnceLock<isize> = OnceLock::new();
+/// Native GUI ownership is published independently from the render cadence.
+/// While non-zero, the real Windows cursor must win over every stale hide
+/// request. This is intentionally atomic so a heavy filter cannot delay the
+/// ownership decision or add work to the capture path.
+static NATIVE_GUI_OWNER: AtomicIsize = AtomicIsize::new(0);
+static MAIN_GUI_MOUSE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+static MAIN_GUI_HWND: AtomicIsize = AtomicIsize::new(0);
+static MAIN_GUI_ROUTE_REPAIR_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_CURSOR_CONTRACT_OWNER: AtomicIsize = AtomicIsize::new(isize::MIN);
+static DEBUG_LAST_EDGE_PLACE_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static DEBUG_LAST_EDGE_PLACE_Y: AtomicI32 = AtomicI32::new(i32::MIN);
+static GHOST_ROUTE_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn state() -> &'static Arc<Mutex<State>> {
+    STATE.get_or_init(|| Arc::new(Mutex::new(State::default())))
+}
+
+pub fn main_gui_mouse_passthrough() -> bool {
+    MAIN_GUI_MOUSE_PASSTHROUGH.load(Ordering::Acquire)
+}
+
+// ---------------- sprite cursor (layered arrow window) ----------------
+
+/// Sprite box at 96dpi with the default cursor size. The REAL system cursor
+/// scales with monitor DPI and the accessibility cursor-size setting; a fixed
+/// A fixed 24px sprite can look undersized beside a 4K/150% system cursor (e.g.
+/// on high-DPI displays, so the sprite box is computed
+/// once at creation from DPI × CursorBaseSize.
+const SPRITE_BASE_SIZE: i32 = 24;
+static SPRITE_SIZE_PX: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(SPRITE_BASE_SIZE);
+
+#[allow(dead_code)] // retained for cursor-sprite diagnostics
+fn sprite_size_px() -> i32 {
+    SPRITE_SIZE_PX.load(Ordering::Relaxed)
+}
+
+/// Match the system cursor scale: monitor/system DPI × the Windows 11
+/// accessibility cursor size (HKCU\Control Panel\Cursors\CursorBaseSize,
+/// 32 = default slider position).
+fn compute_sprite_size() -> i32 {
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() } as f32;
+    let scale = dpi / 96.0;
+    ((SPRITE_BASE_SIZE as f32 * scale).round() as i32).clamp(SPRITE_BASE_SIZE, 192)
+}
+
+fn arrow_pixels(size: i32) -> Vec<u32> {
+    // classic arrow polygon in a 24x24 box (premultiplied BGRA), scaled to
+    // `size`
+    let poly: &[(f32, f32)] = &[
+        (1.0, 1.0),
+        (1.0, 17.0),
+        (5.2, 13.4),
+        (8.2, 20.4),
+        (10.8, 19.3),
+        (7.9, 12.5),
+        (13.4, 12.2),
+    ];
+    let s = SPRITE_BASE_SIZE as f32 / size as f32;
+    let inside = |x: f32, y: f32| -> bool {
+        let (x, y) = (x * s, y * s);
+        let mut c = false;
+        let n = poly.len();
+        for i in 0..n {
+            let (x1, y1) = poly[i];
+            let (x2, y2) = poly[(i + 1) % n];
+            if ((y1 > y) != (y2 > y)) && (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1) {
+                c = !c;
+            }
+        }
+        c
+    };
+    // outline thickness scales with the sprite (1px at 24, ~2px at 48 …)
+    let edge_r = (1.0 / s).round().max(1.0) as i32;
+    let mut px = vec![0u32; (size * size) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let v = if inside(fx, fy) {
+                0xFFFFFFFFu32 // white fill
+            } else {
+                // black outline: any neighbour inside?
+                let mut edge = false;
+                'o: for dy in -edge_r..=edge_r {
+                    for dx in -edge_r..=edge_r {
+                        if inside(fx + dx as f32, fy + dy as f32) {
+                            edge = true;
+                            break 'o;
+                        }
+                    }
+                }
+                if edge { 0xFF000000u32 } else { 0 }
+            };
+            px[(y * size + x) as usize] = v;
+        }
+    }
+    px
+}
+
+/// Coalesced sprite move (the cursor-routing design parity). The LL hook must return fast,
+/// so instead of calling SetWindowPos (a z-order op) on EVERY mouse event —
+/// which snags the whole system at high polling rates — the hook only stores
+/// the target and posts ONE message; the hook thread's own message loop then
+/// does the actual SetWindowPos, collapsing a burst of moves into a single
+/// update. `SPRITE_TARGET` packs y<<32 | x (as u32s); `SPRITE_SHOW` the vis.
+const WM_APP_SPRITE_MOVE: u32 = WM_APP + 1;
+static SPRITE_TARGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// Desired sprite visibility. Actual visibility is additionally gated by
+/// CURSOR_HIDE_APPLIED so the native cursor and sprite are never shown together.
+static SPRITE_SHOW: AtomicBool = AtomicBool::new(false);
+static SPRITE_MOVE_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn sprite_visibility_allowed(requested: bool, real_cursor_hidden: bool) -> bool {
+    requested && real_cursor_hidden
+}
+
+/// Timer that RE-ASSERTS the system-cursor hide while engaged (the cursor-routing design's
+/// TIMER_CURSOR). A cached "already hidden" flag is not enough: the Magnification
+/// hide can be reset by the compositor / capture / another app, and then the
+/// REAL cursor — which sits at the SOURCE position, offset ~100px from the
+/// sprite and appears as a second cursor or visible jump.
+/// It is intermittent, matching the "sometimes smooth, sometimes returns"
+/// report. MagShowSystemCursor(false) is cheap and idempotent, so we simply
+/// re-assert it ~every 50ms on the hook thread (which owns the Mag API).
+const CURSOR_REASSERT_TIMER_ID: usize = 1;
+
+unsafe fn set_sprite_window_pos(h: HWND, x: i32, y: i32, show: bool) {
+    unsafe {
+        let flags = SWP_NOACTIVATE
+            | SWP_NOSIZE
+            | SWP_NOSENDCHANGING
+            | SWP_NOOWNERZORDER
+            | if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW };
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), x, y, 0, 0, flags);
+    }
+}
+
+unsafe fn raise_sprite_window(h: HWND) {
+    unsafe {
+        // Only use the heavy two-step resort when another topmost window was
+        // explicitly raised. Doing this on every mouse move makes topmost
+        // siblings fight and can flicker; the cursor-routing design moves the sprite with a
+        // plain HWND_TOPMOST call and reserves forced resorting for priorities.
+        let flags = SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOACTIVATE
+            | SWP_NOSENDCHANGING
+            | SWP_NOOWNERZORDER
+            | SWP_SHOWWINDOW;
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+        let _ = SetWindowPos(h, Some(HWND_TOP), 0, 0, 0, 0, flags);
+    }
+}
+
+unsafe extern "system" fn sprite_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if m == WM_APP_SPRITE_MOVE {
+            SPRITE_MOVE_PENDING.store(false, Ordering::Release);
+            let packed = SPRITE_TARGET.load(Ordering::Acquire);
+            let x = packed as i32;
+            let y = (packed >> 32) as i32;
+            let show = sprite_visibility_allowed(
+                SPRITE_SHOW.load(Ordering::Acquire),
+                CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+            );
+            set_sprite_window_pos(h, x, y, show);
+            return LRESULT(0);
+        }
+        if m == WM_TIMER && w.0 == CURSOR_REASSERT_TIMER_ID {
+            // The hide itself is driven by the render-engine thread; here we only
+            // keep the desired-visibility flag in sync with the engaged state, so
+            // a missed engage/disengage edge cannot strand the real cursor.
+            let now = std::time::Instant::now();
+            let Ok(mut g) = state().try_lock() else {
+                // A busy engine/configure tick means "state temporarily
+                // unknown", not "show the native cursor". Treating lock
+                // contention as false toggled native↔sprite every 250ms while
+                // the pointer was stationary over the topmost GUI.
+                return LRESULT(0);
+            };
+            let stale_buttons = reconcile_stale_buttons(&mut g, now);
+            let state_wants_hidden = g.active && g.engaged && g.cursor_hidden;
+            drop(g);
+            if stale_buttons != 0 {
+                // begin_ui_hold injects the DOWN that gives the native GUI full
+                // drag ownership. If its physical UP was lost during a focus
+                // handoff, Windows itself remains in a button-down state until
+                // Stop. Send the matching UP here so GUI/source input recovers
+                // without ending magnification.
+                for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+                    if stale_buttons & bit != 0 {
+                        inject_mouse_button(bit, false);
+                    }
+                }
+                log::warn!("mouse-button-watchdog released stale bits={stale_buttons:#04x}");
+            }
+            let want_hidden =
+                cursor_reassert_want_hidden(state_wants_hidden, cursor_reveal_pending());
+            request_cursor_hidden(want_hidden);
+            return LRESULT(0);
+        }
+        DefWindowProcW(h, m, w, l)
+    }
+}
+
+unsafe fn create_sprite_window() -> Option<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+        let class: Vec<u16> = "NeoCursorSprite\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(sprite_proc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let sprite_px = compute_sprite_size();
+        SPRITE_SIZE_PX.store(sprite_px, Ordering::Relaxed);
+        log::info!("cursor sprite size: {sprite_px}px (dpi/cursor-size scaled)");
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            windows::core::PCWSTR(class.as_ptr()),
+            windows::core::PCWSTR(class.as_ptr()),
+            WS_POPUP,
+            0,
+            0,
+            sprite_px,
+            sprite_px,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()?;
+
+        // paint the ARGB arrow via UpdateLayeredWindow
+        let screen_dc = GetDC(None);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: sprite_px,
+                biHeight: -sprite_px, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(Some(mem_dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let old = SelectObject(mem_dc, dib.into());
+        let pixels = arrow_pixels(sprite_px);
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+
+        let mut pos = POINT { x: 0, y: 0 };
+        let size = windows::Win32::Foundation::SIZE {
+            cx: sprite_px,
+            cy: sprite_px,
+        };
+        let src_pos = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            Some(screen_dc),
+            Some(&mut pos),
+            Some(&size),
+            Some(mem_dc),
+            Some(&src_pos),
+            windows::Win32::Foundation::COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        SelectObject(mem_dc, old);
+        let _ = DeleteObject(dib.into());
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+        // 50ms timer to re-assert the system-cursor hide while engaged
+        // (the cursor-routing design's TIMER_CURSOR — prevents the real cursor bleeding
+        // through at the offset source position).
+        let _ = SetTimer(Some(hwnd), CURSOR_REASSERT_TIMER_ID, 50, None);
+        Some(hwnd)
+    }
+}
+
+fn post_sprite_update() {
+    if !SPRITE_MOVE_PENDING.swap(true, Ordering::AcqRel) {
+        if let Some(&h) = SPRITE_HWND.get() {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(h as *mut _)),
+                    WM_APP_SPRITE_MOVE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+}
+
+fn sprite_move(x: i32, y: i32, show: bool) {
+    // record the latest target + post ONE message if none is pending yet
+    // (bursts of moves collapse to a single SetWindowPos on the hook thread).
+    SPRITE_TARGET.store(
+        (((y as u32) as i64) << 32) | ((x as u32) as i64),
+        Ordering::Release,
+    );
+    SPRITE_SHOW.store(show, Ordering::Release);
+    post_sprite_update();
+}
+
+fn sprite_move_now(x: i32, y: i32, show: bool) {
+    SPRITE_TARGET.store(
+        (((y as u32) as i64) << 32) | ((x as u32) as i64),
+        Ordering::Release,
+    );
+    SPRITE_SHOW.store(show, Ordering::Release);
+    if let Some(&h) = SPRITE_HWND.get() {
+        unsafe {
+            set_sprite_window_pos(
+                HWND(h as *mut _),
+                x,
+                y,
+                sprite_visibility_allowed(show, CURSOR_HIDE_APPLIED.load(Ordering::Acquire)),
+            );
+        }
+    }
+}
+
+pub fn keep_cursor_sprite_on_top() {
+    if !sprite_visibility_allowed(
+        SPRITE_SHOW.load(Ordering::Acquire),
+        CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+    ) {
+        return;
+    }
+    let Some(&h) = SPRITE_HWND.get() else {
+        return;
+    };
+    let packed = SPRITE_TARGET.load(Ordering::Acquire);
+    let x = packed as i32;
+    let y = (packed >> 32) as i32;
+    unsafe {
+        let hwnd = HWND(h as *mut _);
+        set_sprite_window_pos(hwnd, x, y, true);
+        raise_sprite_window(hwnd);
+    }
+}
+
+fn sprite_hide() {
+    // hide immediately (disengage) and make sure a pending move cannot re-show it
+    SPRITE_SHOW.store(false, Ordering::Release);
+    if let Some(&h) = SPRITE_HWND.get() {
+        unsafe {
+            let _ = ShowWindow(HWND(h as *mut _), SW_HIDE);
+        }
+    }
+}
+
+// ---------------- low-level mouse hook ----------------
+
+const LLMHF_INJECTED: u32 = 0x1;
+
+fn button_transition(msg: u32) -> Option<(u8, bool)> {
+    match msg {
+        WM_LBUTTONDOWN => Some((BTN_LEFT, true)),
+        WM_LBUTTONUP => Some((BTN_LEFT, false)),
+        WM_RBUTTONDOWN => Some((BTN_RIGHT, true)),
+        WM_RBUTTONUP => Some((BTN_RIGHT, false)),
+        WM_MBUTTONDOWN => Some((BTN_MIDDLE, true)),
+        WM_MBUTTONUP => Some((BTN_MIDDLE, false)),
+        _ => None,
+    }
+}
+
+fn physical_button_bits() -> u8 {
+    let mut bits = 0;
+    unsafe {
+        if GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 {
+            bits |= BTN_LEFT;
+        }
+        if GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 {
+            bits |= BTN_RIGHT;
+        }
+        if GetAsyncKeyState(VK_MBUTTON.0 as i32) < 0 {
+            bits |= BTN_MIDDLE;
+        }
+    }
+    bits
+}
+
+const STALE_BUTTON_WATCHDOG_MS: u64 = 180;
+
+fn reconcile_stale_buttons(g: &mut State, now: std::time::Instant) -> u8 {
+    reconcile_stale_buttons_with_physical(g, now, physical_button_bits())
+}
+
+fn reconcile_stale_buttons_with_physical(
+    g: &mut State,
+    now: std::time::Instant,
+    physical: u8,
+) -> u8 {
+    let tracked = g.buttons_down | g.ui_hold_bits | g.native_ui_hold_bits;
+    if tracked == 0
+        || g.last_button_event.is_some_and(|edge| {
+            now.saturating_duration_since(edge)
+                < std::time::Duration::from_millis(STALE_BUTTON_WATCHDOG_MS)
+        })
+    {
+        return 0;
+    }
+    let stale = tracked & !physical;
+    if stale != 0 {
+        g.buttons_down &= physical;
+        g.ui_hold_bits &= physical;
+        g.native_ui_hold_bits &= physical;
+        g.swallow_up &= physical;
+        g.last_button_event = Some(now);
+    }
+    stale
+}
+
+fn track_button_state(msg: u32, px: i32, py: i32) {
+    let Some((bit, down)) = button_transition(msg) else {
+        return;
+    };
+    // A click can be the first physical input after Stop. Repair the native
+    // route before CallNextHookEx delivers this very button edge so the user
+    // does not need an extra mouse move to unstick the GUI.
+    repair_main_gui_passthrough_if_needed();
+    let Ok(mut g) = state().try_lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if down {
+        g.buttons_down |= bit;
+        // Re-sample the real HWND before classifying the gesture. The render
+        // thread can be hundreds of milliseconds behind under a heavy GLSL
+        // chain, but native window dragging must never depend on that cadence.
+        refresh_live_own_no_engage_geometry(&mut g, now);
+        g.native_ui_hold_bits &= !bit;
+        let native_gui_hit = if !g.engaged {
+            hit_ui_for_cursor_ownership(&g.no_engage, px, py)
+        } else {
+            None
+        };
+        if let Some(hit) = native_gui_hit {
+            g.native_ui_hold_bits |= bit;
+            g.native_gui_owner_hwnd = hit.hwnd;
+            NATIVE_GUI_OWNER.store(hit.hwnd, Ordering::Release);
+            log::info!(
+                "native-gui-gesture-begin: bit={bit:#04x} hwnd={:#x} pos=({px},{py}) rect={:?}",
+                hit.hwnd,
+                hit.land
+            );
+        }
+    } else {
+        g.buttons_down &= !bit;
+        let was_native_ui = g.native_ui_hold_bits & bit != 0;
+        g.native_ui_hold_bits &= !bit;
+        if was_native_ui && g.native_ui_hold_bits == 0 {
+            // The next move re-samples the live HWND rectangle. A time gate here
+            // makes ownership crossing-speed dependent.
+            log::info!(
+                "native-gui-gesture-end: bit={bit:#04x} pos=({px},{py}) reengage_grace_ms=0 exact_owner=true"
+            );
+        }
+    }
+    g.last_button_event = Some(now);
+}
+
+fn inject_mouse_button(bit: u8, down: bool) {
+    let flag = match (bit, down) {
+        (BTN_LEFT, true) => MOUSEEVENTF_LEFTDOWN,
+        (BTN_LEFT, false) => MOUSEEVENTF_LEFTUP,
+        (BTN_RIGHT, true) => MOUSEEVENTF_RIGHTDOWN,
+        (BTN_RIGHT, false) => MOUSEEVENTF_RIGHTUP,
+        (BTN_MIDDLE, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (BTN_MIDDLE, false) => MOUSEEVENTF_MIDDLEUP,
+        _ => return,
+    };
+    let mut input = INPUT {
+        r#type: INPUT_MOUSE,
+        ..Default::default()
+    };
+    input.Anonymous.mi.dwFlags = flag;
+    unsafe {
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+/// the cursor-routing design panel model: while engaged the real cursor is confined to the
+/// (small/hidden) source and can never physically reach the control panel or
+/// top-most GUI. Instead the VIRTUAL cursor travels over the panel, and a
+/// press there is turned into a synthetic full click AT the panel's on-screen
+/// position, then the real cursor is restored to the source and re-clipped.
+/// The matching hardware button-up is swallowed too. Returns true if the event
+/// was consumed (the hook must then swallow it by returning non-zero).
+///
+/// This NEVER disengages, so it cannot oscillate or fling the cursor — the
+/// failure mode caused by a stale no-engage-zone handoff.
+/// Native hold: send only the DOWN at the visual UI point, then let the
+/// user's real drag/move/UP continue natively on that GUI.
+fn begin_ui_hold(g: &mut State, hover: UiHover, bit: u8) -> bool {
+    let click = hover.pos;
+    let Some(actual) = release_windows_to_native_at(g, click, "native UI click handoff") else {
+        // The visible cursor was over native UI, so never let the physical DOWN
+        // fall through to the hidden source when the ownership warp could not
+        // be verified. Swallow the matching UP and retry on the next gesture.
+        g.swallow_up |= bit;
+        return false;
+    };
+    g.engaged = false;
+    g.edge_out_accum = 0.0;
+    g.last_engage_at = None;
+    g.teleport_guard_until = None;
+    g.must_leave_content = false;
+    g.ui_hold_bits |= bit;
+    g.last_ui_hover = Some(hover);
+    if hover.hit.hwnd != 0
+        && !is_panel_hit(hover.hit)
+        && crate::platform::win32::is_own_window(hover.hit.hwnd)
+    {
+        g.native_gui_owner_hwnd = hover.hit.hwnd;
+        NATIVE_GUI_OWNER.store(hover.hit.hwnd, Ordering::Release);
+    }
+    g.virt = (actual.0 as f64, actual.1 as f64);
+    g.last_set = actual;
+    g.last_hw = actual;
+    inject_mouse_button(bit, true);
+    true
+}
+
+fn handoff_to_gui(g: &mut State, hover: UiHover, _now: std::time::Instant) -> bool {
+    let pos = hover.pos;
+    let source_origin = g.last_hw;
+    let native_own_gui = !is_panel_hit(hover.hit)
+        && hover.hit.hwnd != 0
+        && crate::platform::win32::is_own_window(hover.hit.hwnd);
+    if native_own_gui {
+        // Restore normal hit-testing before placing the native cursor here.
+        publish_main_gui_passthrough(hover.hit.hwnd, false, "native-gui-handoff");
+    }
+    // Crossing from sprite ownership to native UI is a read-only ownership
+    // transfer. The dedicated GUI/panel z-order manager decides topmost policy;
+    // the input classifier must never mutate Z-order while deciding ownership.
+    let Some(actual) = release_windows_to_native_at(g, pos, "native GUI hover handoff") else {
+        if native_own_gui {
+            publish_main_gui_passthrough(hover.hit.hwnd, true, "native-gui-handoff-failed");
+        }
+        g.ui_hover_active = true;
+        g.hidden_by_idle = false;
+        g.last_ui_hover = Some(hover);
+        sprite_move_now(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+        keep_cursor_sprite_on_top();
+        return false;
+    };
+    g.engaged = false;
+    g.edge_out_accum = 0.0;
+    g.last_engage_at = None;
+    g.teleport_guard_until = None;
+    g.must_leave_content = false;
+    g.ui_hold_bits = 0;
+    g.ui_hover_active = true;
+    g.hidden_by_idle = false;
+    // No time-based ownership grace here. While the real cursor is inside the
+    // exact live GUI rectangle plan_engage() rejects source ownership; the first
+    // pixel outside can re-engage immediately. This removes the old fuzzy
+    // 120ms/20px boundary while remaining stable.
+    g.native_gui_owner_hwnd = hover.hit.hwnd;
+    NATIVE_GUI_OWNER.store(hover.hit.hwnd, Ordering::Release);
+    g.last_ui_hover = Some(UiHover {
+        hit: hover.hit,
+        pos: actual,
+    });
+    g.virt = (actual.0 as f64, actual.1 as f64);
+    g.last_set = actual;
+    g.last_hw = actual;
+    g.native_gui_settle = Some(NativeGuiSettle {
+        target: actual,
+        source_origin,
+        until: std::time::Instant::now() + std::time::Duration::from_millis(45),
+        reasserted: false,
+    });
+    // The native cursor may need one Mag-owner tick to become visible. Keep
+    // the bridge sprite above the topmost GUI until that confirmation arrives.
+    keep_cursor_sprite_on_top();
+    log::debug!(
+        "native-ui-ownership-enter: hwnd={:#x} boundary=exact zorder=win32 pos=({},{})",
+        hover.hit.hwnd,
+        actual.0,
+        actual.1
+    );
+    true
+}
+
+/// When the mapper is disengaged, native UI ownership is decided by the
+/// CURRENT visible screen point and WindowFromPoint/GA_ROOT. No timer, geometry
+/// hysteresis, list-order priority, or input-side Z-order mutation participates.
+fn hold_native_gui_ownership_if_inside(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    _now: std::time::Instant,
+) -> bool {
+    // A physical gesture that STARTED on a native window follows normal Win32
+    // capture semantics until button-up. This is the only ownership latch: it
+    // is gesture-based, not a hidden spatial/time band, so ordinary hover can
+    // always pass straight through GUI/panel boundaries.
+    if g.native_ui_hold_bits != 0 && g.native_gui_owner_hwnd != 0 {
+        let pos = (px, py);
+        g.virt = (px as f64, py as f64);
+        g.last_set = pos;
+        g.last_hw = pos;
+        return true;
+    }
+
+    // The main GUI is intentionally hit-test transparent while the visible
+    // cursor is outside it. Therefore WindowFromPoint cannot be used to enter
+    // it again; its exact live HWND rectangle is authoritative for this one
+    // owned window, and the first pixel inside restores native hit-testing.
+    let hit = own_main_gui_at_visible_point(&g.no_engage, px, py)
+        .or_else(|| hit_ui_for_cursor_ownership(&g.no_engage, px, py));
+    let new_owner = hit.map_or(0, |h| h.hwnd);
+    let old_owner = g.native_gui_owner_hwnd;
+
+    if new_owner == 0 {
+        if old_owner != 0 {
+            log::debug!(
+                "native-ui-ownership-exit: hwnd={:#x} boundary=exact pos=({px},{py})",
+                old_owner
+            );
+            if crate::platform::win32::is_own_window(old_owner) {
+                set_own_main_gui_passthrough(g, true, "exact-gui-exit");
+            }
+        }
+        g.native_gui_owner_hwnd = 0;
+        NATIVE_GUI_OWNER.store(0, Ordering::Release);
+        g.ui_hover_active = false;
+        g.last_ui_hover = None;
+        g.last_ui_post = None;
+        return false;
+    }
+
+    let hit = hit.expect("nonzero native UI owner requires a hit");
+    if old_owner != new_owner {
+        log::debug!(
+            "native-ui-ownership-enter: hwnd={:#x} previous={:#x} boundary=exact zorder=win32 pos=({px},{py})",
+            new_owner,
+            old_owner
+        );
+    }
+
+    g.native_gui_owner_hwnd = new_owner;
+    NATIVE_GUI_OWNER.store(new_owner, Ordering::Release);
+    if crate::platform::win32::is_own_window(new_owner) && !is_panel_hit(hit) {
+        publish_main_gui_passthrough(new_owner, false, "native-gui-owner-enter");
+    }
+    let pos = (px, py);
+    g.ui_hover_active = true;
+    g.last_ui_hover = Some(UiHover { hit, pos });
+    g.virt = (px as f64, py as f64);
+    g.last_set = pos;
+    g.last_hw = pos;
+    if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        sprite_move(px, py, true);
+        keep_cursor_sprite_on_top();
+    }
+    true
+}
+
+fn click_panel_once(g: &mut State, hover: UiHover, bit: u8, _now: std::time::Instant) {
+    let pos = hover.pos;
+    g.edge_out_accum = 0.0;
+    g.last_engage_at = None;
+    g.must_leave_content = false;
+    g.swallow_up |= bit;
+    g.ui_hold_bits = 0;
+    g.ui_hover_active = true;
+    g.hidden_by_idle = false;
+    g.last_ui_hover = Some(hover);
+    post_mouse_button_to_hwnd(hover.hit.hwnd, pos.0, pos.1, bit);
+    queue_panel_action(hover, bit);
+    if g.cursor_hidden {
+        request_cursor_hidden(true);
+    }
+    sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+    keep_cursor_sprite_on_top();
+}
+
+fn consume_button_during_pending_engage(msg: u32) -> bool {
+    let Some((bit, down)) = button_transition(msg) else {
+        return false;
+    };
+    let Ok(mut g) = state().try_lock() else {
+        return false;
+    };
+    if g.pending_engage.is_none() {
+        return false;
+    }
+    if down {
+        g.swallow_up |= bit;
+    } else {
+        g.swallow_up &= !bit;
+    }
+    g.last_button_event = Some(std::time::Instant::now());
+    log::info!("cursor handoff consumed button edge: bit={bit:#04x} down={down}");
+    true
+}
+
+fn pending_engage_active() -> bool {
+    state().try_lock().is_ok_and(|g| g.pending_engage.is_some())
+}
+
+fn try_panel_redirect(msg: u32, px: i32, py: i32) -> bool {
+    let Some((bit, down)) = button_transition(msg) else {
+        return false;
+    };
+    let st = state();
+    let mut g = match st.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if !g.active {
+        return false;
+    }
+    g.last_button_event = Some(std::time::Instant::now());
+    if !down {
+        if g.ui_hold_bits & bit != 0 {
+            g.ui_hold_bits &= !bit;
+            if g.ui_hold_bits == 0 {}
+            return false;
+        }
+        // swallow the up that pairs with a redirected down
+        if g.swallow_up & bit != 0 {
+            g.swallow_up &= !bit;
+            return true;
+        }
+        return false;
+    }
+    if !g.engaged {
+        return false;
+    }
+    // Is the VISIBLE virtual cursor exactly over the current topmost panel /
+    // GUI? No halo, no click margin and no previous-hover grace are allowed.
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    let now = std::time::Instant::now();
+    let Some(hover) = ui_click_target_for_event(&mut g, px, py, now) else {
+        return false;
+    };
+    let hit = hover.hit;
+    let click = hover.pos;
+    let s = g.src;
+    let back = g.last_set;
+    if hit.hwnd != 0 {
+        if is_panel_hit(hit) {
+            click_panel_once(&mut g, hover, bit, now);
+            drop(g);
+            log::info!(
+                "panel click handoff to hwnd={:#x} at ({},{}) virt=({vx},{vy}) raw=({px},{py})",
+                hit.hwnd,
+                click.0,
+                click.1
+            );
+            return true;
+        } else {
+            let handoff_ok = begin_ui_hold(&mut g, hover, bit);
+            drop(g);
+            if handoff_ok {
+                log::info!(
+                    "ui hold handoff to hwnd={:#x} at ({},{}) virt=({vx},{vy}) raw=({px},{py})",
+                    hit.hwnd,
+                    click.0,
+                    click.1
+                );
+            } else {
+                log::warn!(
+                    "ui hold click swallowed after unverified native warp: hwnd={:#x} at ({},{}) virt=({vx},{vy}) raw=({px},{py})",
+                    hit.hwnd,
+                    click.0,
+                    click.1
+                );
+            }
+            return true;
+        }
+    } else {
+        g.swallow_up |= bit;
+        g.last_hw = back;
+        g.last_set = back;
+        drop(g);
+        let (clicked, _) = warp_unclipped_verified(click, "synthetic panel click handoff");
+        if clicked {
+            inject_mouse_button(bit, true);
+            inject_mouse_button(bit, false);
+        }
+        let (restored, actual) = warp_then_clip_source(back, s);
+        log::info!(
+            "panel click redirected (inject) target=({},{}) clicked={} source_restored={} actual=({},{})",
+            click.0,
+            click.1,
+            clicked,
+            restored,
+            actual.0,
+            actual.1
+        );
+        return true;
+    }
+}
+
+unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 {
+            let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
+            // Hardware events only. The native desktop regression harness can
+            // opt in to one private SendInput tag so it exercises this exact
+            // hook path; ordinary injected input and our SetCursorPos feedback
+            // remain ignored.
+            let is_injected = info.flags & LLMHF_INJECTED != 0;
+            if is_injected
+                && desktop_test_input_enabled()
+                && !DESKTOP_TEST_INJECTED_DIAG.swap(true, Ordering::Relaxed)
+            {
+                log::info!(
+                    "native desktop injected DIAG: flags={:?} extra={:#x} expected={:#x}",
+                    info.flags,
+                    info.dwExtraInfo,
+                    DESKTOP_TEST_INPUT_TAG
+                );
+            }
+            let test_mode = desktop_test_input_enabled();
+            let native_test_move =
+                is_injected && info.dwExtraInfo == DESKTOP_TEST_INPUT_TAG && test_mode;
+            if native_test_move && !DESKTOP_TEST_INPUT_SEEN.swap(true, Ordering::Relaxed) {
+                log::info!("native desktop test input entered WH_MOUSE_LL production path");
+            }
+            if test_mode && !native_test_move && wp.0 as u32 == WM_MOUSEMOVE {
+                return LRESULT(1);
+            }
+            // Keep the native desktop regression deterministic: while its
+            // explicit opt-in is active, physical mouse jitter must not mix
+            // with the tagged path being measured.
+            if native_test_move || (!test_mode && info.flags & LLMHF_INJECTED == 0) {
+                let msg = wp.0 as u32;
+                match msg {
+                    WM_MOUSEMOVE => {
+                        // SetCursorPos during engagement moves the real cursor into the
+                        // source rect. Do not let the original hardware move continue
+                        // afterwards and overwrite that new position with its old point.
+                        let consumed = on_hardware_move(info.pt.x, info.pt.y);
+                        if native_test_move {
+                            let n = DESKTOP_TEST_MOVE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n % 32 == 0 {
+                                let virt = virtual_cursor_pos();
+                                log::info!(
+                                    "native-desktop-cursor-sample: n={n} raw=({},{}) virtual={virt:?} owner={:#x} hidden={} consumed={consumed}",
+                                    info.pt.x,
+                                    info.pt.y,
+                                    NATIVE_GUI_OWNER.load(Ordering::Acquire),
+                                    CURSOR_HIDE_APPLIED.load(Ordering::Acquire)
+                                );
+                            }
+                        }
+                        if consumed {
+                            return LRESULT(1);
+                        }
+                    }
+                    WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP
+                    | WM_RBUTTONUP | WM_MBUTTONUP => {
+                        // A GUI -> overlay handoff may be waiting a few
+                        // milliseconds for the owner-thread cursor hide. Never
+                        // let a click warp or land at source coordinates during
+                        // that atomic transition.
+                        if consume_button_during_pending_engage(msg) {
+                            return LRESULT(1);
+                        }
+                        // a press aimed (visually) at the panel is redirected and
+                        // swallowed so it never reaches the source underneath
+                        if try_panel_redirect(msg, info.pt.x, info.pt.y) {
+                            return LRESULT(1);
+                        }
+                        track_button_state(msg, info.pt.x, info.pt.y);
+                        align_engaged_cursor_for_input(info.pt.x, info.pt.y);
+                        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+                            diagnose_click(info.pt.x, info.pt.y);
+                        }
+                    }
+                    WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                        if pending_engage_active() {
+                            return LRESULT(1);
+                        }
+                        align_engaged_cursor_for_input(info.pt.x, info.pt.y);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        CallNextHookEx(None, code, wp, lp)
+    }
+}
+
+fn mouse_button_flag(msg: u32) -> Option<MOUSE_EVENT_FLAGS> {
+    match msg {
+        WM_LBUTTONDOWN => Some(MOUSEEVENTF_LEFTDOWN),
+        WM_LBUTTONUP => Some(MOUSEEVENTF_LEFTUP),
+        WM_RBUTTONDOWN => Some(MOUSEEVENTF_RIGHTDOWN),
+        WM_RBUTTONUP => Some(MOUSEEVENTF_RIGHTUP),
+        WM_MBUTTONDOWN => Some(MOUSEEVENTF_MIDDLEDOWN),
+        WM_MBUTTONUP => Some(MOUSEEVENTF_MIDDLEUP),
+        _ => None,
+    }
+}
+
+fn post_mouse_button(msg: u32, tx: i32, ty: i32, src_hwnd: isize) -> bool {
+    unsafe {
+        let screen = POINT { x: tx, y: ty };
+        let mut hit = WindowFromPoint(screen);
+        if hit.0.is_null() {
+            hit = HWND(src_hwnd as *mut _);
+        }
+        let mut client = screen;
+        let _ = ScreenToClient(hit, &mut client);
+        let down_wparam = match msg {
+            WM_LBUTTONDOWN => 0x0001usize,
+            WM_RBUTTONDOWN => 0x0002usize,
+            WM_MBUTTONDOWN => 0x0010usize,
+            _ => 0usize,
+        };
+        let lp = ((client.y as u32 & 0xFFFF) << 16) | (client.x as u32 & 0xFFFF);
+        PostMessageW(Some(hit), msg, WPARAM(down_wparam), LPARAM(lp as isize)).is_ok()
+    }
+}
+
+fn send_mouse_button(flag: MOUSE_EVENT_FLAGS, msg: u32, tx: i32, ty: i32, src_hwnd: isize) -> bool {
+    let mut input = INPUT {
+        r#type: INPUT_MOUSE,
+        ..Default::default()
+    };
+    input.Anonymous.mi.dwFlags = flag;
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    if sent == 1 {
+        return true;
+    }
+    let err = unsafe { GetLastError() };
+    log::warn!("SendInput mouse button failed: sent={sent} error={err:?}; posting mouse message");
+    if post_mouse_button(msg, tx, ty, src_hwnd) {
+        return true;
+    }
+    log::warn!("PostMessage mouse button failed; using mouse_event as final fallback");
+    unsafe {
+        mouse_event(flag, 0, 0, 0, 0);
+    }
+    true
+}
+
+fn forward_engaged_button(msg: u32) -> bool {
+    let Some(flag) = mouse_button_flag(msg) else {
+        return false;
+    };
+    let st = state();
+    let mut g = match st.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if !g.active || !g.engaged {
+        return false;
+    }
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    if !g.content.contains(vx, vy) {
+        let now = std::time::Instant::now();
+        if let Some(actual) =
+            release_windows_to_native_at(&mut g, (vx, vy), "button edge native handoff")
+        {
+            disengage_state(&mut g, now);
+            g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
+            log::info!(
+                "button pass-through after verified edge release at ({},{})",
+                actual.0,
+                actual.1
+            );
+            return false;
+        }
+        log::warn!(
+            "button edge release swallowed because native position was not verified: target=({vx},{vy})"
+        );
+        return true;
+    }
+    let s = g.src;
+    if s.w <= 1 || s.h <= 1 {
+        return false;
+    }
+    let (tx, ty) = map_content_to_source(g.content, s, g.virt.0, g.virt.1);
+    let (aligned, actual) = warp_then_clip_source((tx, ty), s);
+    if !aligned {
+        log::warn!(
+            "forward button source alignment rejected: virtual=({vx},{vy}) target=({tx},{ty}) actual=({},{})",
+            actual.0,
+            actual.1
+        );
+        return true;
+    }
+    g.last_set = actual;
+    g.last_hw = actual;
+    log::info!("forward button {msg:#x}: virtual=({vx},{vy}) -> source=({tx},{ty})");
+    let src_hwnd = g.src_hwnd;
+    drop(g);
+    send_mouse_button(flag, msg, tx, ty, src_hwnd)
+}
+
+fn align_engaged_cursor_for_input(_px: i32, _py: i32) {
+    let st = state();
+    let mut g = match st.try_lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if !g.active || !g.engaged || g.pending_engage.is_some() {
+        return;
+    }
+    let s = g.src;
+    if s.w <= 1 || s.h <= 1 {
+        return;
+    }
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    if !g.content.contains(vx, vy) {
+        let now = std::time::Instant::now();
+        if release_windows_to_native_at(&mut g, (vx, vy), "input edge native handoff").is_some() {
+            disengage_state(&mut g, now);
+            g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
+        }
+        return;
+    }
+    // Keep the visible cursor authoritative. Rebuilding it from GetCursorPos()
+    // would use the clipped source-edge cursor and visibly pull the pointer
+    // inward exactly when the user is working at the magnified edge.
+    let (tx, ty) = map_content_to_source(g.content, s, g.virt.0, g.virt.1);
+    // A click over the panel is handled earlier by try_panel_redirect (which
+    // swallows it); here we only ever align a click destined for the SOURCE,
+    // so keep the cursor confined and let the real click pass through to it.
+    let (aligned, actual) = warp_then_clip_source((tx, ty), s);
+    if aligned {
+        g.last_set = actual;
+        g.last_hw = actual;
+    } else {
+        log::warn!(
+            "engaged input alignment rejected: target=({tx},{ty}) actual=({},{})",
+            actual.0,
+            actual.1
+        );
+    }
+}
+
+/// Log exactly where a click will land while engaged — the key diagnostic for
+/// cases where clicks would otherwise fail to reach the source.
+fn diagnose_click(px: i32, py: i32) {
+    let st = state();
+    let Ok(g) = st.try_lock() else { return };
+    if !g.active {
+        return;
+    }
+    unsafe {
+        let mut point = POINT { x: px, y: py };
+        if g.engaged {
+            let _ = GetCursorPos(&mut point);
+        }
+        let px = point.x;
+        let py = point.y;
+        let hit = WindowFromPoint(point);
+        let root = GetAncestor(hit, GA_ROOT);
+        let src = g.src_hwnd;
+        let mut title = [0u16; 128];
+        let n = GetWindowTextW(root, &mut title);
+        let title = String::from_utf16_lossy(&title[..n.max(0) as usize]);
+        log::info!(
+            "click at ({px},{py}) engaged={} -> hwnd={:?} root={:?} (src={src:#x}) match={} title='{title}'",
+            g.engaged,
+            hit.0,
+            root.0,
+            root.0 as isize == src
+        );
+    }
+}
+
+/// Show/hide the REAL system cursor via the Magnification API — WITH the
+/// the cursor-routing design recovery. The Mag context is thread-affine and can go stale
+/// (e.g. across start/stop sessions), and then MagShowSystemCursor silently
+/// FAILS: the real cursor stays visible and, confined to the source rect,
+/// appears "stuck inside" the magnified view at the source-edge position —
+/// exactly the stale-cursor return path. On failure we drop the stale context and
+/// re-initialise on THIS thread, then retry. MUST be called on the hook thread
+/// (which owns the Mag context).
+fn set_system_cursor_visible(visible: bool) -> bool {
+    unsafe {
+        let ok = MagShowSystemCursor(visible).as_bool();
+        if !ok {
+            // Never repair a thread-affine Mag context here: this helper is
+            // also reached from the LL hook. Ask the owner thread to do it.
+            MAG_REINIT_REQUESTED.store(true, Ordering::Release);
+        }
+        if !ok && !visible {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!("MagShowSystemCursor(false) failed; owner-thread re-init requested");
+            }
+        }
+        ok
+    }
+}
+
+/// Is the real system cursor currently being drawn? (GetCursorInfo CURSOR_SHOWING)
+fn system_cursor_showing() -> bool {
+    unsafe {
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetCursorInfo(&mut ci).is_ok() {
+            ci.flags.0 & CURSOR_SHOWING.0 != 0
+        } else {
+            true
+        }
+    }
+}
+
+// ---------------- cross-thread real-cursor hide (the 80 architecture) ----------
+//
+// Cursor pullback root cause:
+// `MagShowSystemCursor(false).ok=true cursor_still_showing=true`): the
+// Magnification API is a SILENT NO-OP when called from the WH_MOUSE_LL hook
+// thread. It reports success but never hides the cursor, so the real cursor —
+// confined to the source rect, which sits ~100-200px INSIDE the magnified view —
+// bleeds through and looks like the cursor "returned" to the source edge.
+//
+// the cursor-routing design never hits this because it runs the whole Magnification API on
+// its OVERLAY thread (the one that owns a shown top-level window and pumps its
+// messages), with the LL-hook on a separate arithmetic-only thread. So we do the
+// same: the hook thread only RECORDS the desired visibility here; the
+// render-engine thread (which owns the overlay window + pumps it) APPLIES it via
+// pump_cursor_visibility(). Bonus: a Mag hide is auto-restored by the OS on
+// process exit, so a crash never leaves the desktop cursor-less. Do not add a
+// SetSystemCursor fallback here: it changes global desktop state and survives
+// TerminateProcess/Task Manager.
+static WANT_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// True only after the Magnification owner thread successfully applied hide.
+/// The sprite is gated by this flag, preventing a native+sprite double cursor.
+static CURSOR_HIDE_APPLIED: AtomicBool = AtomicBool::new(false);
+/// Cross-thread request; consumed only by the render-engine/Mag owner thread.
+static MAG_REINIT_REQUESTED: AtomicBool = AtomicBool::new(true);
+static CURSOR_DIAG_DONE: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy)]
+struct PendingCursorReveal {
+    at: std::time::Instant,
+    pos: (i32, i32),
+}
+
+static PENDING_CURSOR_REVEAL: OnceLock<Mutex<Option<PendingCursorReveal>>> = OnceLock::new();
+
+fn cursor_reassert_want_hidden(state_wants_hidden: bool, reveal_pending: bool) -> bool {
+    state_wants_hidden || reveal_pending
+}
+
+/// Called from the HOOK thread: record whether the real cursor should be hidden.
+/// Applied asynchronously (within ~1 frame) by the render-engine thread.
+pub fn request_cursor_hidden(hidden: bool) {
+    if !hidden {
+        cancel_cursor_reveal();
+        // Keep CURSOR_HIDE_APPLIED true until the Magnification owner thread
+        // actually shows the native cursor. This lets the sprite bridge the
+        // GUI-entry handoff with no cursor-less frame.
+    }
+    let previous = WANT_CURSOR_HIDDEN.swap(hidden, Ordering::AcqRel);
+    if hidden && !previous && !CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        // The native cursor is currently visible, so keep the sprite gated off
+        // until the owner confirms the hide. If APPLIED is already true (rapid
+        // GUI<->content reversal), native never became visible; preserve the
+        // sprite bridge instead of creating a blank boundary frame.
+        post_sprite_update();
+    }
+}
+
+fn pending_cursor_reveal() -> &'static Mutex<Option<PendingCursorReveal>> {
+    PENDING_CURSOR_REVEAL.get_or_init(|| Mutex::new(None))
+}
+
+fn defer_cursor_reveal(pos: (i32, i32)) {
+    let reveal_at = std::time::Instant::now() + std::time::Duration::from_millis(45);
+    *pending_cursor_reveal().lock().unwrap() = Some(PendingCursorReveal { at: reveal_at, pos });
+    request_cursor_hidden(true);
+}
+
+fn cancel_cursor_reveal() {
+    *pending_cursor_reveal().lock().unwrap() = None;
+}
+
+fn cursor_reveal_pending() -> bool {
+    pending_cursor_reveal().lock().unwrap().is_some()
+}
+
+fn restore_configured_system_cursors() {
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETCURSORS,
+            0,
+            None,
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+}
+
+thread_local! {
+    static MAG_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAST_CURSOR_ASSERT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static LAST_CURSOR_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Drive the real system-cursor hide/show to match request_cursor_hidden().
+/// MUST be called repeatedly from the thread that owns the overlay window and
+/// pumps its messages (the render-engine thread) — see the module note above for
+/// why the hook thread cannot do this. Idempotent + cheap; rate-limited so a
+/// high frame rate does not spam MagShowSystemCursor. Re-asserts on a ~40ms
+/// heartbeat because a game/other app can reset the hide on a cursor-shape change.
+pub fn pump_cursor_visibility() {
+    // Initialize and repair Magnification only on its owning engine thread.
+    let reinit_requested = MAG_REINIT_REQUESTED.swap(false, Ordering::AcqRel);
+    MAG_ON_THIS_THREAD.with(|f| {
+        if reinit_requested && f.get() {
+            unsafe {
+                let _ = MagUninitialize();
+            }
+            f.set(false);
+        }
+        if !f.get() {
+            let ok = unsafe { MagInitialize() }.as_bool();
+            log::info!("render-engine thread: MagInitialize={ok} (owns the real-cursor hide)");
+            f.set(ok);
+            if !ok {
+                MAG_REINIT_REQUESTED.store(true, Ordering::Release);
+            }
+        }
+    });
+    if reinit_requested {
+        LAST_CURSOR_ASSERT.with(|c| c.set(None));
+        CURSOR_DIAG_DONE.store(false, Ordering::Relaxed);
+    }
+    let native_gui_owner = NATIVE_GUI_OWNER.load(Ordering::Acquire);
+    let mut want_hidden = WANT_CURSOR_HIDDEN.load(Ordering::Relaxed);
+    // Native GUI ownership is the highest-priority cursor contract. A timer,
+    // stale engaged flag, or delayed render publication must never keep the
+    // Magnification cursor hidden while Windows is routing input to our GUI.
+    if native_gui_owner != 0 {
+        want_hidden = false;
+        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+    }
+    let mut reveal_due = false;
+    let mut reveal_target = None;
+    {
+        let pending = pending_cursor_reveal().lock().unwrap();
+        if let Some(p) = *pending {
+            if std::time::Instant::now() >= p.at {
+                reveal_target = Some(p.pos);
+            }
+            // A pending reveal always keeps native hidden until the requested
+            // screen point has been independently verified.
+            want_hidden = true;
+        }
+    }
+    if let Some(pos) = reveal_target {
+        let (reached, actual) = warp_unclipped_verified(pos, "deferred cursor reveal");
+        if reached {
+            *pending_cursor_reveal().lock().unwrap() = None;
+            reveal_due = true;
+            want_hidden = false;
+            WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+            log::info!(
+                "cursor-reveal verified: target=({},{}) actual=({},{})",
+                pos.0,
+                pos.1,
+                actual.0,
+                actual.1
+            );
+        } else {
+            let mut pending = pending_cursor_reveal().lock().unwrap();
+            if let Some(mut p) = *pending {
+                p.at = std::time::Instant::now() + std::time::Duration::from_millis(8);
+                *pending = Some(p);
+            }
+            want_hidden = true;
+            WANT_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+            log::warn!(
+                "cursor-reveal deferred: target=({},{}) actual=({},{})",
+                pos.0,
+                pos.1,
+                actual.0,
+                actual.1
+            );
+        }
+    }
+    // Re-check ownership after deferred-reveal processing. That work may have
+    // inherited a stale source-side request and set `want_hidden` again while
+    // the native GUI already owns the pointer. GUI ownership is the final
+    // authority: cancel the obsolete warp and keep the system cursor visible.
+    if native_gui_owner != 0 {
+        *pending_cursor_reveal().lock().unwrap() = None;
+        reveal_due = false;
+        want_hidden = false;
+        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+    }
+    let changed = LAST_CURSOR_WANT.with(|c| c.replace(want_hidden)) != want_hidden;
+    let due = LAST_CURSOR_ASSERT.with(|c| match c.get() {
+        Some(t) => t.elapsed() >= std::time::Duration::from_millis(40),
+        None => true,
+    });
+    if !changed && !due && !reveal_due {
+        return;
+    }
+    LAST_CURSOR_ASSERT.with(|c| c.set(Some(std::time::Instant::now())));
+    let ok = set_system_cursor_visible(!want_hidden);
+    if want_hidden {
+        if ok {
+            if !CURSOR_HIDE_APPLIED.swap(true, Ordering::AcqRel) {
+                // The initial engage move recorded the sprite position but kept
+                // its window hidden. Reveal it only after native hide succeeds.
+                post_sprite_update();
+                log::info!("cursor handoff committed: native hidden -> sprite visible");
+            }
+        } else {
+            CURSOR_HIDE_APPLIED.store(false, Ordering::Release);
+            post_sprite_update();
+        }
+    } else {
+        if ok {
+            let was_hidden = CURSOR_HIDE_APPLIED.swap(false, Ordering::AcqRel);
+            if was_hidden {
+                // Native is now visible; recompute sprite visibility in this
+                // same owner-thread tick.
+                post_sprite_update();
+            }
+        } else {
+            // If show failed, native is still presumed hidden. Keep the sprite
+            // visible and retry on the next owner-thread heartbeat.
+            log::warn!("native cursor reveal deferred: MagShowSystemCursor(true) failed");
+        }
+        if reveal_due && ok {
+            sprite_hide();
+            let showing = system_cursor_showing();
+            unsafe {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                log::info!(
+                    "cursor-reveal shown: MagShowSystemCursor(true).ok={ok} actual=({},{}) cursor_showing={showing}",
+                    pt.x,
+                    pt.y
+                );
+            }
+        }
+    }
+    // One-time state dump. NOTE: GetCursorInfo's CURSOR_SHOWING tracks the
+    // ShowCursor() display REF-COUNT only — the Magnification hide does not
+    // touch it, so showing=true here is NORMAL and does not mean the hide
+    // failed. Trust the explicit API result rather than stale diagnostic state.
+    if want_hidden && !CURSOR_DIAG_DONE.swap(true, Ordering::Relaxed) {
+        let showing = system_cursor_showing();
+        log::info!(
+            "cursor-hide DIAG (engine thread): MagShowSystemCursor(false).ok={ok} \
+             showcursor_refcount_visible={showing} (refcount ignores Mag; showing=true is normal)"
+        );
+    }
+    let previous_owner = LAST_CURSOR_CONTRACT_OWNER.swap(native_gui_owner, Ordering::AcqRel);
+    if previous_owner != native_gui_owner {
+        let actual = read_cursor_pos_or((i32::MIN, i32::MIN), "cursor ownership contract");
+        let top = if actual.0 == i32::MIN {
+            0
+        } else {
+            crate::platform::win32::direct_top_level_window_at_point(actual.0, actual.1)
+        };
+        log::info!(
+            "cursor-ownership-contract: native_gui={:#x} previous={:#x} want_hidden={} mag_ok={} hide_applied={} actual=({},{}) top_hwnd={:#x}",
+            native_gui_owner,
+            previous_owner,
+            want_hidden,
+            ok,
+            CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+            actual.0,
+            actual.1,
+            top
+        );
+    }
+}
+
+/// Move the hidden real cursor to its mapped source point BEFORE applying the
+/// source clip. ClipCursor immediately clamps an out-of-rect cursor to the
+/// nearest corner; applying it first occasionally left the cursor parked at the
+/// source top-left when SetCursorPos lost the race, producing the visible
+/// "jump upward". Warp-first then clip is atomic from the user's perspective
+/// because the native cursor is already hidden at this point.
+fn warp_unclipped_verified(target: (i32, i32), reason: &str) -> (bool, (i32, i32)) {
+    unsafe {
+        let mut actual = read_cursor_pos_or(target, reason);
+        for attempt in 1..=4 {
+            // ClipCursor can remain effective for a scheduling turn after an
+            // ownership transition. Clear it before EVERY attempt, then trust
+            // GetCursorPos rather than SetCursorPos's return value alone.
+            let unclipped = ClipCursor(None).is_ok();
+            let moved = SetCursorPos(target.0, target.1).is_ok();
+            actual = read_cursor_pos_or(actual, reason);
+            let reached = (actual.0 - target.0).abs() <= 1 && (actual.1 - target.1).abs() <= 1;
+            if unclipped && moved && reached {
+                if attempt > 1 {
+                    log::info!(
+                        "cursor warp recovered: reason={reason} attempt={attempt} target=({},{}) actual=({},{})",
+                        target.0,
+                        target.1,
+                        actual.0,
+                        actual.1
+                    );
+                }
+                return (true, actual);
+            }
+            if attempt < 4 {
+                std::thread::yield_now();
+            }
+        }
+        log::warn!(
+            "cursor warp verification failed: reason={reason} target=({},{}) actual=({},{})",
+            target.0,
+            target.1,
+            actual.0,
+            actual.1
+        );
+        (false, actual)
+    }
+}
+
+fn warp_then_clip_source(target: (i32, i32), src: Rect) -> (bool, (i32, i32)) {
+    unsafe {
+        let (warped, actual) = warp_unclipped_verified(target, "source handoff warp verify");
+        if !warped {
+            return (false, actual);
+        }
+
+        let clip = clip_rect(src);
+        if ClipCursor(Some(&clip)).is_err() {
+            let _ = ClipCursor(None);
+            return (false, actual);
+        }
+        let after_clip = read_cursor_pos_or(actual, "source handoff clip verify");
+        let reached = (after_clip.0 - target.0).abs() <= 1 && (after_clip.1 - target.1).abs() <= 1;
+        if !reached {
+            // Never leave a rejected corner clamp active. Keeping the native
+            // cursor hidden and unclipped is safer than exposing a source-corner
+            // position as a visible top-left jump.
+            let _ = ClipCursor(None);
+        }
+        (reached, after_clip)
+    }
+}
+
+/// Commit a normal GUI -> magnified-content cursor handoff after the
+/// Magnification owner thread has successfully hidden the native cursor.
+/// Called immediately after pump_cursor_visibility() on the render thread.
+pub fn pump_cursor_engage_commit() {
+    if !CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(mut g) = state().try_lock() else {
+        return;
+    };
+    let Some(pending) = g.pending_engage else {
+        return;
+    };
+    if !g.active || !g.engaged || !g.cursor_hidden || g.src != pending.src {
+        log::info!(
+            "cursor handoff cancelled before commit: active={} engaged={} hidden={} geometry_match={}",
+            g.active,
+            g.engaged,
+            g.cursor_hidden,
+            g.src == pending.src
+        );
+        g.pending_engage = None;
+        g.engaged = false;
+        g.expect_teleport = None;
+        g.teleport_guard_until = None;
+        g.cursor_hidden = false;
+        set_own_main_gui_passthrough(&g, false, "engage-cancelled");
+        request_cursor_hidden(false);
+        sprite_hide();
+        pump_cursor_visibility();
+        return;
+    }
+
+    let (warp_applied, warp_actual) = warp_then_clip_source(pending.target, pending.src);
+
+    if !warp_applied {
+        log::warn!(
+            "cursor handoff commit warp rejected: requested=({},{}) actual=({},{}) src={:?}",
+            pending.target.0,
+            pending.target.1,
+            warp_actual.0,
+            warp_actual.1,
+            pending.src
+        );
+        let (origin_restored, origin_actual) =
+            warp_unclipped_verified(pending.origin, "engage abort native restore");
+        g.pending_engage = None;
+        g.engaged = false;
+        g.expect_teleport = None;
+        g.teleport_guard_until = None;
+        g.cursor_hidden = false;
+        set_own_main_gui_passthrough(&g, false, "engage-warp-rejected");
+        if origin_restored {
+            sprite_move_now(origin_actual.0, origin_actual.1, true);
+            request_cursor_hidden(false);
+        } else {
+            // Keep the sprite at the intended visible origin and let the Mag
+            // owner retry the native placement before revealing it.
+            sprite_move_now(pending.origin.0, pending.origin.1, true);
+            defer_cursor_reveal(pending.origin);
+        }
+        restore_mouse_speed();
+        g.cooldown_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(REENTER_COOLDOWN_MS));
+        pump_cursor_visibility();
+        return;
+    }
+
+    if g.adjust_speed {
+        let zoom = (g.content.w as f64 / pending.src.w.max(1) as f64)
+            .max(g.content.h as f64 / pending.src.h.max(1) as f64);
+        slow_mouse_for_zoom(zoom);
+    }
+    g.pending_engage = None;
+    let commit_now = std::time::Instant::now();
+    mark_engage_committed(&mut g, pending.target, commit_now);
+    sprite_move_now(pending.sprite.0, pending.sprite.1, true);
+    log::info!(
+        "cursor handoff committed atomically: native-hidden target-source=({},{}) sprite=({},{}) arm_to_commit_ms={} stale_guard_ms={}",
+        pending.target.0,
+        pending.target.1,
+        pending.sprite.0,
+        pending.sprite.1,
+        commit_now.duration_since(pending.requested_at).as_millis(),
+        POST_COMMIT_STALE_GUARD_MS
+    );
+}
+
+// ---------------- pointer-speed matching (the cursor-routing design parity) ----------------
+//
+// While engaged the real cursor is confined to the (smaller) source, so a raw
+// hand movement of H px moves the SPRITE H*zoom px on the magnified view — the
+// sprite is `zoom`× faster than the hand. When the cursor slips out at an edge
+// it reverts to 1:1 desktop speed. That abrupt speed change at the border is
+// an edge-return jerk. The cursor-routing design compensates by slowing the OS
+// pointer speed by 1/zoom while engaged, so the sprite tracks the hand 1:1 in
+// BOTH states — the edge crossing is then perfectly continuous. We save the
+// user's speed the first time we slow it and always restore it (also from
+// emergency_release_all), using fwinini=0 so nothing is broadcast or persisted.
+
+/// Windows mouse-speed slider (1..=20) → pointer multiplier.
+const SPEED_MULT: [f64; 20] = [
+    0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25,
+    2.5, 2.75, 3.0, 3.25, 3.5,
+];
+/// The user's pointer speed while we have it slowed (0 = we are not slowing it).
+static SAVED_MOUSE_SPEED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn get_mouse_speed() -> i32 {
+    let mut val: i32 = 10;
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETMOUSESPEED,
+            0,
+            Some(&mut val as *mut i32 as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    val.clamp(1, 20)
+}
+
+fn set_mouse_speed(speed: i32) {
+    unsafe {
+        // for SPI_SETMOUSESPEED the value IS passed in the pvparam slot
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSESPEED,
+            0,
+            Some(speed.clamp(1, 20) as usize as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+}
+
+/// slider whose multiplier best matches current/zoom (the cursor-routing design).
+fn slow_speed_for_zoom(current: i32, zoom: f64) -> i32 {
+    let cur_mult = SPEED_MULT[(current.clamp(1, 20) - 1) as usize];
+    let target = cur_mult / zoom.max(1e-6);
+    let mut best = 0usize;
+    let mut best_diff = f64::INFINITY;
+    for (i, &m) in SPEED_MULT.iter().enumerate() {
+        let d = (m - target).abs();
+        if d < best_diff {
+            best_diff = d;
+            best = i;
+        }
+    }
+    (best + 1) as i32
+}
+
+/// Crash-safety: the original speed is also written here while slowed, so a
+/// hard kill (Task Manager) mid-engagement can be healed on the next start
+/// (in-process restore paths cover every clean exit).
+fn speed_backup_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("chidescaler_neo_ptr_speed.bak")
+}
+
+/// Slow the pointer by 1/zoom so the sprite tracks the hand 1:1. No-op if the
+/// magnification is negligible or we are already slowing it.
+fn slow_mouse_for_zoom(zoom: f64) {
+    if zoom <= 1.05 {
+        return;
+    }
+    if SAVED_MOUSE_SPEED.load(Ordering::Acquire) != 0 {
+        return; // already slowed
+    }
+    let cur = get_mouse_speed();
+    let slowed = slow_speed_for_zoom(cur, zoom);
+    if slowed != cur {
+        SAVED_MOUSE_SPEED.store(cur, Ordering::Release);
+        let _ = std::fs::write(speed_backup_path(), cur.to_string());
+        set_mouse_speed(slowed);
+    }
+}
+
+/// Restore the user's pointer speed if we slowed it.
+fn restore_mouse_speed() {
+    let saved = SAVED_MOUSE_SPEED.swap(0, Ordering::AcqRel);
+    if saved != 0 {
+        set_mouse_speed(saved);
+        let _ = std::fs::remove_file(speed_backup_path());
+    }
+}
+
+/// If a previous run was hard-killed while it had the pointer slowed, restore
+/// the user's speed from the backup file. Called once at hook startup.
+fn heal_leftover_mouse_speed() {
+    let p = speed_backup_path();
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Ok(v) = s.trim().parse::<i32>() {
+            if (1..=20).contains(&v) {
+                set_mouse_speed(v);
+                log::warn!("restored pointer speed {v} left slowed by a previous run");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// What the applier should do after planning an engaged move.
+#[derive(Debug, PartialEq)]
+enum MovePlan {
+    /// stay engaged; redraw the sprite at the virtual cursor
+    Stay,
+    /// disengage and place the REAL cursor at `place` (edge escape)
+    Escape {
+        place: (i32, i32),
+        sprite: (i32, i32),
+    },
+}
+
+fn mark_engage_committed(g: &mut State, target: (i32, i32), now: std::time::Instant) {
+    g.native_gui_owner_hwnd = 0;
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    // The engage is not real until the owner thread has hidden the native
+    // cursor and SetCursorPos has actually reached the source target. Start all
+    // stale-event timing from THIS moment, not from the earlier LL-hook arm.
+    g.last_engage_at = Some(now);
+    g.last_set = target;
+    g.last_hw = target;
+    g.expect_teleport = Some(target);
+    g.teleport_guard_until =
+        Some(now + std::time::Duration::from_millis(POST_COMMIT_STALE_GUARD_MS));
+}
+
+fn suppress_post_commit_stale_move(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    actual: (i32, i32),
+    now: std::time::Instant,
+) -> bool {
+    let Some(until) = g.teleport_guard_until else {
+        return false;
+    };
+    if now >= until {
+        g.teleport_guard_until = None;
+        return false;
+    }
+    // Source dragging must remain immediate. Outside a drag, a raw hook point
+    // hundreds of pixels away from the clipped OS cursor immediately after a
+    // commit is an old pre-warp screen-space event, not genuine source motion.
+    if g.buttons_down != 0 {
+        return false;
+    }
+    let dx = (px - actual.0).abs();
+    let dy = (py - actual.1).abs();
+    if dx <= POST_COMMIT_RAW_DIVERGENCE_PX && dy <= POST_COMMIT_RAW_DIVERGENCE_PX {
+        return false;
+    }
+    g.last_hw = actual;
+    log::info!(
+        "post-commit stale cursor event suppressed: raw=({px},{py}) actual=({},{}) divergence=({dx},{dy}) guard_remaining_ms={}",
+        actual.0,
+        actual.1,
+        until.saturating_duration_since(now).as_millis()
+    );
+    true
+}
+
+/// Pure planner for a hardware move while engaged (stable legacy behavior
+/// model). `actual` is the OS-clipped cursor position (GetCursorPos) = the
+/// TRUTH for where the confined cursor sits; `px,py` is the raw (pre-clip)
+/// hook position, which is what reveals an outward push past the source edge.
+///
+/// Crucially this NEVER disengages over the control panel / GUI: the panel is
+/// reached with the virtual cursor and clicks are redirected in the hook. Only
+/// a genuine edge push leaves the view. No Windows calls — unit-testable.
+fn plan_engaged(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    now: std::time::Instant,
+    actual: (i32, i32),
+) -> MovePlan {
+    // Stale pre-teleport strays (see `expect_teleport`): swallow every move
+    // until the injected engage teleport shows up in the hook stream, so a
+    // queued screen-coordinate event can never be mapped as a source
+    // coordinate and yank the sprite during post-engage handoff.
+    // bounce in the 4K GUI-topmost logs). Time-capped by the engage grace so
+    // a lost injection can't freeze the cursor.
+    if let Some(expected) = g.expect_teleport {
+        // A GUI-side stale event can agree perfectly with GetCursorPos after
+        // Windows overwrites our SetCursorPos, while both are hundreds of
+        // pixels away from the requested SOURCE target. Treating raw==actual
+        // as acknowledgement caused that screen coordinate to be remapped as
+        // source space and produced the observed jump toward the upper-left.
+        let raw_at_target = (px - expected.0).abs() <= TELEPORT_SETTLE_PX
+            && (py - expected.1).abs() <= TELEPORT_SETTLE_PX;
+        let actual_at_target = (actual.0 - expected.0).abs() <= TELEPORT_SETTLE_PX
+            && (actual.1 - expected.1).abs() <= TELEPORT_SETTLE_PX;
+        let fresh = raw_at_target && actual_at_target;
+        let expired = g.last_engage_at.map_or(true, |t| {
+            now.duration_since(t) >= std::time::Duration::from_millis(TELEPORT_SETTLE_TIMEOUT_MS)
+        });
+        if fresh || expired {
+            g.expect_teleport = None;
+            if fresh {
+                // The first verified event is also real user motion. Base its
+                // delta on the warp target and continue through the normal
+                // planner; discarding it caused a one-event boundary snag and
+                // could leave a fast reversal one pixel short of the GUI.
+                g.last_hw = expected;
+            } else {
+                // Never resume source-space mapping from an unacknowledged
+                // teleport. `actual` may still be an old GUI/screen coordinate;
+                // rebasing to it can cause a jump toward the desktop's
+                // upper-left. Abort to the cursor's current VISIBLE position.
+                let visible = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+                log::warn!(
+                    "cursor teleport settle expired: aborting at visible=({},{}) expected=({},{}) stale_raw=({px},{py}) stale_actual=({},{})",
+                    visible.0,
+                    visible.1,
+                    expected.0,
+                    expected.1,
+                    actual.0,
+                    actual.1
+                );
+                disengage_state(g, now);
+                g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
+                return MovePlan::Escape {
+                    place: visible,
+                    sprite: visible,
+                };
+            }
+        } else {
+            if (px - actual.0).abs() <= TELEPORT_SETTLE_PX
+                && (py - actual.1).abs() <= TELEPORT_SETTLE_PX
+            {
+                log::warn!(
+                    "cursor teleport false-ack suppressed: expected=({},{}) raw=({px},{py}) actual=({},{})",
+                    expected.0,
+                    expected.1,
+                    actual.0,
+                    actual.1
+                );
+            }
+            return MovePlan::Stay;
+        }
+    }
+    if suppress_post_commit_stale_move(g, px, py, actual, now) {
+        return MovePlan::Stay;
+    }
+    let s = g.src;
+    let c = g.content;
+    let old_virt = g.virt;
+    // CLICK delivery / source sync uses the ACTUAL clipped cursor (confined to
+    // the source). The SPRITE, however, follows the RAW pre-clip hook pt mapped
+    // WITHOUT clamping — so as the hand pushes past the source edge the visible
+    // cursor keeps moving toward/past the content edge, instead of snapping back
+    // to the clamped source-edge mapping (map_source_to_content(clipped)) which
+    // creates a visible return. Interior events have raw == clipped.
+    let ax = actual.0.clamp(s.x, s.x + s.w - 1);
+    let ay = actual.1.clamp(s.y, s.y + s.h - 1);
+    g.last_set = (ax, ay);
+    let mapped = map_source_to_content_unclamped(c, s, px as f64, py as f64);
+    g.virt = mapped;
+    let prev_hw = g.last_hw;
+    g.last_hw = (px, py);
+    if fullscreen_ui_virtual_move(g, old_virt, (px, py), (px - prev_hw.0, py - prev_hw.1)) {
+        g.edge_out_accum = 0.0;
+        return MovePlan::Stay;
+    }
+
+    // dragging the source with a held button: never escape — the whole gesture
+    // belongs to the source window (e.g. dragging its own title bar toward a
+    // screen edge must not yank the cursor out).
+    if g.buttons_down != 0 {
+        g.edge_out_accum = 0.0;
+        return MovePlan::Stay;
+    }
+
+    // post-engage grace: swallow the stale queued pre-teleport event(s) so they
+    // cannot instantly fling the view out (see ENGAGE_GRACE_MS).
+    if let Some(t) = g.last_engage_at {
+        if now.duration_since(t) < std::time::Duration::from_millis(ENGAGE_GRACE_MS) {
+            g.edge_out_accum = 0.0;
+            return MovePlan::Stay;
+        }
+    }
+
+    // Edge push. The LL hook reports PRE-clip coordinates, so a push beyond the
+    // source border is observable as `out > 0`. We accumulate ONLY the ACTIVE
+    // outward travel (how much FURTHER out the hand moved this event), NOT the
+    // absolute overshoot and NOT a time-held gate. That distinction is what the
+    // user feels: a deliberate push (fast or slow) moves the cursor outward and
+    // accumulates → exits cleanly; merely brushing/resting AT the edge adds no
+    // travel → never triggers an unintended escape that then "returns".
+    let out = edge_out_amount(s, px, py);
+    if out > 0 {
+        // FULLSCREEN: never slip out at an edge — the view is the whole screen
+        // and the panel sits at the top edge, so exiting there is what made the
+        // panel unreachable and flung the cursor away. However, if a top-most
+        // GUI no-engage rect lives in the letterbox area, let only the virtual
+        // cursor continue into that GUI so it remains operable.
+        if g.fullscreen {
+            if let Some(side) = edge_out_side(s, px, py) {
+                if !extend_fullscreen_virtual_into_ui(g, side, out) {
+                    log_fullscreen_ui_edge_miss(g, side, px, py, old_virt, mapped);
+                    g.edge_out_accum = 0.0;
+                    g.virt = clamp_virtual_point(c, g.virt.0, g.virt.1, 0.0);
+                }
+            }
+            return MovePlan::Stay;
+        }
+        // Accumulate the (per-event, roughly constant while pushing) outward
+        // overshoot scaled to content px. NO time gate: merely resting/brushing
+        // against the edge adds little and never crosses the threshold, so it
+        // cannot trigger an unintended escape that then "returns". A deliberate
+        // push — a firm slow push or a fast flick — accumulates quickly and
+        // exits. `out` is essentially the hand's per-event outward speed, so a
+        // faster push exits in fewer events (matches the user's observation).
+        let (scale_x, scale_y) = content_per_source_px(c, s);
+        g.edge_out_accum += out as f64 * scale_x.max(scale_y).max(1.0);
+        if g.edge_out_accum >= EXIT_TRAVEL_PX {
+            // Place the real cursor WHERE THE SPRITE IS (g.virt, driven by raw,
+            // already outside the content) then reveal it — so there is no jump
+            // between the sprite and the revealed system cursor. Fall back to a
+            // just-outside point if the sprite is somehow still inside.
+            let place = exit_point_for_escape(g, px, py);
+            let sprite = place;
+            disengage_state(g, now);
+            g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
+            return MovePlan::Escape { place, sprite };
+        }
+        return MovePlan::Stay;
+    }
+    g.edge_out_accum = 0.0;
+    MovePlan::Stay
+}
+
+/// What the applier should do after a hardware move. Pure — no Windows calls,
+/// so the whole engage/disengage state machine is fully unit-testable via the
+/// Sim harness in the tests.
+#[derive(Debug, PartialEq)]
+enum MoveOutcome {
+    /// stay in the current state; optionally redraw the sprite at (x,y)
+    Stay { sprite: Option<(i32, i32)> },
+    /// engage: clip to source + place the real cursor at the source point
+    Engage { tx: i32, ty: i32, vx: f64, vy: f64 },
+    /// disengage: release the clip + place the real cursor at `place`
+    Disengage {
+        place: (i32, i32),
+        sprite: (i32, i32),
+    },
+}
+
+/// Core engage/disengage decision for a hardware move. `actual` is the
+/// OS-clipped cursor (GetCursorPos); `px,py` is the raw pre-clip hook pt.
+fn handle_move(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    now: std::time::Instant,
+    actual: (i32, i32),
+) -> MoveOutcome {
+    if !g.active {
+        return MoveOutcome::Stay { sprite: None };
+    }
+    if g.engaged {
+        match plan_engaged(g, px, py, now, actual) {
+            MovePlan::Stay => {
+                let sprite = if g.hidden_by_idle {
+                    None
+                } else {
+                    Some((g.virt.0.round() as i32, g.virt.1.round() as i32))
+                };
+                MoveOutcome::Stay { sprite }
+            }
+            MovePlan::Escape { place, sprite } => {
+                g.must_leave_content = true;
+                MoveOutcome::Disengage { place, sprite }
+            }
+        }
+    } else if let Some(e) = plan_engage(g, px, py, now) {
+        // Guard against a small bounce immediately after an edge exit: only a
+        // DELIBERATE return re-engages — the ENGAGE point (mapped source pos)
+        // must sit well inside every source edge. A shallow drift back near the
+        // edge stays disengaged (no teleport-back). Evaluated ONLY here, at the
+        // instant of an actual engage, and `must_leave` is cleared ONLY when we
+        // truly engage — so a brief overshoot during the re-enter cooldown can
+        // no longer silently disarm the guard.
+        if g.must_leave_content {
+            let s = g.src;
+            let m = POST_ESCAPE_SRC_MARGIN_PX;
+            let deliberate = s.w > 2 * m
+                && s.h > 2 * m
+                && e.tx >= s.x + m
+                && e.tx < s.x + s.w - m
+                && e.ty >= s.y + m
+                && e.ty < s.y + s.h - m;
+            if !deliberate {
+                return MoveOutcome::Stay { sprite: None };
+            }
+        }
+        g.must_leave_content = false;
+        g.engaged = true;
+        g.virt = (e.vx, e.vy);
+        g.last_set = (e.tx, e.ty);
+        g.last_hw = (px, py);
+        g.edge_out_accum = 0.0;
+        g.last_engage_at = Some(now);
+        g.expect_teleport = Some((e.tx, e.ty));
+        g.teleport_guard_until = None;
+        g.hidden_by_idle = false;
+        MoveOutcome::Engage {
+            tx: e.tx,
+            ty: e.ty,
+            vx: e.vx,
+            vy: e.vy,
+        }
+    } else {
+        MoveOutcome::Stay { sprite: None }
+    }
+}
+
+fn read_cursor_pos_or(fallback: (i32, i32), context: &str) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT::default();
+        match GetCursorPos(&mut pt) {
+            Ok(()) => (pt.x, pt.y),
+            Err(err) => {
+                // POINT::default() is (0,0). Never let an API failure inject
+                // that sentinel into cursor state, because subsequent mapping
+                // can make the visible cursor appear to jump to monitor origin.
+                log::warn!(
+                    "GetCursorPos failed during {context}: {err:?}; preserving fallback=({},{})",
+                    fallback.0,
+                    fallback.1
+                );
+                fallback
+            }
+        }
+    }
+}
+
+/// Returns true only when this move engaged the mapper and successfully warped
+/// the real cursor. The low-level hook must consume that one triggering event.
+fn on_hardware_move(px: i32, py: i32) -> bool {
+    let st = state();
+    let mut g = match st.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false, // never block the LL hook
+    };
+    let now = std::time::Instant::now();
+    repair_main_gui_passthrough_if_needed();
+    g.last_move = Some(now);
+    if !g.transition_suspended
+        && (g.active || g.engaged || g.src_hwnd != 0)
+        && g.last_configure_at
+            .is_none_or(|last| now.duration_since(last) > std::time::Duration::from_millis(1500))
+    {
+        // If the render thread stalls or dies while Windows still owns a
+        // source clip, the first physical mouse movement must free the user
+        // without depending on the GUI or provider thread.
+        log::warn!("input-heartbeat-timeout: releasing stale cursor mapping");
+        release_locked(&mut g);
+        g.active = false;
+        g.buttons_down = 0;
+        g.native_ui_hold_bits = 0;
+        return false;
+    }
+    // A low-level button-up can be lost while a synthetic UI handoff changes
+    // focus. Never let that leave the mapper permanently in "dragging" mode,
+    // which makes both the GUI and magnified window feel immovable.
+    let stale_buttons = reconcile_stale_buttons(&mut g, now);
+    for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+        if stale_buttons & bit != 0 {
+            inject_mouse_button(bit, false);
+        }
+    }
+    if stale_buttons != 0 {
+        log::warn!("mouse-move released stale GUI hold bits={stale_buttons:#04x}");
+    }
+    if g.hidden_by_idle && g.engaged {
+        g.hidden_by_idle = false;
+        let vx = g.virt.0 as i32;
+        let vy = g.virt.1 as i32;
+        sprite_move(vx, vy, true);
+    }
+    if !g.active {
+        if g.engaged {
+            release_locked(&mut g);
+        }
+        return false;
+    }
+    if let Some(pending) = g.pending_engage {
+        if now.duration_since(pending.requested_at) <= std::time::Duration::from_millis(250) {
+            // Keep the native cursor at its GUI-side position while the owner
+            // thread applies MagShowSystemCursor(false). Consuming these few
+            // events prevents a 120/144Hz display from exposing the cursor at
+            // the hidden source position for one refresh.
+            request_cursor_hidden(true);
+            return true;
+        }
+        log::warn!(
+            "cursor handoff timed out before native hide: origin=({},{}) target=({},{}) age_ms={}",
+            pending.origin.0,
+            pending.origin.1,
+            pending.target.0,
+            pending.target.1,
+            now.duration_since(pending.requested_at).as_millis()
+        );
+        g.pending_engage = None;
+        g.engaged = false;
+        g.expect_teleport = None;
+        g.teleport_guard_until = None;
+        g.cursor_hidden = false;
+        // The native cursor was never warped on this path. Rebase bookkeeping
+        // to the currently visible hook point and briefly suppress immediate
+        // re-arm, which otherwise forms timeout->arm loops under 100% GPU load.
+        g.last_set = (px, py);
+        g.last_hw = (px, py);
+        g.cooldown_until = Some(now + std::time::Duration::from_millis(REENTER_COOLDOWN_MS));
+        request_cursor_hidden(false);
+        sprite_hide();
+        log::info!(
+            "cursor handoff timeout recovered: native=({px},{py}) cooldown_ms={REENTER_COOLDOWN_MS}"
+        );
+        return false;
+    }
+    if g.ui_hold_bits != 0 {
+        return false;
+    }
+    if let Some(mut settle) = g.native_gui_settle {
+        let dx = px - settle.target.0;
+        let dy = py - settle.target.1;
+        let near_target = dx.abs() <= 24 && dy.abs() <= 24;
+        if near_target {
+            g.native_gui_settle = None;
+        } else if now <= settle.until {
+            if !settle.reasserted {
+                let (_, actual) = warp_unclipped_verified(
+                    settle.target,
+                    "native GUI stale-source quarantine",
+                );
+                settle.target = actual;
+                settle.reasserted = true;
+                log::warn!(
+                    "native-gui stale move quarantined: target=({},{}) source_origin=({},{}) stale=({px},{py})",
+                    settle.target.0,
+                    settle.target.1,
+                    settle.source_origin.0,
+                    settle.source_origin.1
+                );
+            }
+            g.native_gui_settle = Some(settle);
+            return true;
+        } else {
+            let (_, actual) = warp_unclipped_verified(
+                settle.target,
+                "native GUI settle timeout recovery",
+            );
+            g.native_gui_settle = None;
+            g.last_set = actual;
+            g.last_hw = actual;
+            log::warn!(
+                "native-gui settle timeout recovered: target=({},{}) stale=({px},{py})",
+                actual.0,
+                actual.1
+            );
+            return true;
+        }
+    }
+    // Bypass render-thread geometry latency while Neo's GUI is moving/resizing.
+    // This samples the actual HWND on the LL hook path, so language/DPI/mode
+    // changes and native title-bar dragging cannot leave a stale exclusion rect
+    // long enough to arm a source engage.
+    refresh_live_own_no_engage_geometry(&mut g, now);
+    // Disengaged ownership is exact and native: if the current OS cursor is
+    // inside Neo's live GUI rectangle, Windows owns it immediately. The first
+    // pixel outside falls through to plan_engage in this SAME event.
+    if !g.engaged && hold_native_gui_ownership_if_inside(&mut g, px, py, now) {
+        return false;
+    }
+    // TRUTH position while engaged = the OS-clipped cursor.
+    let actual = if g.engaged {
+        let s = g.src;
+        if s.w <= 1 || s.h <= 1 {
+            return false;
+        }
+        if g.cursor_hidden && on_or_past_source_edge(s, px, py) {
+            request_cursor_hidden(true);
+        }
+        read_cursor_pos_or(g.last_set, "engaged hardware move")
+    } else {
+        (px, py)
+    };
+    // Do not reissue SetCursorPos while stale pre-handoff moves are draining.
+    // Repeated warps erase genuine reversal input at a GUI boundary and are the
+    // direct cause of the visible snag/jump. `plan_engaged` owns the bounded
+    // stale-event quarantine and clears it on the verified target event.
+    if g.engaged {
+        let vx = g.virt.0.round() as i32;
+        let vy = g.virt.1.round() as i32;
+        let physical_gui = own_main_gui_at_visible_point(&g.no_engage, actual.0, actual.1);
+        let visible_gui = own_main_gui_at_visible_point(&g.no_engage, vx, vy);
+        if let Some(gui) = physical_gui.filter(|_| visible_gui.is_none()) {
+            let mut shielded = crate::platform::win32::window_input_passthrough(gui.hwnd);
+            if !shielded {
+                publish_main_gui_passthrough(gui.hwnd, true, "gui-ghost-route-repair");
+                shielded = crate::platform::win32::window_input_passthrough(gui.hwnd);
+                log::error!(
+                    "gui-ghost-route repaired: hwnd={:#x} physical=({},{}) virtual=({vx},{vy}) rect={:?} passthrough_after={shielded}",
+                    gui.hwnd,
+                    actual.0,
+                    actual.1,
+                    gui.land
+                );
+            } else if GHOST_ROUTE_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) % 128 == 0 {
+                log::info!(
+                    "gui-ghost-route shielded: hwnd={:#x} physical=({},{}) virtual=({vx},{vy}) rect={:?} passthrough=true",
+                    gui.hwnd,
+                    actual.0,
+                    actual.1,
+                    gui.land
+                );
+            }
+        }
+    }
+    match handle_move(&mut g, px, py, now, actual) {
+        MoveOutcome::Stay { sprite } => {
+            // Re-assert the system-cursor hide on every engaged move (not a
+            // cached flag): the Magnification hide can be reset by the
+            // compositor / capture / another app, and then the REAL cursor —
+            // sitting at the offset source position — bleeds through as a second
+            // cursor or a bidirectional resize cursor. Cheap and idempotent.
+            if g.engaged && g.cursor_hidden {
+                request_cursor_hidden(true);
+            }
+            if let Some((sx, sy)) = sprite {
+                sprite_move(sx, sy, true);
+            }
+            let gui_handoff_applied = if g.engaged && !g.hidden_by_idle && g.buttons_down == 0 {
+                post_ui_hover_from_state(&mut g, now)
+            } else {
+                false
+            };
+            if gui_handoff_applied {
+                log::info!("gui handoff trigger consumed: raw=({px},{py})");
+            }
+            gui_handoff_applied
+        }
+        MoveOutcome::Engage { tx, ty, vx, vy } => {
+            apply_engage_windows(&mut g, px, py, tx, ty, vx, vy, now, false)
+        }
+        MoveOutcome::Disengage { place, sprite } => {
+            set_own_main_gui_passthrough(&g, false, "edge-release");
+            if g.cursor_hidden {
+                request_cursor_hidden(true);
+            }
+            sprite_move_now(sprite.0, sprite.1, true);
+            log::info!(
+                "edge-release detail: raw=({px},{py}) actual=({},{}) sprite=({},{}) place=({},{}) content={:?} src={:?}",
+                actual.0,
+                actual.1,
+                sprite.0,
+                sprite.1,
+                place.0,
+                place.1,
+                g.content,
+                g.src
+            );
+            DEBUG_LAST_EDGE_PLACE_X.store(place.0, Ordering::Release);
+            DEBUG_LAST_EDGE_PLACE_Y.store(place.1, Ordering::Release);
+            // Move the STILL-HIDDEN real cursor to the exit point FIRST (unclip
+            // so it can leave the source), THEN reveal it. Revealing it before
+            // the move (as release_windows does) would flash it at the source
+            // position — offset from the sprite — so it looks like the cursor
+            // jumps back into the view once before leaving.
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+            // Do not expose an unverified SetCursorPos result. The Mag-owner
+            // thread keeps native hidden, verifies `place`, and only then shows
+            // it via the deferred reveal transaction.
+            defer_cursor_reveal(place);
+            log::info!(
+                "edge-release deferred until verified native position: target=({},{})",
+                place.0,
+                place.1
+            );
+            restore_mouse_speed();
+            g.cursor_hidden = false;
+            g.hidden_by_idle = false;
+            log::info!("disengage(edge push): cursor=({},{})", place.0, place.1);
+            false
+        }
+    }
+}
+
+/// Apply the Windows side of an engage. Normal mouse-hook engages can only
+/// request the thread-affine Magnification hide asynchronously. The initial
+/// overlay reveal runs on the Mag owner thread, so it can commit that hide
+/// before moving the native cursor into the offset source window.
+#[allow(clippy::too_many_arguments)]
+fn apply_engage_windows(
+    g: &mut State,
+    px: i32,
+    py: i32,
+    tx: i32,
+    ty: i32,
+    vx: f64,
+    vy: f64,
+    now: std::time::Instant,
+    commit_hide_before_warp: bool,
+) -> bool {
+    let s = g.src;
+    set_own_main_gui_passthrough(g, true, "source-ownership-arm");
+    if !g.cursor_hidden {
+        request_cursor_hidden(true);
+        g.cursor_hidden = true;
+    }
+    if commit_hide_before_warp {
+        pump_cursor_visibility();
+        if !CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+            log::warn!("pre-reveal cursor hide not committed; keeping overlay hidden");
+            release_locked(g);
+            g.active = false;
+            return false;
+        }
+    } else {
+        // Normal GUI -> overlay entry originates on the LL-hook thread, while
+        // Magnification cursor visibility is owned by the render thread. Do
+        // not warp the still-visible native cursor into source space. Arm a
+        // transaction; the owner thread hides native first and commits warp +
+        // sprite in the same tick via pump_cursor_engage_commit().
+        g.pending_engage = Some(PendingEngage {
+            origin: (px, py),
+            target: (tx, ty),
+            sprite: (vx.round() as i32, vy.round() as i32),
+            src: s,
+            requested_at: now,
+        });
+        sprite_move(vx.round() as i32, vy.round() as i32, true);
+        log::info!(
+            "cursor handoff armed: native-visible position=({px},{py}) target-source=({tx},{ty})"
+        );
+        return true;
+    }
+    let (warp_applied, warp_actual) = warp_then_clip_source((tx, ty), s);
+    if !warp_applied {
+        log::warn!(
+            "engage warp rejected: requested=({tx},{ty}) actual=({},{}) src={:?} raw=({px},{py})",
+            warp_actual.0,
+            warp_actual.1,
+            s
+        );
+        let (origin_restored, _) =
+            warp_unclipped_verified((px, py), "synchronous engage abort native restore");
+        release_locked(g);
+        if !origin_restored {
+            sprite_move_now(px, py, true);
+            defer_cursor_reveal((px, py));
+        }
+        g.must_leave_content = true;
+        g.cooldown_until = Some(now + std::time::Duration::from_millis(REENTER_COOLDOWN_MS));
+        return false;
+    }
+    // The synchronous pre-reveal path also becomes real only after this warp
+    // succeeds. Use the same commit-relative stale-event guard as the normal
+    // asynchronous handoff so there is no unprotected first-reveal window.
+    mark_engage_committed(g, (tx, ty), std::time::Instant::now());
+    if g.adjust_speed {
+        let zoom =
+            (g.content.w as f64 / s.w.max(1) as f64).max(g.content.h as f64 / s.h.max(1) as f64);
+        slow_mouse_for_zoom(zoom);
+    }
+    sprite_move(vx.round() as i32, vy.round() as i32, true);
+    log::info!(
+        "engage: ({px},{py}) -> source({tx},{ty}) clip={:?} trigger_consumed={warp_applied} pre_reveal={commit_hide_before_warp}",
+        (s.x, s.y, s.w, s.h),
+    );
+    warp_applied
+}
+
+/// Result of the pure engage planner.
+#[derive(Debug, PartialEq)]
+struct EngagePlan {
+    tx: i32,
+    ty: i32,
+    vx: f64,
+    vy: f64,
+}
+
+/// Pure planner deciding whether a disengaged hardware move should engage.
+/// No Windows calls — unit-testable.
+fn plan_engage(g: &State, px: i32, py: i32, now: std::time::Instant) -> Option<EngagePlan> {
+    plan_engage_impl(g, px, py, now, true)
+}
+
+fn plan_engage_for_overlay_reveal(
+    g: &State,
+    px: i32,
+    py: i32,
+    now: std::time::Instant,
+) -> Option<EngagePlan> {
+    // Startup panel placement updates the no-engage geometry moments before
+    // the first filtered frame. Keep the real UI rectangles, but do not let the
+    // normal 300ms drag guard delay this one atomic cursor handoff.
+    plan_engage_impl(g, px, py, now, false)
+}
+
+fn plan_engage_impl(
+    g: &State,
+    px: i32,
+    py: i32,
+    now: std::time::Instant,
+    honor_recent_no_engage_motion: bool,
+) -> Option<EngagePlan> {
+    // Never start source ownership in the middle of a Neo-native GUI gesture.
+    // `native_ui_hold_bits` marks only a physical button press that STARTED on
+    // Neo's real GUI. This is deliberately narrower than `buttons_down`: a
+    // normal press/drag aimed at magnified content keeps the historic source
+    // input behaviour. Warping during a native title-bar drag would make
+    // Windows interpret source coordinates as the next window-move point.
+    if g.native_ui_hold_bits != 0 || g.ui_hold_bits != 0 {
+        return None;
+    }
+    if let Some(t) = g.cooldown_until {
+        if now < t {
+            return None;
+        }
+    }
+    if !contains_for_engage(g.content, px, py) {
+        return None;
+    }
+    // Do not block engage from cached rectangles. A GUI can move many pixels
+    // between render-thread geometry publications; using that stale rectangle
+    // here created invisible no-engage islands near the GUI boundary.
+    // The current topmost Win32 window at the actual pointer point is authority.
+    if hit_ui_for_cursor_ownership(&g.no_engage, px, py).is_some() {
+        return None;
+    }
+    let c = g.content;
+    let s = g.src;
+    if s.w <= 1 || s.h <= 1 || c.w <= 1 || c.h <= 1 {
+        return None;
+    }
+    let (tx, ty) = map_content_to_source(c, s, px as f64, py as f64);
+    // hysteresis dead-band in SOURCE space (see ENGAGE_SRC_MARGIN_PX): don't
+    // engage while the mapped source position sits within the band of a source
+    // edge, so the engage boundary is well inside the escape boundary and the
+    // windowed edge cannot oscillate / pull the cursor back. Skipped for a
+    // source too small to hold the band.
+    let m = ENGAGE_SRC_MARGIN_PX;
+    if s.w > 2 * m
+        && s.h > 2 * m
+        && (tx < s.x + m || tx >= s.x + s.w - m || ty < s.y + m || ty >= s.y + s.h - m)
+    {
+        return None;
+    }
+    let (vx, vy) = map_source_to_content(c, s, tx as f64, ty as f64);
+    // If the SPRITE would materialise inside a GUI zone, engaging is pointless:
+    // the very next move hands straight back to the GUI — the log showed
+    // engage↔handoff pairs at 10ms period while skirting the GUI boundary.
+    // Stay a free cursor until the mapped position is clearly outside.
+    if hit_ui_for_cursor_ownership(&g.no_engage, vx.round() as i32, vy.round() as i32).is_some() {
+        return None;
+    }
+    // Engage is blocked for the lifetime of a physical GUI gesture
+    // and refreshes the HWND rect directly in the LL hook. A second 300ms
+    // movement timer only made ownership feel random at different crossing
+    // speeds, so normal GUI ownership is now purely geometric.
+    let _ = honor_recent_no_engage_motion;
+    Some(EngagePlan { tx, ty, vx, vy })
+}
+
+/// Windows-side release ONLY (no state fields): clear the clip, restore the
+/// system cursor, hide the sprite. State transitions live in `disengage_state`
+/// so the move planner can stay pure and unit-testable.
+fn release_windows(g: &mut State) {
+    set_own_main_gui_passthrough(g, false, "source-ownership-release");
+    g.pending_engage = None;
+    g.native_gui_settle = None;
+    let visible = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+    let native_is_hidden =
+        g.cursor_hidden || CURSOR_HIDE_APPLIED.load(Ordering::Acquire) || cursor_reveal_pending();
+
+    if native_is_hidden {
+        let (reached, actual) = warp_unclipped_verified(visible, "generic native release");
+        if reached {
+            // Bridge with the sprite until the Mag owner confirms native show.
+            sprite_move_now(actual.0, actual.1, true);
+            request_cursor_hidden(false);
+        } else {
+            // Never reveal the source-space cursor merely because a Stop,
+            // geometry transition or watchdog asked for release. Retry the
+            // visible screen point on the Mag-owner thread first.
+            sprite_move_now(visible.0, visible.1, true);
+            defer_cursor_reveal(visible);
+        }
+        g.cursor_hidden = false;
+    } else {
+        unsafe {
+            let _ = ClipCursor(None);
+        }
+        sprite_hide();
+    }
+    restore_mouse_speed();
+}
+
+/// Transfer ownership from the magnified sprite to a native window without a
+/// one-frame cursor flash at the hidden source position. Move the still-hidden
+/// real cursor first, then request native visibility. This ordering makes GUI
+/// entry deterministic even when the render thread is between visibility pumps.
+fn release_windows_to_native_at(
+    g: &mut State,
+    pos: (i32, i32),
+    reason: &str,
+) -> Option<(i32, i32)> {
+    // State flags can lag the Magnification owner by one pump. Base the reveal
+    // decision on BOTH logical and actually-applied hide state so a rapid
+    // GUI/content reversal cannot leave the verified native cursor hidden or
+    // hide the sprite prematurely.
+    let native_was_hidden =
+        g.cursor_hidden || CURSOR_HIDE_APPLIED.load(Ordering::Acquire) || cursor_reveal_pending();
+    // Keep the last known source point so a failed native handoff can be rolled
+    // back while the real cursor is still hidden. Ownership is not committed
+    // until the requested native point is verified by GetCursorPos.
+    let source_origin = read_cursor_pos_or(g.last_set, "native handoff source origin");
+    let (reached, actual) = warp_unclipped_verified(pos, reason);
+    if !reached {
+        let mut recovered = false;
+        let mut recovery_actual = source_origin;
+        if g.engaged && g.src.w > 1 && g.src.h > 1 {
+            (recovered, recovery_actual) = warp_then_clip_source(source_origin, g.src);
+        }
+        if recovered {
+            g.last_set = recovery_actual;
+            g.last_hw = recovery_actual;
+        } else {
+            unsafe {
+                // Never reveal a cursor at an unverified location. If recovery
+                // also failed, leave it hidden/unclipped and retry ownership on
+                // the next real move instead of exposing a source corner.
+                let _ = ClipCursor(None);
+            }
+        }
+        request_cursor_hidden(true);
+        g.cursor_hidden = true;
+        sprite_move_now(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+        log::warn!(
+            "native cursor ownership transfer aborted: reason={reason} requested=({},{}) actual=({},{}) source_recovered={} recovery=({},{})",
+            pos.0,
+            pos.1,
+            actual.0,
+            actual.1,
+            recovered,
+            recovery_actual.0,
+            recovery_actual.1
+        );
+        return None;
+    }
+
+    g.pending_engage = None;
+    if native_was_hidden {
+        // Park the sprite on the exact verified GUI point and retain it until
+        // the Mag owner confirms the native cursor is actually visible.
+        sprite_move_now(actual.0, actual.1, true);
+        request_cursor_hidden(false);
+        g.cursor_hidden = false;
+    } else {
+        sprite_hide();
+    }
+    restore_mouse_speed();
+    Some(actual)
+}
+
+/// Pure state transition for a disengage (no Windows calls).
+fn disengage_state(g: &mut State, now: std::time::Instant) {
+    mark_disengage(g, now);
+    g.engaged = false;
+    g.edge_out_accum = 0.0;
+    g.last_engage_at = None;
+    g.teleport_guard_until = None;
+    g.swallow_up = 0;
+    g.ui_hold_bits = 0;
+    g.native_ui_hold_bits = 0;
+    g.last_button_event = None;
+    g.last_ui_hover = None;
+    g.last_ui_post = None;
+    g.native_gui_owner_hwnd = 0;
+    g.native_gui_settle = None;
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+}
+
+fn release_locked(g: &mut State) {
+    // begin_ui_hold injects a DOWN at the native GUI so dragging behaves like
+    // an ordinary window. A focus transition can occasionally lose the
+    // matching physical UP. Close any outstanding synthetic hold before
+    // clearing the bookkeeping, or the GUI can remain immovable after Stop.
+    let held = g.ui_hold_bits;
+    for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+        if held & bit != 0 {
+            inject_mouse_button(bit, false);
+        }
+    }
+    if held != 0 {
+        log::warn!("release cleared outstanding GUI mouse hold bits={held:#04x}");
+    }
+    if g.src_hwnd != 0 {
+        unsafe {
+            // Tell the source to abandon any native move/resize/drag modal
+            // loop entered while Neo owned the mapped cursor. This is needed
+            // in addition to button-up: mpv can retain window capture after a
+            // synthetic/native handoff even though GetAsyncKeyState is clear.
+            let _ = PostMessageW(
+                Some(HWND(g.src_hwnd as *mut _)),
+                WM_CANCELMODE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        log::info!(
+            "source input capture cancelled on release: hwnd={:#x}",
+            g.src_hwnd
+        );
+    }
+    release_windows(g);
+    g.engaged = false;
+    g.edge_out_accum = 0.0;
+    g.last_engage_at = None;
+    g.teleport_guard_until = None;
+    g.swallow_up = 0;
+    g.ui_hold_bits = 0;
+    g.native_ui_hold_bits = 0;
+    g.last_button_event = None;
+    g.must_leave_content = false;
+    g.last_ui_hover = None;
+    g.last_ui_post = None;
+    g.native_gui_owner_hwnd = 0;
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    g.src_hwnd = 0;
+}
+
+fn mark_disengage(g: &mut State, now: std::time::Instant) {
+    if let Some(start) = g.last_engage_at {
+        if now.duration_since(start) < std::time::Duration::from_millis(OSC_SHORT_MS) {
+            g.oscillations = (g.oscillations + 1).min(OSC_MAX);
+        } else {
+            g.oscillations = 0;
+        }
+    }
+    g.last_engage_at = None;
+}
+
+// ---------------- public interface ----------------
+
+pub struct InputSystem {
+    thread_id: u32,
+    handle: Option<std::thread::JoinHandle<()>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+}
+
+static HOOK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Marker accepted only by the opt-in native desktop regression harness.
+/// Normal injected input remains ignored by the low-level hook.
+pub const DESKTOP_TEST_INPUT_TAG: usize = 0x4554_5354;
+static DESKTOP_TEST_INPUT_ENABLED: OnceLock<bool> = OnceLock::new();
+static DESKTOP_TEST_INPUT_SEEN: AtomicBool = AtomicBool::new(false);
+static DESKTOP_TEST_INJECTED_DIAG: AtomicBool = AtomicBool::new(false);
+static DESKTOP_TEST_MOVE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn desktop_test_input_enabled() -> bool {
+    *DESKTOP_TEST_INPUT_ENABLED.get_or_init(|| {
+        std::env::var_os("CHIDESCALER_DESKTOP_TEST_INPUT").is_some_and(|value| value == "1")
+    })
+}
+
+impl InputSystem {
+    pub fn start() -> Self {
+        // Startup recovery must never inject mouse-button UP events.
+        startup_recover_input_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("mouse-hook".into())
+            .spawn(move || unsafe {
+                struct HookDone(Option<std::sync::mpsc::Sender<()>>);
+                impl Drop for HookDone {
+                    fn drop(&mut self) {
+                        if let Some(tx) = self.0.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+                let _done = HookDone(Some(done_tx));
+                // NOTE: the Magnification API (real-cursor hide) is deliberately
+                // NOT initialised here — it is a silent no-op on the LL-hook
+                // thread. It lives on the render-engine thread instead
+                // (pump_cursor_visibility). See WANT_CURSOR_HIDDEN.
+                if let Some(h) = create_sprite_window() {
+                    let _ = SPRITE_HWND.set(h.0 as isize);
+                }
+                // NOTE: hMod must be a real module handle; a truncated handle
+                // gives SetWindowsHookEx error 126.
+                let hmod = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
+                let hook = SetWindowsHookExW(
+                    WH_MOUSE_LL,
+                    Some(mouse_proc),
+                    hmod.map(|m| windows::Win32::Foundation::HINSTANCE(m.0)),
+                    0,
+                );
+                let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                let _ = tx.send(tid);
+                HOOK_RUNNING.store(true, Ordering::Release);
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                if let Ok(h) = hook {
+                    let _ = UnhookWindowsHookEx(h);
+                }
+                // final safety: never leave a clip, hidden cursor, or stuck
+                // button behind if the hook thread is asked to stop.
+                emergency_release_all();
+                HOOK_RUNNING.store(false, Ordering::Release);
+            })
+            .expect("mouse hook thread");
+        let thread_id = rx.recv().unwrap_or(0);
+        Self {
+            thread_id,
+            handle: Some(handle),
+            done_rx,
+        }
+    }
+
+    /// Explicitly suspend cursor mapping during a provider/session transition.
+    /// This is distinct from the emergency heartbeat path: a cold TensorRT
+    /// build is expected work, so release ownership immediately and wait for
+    /// the first successfully presented frame before allowing re-engagement.
+    pub fn set_transition_suspended(&self, suspended: bool) {
+        let mut g = state().lock().unwrap();
+        if g.transition_suspended == suspended {
+            g.last_configure_at = Some(std::time::Instant::now());
+            return;
+        }
+        g.transition_suspended = suspended;
+        g.last_configure_at = Some(std::time::Instant::now());
+        if suspended {
+            release_locked(&mut g);
+            g.active = false;
+            g.src_hwnd = 0;
+            g.buttons_down = 0;
+            g.native_ui_hold_bits = 0;
+            log::info!("input mapping suspended during provider transition");
+        } else {
+            log::info!("input mapping resumed after provider transition");
+        }
+    }
+
+    /// Update the geometry/activity for the engage logic (engine tick).
+    pub fn configure(
+        &self,
+        active: bool,
+        fullscreen: bool,
+        overlay: Rect,
+        content: Rect,
+        src: Rect,
+        src_hwnd: isize,
+        no_engage: Vec<NoEngageRect>,
+        autohide_secs: f32,
+        adjust_speed: bool,
+    ) {
+        let mut g = state().lock().unwrap();
+        g.last_configure_at = Some(std::time::Instant::now());
+        g.fullscreen = fullscreen;
+        g.overlay = overlay;
+        g.adjust_speed = adjust_speed;
+        let was_engaged = g.engaged;
+        let had_source_ownership = g.src_hwnd != 0;
+        // Source/overlay geometry can move while engaged. Preserve the visible
+        // virtual cursor across the new content rect, then move the hidden real
+        // cursor to the matching source point. Rebuilding the sprite from
+        // GetCursorPos() would use the clipped source-edge cursor and produce
+        // the inward "source edge" pull-back.
+        if g.pending_engage.is_some() && (src != g.src || content != g.content) {
+            log::info!(
+                "cursor handoff cancelled by geometry change: old_src={:?} new_src={:?}",
+                g.src,
+                src
+            );
+            release_windows(&mut g);
+            g.engaged = false;
+            g.expect_teleport = None;
+            g.teleport_guard_until = None;
+        }
+        if g.engaged && g.pending_engage.is_none() && (src != g.src || content != g.content) {
+            let (vx, vy) = remap_virtual_between_content(g.content, content, g.virt.0, g.virt.1);
+            g.virt = (vx, vy);
+            let (tx, ty) = map_content_to_source(content, src, vx, vy);
+            if g.buttons_down == 0 {
+                let (remapped, actual) = warp_then_clip_source((tx, ty), src);
+                if remapped {
+                    g.last_set = actual;
+                    g.last_hw = actual;
+                } else {
+                    log::warn!(
+                        "geometry-change cursor remap rejected: target=({tx},{ty}) actual=({},{}) src={:?}",
+                        actual.0,
+                        actual.1,
+                        src
+                    );
+                }
+            } else {
+                let actual = read_cursor_pos_or(g.last_set, "geometry change with button held");
+                g.last_set = actual;
+                g.last_hw = actual;
+                let clip = clip_rect(src);
+                unsafe {
+                    let _ = ClipCursor(Some(&clip));
+                }
+            }
+            if !g.hidden_by_idle {
+                sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+            }
+        }
+        let effective_active = active && !g.transition_suspended;
+        g.active = effective_active;
+        g.content = content;
+        g.src = src;
+        g.src_hwnd = src_hwnd;
+        let no_engage_changed = g.no_engage != no_engage;
+        if no_engage_changed {
+            g.no_engage_moved_at = Some(std::time::Instant::now());
+        }
+        g.no_engage = no_engage;
+        if no_engage_changed {
+            // Full/Basic/Mini changes keep the same GUI HWND while replacing
+            // its rectangle. `native_gui_owner_hwnd` is deliberately not
+            // invalidated here; physical ownership is independently re-tested
+            // from the live HWND rectangle on the next hook event. A hover
+            // remembered from the old, larger layout
+            // must not keep blocking source re-engage over space that the GUI
+            // no longer occupies. Preserve the grace only when the exact hit
+            // rectangle is still part of the current no-engage set.
+            if let Some((old_hit, replacement)) =
+                invalidate_stale_ui_hover_after_no_engage_change(&mut g)
+            {
+                log::info!(
+                    "stale GUI hover invalidated after no-engage geometry change: hwnd={:#x} old={:?} replacement={:?}",
+                    old_hit.hwnd,
+                    old_hit.land,
+                    replacement.map(|r| r.land)
+                );
+            }
+        }
+        if effective_active
+            && !g.engaged
+            && g.last_ui_hover
+                .filter(|h| h.hit.hwnd != 0 && !is_panel_hit(h.hit))
+                .is_some()
+        {
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+        }
+        g.autohide_secs = autohide_secs;
+        if !effective_active
+            && (was_engaged
+                || had_source_ownership
+                || g.cursor_hidden
+                || WANT_CURSOR_HIDDEN.load(Ordering::Acquire))
+        {
+            // Geometry can disappear while the logical engaged flag has
+            // already been cleared (PIP replacement, render-thread error,
+            // ratio transition). Always release the actual Windows ownership
+            // state as well, not only the high-level engaged state.
+            release_locked(&mut g);
+            g.buttons_down = 0;
+            g.native_ui_hold_bits = 0;
+            g.oscillations = 0;
+        }
+        if !effective_active {
+            g.src_hwnd = 0;
+        }
+        // The topmost GUI rect can arrive one GUI tick after the first filtered
+        // overlay frame. If the stationary virtual cursor is already inside it,
+        // hand ownership back immediately instead of waiting for mouse movement.
+        if no_engage_changed && g.engaged && !g.hidden_by_idle && g.buttons_down == 0 {
+            let now = std::time::Instant::now();
+            if let Some(hover) = note_ui_hover(&mut g, now) {
+                if hover.hit.hwnd != 0 && !is_panel_hit(hover.hit) {
+                    if handoff_to_gui(&mut g, hover, now) {
+                        // configure() is called by the Magnification owner thread,
+                        // so commit the native-cursor reveal in this same tick.
+                        pump_cursor_visibility();
+                        log::info!(
+                            "native-window geometry handoff committed without mouse movement: hwnd={:#x} at ({},{})",
+                            hover.hit.hwnd,
+                            hover.pos.0,
+                            hover.pos.1
+                        );
+                    } else {
+                        log::warn!(
+                            "native-window geometry handoff deferred after unverified warp: hwnd={:#x} at ({},{})",
+                            hover.hit.hwnd,
+                            hover.pos.0,
+                            hover.pos.1
+                        );
+                    }
+                }
+            }
+        }
+        // cursor auto-hide (engine tick drives the timeout)
+        let over_ui = g.engaged && virtual_over_ui(&g);
+        if over_ui {
+            g.hidden_by_idle = false;
+            sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+            keep_cursor_sprite_on_top();
+        } else {
+            g.ui_hover_active = false;
+        }
+        if should_hide_cursor_for_idle(&g, std::time::Instant::now()) {
+            g.hidden_by_idle = true;
+            sprite_hide();
+        }
+    }
+
+    /// Complete the first cursor handoff before the filtered overlay is shown.
+    /// Called only by the render-engine thread, which owns Magnification.
+    pub fn prepare_overlay_reveal() -> bool {
+        let mut g = state().lock().unwrap();
+        g.active = true;
+        if g.engaged {
+            if g.cursor_hidden {
+                request_cursor_hidden(true);
+                pump_cursor_visibility();
+                return CURSOR_HIDE_APPLIED.load(Ordering::Acquire);
+            }
+            return true;
+        }
+
+        let (px, py) = unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return true;
+            }
+            (pt.x, pt.y)
+        };
+        let native_hit = unsafe { WindowFromPoint(POINT { x: px, y: py }) };
+        if !native_hit.0.is_null() && crate::platform::win32::is_own_window(native_hit.0 as isize) {
+            // In particular, "bring GUI to front" leaves the stationary cursor
+            // on our normal GUI. Keep Windows' native cursor from the outset;
+            // engaging here would create a sprite until the delayed GUI rect
+            // reaches the engine.
+            log::info!(
+                "pre-reveal cursor remains native over own window: hwnd={:?} at ({px},{py})",
+                native_hit.0
+            );
+            return true;
+        }
+        let now = std::time::Instant::now();
+        g.last_move = Some(now);
+        let Some(e) = plan_engage_for_overlay_reveal(&g, px, py, now) else {
+            // Outside mapped content or over the real GUI/panel: keep the one
+            // native cursor. Normal movement can engage later.
+            return true;
+        };
+
+        g.must_leave_content = false;
+        g.engaged = true;
+        g.virt = (e.vx, e.vy);
+        g.last_set = (e.tx, e.ty);
+        g.last_hw = (px, py);
+        g.edge_out_accum = 0.0;
+        g.last_engage_at = Some(now);
+        g.expect_teleport = Some((e.tx, e.ty));
+        g.hidden_by_idle = false;
+        apply_engage_windows(&mut g, px, py, e.tx, e.ty, e.vx, e.vy, now, true)
+    }
+
+    /// Force-release the clip (stop paths).
+    pub fn release(&self) {
+        let mut g = state().lock().unwrap();
+        release_locked(&mut g);
+        g.active = false;
+        g.buttons_down = 0;
+        g.native_ui_hold_bits = 0;
+        g.oscillations = 0;
+        drop(g);
+    }
+
+    pub fn stop(&mut self) {
+        // Application close must never wait indefinitely for the WH_MOUSE_LL
+        // thread. The visible/clip/button state is released synchronously
+        // first, then WM_QUIT asks the hook thread to unwind. A hook callback
+        // can occasionally be delayed by Windows during window destruction;
+        // waiting on JoinHandle there was the exact ~2 s X-button stall seen
+        // when the outer render-engine shutdown cannot complete promptly.
+        self.release();
+        emergency_release_all();
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(h) = self.handle.take() {
+            match self.done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(()) => {
+                    let _ = h.join();
+                    log::debug!("mouse-hook shutdown complete");
+                }
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the thread. This is safe
+                    // on process exit: emergency_release_all() already restored
+                    // cursor/input state, and Windows removes the LL hook when
+                    // the process terminates. Never hold the GUI close for it.
+                    log::warn!("mouse-hook shutdown deferred: elapsed_ms=50 action=detach");
+                    drop(h);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for InputSystem {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// TEST ONLY: run the engage logic as if a hardware move happened at (x,y).
+pub fn debug_force_move(x: i32, y: i32) {
+    let _ = on_hardware_move(x, y);
+}
+
+/// TEST ONLY: run a move and report whether the real hook would consume it.
+pub fn debug_force_move_consumed(x: i32, y: i32) -> bool {
+    on_hardware_move(x, y)
+}
+
+/// TEST ONLY: last edge-release cursor placement requested by the input layer.
+pub fn debug_last_edge_release() -> Option<(i32, i32)> {
+    let x = DEBUG_LAST_EDGE_PLACE_X.load(Ordering::Acquire);
+    let y = DEBUG_LAST_EDGE_PLACE_Y.load(Ordering::Acquire);
+    if x == i32::MIN || y == i32::MIN {
+        None
+    } else {
+        Some((x, y))
+    }
+}
+
+/// TEST ONLY: clear the recorded edge-release placement.
+pub fn debug_clear_last_edge_release() {
+    DEBUG_LAST_EDGE_PLACE_X.store(i32::MIN, Ordering::Release);
+    DEBUG_LAST_EDGE_PLACE_Y.store(i32::MIN, Ordering::Release);
+}
+
+/// TEST ONLY: route a hardware mouse button while engaged.
+pub fn debug_force_button(msg: u32) -> bool {
+    forward_engaged_button(msg)
+}
+
+/// The current VIRTUAL cursor position (content/screen space) while engaged, so
+/// the GUI can detect the sprite hovering its collapsed control-panel chip and
+/// auto-expand it — the real cursor is confined to the source and never lands
+/// on the chip, so a plain GetCursorPos hit-test would miss it (the cursor-routing design's
+/// `_check_panel_hover`). None when not engaged.
+pub fn virtual_cursor_pos() -> Option<(i32, i32)> {
+    let g = state().try_lock().ok()?;
+    if g.active && g.engaged {
+        Some((g.virt.0.round() as i32, g.virt.1.round() as i32))
+    } else {
+        None
+    }
+}
+
+/// Compute the on-screen content rect (letterbox area inside the overlay
+/// where the source image actually appears) — must match OverlayWindow::present.
+pub fn content_rect(overlay: Rect, frame_w: i32, frame_h: i32) -> Rect {
+    if frame_w <= 0 || frame_h <= 0 || overlay.w <= 0 || overlay.h <= 0 {
+        return overlay;
+    }
+    let scale = (overlay.w as f64 / frame_w as f64).min(overlay.h as f64 / frame_h as f64);
+    let vw = (frame_w as f64 * scale).round() as i32;
+    let vh = (frame_h as f64 * scale).round() as i32;
+    Rect {
+        x: overlay.x + (overlay.w - vw) / 2,
+        y: overlay.y + (overlay.h - vh) / 2,
+        w: vw.max(1),
+        h: vh.max(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letterbox_content() {
+        // 16:9 frame in a square overlay -> horizontal bars
+        let c = content_rect(
+            Rect {
+                x: 100,
+                y: 100,
+                w: 400,
+                h: 400,
+            },
+            1920,
+            1080,
+        );
+        assert_eq!(c.w, 400);
+        assert_eq!(c.h, 225);
+        assert_eq!(c.x, 100);
+        assert_eq!(c.y, 100 + (400 - 225) / 2);
+    }
+
+    #[test]
+    fn roundtrip_mapping_error_subpixel() {
+        // content -> source -> content must round-trip within 1px
+        let c = Rect {
+            x: 0,
+            y: 20,
+            w: 1440,
+            h: 960,
+        };
+        let s = Rect {
+            x: 300,
+            y: 200,
+            w: 480,
+            h: 320,
+        };
+        for (px, py) in [(10, 30), (700, 500), (1430, 970)] {
+            let (tx, ty) = map_content_to_source(c, s, px as f64, py as f64);
+            let bx = (c.x as f64 + ((tx - s.x) as f64 + 0.5) * c.w as f64 / s.w as f64 - 0.5)
+                .round() as i32;
+            let by = (c.y as f64 + ((ty - s.y) as f64 + 0.5) * c.h as f64 / s.h as f64 - 0.5)
+                .round() as i32;
+            assert!(
+                (bx - px).abs() <= 1 && (by - py).abs() <= 1,
+                "err too big: {px},{py} -> {bx},{by}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_source_mapping_hits_edges() {
+        let c = Rect {
+            x: 100,
+            y: 50,
+            w: 3840,
+            h: 2160,
+        };
+        let s = Rect {
+            x: 841,
+            y: 122,
+            w: 1040,
+            h: 785,
+        };
+        assert_eq!(
+            map_content_to_source(c, s, c.x as f64, c.y as f64),
+            (s.x, s.y)
+        );
+        assert_eq!(
+            map_content_to_source(c, s, (c.x + c.w - 1) as f64, (c.y + c.h - 1) as f64),
+            (s.x + s.w - 1, s.y + s.h - 1)
+        );
+    }
+
+    #[test]
+    fn source_delta_spans_scaled_content() {
+        let c = Rect {
+            x: 200,
+            y: 100,
+            w: 1920,
+            h: 1080,
+        };
+        let s = Rect {
+            x: 20,
+            y: 30,
+            w: 640,
+            h: 360,
+        };
+        let (sx, sy) = content_per_source_px(c, s);
+        assert!((sx - 3.0).abs() < f64::EPSILON);
+        assert!((sy - 3.0).abs() < f64::EPSILON);
+
+        let mut vx = c.x as f64;
+        for _ in 0..(s.w - 1) {
+            vx += sx;
+        }
+        assert!(
+            vx >= (c.x + c.w - 4) as f64,
+            "virtual cursor did not reach the magnified edge: {vx}"
+        );
+    }
+
+    #[test]
+    fn source_to_content_roundtrip_is_within_one_pixel() {
+        let c = Rect {
+            x: 100,
+            y: 50,
+            w: 1920,
+            h: 1080,
+        };
+        let s = Rect {
+            x: 878,
+            y: 190,
+            w: 1040,
+            h: 785,
+        };
+        for (sx, sy) in [(s.x, s.y), (1200, 500), (s.x + s.w - 1, s.y + s.h - 1)] {
+            let (vx, vy) = map_source_to_content(c, s, sx as f64, sy as f64);
+            let (back_x, back_y) = map_content_to_source(c, s, vx, vy);
+            assert!(
+                (back_x - sx).abs() <= 1 && (back_y - sy).abs() <= 1,
+                "{sx},{sy} -> {vx:.2},{vy:.2} -> {back_x},{back_y}"
+            );
+        }
+    }
+
+    #[test]
+    fn engage_requires_inner_margin_to_prevent_edge_resuck() {
+        let c = Rect {
+            x: 100,
+            y: 50,
+            w: 800,
+            h: 450,
+        };
+        assert!(!contains_for_engage(c, 100, 200));
+        assert!(!contains_for_engage(c, 107, 200));
+        assert!(contains_for_engage(c, 108, 200));
+        assert!(!contains_for_engage(c, 899, 200));
+        assert!(!contains_for_engage(c, 892, 200));
+        assert!(contains_for_engage(c, 891, 200));
+    }
+
+    #[test]
+    fn panel_no_engage_is_exact_visible_rect() {
+        let panel = Rect {
+            x: 862,
+            y: 4,
+            w: 126,
+            h: 33,
+        };
+        let hit = panel_no_engage_rect(panel);
+        assert_eq!(hit.rect, panel);
+        assert_eq!(hit.land, panel);
+        assert!(hit.panel);
+        assert!(hit.contains(panel.x, panel.y));
+        assert!(hit.contains(panel.x + panel.w - 1, panel.y + panel.h - 1));
+        assert!(!hit.contains(panel.x - 1, panel.y + 10));
+        assert!(!hit.contains(panel.x + panel.w, panel.y + 10));
+        assert!(!hit.contains(panel.x + 10, panel.y - 1));
+        assert!(!hit.contains(panel.x + 10, panel.y + panel.h));
+    }
+
+    #[test]
+    fn panel_identity_is_explicit_not_geometry_shape() {
+        let panel = Rect {
+            x: 900,
+            y: 4,
+            w: 126,
+            h: 30,
+        };
+        let gui = Rect {
+            x: 50,
+            y: 60,
+            w: 600,
+            h: 420,
+        };
+        assert!(is_panel_hit(panel_no_engage_rect(panel).with_hwnd(0x2222)));
+        assert!(is_panel_hit(panel_no_engage_rect(panel)));
+        assert!(!is_panel_hit(NoEngageRect::new(gui).with_hwnd(0x1111)));
+    }
+
+    #[test]
+    fn panel_hover_and_click_point_is_never_magnetized() {
+        let panel = Rect {
+            x: 890,
+            y: 4,
+            w: 139,
+            h: 33,
+        };
+        let hit = panel_no_engage_rect(panel).with_hwnd(0x2222);
+        for point in [
+            (panel.x, panel.y),
+            (panel.x + 50, panel.y + 1),
+            (panel.x + panel.w - 1, panel.y + panel.h - 1),
+        ] {
+            assert_eq!(ui_landing_point(hit, point.0, point.1), point);
+        }
+    }
+
+    #[test]
+    fn panel_action_regions_match_the_painted_layout() {
+        let width = 270;
+        assert_eq!(
+            panel_action_for_relative_x(width, 42),
+            Some(PANEL_ACTION_STOP)
+        );
+        assert_eq!(panel_action_for_relative_x(width, 120), None);
+        assert_eq!(
+            panel_action_for_relative_x(width, 174),
+            Some(PANEL_ACTION_SCREENSHOT)
+        );
+        assert_eq!(
+            panel_action_for_relative_x(width, 210),
+            Some(PANEL_ACTION_GUI_TOPMOST)
+        );
+        assert_eq!(
+            panel_action_for_relative_x(width, 250),
+            Some(PANEL_ACTION_COLLAPSE)
+        );
+        assert_eq!(panel_action_for_relative_x(width, -1), None);
+        assert_eq!(panel_action_for_relative_x(width, width), None);
+    }
+
+    #[test]
+    fn slow_speed_halves_multiplier_at_2x() {
+        // slider 10 = 1.0×; at zoom 2 we want ~0.5× → slider 6 (0.5). And the
+        // slowed speed is always <= the original so the sprite never overshoots.
+        assert_eq!(slow_speed_for_zoom(10, 2.0), 6);
+        for cur in 1..=20 {
+            for &z in &[1.2_f64, 1.5, 2.0, 3.0, 4.0] {
+                let s = slow_speed_for_zoom(cur, z);
+                assert!(s >= 1 && s <= 20);
+                assert!(
+                    SPEED_MULT[(s - 1) as usize] <= SPEED_MULT[(cur - 1) as usize] + 1e-9,
+                    "slowed faster than original: cur={cur} z={z} -> {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exit_point_is_placed_outside_content_with_margin() {
+        let c = Rect {
+            x: 100,
+            y: 50,
+            w: 800,
+            h: 450,
+        };
+        assert_eq!(
+            exit_point_for_virtual(c, 99.0, 200.0),
+            (c.x - EXIT_PLACE_MARGIN_PX, 200)
+        );
+        assert_eq!(
+            exit_point_for_virtual(c, 900.0, 200.0),
+            (c.x + c.w + EXIT_PLACE_MARGIN_PX, 200)
+        );
+        assert_eq!(
+            exit_point_for_virtual(c, 300.0, 49.0),
+            (300, c.y - EXIT_PLACE_MARGIN_PX)
+        );
+        assert_eq!(
+            exit_point_for_virtual(c, 300.0, 500.0),
+            (300, c.y + c.h + EXIT_PLACE_MARGIN_PX)
+        );
+    }
+
+    #[test]
+    fn edge_push_exit_uses_source_overshoot() {
+        let c = Rect {
+            x: 100,
+            y: 50,
+            w: 1000,
+            h: 500,
+        };
+        let s = Rect {
+            x: 10,
+            y: 20,
+            w: 28,
+            h: 14,
+        };
+        assert_eq!(edge_out_amount(s, s.x + s.w - 1, s.y + 3), 0);
+        assert_eq!(edge_out_amount(s, s.x + s.w + 2, s.y + 3), 2);
+        assert_eq!(
+            exit_point_for_source_edge(c, s, s.x + s.w + 2, s.y + 3).0,
+            c.x + c.w + EXIT_PLACE_MARGIN_PX
+        );
+        assert_eq!(
+            exit_point_for_source_edge(c, s, s.x - 2, s.y + 3).0,
+            c.x - EXIT_PLACE_MARGIN_PX
+        );
+    }
+
+    // ---- engaged-move planner scenario suite ----------------------------
+    // Exercise the FULL engaged-move state machine (plan_engaged) with no
+    // Windows calls, covering the patterns a user actually produces.
+
+    fn engaged_state(content: Rect, src: Rect, panels: &[Rect]) -> State {
+        State {
+            active: true,
+            engaged: true,
+            overlay: content,
+            content,
+            src,
+            src_hwnd: 0x1234,
+            no_engage: panels.iter().map(|p| panel_no_engage_rect(*p)).collect(),
+            last_hw: (src.x, src.y),
+            last_set: (src.x, src.y),
+            virt: (content.x as f64, content.y as f64),
+            last_engage_at: Some(std::time::Instant::now()),
+            adjust_speed: false,
+            ..Default::default()
+        }
+    }
+
+    // fullscreen: content = whole monitor, source = small hidden window
+    fn fs() -> (Rect, Rect) {
+        (
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            Rect {
+                x: 795,
+                y: 38,
+                w: 973,
+                h: 548,
+            },
+        )
+    }
+    // windowed: content = source * ~1.5
+    fn win() -> (Rect, Rect) {
+        (
+            Rect {
+                x: 200,
+                y: 100,
+                w: 1836,
+                h: 1033,
+            },
+            Rect {
+                x: 544,
+                y: 38,
+                w: 1224,
+                h: 689,
+            },
+        )
+    }
+    // Windowed offset case: content (mag≈1.2) is centred over a
+    // smaller source, so it extends ~97px LEFT of the source on screen and the
+    // content-left edge maps right onto the source-left edge (the oscillation
+    // geometry). content.x(724) -> source.x(821).
+    fn win_offset() -> (Rect, Rect) {
+        (
+            Rect {
+                x: 724,
+                y: 99,
+                w: 1159,
+                h: 817,
+            },
+            Rect {
+                x: 821,
+                y: 167,
+                w: 965,
+                h: 681,
+            },
+        )
+    }
+    // HIGH magnification (3x) windowed geometry — the doc says the bug is most
+    // visible at high zoom. content is 3x the source, concentric.
+    fn win_hi() -> (Rect, Rect) {
+        (
+            Rect {
+                x: 100,
+                y: 100,
+                w: 1200,
+                h: 900,
+            },
+            Rect {
+                x: 500,
+                y: 250,
+                w: 400,
+                h: 300,
+            },
+        )
+    }
+
+    #[test]
+    fn sprite_follows_raw_outward_at_edge_not_pulled_back() {
+        // Regression case: while engaged, the ACTUAL
+        // cursor is clamped at the source edge, but RAW input keeps moving
+        // outward. The visible sprite (g.virt) MUST keep travelling toward/past
+        // the content edge, never snap back to map(clamped source-edge). Checked
+        // on all four edges, and (separately) DURING the post-engage grace.
+        let (c, s) = win_hi();
+        let raw_of = |ei: usize, k: i32| -> (i32, i32) {
+            match ei {
+                0 => (s.x - k, s.y + s.h / 2),           // left
+                1 => (s.x + s.w - 1 + k, s.y + s.h / 2), // right
+                2 => (s.x + s.w / 2, s.y - k),           // top
+                _ => (s.x + s.w / 2, s.y + s.h - 1 + k), // bottom
+            }
+        };
+        for ei in 0..4 {
+            let mut g = engaged_state(c, s, &[]);
+            let now = std::time::Instant::now();
+            // actual pinned at the corresponding source edge
+            let a = raw_of(ei, 0);
+            let actual = (a.0.clamp(s.x, s.x + s.w - 1), a.1.clamp(s.y, s.y + s.h - 1));
+            let mut prev = None::<(f64, f64)>;
+            for k in 1..=40 {
+                let raw = raw_of(ei, k * 2);
+                let t = now + std::time::Duration::from_millis(200 + k as u64 * 8);
+                let _ = plan_engaged(&mut g, raw.0, raw.1, t, actual);
+                let (vx, vy) = g.virt;
+                // the sprite must be OUTSIDE the content on the pushed axis
+                let outside = match ei {
+                    0 => vx <= c.x as f64 + 1.0,
+                    1 => vx >= (c.x + c.w) as f64 - 1.0,
+                    2 => vy <= c.y as f64 + 1.0,
+                    _ => vy >= (c.y + c.h) as f64 - 1.0,
+                };
+                assert!(
+                    outside,
+                    "edge {ei}: sprite pulled back inside: virt=({vx},{vy})"
+                );
+                // and it must keep moving further OUT (never back toward inside)
+                if let Some((pvx, pvy)) = prev {
+                    let progressing = match ei {
+                        0 => vx <= pvx + 0.001,
+                        1 => vx >= pvx - 0.001,
+                        2 => vy <= pvy + 0.001,
+                        _ => vy >= pvy - 0.001,
+                    };
+                    assert!(
+                        progressing,
+                        "edge {ei}: sprite returned inward: {vx},{vy} after {pvx},{pvy}"
+                    );
+                }
+                prev = Some((vx, vy));
+                if !g.engaged {
+                    break; // exited — the sprite was already outside, good
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sprite_follows_raw_outward_even_during_grace() {
+        // The doc: even DURING the post-engage grace, the sprite must not be
+        // sucked back to the source edge.
+        let (c, s) = win_hi();
+        let mut g = engaged_state(c, s, &[]);
+        let engage_t = std::time::Instant::now();
+        g.last_engage_at = Some(engage_t);
+        let actual = (s.x, s.y + s.h / 2); // clamped left edge
+        let mut prev = f64::INFINITY;
+        for k in 1..=6 {
+            let raw = (s.x - k * 3, s.y + s.h / 2);
+            // WITHIN grace (< ENGAGE_GRACE_MS)
+            let t = engage_t + std::time::Duration::from_millis(k as u64 * 5);
+            let plan = plan_engaged(&mut g, raw.0, raw.1, t, actual);
+            assert_eq!(plan, MovePlan::Stay, "should not escape during grace");
+            assert!(
+                g.virt.0 <= c.x as f64 + 1.0,
+                "grace: sprite not outside: {}",
+                g.virt.0
+            );
+            assert!(
+                g.virt.0 < prev,
+                "grace: sprite pulled back inward: {} !< {}",
+                g.virt.0,
+                prev
+            );
+            prev = g.virt.0;
+        }
+    }
+
+    #[test]
+    fn sprite_matches_clamped_mapping_in_interior() {
+        // Sanity: away from the edges (raw == clamped actual), the raw-driven
+        // sprite equals the old clamped mapping — no behaviour change interior.
+        let (c, s) = win_hi();
+        let mut g = engaged_state(c, s, &[]);
+        let now = std::time::Instant::now();
+        for (rx, ry) in [
+            (s.x + 100, s.y + 100),
+            (s.x + 200, s.y + 150),
+            (s.x + 350, s.y + 250),
+        ] {
+            let _ = plan_engaged(&mut g, rx, ry, now, (rx, ry));
+            let expect = map_source_to_content(c, s, rx as f64, ry as f64);
+            assert!((g.virt.0 - expect.0).abs() < 0.01 && (g.virt.1 - expect.1).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn engage_dead_band_sits_inside_source_edge() {
+        // The core fix: a content position whose mapped SOURCE position is near
+        // the source edge must NOT engage (else the next tiny push re-escapes).
+        let (c, s) = win_offset();
+        let mut g = engaged_state(c, s, &[]);
+        g.engaged = false;
+        let now = std::time::Instant::now();
+        // content pos mapping to just inside the source-left edge -> blocked
+        let (nx, ny) = map_source_to_content(c, s, (s.x + 2) as f64, (s.y + s.h / 2) as f64);
+        assert!(
+            plan_engage(&g, nx.round() as i32, ny.round() as i32, now).is_none(),
+            "engaged right at the source edge (would oscillate)"
+        );
+        // content pos mapping WELL inside the source -> allowed
+        let (dx, dy) = map_source_to_content(
+            c,
+            s,
+            (s.x + ENGAGE_SRC_MARGIN_PX + 12) as f64,
+            (s.y + s.h / 2) as f64,
+        );
+        assert!(
+            plan_engage(&g, dx.round() as i32, dy.round() as i32, now).is_some(),
+            "failed to engage well inside the source"
+        );
+    }
+
+    #[test]
+    fn cursor_timer_preserves_deferred_reveal_after_edge_exit() {
+        assert!(
+            cursor_reassert_want_hidden(false, true),
+            "timer must not reveal the real cursor while an edge-exit reveal is pending"
+        );
+        assert!(
+            cursor_reassert_want_hidden(true, false),
+            "timer must keep hiding while still engaged"
+        );
+        assert!(
+            !cursor_reassert_want_hidden(false, false),
+            "timer may reveal only after both engagement and pending reveal are clear"
+        );
+    }
+
+    #[test]
+    fn sprite_waits_until_native_cursor_hide_is_committed() {
+        assert!(!sprite_visibility_allowed(true, false));
+        assert!(sprite_visibility_allowed(true, true));
+        assert!(!sprite_visibility_allowed(false, true));
+    }
+
+    #[test]
+    fn post_engage_grace_swallows_stale_edge_event() {
+        // Regression case: engage near the source-left, then a queued
+        // pre-teleport hook event arrives with a raw px far left of the source.
+        // Within the post-engage grace it must NOT escape.
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        let engage_t = std::time::Instant::now();
+        g.last_engage_at = Some(engage_t);
+        let actual = (s.x, s.y + 200);
+        // event 20ms after engage (inside the grace window)
+        let plan = plan_engaged(
+            &mut g,
+            120,
+            240,
+            engage_t + std::time::Duration::from_millis(20),
+            actual,
+        );
+        assert_eq!(
+            plan,
+            MovePlan::Stay,
+            "stale event inside grace must not escape"
+        );
+        assert!(g.engaged);
+    }
+
+    #[test]
+    fn many_normal_moves_never_escape() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        let now = std::time::Instant::now();
+        for i in 0..=200 {
+            let ax = s.x + (i * (s.w - 1) / 200);
+            let ay = s.y + s.h / 2;
+            let plan = plan_engaged(&mut g, ax, ay, now, (ax, ay));
+            assert_eq!(plan, MovePlan::Stay, "normal move {i} escaped");
+            assert!(g.engaged);
+        }
+    }
+
+    #[test]
+    fn sustained_edge_push_eventually_escapes_each_edge() {
+        for edge in 0..4 {
+            let (c, s) = win(); // windowed: edge push exits (fullscreen does not)
+            let mut g = engaged_state(c, s, &[]);
+            let t0 = std::time::Instant::now();
+            let mut escaped = false;
+            for k in 0..40 {
+                let (ax, ay, px, py) = match edge {
+                    0 => (s.x, s.y + 100, s.x - 5, s.y + 100),
+                    1 => (s.x + s.w - 1, s.y + 100, s.x + s.w + 5, s.y + 100),
+                    2 => (s.x + 100, s.y, s.x + 100, s.y - 5),
+                    _ => (s.x + 100, s.y + s.h - 1, s.x + 100, s.y + s.h + 5),
+                };
+                let now = t0 + std::time::Duration::from_millis(k * 20);
+                if let MovePlan::Escape { place, .. } = plan_engaged(&mut g, px, py, now, (ax, ay))
+                {
+                    match edge {
+                        0 => assert!(place.0 < c.x),
+                        1 => assert!(place.0 > c.x + c.w - 1),
+                        2 => assert!(place.1 < c.y),
+                        _ => assert!(place.1 > c.y + c.h - 1),
+                    }
+                    assert!(!g.engaged);
+                    escaped = true;
+                    break;
+                }
+            }
+            assert!(escaped, "edge {edge} never escaped under sustained push");
+        }
+    }
+
+    #[test]
+    fn fullscreen_edge_push_never_exits() {
+        // The core fullscreen fix: pushing HARD against every edge for a long
+        // time must keep the cursor confined (the view is the whole screen and
+        // the panel lives at the top edge). Covers the edge-transition case where the
+        // cursor being flung to the left/top and the panel being unreachable.
+        for edge in 0..4 {
+            let (c, s) = fs();
+            let mut g = engaged_state(c, s, &[]);
+            g.fullscreen = true;
+            let t0 = std::time::Instant::now();
+            for k in 0..100 {
+                let (ax, ay, px, py) = match edge {
+                    0 => (s.x, s.y + 100, s.x - 60, s.y + 100),
+                    1 => (s.x + s.w - 1, s.y + 100, s.x + s.w + 60, s.y + 100),
+                    2 => (s.x + 100, s.y, s.x + 100, s.y - 60),
+                    _ => (s.x + 100, s.y + s.h - 1, s.x + 100, s.y + s.h + 60),
+                };
+                let now = t0 + std::time::Duration::from_millis(k * 20);
+                let plan = plan_engaged(&mut g, px, py, now, (ax, ay));
+                assert_eq!(
+                    plan,
+                    MovePlan::Stay,
+                    "fullscreen edge {edge} exited at k={k}"
+                );
+                assert!(g.engaged, "fullscreen edge {edge} disengaged");
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_edge_spike_does_not_escape() {
+        let (c, s) = win();
+        let mut g = engaged_state(c, s, &[]);
+        let plan = plan_engaged(
+            &mut g,
+            s.x + s.w + 40,
+            s.y + 100,
+            std::time::Instant::now(),
+            (s.x + s.w - 1, s.y + 100),
+        );
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(g.engaged);
+    }
+
+    #[test]
+    fn dragging_source_never_escapes_across_the_edge() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        g.buttons_down = BTN_LEFT;
+        let t0 = std::time::Instant::now();
+        for k in 0..50 {
+            let now = t0 + std::time::Duration::from_millis(k * 20);
+            let plan = plan_engaged(
+                &mut g,
+                s.x + s.w + 30,
+                s.y + 100,
+                now,
+                (s.x + s.w - 1, s.y + 100),
+            );
+            assert_eq!(plan, MovePlan::Stay, "drag escaped at k={k}");
+            assert!(g.engaged);
+        }
+    }
+
+    #[test]
+    fn dragging_source_ignores_panel_zone() {
+        // a drag whose virtual cursor passes over the panel must NOT hand off
+        // (the drag belongs to the source).
+        let (c, s) = fs();
+        let panel = Rect {
+            x: 897,
+            y: 4,
+            w: 126,
+            h: 30,
+        };
+        let mut g = engaged_state(c, s, &[panel]);
+        g.buttons_down = BTN_LEFT;
+        let cx = panel.x + panel.w / 2;
+        let cy = panel.y + panel.h / 2;
+        let (tx, ty) = map_content_to_source(c, s, cx as f64, cy as f64);
+        let plan = plan_engaged(&mut g, tx, ty, std::time::Instant::now(), (tx, ty));
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(g.engaged);
+    }
+
+    #[test]
+    fn panel_zone_stays_engaged_never_disengages() {
+        // the cursor-routing design model: the virtual cursor moving over the panel must NOT
+        // disengage (that was the fling/oscillation bug). The panel is reached
+        // with the sprite and clicks are redirected in the hook instead.
+        let (c, s) = fs();
+        let panel = Rect {
+            x: 897,
+            y: 4,
+            w: 126,
+            h: 30,
+        };
+        let mut g = engaged_state(c, s, &[panel]);
+        // sweep the virtual cursor all across the panel (map its centre + corners
+        // back to source and feed those as clipped positions)
+        for (fxp, fyp) in [(0.1, 0.5), (0.5, 0.5), (0.9, 0.5), (0.5, 0.1), (0.5, 0.9)] {
+            let vx = panel.x as f64 + fxp * panel.w as f64;
+            let vy = panel.y as f64 + fyp * panel.h as f64;
+            let (tx, ty) = map_content_to_source(c, s, vx, vy);
+            let plan = plan_engaged(&mut g, tx, ty, std::time::Instant::now(), (tx, ty));
+            assert_eq!(
+                plan,
+                MovePlan::Stay,
+                "panel sweep disengaged at ({vx},{vy})"
+            );
+            assert!(g.engaged, "panel sweep disengaged");
+            // the virtual cursor is reported over the panel (for hover-expand)
+            let (rvx, rvy) = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+            assert!(
+                panel.contains(rvx, rvy),
+                "virtual cursor not over panel: ({rvx},{rvy})"
+            );
+        }
+    }
+
+    #[test]
+    fn windowed_moves_stay_engaged_across_interior() {
+        let (c, s) = win();
+        let mut g = engaged_state(c, s, &[]);
+        let now = std::time::Instant::now();
+        for i in 0..=100 {
+            let ax = s.x + (i * (s.w - 1) / 100);
+            let ay = s.y + (i * (s.h - 1) / 100);
+            let plan = plan_engaged(&mut g, ax, ay, now, (ax, ay));
+            assert_eq!(plan, MovePlan::Stay, "windowed interior move {i} escaped");
+        }
+    }
+
+    #[test]
+    fn tiny_source_interior_moves_do_not_escape() {
+        let c = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let s = Rect {
+            x: 900,
+            y: 500,
+            w: 40,
+            h: 24,
+        };
+        let mut g = engaged_state(c, s, &[]);
+        let now = std::time::Instant::now();
+        for ax in s.x + 1..s.x + s.w - 1 {
+            let plan = plan_engaged(&mut g, ax, s.y + 12, now, (ax, s.y + 12));
+            assert_eq!(plan, MovePlan::Stay, "tiny-source move at {ax} escaped");
+        }
+    }
+
+    #[test]
+    fn engage_planner_respects_cooldown_and_margins() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        g.engaged = false;
+        let now = std::time::Instant::now();
+        g.cooldown_until = Some(now + std::time::Duration::from_millis(500));
+        assert!(plan_engage(&g, c.x + c.w / 2, c.y + c.h / 2, now).is_none());
+        let later = now + std::time::Duration::from_millis(600);
+        assert!(plan_engage(&g, c.x + c.w / 2, c.y + c.h / 2, later).is_some());
+        let panel = Rect {
+            x: 897,
+            y: 4,
+            w: 126,
+            h: 30,
+        };
+        g.no_engage = vec![panel_no_engage_rect(panel)];
+        assert!(plan_engage(&g, panel.x + 10, panel.y + 10, later).is_none());
+    }
+
+    #[test]
+    fn overlay_reveal_and_normal_engage_share_exact_ui_ownership_rules() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        g.engaged = false;
+        let now = std::time::Instant::now();
+        let centre = (c.x + c.w / 2, c.y + c.h / 2);
+        assert!(plan_engage(&g, centre.0, centre.1, now).is_some());
+        assert!(plan_engage_for_overlay_reveal(&g, centre.0, centre.1, now).is_some());
+
+        let panel = Rect {
+            x: centre.0 - 30,
+            y: centre.1 - 20,
+            w: 60,
+            h: 40,
+        };
+        g.no_engage = vec![panel_no_engage_rect(panel)];
+        assert!(plan_engage(&g, centre.0, centre.1, now).is_none());
+        assert!(plan_engage_for_overlay_reveal(&g, centre.0, centre.1, now).is_none());
+    }
+
+    #[test]
+    fn gui_handoff_releases_exactly_at_the_visible_boundary() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        g.engaged = false;
+        let gui = Rect {
+            x: 100,
+            y: 100,
+            w: 800,
+            h: 700,
+        };
+        let hit = NoEngageRect::new(gui).with_hwnd(0x1234);
+        g.no_engage = vec![hit];
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(plan_engage(&g, 899, 400, now).is_none());
+        assert!(
+            plan_engage(&g, 900, 400, now).is_some(),
+            "one pixel outside the live GUI must be immediately eligible; no sticky band"
+        );
+        assert!(plan_engage(&g, 940, 400, now).is_some());
+    }
+
+    #[test]
+    fn gui_layout_shrink_drops_stale_hover_reengage_boundary() {
+        let (c, s) = fs();
+        let mut g = engaged_state(c, s, &[]);
+        g.engaged = false;
+        let full = NoEngageRect::new(Rect {
+            x: 15,
+            y: 77,
+            w: 996,
+            h: 1009,
+        })
+        .with_hwnd(0x1234);
+        let mini = NoEngageRect::new(Rect {
+            x: 15,
+            y: 77,
+            w: 776,
+            h: 139,
+        })
+        .with_hwnd(0x1234);
+        g.no_engage = vec![mini];
+        g.last_ui_hover = Some(UiHover {
+            hit: mini,
+            pos: (400, 120),
+        });
+        assert!(
+            invalidate_stale_ui_hover_after_no_engage_change(&mut g).is_none(),
+            "an exact current GUI hit may remain as diagnostic hover cache"
+        );
+        assert_eq!(g.last_ui_hover.map(|hover| hover.hit), Some(mini));
+
+        g.last_ui_hover = Some(UiHover {
+            hit: full,
+            pos: (900, 500),
+        });
+        let invalidated = invalidate_stale_ui_hover_after_no_engage_change(&mut g)
+            .expect("old Full hover must be invalidated when the same GUI shrinks to Mini");
+        assert_eq!(invalidated.0, full);
+        assert_eq!(invalidated.1, Some(mini));
+
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            plan_engage(&g, 900, 500, later).is_some(),
+            "space vacated by the old Full GUI must immediately become eligible"
+        );
+        assert!(
+            plan_engage(&g, 400, 120, later).is_none(),
+            "the current Mini GUI rectangle must remain protected"
+        );
+    }
+
+    #[test]
+    fn escape_then_reengage_full_cycle() {
+        // push out the right edge, then move back into the interior (after the
+        // cooldown) and re-engage: the round trip must be clean. Windowed only —
+        // fullscreen never exits at an edge.
+        let (c, s) = win();
+        let mut g = engaged_state(c, s, &[]);
+        let t0 = std::time::Instant::now();
+        let mut escaped_at = None;
+        for k in 0..40 {
+            let now = t0 + std::time::Duration::from_millis(k * 20);
+            if let MovePlan::Escape { .. } = plan_engaged(
+                &mut g,
+                s.x + s.w + 5,
+                s.y + 100,
+                now,
+                (s.x + s.w - 1, s.y + 100),
+            ) {
+                escaped_at = Some(now);
+                break;
+            }
+        }
+        let escaped_at = escaped_at.expect("did not escape");
+        assert!(!g.engaged);
+        // during cooldown: no re-engage
+        assert!(plan_engage(&g, c.x + c.w / 2, c.y + c.h / 2, escaped_at).is_none());
+        // after cooldown: re-engages in the interior
+        let after = escaped_at + std::time::Duration::from_millis(3000);
+        assert!(plan_engage(&g, c.x + c.w / 2, c.y + c.h / 2, after).is_some());
+    }
+
+    // ---- full-system Sim: models the OS cursor + clip + teleports so we can
+    // reproduce real user gestures (panel approach, edge exit, GUI overlap,
+    // window drag, button-held drag) and assert no oscillation / fling-off. ---
+
+    struct Sim {
+        g: State,
+        cursor: (i32, i32), // the OS cursor (== GetCursorPos)
+        t: std::time::Instant,
+        transitions: u32, // engage<->disengage flips
+    }
+
+    impl Sim {
+        fn new(content: Rect, src: Rect, panels: &[NoEngageRect], start: (i32, i32)) -> Self {
+            let g = State {
+                active: true,
+                engaged: false,
+                overlay: content,
+                content,
+                src,
+                src_hwnd: 0x1234,
+                no_engage: panels.to_vec(),
+                last_hw: start,
+                last_set: start,
+                virt: (start.0 as f64, start.1 as f64),
+                adjust_speed: false,
+                ..Default::default()
+            };
+            Sim {
+                g,
+                cursor: start,
+                t: std::time::Instant::now(),
+                transitions: 0,
+            }
+        }
+
+        fn set_geometry(&mut self, content: Rect, src: Rect, panels: &[NoEngageRect]) {
+            // mirror the engine's configure() geometry-change re-sync while engaged
+            if self.g.engaged && (src != self.g.src || content != self.g.content) {
+                let (vx, vy) = remap_virtual_between_content(
+                    self.g.content,
+                    content,
+                    self.g.virt.0,
+                    self.g.virt.1,
+                );
+                self.g.virt = (vx, vy);
+                let (tx, ty) = map_content_to_source(content, src, vx, vy);
+                self.cursor = (tx, ty);
+                self.g.last_set = (tx, ty);
+                self.g.last_hw = (tx, ty);
+            }
+            self.g.overlay = content;
+            self.g.content = content;
+            self.g.src = src;
+            self.g.no_engage = panels.to_vec();
+        }
+
+        fn apply(&mut self, raw: (i32, i32), actual: (i32, i32)) {
+            let was = self.g.engaged;
+            match handle_move(&mut self.g, raw.0, raw.1, self.t, actual) {
+                MoveOutcome::Stay { .. } => {}
+                MoveOutcome::Engage { tx, ty, .. } => self.cursor = (tx, ty),
+                MoveOutcome::Disengage { place, .. } => self.cursor = place,
+            }
+            if was != self.g.engaged {
+                self.transitions += 1;
+            }
+        }
+
+        /// Move the physical hand by (dx,dy). Hook sees the pre-clip raw pt; the
+        /// OS clamps the actual cursor to the clip when engaged; teleports move
+        /// the OS cursor.
+        fn hand(&mut self, dx: i32, dy: i32, dt_ms: u64) {
+            self.t += std::time::Duration::from_millis(dt_ms.max(1));
+            let raw = (self.cursor.0 + dx, self.cursor.1 + dy);
+            let actual = if self.g.engaged {
+                let s = self.g.src;
+                (
+                    raw.0.clamp(s.x, s.x + s.w - 1),
+                    raw.1.clamp(s.y, s.y + s.h - 1),
+                )
+            } else {
+                raw
+            };
+            self.cursor = actual;
+            self.apply(raw, actual);
+        }
+
+        /// press/release a mouse button (updates the drag flag like the hook).
+        fn button(&mut self, bit: u8, down: bool) {
+            if down {
+                self.g.buttons_down |= bit;
+            } else {
+                self.g.buttons_down &= !bit;
+            }
+        }
+    }
+
+    fn panels(rects: &[Rect]) -> Vec<NoEngageRect> {
+        rects.iter().map(|r| panel_no_engage_rect(*r)).collect()
+    }
+
+    #[test]
+    fn fullscreen_panel_reachable_without_fling_or_oscillation() {
+        // Fullscreen regression case: panel top-centre INSIDE content.
+        // the cursor-routing design model: the sprite reaches the panel while the real cursor
+        // stays confined; NO disengage, NO teleport => no fling / oscillation.
+        let (c, s) = fs();
+        let panel = Rect {
+            x: 897,
+            y: 4,
+            w: 126,
+            h: 30,
+        };
+        let mut sim = Sim::new(c, s, &panels(&[panel]), (c.x + c.w / 2, c.y + c.h / 2));
+        sim.g.fullscreen = true;
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged, "did not engage from interior");
+        let base = sim.transitions;
+        // drive the virtual cursor onto the panel centre
+        let pcx = panel.x + panel.w / 2;
+        let pcy = panel.y + panel.h / 2;
+        let (tx, ty) = map_content_to_source(c, s, pcx as f64, pcy as f64);
+        for _ in 0..600 {
+            let dx = (tx - sim.cursor.0).clamp(-5, 5);
+            let dy = (ty - sim.cursor.1).clamp(-5, 5);
+            sim.hand(dx, dy, 16);
+            if (sim.cursor.0 - tx).abs() <= 1 && (sim.cursor.1 - ty).abs() <= 1 {
+                break;
+            }
+        }
+        assert!(
+            sim.g.engaged,
+            "panel approach flung the cursor out (disengaged)"
+        );
+        let (vx, vy) = (sim.g.virt.0.round() as i32, sim.g.virt.1.round() as i32);
+        assert!(
+            panel.contains(vx, vy),
+            "virtual cursor not over panel: ({vx},{vy})"
+        );
+        // jitter all over the panel: still engaged, zero transitions
+        for _ in 0..60 {
+            sim.hand(1, 0, 16);
+            sim.hand(-1, 1, 16);
+            sim.hand(0, -1, 16);
+            assert!(sim.g.engaged, "panel jitter disengaged (fling)");
+        }
+        assert_eq!(sim.transitions, base, "panel hover oscillated");
+    }
+
+    #[test]
+    fn fullscreen_gui_in_left_letterbox_is_reachable() {
+        // Fullscreen with side letterbox: the content does not cover the whole
+        // monitor. A top-most GUI can sit in that black bar, so pushing past
+        // the content edge should extend only the VIRTUAL cursor into the GUI.
+        let content = Rect {
+            x: 320,
+            y: 0,
+            w: 1280,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 100,
+            y: 100,
+            w: 640,
+            h: 540,
+        };
+        let gui = Rect {
+            x: 24,
+            y: 470,
+            w: 260,
+            h: 140,
+        };
+        let zones = vec![NoEngageRect::new(gui).with_hwnd(0x1111)];
+        let mut sim = Sim::new(
+            content,
+            src,
+            &zones,
+            (content.x + content.w / 2, content.y + content.h / 2),
+        );
+        sim.g.fullscreen = true;
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+
+        let target_y = gui.y + gui.h / 2;
+        let (edge_tx, edge_ty) =
+            map_content_to_source(content, src, content.x as f64 + 1.0, target_y as f64);
+        for _ in 0..500 {
+            let dx = (edge_tx - sim.cursor.0).signum() * 8;
+            let dy = (edge_ty - sim.cursor.1).signum() * 8;
+            sim.hand(dx, dy, 16);
+            if (sim.cursor.0 - edge_tx).abs() <= 4 && (sim.cursor.1 - edge_ty).abs() <= 4 {
+                break;
+            }
+        }
+
+        for _ in 0..80 {
+            sim.hand(-8, 0, 16);
+        }
+        assert!(sim.g.engaged, "fullscreen GUI reach must not disengage");
+        let (vx, vy) = (sim.g.virt.0.round() as i32, sim.g.virt.1.round() as i32);
+        assert!(
+            gui.contains(vx, vy),
+            "virtual cursor did not reach GUI in letterbox: ({vx},{vy}) gui={gui:?}"
+        );
+        let hit = hit_ui_for_cursor_ownership(&sim.g.no_engage, vx, vy).unwrap();
+        assert_eq!(hit.hwnd, 0x1111);
+
+        for _ in 0..20 {
+            sim.hand(0, 1, 16);
+            sim.hand(0, -1, 16);
+            sim.hand(-1, 0, 16);
+            let (vx, vy) = (sim.g.virt.0.round() as i32, sim.g.virt.1.round() as i32);
+            assert!(
+                gui.contains(vx, vy),
+                "letterbox GUI cursor flickered back to content edge: ({vx},{vy})"
+            );
+        }
+
+        let leftmost = sim.g.virt.0;
+        for _ in 0..20 {
+            sim.hand(-1, 0, 16);
+        }
+        assert!(
+            sim.g.virt.0 <= leftmost + 0.5,
+            "leftward push was pulled right: before={} after={}",
+            leftmost,
+            sim.g.virt.0
+        );
+    }
+
+    #[test]
+    fn fullscreen_gui_overlapping_left_edge_does_not_snap_to_content_edge() {
+        // Real GUI windows often straddle the black bar and the magnified
+        // content edge. That must still count as a GUI target; otherwise the
+        // virtual cursor is clamped back to the content edge and feels pulled
+        // right when the user moves left over the GUI.
+        let content = Rect {
+            x: 320,
+            y: 0,
+            w: 1280,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 100,
+            y: 100,
+            w: 640,
+            h: 540,
+        };
+        let gui = Rect {
+            x: 300,
+            y: 420,
+            w: 420,
+            h: 240,
+        };
+        let zones = vec![NoEngageRect::new(gui).with_hwnd(0x2222)];
+        let mut sim = Sim::new(
+            content,
+            src,
+            &zones,
+            (content.x + content.w / 2, content.y + content.h / 2),
+        );
+        sim.g.fullscreen = true;
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+
+        let target_y = gui.y + gui.h / 2;
+        let (edge_tx, edge_ty) =
+            map_content_to_source(content, src, content.x as f64 + 1.0, target_y as f64);
+        for _ in 0..500 {
+            let dx = (edge_tx - sim.cursor.0).signum() * 8;
+            let dy = (edge_ty - sim.cursor.1).signum() * 8;
+            sim.hand(dx, dy, 16);
+            if (sim.cursor.0 - edge_tx).abs() <= 4 && (sim.cursor.1 - edge_ty).abs() <= 4 {
+                break;
+            }
+        }
+
+        for _ in 0..16 {
+            sim.hand(-1, 0, 16);
+        }
+        assert!(sim.g.engaged);
+        let (vx, vy) = (sim.g.virt.0.round() as i32, sim.g.virt.1.round() as i32);
+        assert!(
+            vx < content.x && gui.contains(vx, vy),
+            "overlapping GUI cursor snapped to content edge: ({vx},{vy}) content={content:?} gui={gui:?}"
+        );
+
+        let leftmost = sim.g.virt.0;
+        for _ in 0..24 {
+            sim.hand(-1, 0, 16);
+            assert!(
+                sim.g.virt.0 <= content.x as f64,
+                "cursor returned to magnified edge while still over GUI: {}",
+                sim.g.virt.0
+            );
+        }
+        assert!(
+            sim.g.virt.0 <= leftmost + 0.5,
+            "leftward GUI motion was pulled right: before={} after={}",
+            leftmost,
+            sim.g.virt.0
+        );
+    }
+
+    #[test]
+    fn fullscreen_gui_raw_screen_coordinate_is_kept_as_ui_cursor() {
+        // Regression case: while the virtual cursor is over the topmost GUI,
+        // a move arrived as raw=(480,188). That is a screen/GUI coordinate, not
+        // a meaningful source coordinate. Treating it as source-space mapped it
+        // to the content edge and made the cursor vanish/jump. If raw itself is
+        // inside a GUI no-engage rect, it must stay a GUI cursor.
+        let content = Rect {
+            x: 341,
+            y: 0,
+            w: 1238,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 987,
+            y: 161,
+            w: 879,
+            h: 767,
+        };
+        let gui = Rect {
+            x: 78,
+            y: 78,
+            w: 896,
+            h: 859,
+        };
+        let mut g = engaged_state(content, src, &[]);
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        g.virt = (491.9, 188.9);
+        g.last_hw = (1440, 390);
+        g.last_engage_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        let plan = plan_engaged(&mut g, 480, 188, std::time::Instant::now(), (src.x, 188));
+        assert_eq!(plan, MovePlan::Stay);
+        let (vx, vy) = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+        assert!(
+            gui.contains(vx, vy),
+            "raw GUI coordinate was remapped to content/source edge: ({vx},{vy})"
+        );
+        assert!((vx - 480).abs() <= 1 && (vy - 188).abs() <= 1);
+    }
+
+    #[test]
+    fn fullscreen_engaged_move_ignores_gui_rect_under_source_interior() {
+        // Fullscreen + GUI-topmost regression case: moving the cursor in the
+        // magnified view sometimes "pulls" it. Log: engage raw (1018,436), then a
+        // ui-hover handoff at (563,572) which is NOT where the sprite was.
+        // Cause: the GUI's SCREEN rect overlaps the SOURCE window's screen rect;
+        // while engaged, the raw confined cursor is a SOURCE-space coordinate, so
+        // it passing under the GUI rect is coincidental — yet it snapped `virt`
+        // to the raw position (a ~470px sprite yank) and handed off/disengaged.
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 1707,
+            h: 1067,
+        };
+        let src = Rect {
+            x: 661,
+            y: 63,
+            w: 1280,
+            h: 720,
+        };
+        // GUI screen rect overlapping the source rect area (x 661..987 shared)
+        let gui = Rect {
+            x: 91,
+            y: 35,
+            w: 896,
+            h: 859,
+        };
+        let mut g = engaged_state(content, src, &[]);
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        g.last_engage_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        // ordinary interior move: raw INSIDE the source, coincidentally under
+        // the GUI screen rect; the sprite (mapped) is NOT over the GUI
+        let raw = (700, 400);
+        let mapped = map_source_to_content_unclamped(content, src, raw.0 as f64, raw.1 as f64);
+        assert!(
+            !gui.contains(mapped.0.round() as i32, mapped.1.round() as i32),
+            "test geometry: mapped position must be outside the GUI"
+        );
+        g.virt = mapped;
+        g.last_hw = (704, 402);
+
+        let plan = plan_engaged(&mut g, raw.0, raw.1, std::time::Instant::now(), raw);
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(
+            (g.virt.0 - mapped.0).abs() < 1.0 && (g.virt.1 - mapped.1).abs() < 1.0,
+            "sprite snapped unexpectedly from mapped {:?} to raw-ish {:?}",
+            mapped,
+            g.virt
+        );
+        assert!(
+            !virtual_over_ui(&g),
+            "interior move misread as GUI hover would hand off / disengage"
+        );
+
+        // Sweep across the source∩GUI overlap band: virt may legitimately switch
+        // to the delta-integrated UI-cursor hold while the MAPPED sprite is over
+        // the visible GUI window, but it must stay CONTINUOUS — the bug was a
+        // teleport to the raw screen point (hundreds of px in one event).
+        let (sx, sy) = content_per_source_px(content, src);
+        let step_limit = 8.0 * sx.max(sy).max(1.0) + 2.0; // one 8px-hand event, scaled
+        let mut prev = g.virt;
+        for x in (700..980).step_by(8) {
+            let _ = plan_engaged(&mut g, x, 400, std::time::Instant::now(), (x, 400));
+            let jump = ((g.virt.0 - prev.0).powi(2) + (g.virt.1 - prev.1).powi(2)).sqrt();
+            assert!(
+                jump <= step_limit,
+                "sprite teleported at raw=({x},400): prev={prev:?} -> virt={:?} (jump {jump:.1}px > {step_limit:.1})",
+                g.virt
+            );
+            prev = g.virt;
+        }
+    }
+
+    // Representative 4K fullscreen geometry: content (462,0,2915,2160),
+    // source window at (1759,162,2074,1537), near-maximized topmost GUI at
+    // (286,233,1786,1711) overlapping the source's screen rect in x 1759..2072.
+    fn fs_4k() -> (Rect, Rect, Rect) {
+        (
+            Rect {
+                x: 462,
+                y: 0,
+                w: 2915,
+                h: 2160,
+            },
+            Rect {
+                x: 1759,
+                y: 162,
+                w: 2074,
+                h: 1537,
+            },
+            Rect {
+                x: 286,
+                y: 233,
+                w: 1786,
+                h: 1711,
+            },
+        )
+    }
+
+    #[test]
+    fn fullscreen_source_edge_over_gui_screen_rect_gets_no_phantom_snap() {
+        // Pushing past the source BOTTOM edge
+        // in the strip below the GUI produced pre-clip raw points like
+        // (1800,1706) — a SOURCE-space coordinate that coincidentally lies
+        // inside the GUI's SCREEN rect — and the raw-over-UI branch snapped
+        // the sprite into the GUI and cause an immediate handoff bounce.
+        let (content, src, gui) = fs_4k();
+        let mut g = engaged_state(content, src, &[]);
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        g.last_engage_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        // sprite in the bottom strip BELOW the GUI, hand pushing down
+        g.virt = (512.0, 2147.0);
+        g.last_hw = (1795, 1690);
+        let plan = plan_engaged(
+            &mut g,
+            1800,
+            1706, // past source bottom (1698); inside GUI screen rect
+            std::time::Instant::now(),
+            (1800, src.y + src.h - 1),
+        );
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(
+            !virtual_over_ui(&g),
+            "sprite snapped into the GUI from a source-space edge point: virt={:?}",
+            g.virt
+        );
+    }
+
+    #[test]
+    fn fullscreen_letterbox_gui_raw_snap_still_works() {
+        // The raw-over-UI branch exists for GUIs living OUTSIDE the content
+        // (letterbox): there screen == virtual space and the pre-clip raw
+        // point over the GUI is unambiguous. That path must keep working.
+        let (content, src, _) = fs_4k();
+        let gui = Rect {
+            x: 3500,
+            y: 600,
+            w: 340,
+            h: 300,
+        }; // right letterbox: fully outside content (content right edge 3376)
+        let mut g = engaged_state(content, src, &[]);
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        g.last_engage_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        g.virt = (3300.0, 700.0);
+        g.last_hw = (3830, 700);
+        let plan = plan_engaged(
+            &mut g,
+            3833, // at/past the source right edge (3832), outside the content
+            700,
+            std::time::Instant::now(),
+            (src.x + src.w - 1, 700),
+        );
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(
+            virtual_over_ui(&g),
+            "letterbox GUI must still catch the raw cursor: virt={:?}",
+            g.virt
+        );
+    }
+
+    #[test]
+    fn stale_pre_teleport_events_cannot_yank_the_sprite_into_the_gui() {
+        // Engage teleports
+        // the real cursor to the mapped source point; a queued PRE-teleport
+        // hook event (screen coords, e.g. (2316,891) right of the GUI) then
+        // arrives and is mapped as a SOURCE position — virt flew to
+        // (1245,1024), INSIDE the GUI, and handed off instantly.
+        let (content, src, gui) = fs_4k();
+        let mut g = engaged_state(content, src, &[]);
+        g.engaged = false;
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        let t0 = std::time::Instant::now();
+        // engage right of the GUI, over the magnified content
+        let out = handle_move(&mut g, 2288, 887, t0, (2288, 887));
+        let (tx, ty) = match out {
+            MoveOutcome::Engage { tx, ty, .. } => (tx, ty),
+            other => panic!("expected engage, got {other:?}"),
+        };
+        let virt0 = g.virt;
+        assert!(!virtual_over_ui(&g), "engage sprite starts outside the GUI");
+
+        // stale pre-teleport screen-coordinate events: their hook pt is far
+        // from the OS-clipped cursor (GetCursorPos == teleport target). The
+        // hook never sees the injected SetCursorPos move (LLMHF_INJECTED is
+        // ignored), so the swallow must key off that divergence — even long
+        // after the engage grace; long GPU stalls can make
+        // the stale backlog arrive 60-70ms late and yank the sprite).
+        for (ms, sx, sy) in [(8, 2316, 891), (40, 2330, 902), (75, 2350, 915)] {
+            handle_move(
+                &mut g,
+                sx,
+                sy,
+                t0 + std::time::Duration::from_millis(ms),
+                (tx, ty),
+            );
+            assert_eq!(
+                g.virt, virt0,
+                "stale screen-coord event at +{ms}ms moved the sprite (would bounce into the GUI)"
+            );
+            assert!(!virtual_over_ui(&g));
+        }
+
+        // first FRESH event (pt agrees with the clipped cursor) ends the settle
+        handle_move(
+            &mut g,
+            tx + 3,
+            ty + 2,
+            t0 + std::time::Duration::from_millis(90),
+            (tx, ty),
+        );
+        assert!(
+            g.expect_teleport.is_none(),
+            "fresh event must clear the settle"
+        );
+        assert_eq!(g.virt, virt0);
+
+        // subsequent real moves track normally again
+        handle_move(
+            &mut g,
+            tx + 11,
+            ty + 2,
+            t0 + std::time::Duration::from_millis(110),
+            (tx + 11, ty + 2),
+        );
+        assert!(
+            (g.virt.0 - virt0.0).abs() > 0.5,
+            "sprite must track real moves after the settle"
+        );
+    }
+
+    #[test]
+    fn teleport_settle_times_out_instead_of_freezing() {
+        // Safety valve: if GetCursorPos somehow never agrees with the hook pt
+        // (e.g. another program fighting over the cursor), the settle must
+        // expire on its own timeout instead of eating moves forever.
+        let (content, src, gui) = fs_4k();
+        let mut g = engaged_state(content, src, &[]);
+        g.engaged = false;
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        let t0 = std::time::Instant::now();
+        let out = handle_move(&mut g, 2288, 887, t0, (2288, 887));
+        let (tx, ty) = match out {
+            MoveOutcome::Engage { tx, ty, .. } => (tx, ty),
+            other => panic!("expected engage, got {other:?}"),
+        };
+        let virt0 = g.virt;
+        // The event that expires the settle is still untrusted. Abort the
+        // engage transaction at the current visible position and leave the
+        // mapper disengaged; otherwise later moves remain trapped in source
+        // coordinates even though the native cursor has already been revealed.
+        let late = t0 + std::time::Duration::from_millis(TELEPORT_SETTLE_TIMEOUT_MS + 20);
+        let expired = handle_move(&mut g, tx + 200, ty, late, (tx, ty));
+        assert!(matches!(expired, MoveOutcome::Disengage { .. }));
+        assert!(g.expect_teleport.is_none());
+        assert_eq!(g.virt, virt0);
+        assert!(!g.engaged, "settle expiry must release source ownership");
+    }
+
+    #[test]
+    fn gui_screen_event_cannot_false_ack_source_teleport() {
+        // After GUI exit, an old GUI-side hook coordinate and
+        // GetCursorPos agreed with each other, but neither had reached the
+        // requested source coordinate. The old raw==actual check accepted it,
+        // interpreted the screen point as source space, and jumped the sprite
+        // hundreds of pixels toward the upper-left.
+        let (content, src, gui) = fs_4k();
+        let mut g = engaged_state(content, src, &[]);
+        g.engaged = false;
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        let t0 = std::time::Instant::now();
+        let out = handle_move(&mut g, 2288, 887, t0, (2288, 887));
+        let target = match out {
+            MoveOutcome::Engage { tx, ty, .. } => (tx, ty),
+            other => panic!("expected engage, got {other:?}"),
+        };
+        let virt0 = g.virt;
+        let stale_gui_point = (target.0 - 135, target.1 - 125);
+        handle_move(
+            &mut g,
+            stale_gui_point.0,
+            stale_gui_point.1,
+            t0 + std::time::Duration::from_millis(16),
+            stale_gui_point,
+        );
+        assert_eq!(g.expect_teleport, Some(target));
+        assert_eq!(g.virt, virt0, "false acknowledgement moved the sprite");
+    }
+
+    #[test]
+    fn commit_rebases_teleport_guard_and_blocks_late_screen_space_event() {
+        let (content, src, gui) = fs_4k();
+        let mut g = engaged_state(content, src, &[]);
+        g.engaged = false;
+        g.fullscreen = true;
+        g.no_engage = vec![NoEngageRect::new(gui).with_hwnd(0x5555)];
+        let t0 = std::time::Instant::now();
+        let out = handle_move(&mut g, 2288, 887, t0, (2288, 887));
+        let target = match out {
+            MoveOutcome::Engage { tx, ty, .. } => (tx, ty),
+            other => panic!("expected engage, got {other:?}"),
+        };
+        let virt0 = g.virt;
+
+        // Simulate a saturated render thread: native hide/warp commits well
+        // after the old arm-relative 250ms settle would already have expired.
+        let committed = t0 + std::time::Duration::from_millis(380);
+        mark_engage_committed(&mut g, target, committed);
+        assert_eq!(g.last_hw, target);
+
+        // First matching event can clear expect_teleport...
+        let fresh = committed + std::time::Duration::from_millis(8);
+        handle_move(&mut g, target.0, target.1, fresh, target);
+        assert!(g.expect_teleport.is_none());
+        assert_eq!(g.virt, virt0);
+
+        // ...but an older screen-space move that drains AFTER it must still be
+        // quarantined by the commit-relative firewall so it cannot map far
+        // outside the source and clamp the sprite to (0,0).
+        let stale = committed + std::time::Duration::from_millis(90);
+        handle_move(&mut g, 1048, 625, stale, target);
+        assert_eq!(
+            g.virt, virt0,
+            "late pre-warp event moved the virtual cursor"
+        );
+        assert_eq!(g.last_hw, target);
+    }
+
+    #[test]
+    fn idle_autohide_does_not_hide_cursor_over_gui() {
+        let now = std::time::Instant::now();
+        let content = Rect {
+            x: 320,
+            y: 0,
+            w: 1280,
+            h: 1080,
+        };
+        let gui = Rect {
+            x: 300,
+            y: 420,
+            w: 420,
+            h: 240,
+        };
+        let mut g = State {
+            active: true,
+            engaged: true,
+            content,
+            src: Rect {
+                x: 100,
+                y: 100,
+                w: 640,
+                h: 540,
+            },
+            no_engage: vec![NoEngageRect::new(gui).with_hwnd(0x3333)],
+            virt: ((gui.x + 40) as f64, (gui.y + 40) as f64),
+            last_move: Some(now - std::time::Duration::from_secs(2)),
+            autohide_secs: 0.5,
+            ..Default::default()
+        };
+        assert!(virtual_over_ui(&g));
+        assert!(!should_hide_cursor_for_idle(&g, now));
+
+        g.virt = (
+            (content.x + content.w / 2) as f64,
+            (content.y + content.h / 2) as f64,
+        );
+        assert!(!virtual_over_ui(&g));
+        assert!(should_hide_cursor_for_idle(&g, now));
+    }
+
+    #[test]
+    fn windowed_edge_exit_is_smooth_single_transition() {
+        let (c, s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        let start_flips = sim.transitions;
+        let mut exited = false;
+        for _ in 0..80 {
+            sim.hand(30, 0, 16);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "never exited the right edge");
+        assert_eq!(
+            sim.transitions - start_flips,
+            1,
+            "exit was not a single clean transition"
+        );
+        assert!(
+            sim.cursor.0 >= c.x + c.w - 1,
+            "cursor did not leave right: {:?}",
+            sim.cursor
+        );
+        for _ in 0..20 {
+            sim.hand(20, 0, 16);
+            assert!(!sim.g.engaged, "cursor snapped back into the magnifier");
+        }
+    }
+
+    #[test]
+    fn windowed_edge_exit_places_cursor_outside_overlay_window() {
+        let (c, s) = win();
+        let overlay = Rect {
+            x: c.x - 32,
+            y: c.y - 24,
+            w: c.w + 64,
+            h: c.h + 48,
+        };
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.g.overlay = overlay;
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        for _ in 0..120 {
+            sim.hand(-20, 0, 16);
+            if !sim.g.engaged {
+                break;
+            }
+        }
+        assert!(!sim.g.engaged, "never exited");
+        assert!(
+            sim.cursor.0 <= overlay.x - EXIT_WINDOW_MARGIN_PX,
+            "cursor landed on/in the overlay border: cursor={:?} overlay={:?}",
+            sim.cursor,
+            overlay
+        );
+    }
+
+    #[test]
+    fn post_top_exit_shallow_return_does_not_reengage() {
+        let (c, s) = win_offset();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        for _ in 0..200 {
+            sim.hand(0, -8, 16);
+            if !sim.g.engaged {
+                break;
+            }
+        }
+        assert!(!sim.g.engaged, "never exited top");
+        sim.t += std::time::Duration::from_millis(350);
+
+        let shallow_y = c.y + ENTER_MARGIN_PX + 1;
+        for _ in 0..80 {
+            if sim.cursor.1 >= shallow_y {
+                break;
+            }
+            let dy = (shallow_y - sim.cursor.1).clamp(1, 4);
+            sim.hand(0, dy, 16);
+            assert!(
+                !sim.g.engaged,
+                "shallow top-edge return re-engaged and pulled back"
+            );
+        }
+    }
+
+    #[test]
+    fn windowed_gentle_push_exits_without_pullback() {
+        // A gentle push at
+        // the edge must leave within a couple of events (no pinning wall) and,
+        // once out, continued outward motion must never snap back inside.
+        let (c, s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        // ease over to just INSIDE the right edge (stop before pushing past)
+        for _ in 0..600 {
+            if sim.cursor.0 >= s.x + s.w - 8 {
+                break;
+            }
+            sim.hand(4, 0, 16);
+            assert!(sim.g.engaged, "approach exited prematurely");
+        }
+        let base = sim.transitions;
+        // gentle-but-deliberate outward pushes: exits within a handful of small
+        // events (no time gate; it takes a few px of real outward travel).
+        let mut exited_after = None;
+        for k in 0..14 {
+            sim.hand(3, 0, 16);
+            if !sim.g.engaged {
+                exited_after = Some(k);
+                break;
+            }
+        }
+        let k = exited_after.expect("gentle push never exited");
+        assert!(k <= 10, "gentle exit took too many events: {k}");
+        assert_eq!(
+            sim.transitions - base,
+            1,
+            "exit was not a single clean transition"
+        );
+        assert!(
+            sim.cursor.0 >= c.x + c.w - 1,
+            "did not land outside: {:?}",
+            sim.cursor
+        );
+        // continued gentle outward motion must NOT pull back in
+        for _ in 0..25 {
+            sim.hand(3, 0, 16);
+            assert!(!sim.g.engaged, "cursor got pulled back into the view");
+        }
+    }
+
+    #[test]
+    fn windowed_exit_then_edge_wobble_does_not_reengage() {
+        // After exiting an edge, a small
+        // in/out wobble near that edge must NOT re-engage (which would teleport
+        // the cursor back into the offset source region).
+        let (c, s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        let mut exited = false;
+        for _ in 0..200 {
+            sim.hand(20, 0, 16);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "never exited the right edge");
+        let base = sim.transitions;
+        // wobble right at the edge (a few px in and out): never re-engage
+        for k in 0..50 {
+            sim.hand(-5, 0, 16); // drift back toward the view
+            sim.hand(5, 0, 16); // and back out
+            assert!(
+                !sim.g.engaged,
+                "edge wobble re-engaged (pull-back) at k={k}"
+            );
+        }
+        assert_eq!(sim.transitions, base, "edge wobble oscillated");
+        // a DELIBERATE deep return re-engages normally
+        let mut reengaged = false;
+        for _ in 0..200 {
+            sim.hand(-30, 0, 16);
+            if sim.g.engaged {
+                reengaged = true;
+                break;
+            }
+        }
+        assert!(reengaged, "could not re-engage on a deliberate deep return");
+    }
+
+    #[test]
+    fn windowed_offset_left_edge_does_not_oscillate() {
+        // Offset-window regression case: cursor remains correct near
+        // the content-left edge. Without the source-space dead-band this
+        // engages/escapes repeatedly (each re-engage teleporting the cursor back
+        // into the source. With it, the edge is stable.
+        let (c, s) = win_offset();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        // creep toward the source-left edge and out
+        let mut exited = false;
+        for _ in 0..400 {
+            sim.hand(-6, 0, 16);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "never exited the left edge");
+        let base = sim.transitions;
+        // Drift just to the edge band. It must not re-engage yet.
+        for _ in 0..200 {
+            let (tx, _) = map_content_to_source(c, s, sim.cursor.0 as f64, sim.cursor.1 as f64);
+            if tx >= s.x + 3 {
+                break;
+            }
+            sim.hand(3, 0, 16);
+            assert!(
+                !sim.g.engaged,
+                "re-engaged while drifting back near the edge"
+            );
+        }
+        // Linger just outside the edge with tiny wobbles: still no re-engage.
+        for k in 0..80 {
+            sim.hand(2, 0, 16);
+            sim.hand(-2, 0, 16);
+            assert!(
+                !sim.g.engaged,
+                "post-exit wobble re-engaged at k={k}"
+            );
+        }
+        assert_eq!(sim.transitions, base, "post-exit edge zone oscillated");
+        // A deliberate push inward DOES re-engage (normal use preserved).
+        let mut reengaged = false;
+        for _ in 0..200 {
+            sim.hand(12, 0, 16);
+            if sim.g.engaged {
+                reengaged = true;
+                break;
+            }
+        }
+        assert!(reengaged, "could not re-engage on a deliberate deep return");
+    }
+
+    #[test]
+    fn post_exit_cooldown_blocks_fast_return_then_reenters_normally() {
+        // Regression case: after an exit, the cursor must not dart deep-right (past the
+        // deliberate threshold) and back to a shallow spot WITHIN the re-enter
+        // cooldown. The old guard cleared `must_leave` on the deep overshoot even
+        // though the cooldown blocked the engage, so the shallow return then
+        // re-engaged (source ~50px inside). It must stay disengaged now.
+        let (c, s) = win_offset();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        let mut exited = false;
+        for _ in 0..400 {
+            sim.hand(-6, 0, 8);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "never exited");
+        let base = sim.transitions;
+        // dart deep-right (past POST_ESCAPE), fast (small dt = within cooldown)
+        let (deep_cx, _) = map_source_to_content(
+            c,
+            s,
+            (s.x + POST_ESCAPE_SRC_MARGIN_PX + 20) as f64,
+            (s.y + s.h / 2) as f64,
+        );
+        let deep_cx = deep_cx.round() as i32;
+        for _ in 0..300 {
+            if sim.cursor.0 >= deep_cx {
+                break;
+            }
+            sim.hand(8, 0, 3);
+            assert!(
+                !sim.g.engaged,
+                "engaged during the deep dart (cooldown should block)"
+            );
+        }
+        // back to a shallow spot (~source +48), still fast/within cooldown
+        let (shallow_cx, _) =
+            map_source_to_content(c, s, (s.x + 48) as f64, (s.y + s.h / 2) as f64);
+        let shallow_cx = shallow_cx.round() as i32;
+        for _ in 0..300 {
+            if sim.cursor.0 <= shallow_cx {
+                break;
+            }
+            sim.hand(-8, 0, 3);
+            assert!(
+                !sim.g.engaged,
+                "engaged on the way back (cooldown should block)"
+            );
+        }
+        // Let the cooldown expire; a normal deliberate deep return should
+        // re-engage once.
+        sim.t += std::time::Duration::from_millis(300);
+        let (deep_return_cx, _) = map_source_to_content(
+            c,
+            s,
+            (s.x + POST_ESCAPE_SRC_MARGIN_PX + 20) as f64,
+            (s.y + s.h / 2) as f64,
+        );
+        let deep_return_cx = deep_return_cx.round() as i32;
+        for _ in 0..200 {
+            if sim.cursor.0 < deep_return_cx {
+                sim.hand(8, 0, 16);
+            } else {
+                sim.hand(1, 0, 16);
+            }
+            if sim.g.engaged {
+                break;
+            }
+        }
+        assert!(sim.g.engaged, "could not re-enter after cooldown");
+        assert_eq!(sim.transitions - base, 1, "cooldown return oscillated");
+    }
+
+    #[test]
+    fn all_four_edges_exit_smoothly() {
+        for (dx, dy) in [(30, 0), (-30, 0), (0, 30), (0, -30)] {
+            let (c, s) = win();
+            let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+            sim.hand(0, 0, 16);
+            let base = sim.transitions;
+            let mut exited = false;
+            for _ in 0..80 {
+                sim.hand(dx, dy, 16);
+                if !sim.g.engaged {
+                    exited = true;
+                    break;
+                }
+            }
+            assert!(exited, "edge ({dx},{dy}) never exited");
+            assert_eq!(
+                sim.transitions - base,
+                1,
+                "edge ({dx},{dy}) not a single transition"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_entry_hands_off_and_exit_reengages_promptly() {
+        // The GUI is our own window; sprite entry hands the
+        // real system cursor over (impure layer); the PURE contracts are:
+        // (1) virtual_over_ui fires when the mapped sprite enters the GUI
+        //     (this is the trigger the hook uses for the handoff), and
+        // (2) after the handoff state, plan_engage refuses re-engagement while
+        //     the cursor stays inside the GUI, then re-engages promptly
+        //     once it leaves toward the content.
+        let content = Rect {
+            x: 218,
+            y: 0,
+            w: 1484,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 812,
+            y: 161,
+            w: 1054,
+            h: 767,
+        };
+        let gui = Rect {
+            x: 44,
+            y: 169,
+            w: 896,
+            h: 859,
+        };
+        let zones = vec![NoEngageRect::new(gui).with_hwnd(0x1b0758)];
+        let mut sim = Sim::new(content, src, &zones, (1600, 540));
+        sim.g.fullscreen = true;
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+
+        // (1) sweep left until the mapped sprite is over the GUI zone
+        let mut entered = false;
+        for _ in 0..40 {
+            sim.hand(-25, 0, 16);
+            if virtual_over_ui(&sim.g) {
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered, "sprite never entered the GUI zone");
+
+        // simulate the handoff exactly as handoff_to_gui sets the state
+        let inside = (gui.x + gui.w / 2, gui.y + gui.h / 2);
+        release_locked(&mut sim.g);
+        sim.g.virt = (inside.0 as f64, inside.1 as f64);
+        sim.g.last_set = inside;
+        sim.g.last_hw = inside;
+        sim.cursor = inside;
+
+        // (2a) roaming INSIDE the GUI never re-engages (no_engage zone)
+        for _ in 0..30 {
+            sim.hand(7, 3, 16);
+            assert!(!sim.g.engaged, "re-engaged while inside the GUI");
+            sim.hand(-7, -3, 16);
+        }
+
+        // (2b) leaving toward the magnified content re-engages promptly
+        let mut steps_to_reengage = 0;
+        for _ in 0..80 {
+            sim.hand(30, 0, 16);
+            steps_to_reengage += 1;
+            if sim.g.engaged {
+                break;
+            }
+        }
+        assert!(sim.g.engaged, "never re-engaged after leaving the GUI");
+        assert!(
+            steps_to_reengage <= 40,
+            "re-engagement too sluggish: {steps_to_reengage} steps"
+        );
+    }
+
+    #[test]
+    fn gui_zone_stays_engaged_no_churn() {
+        // windowed GUI inside the content: the sprite passes over it while the
+        // real cursor stays confined. Clicks are redirected in the hook; the
+        // move planner must simply STAY engaged with zero oscillation.
+        let (c, s) = win();
+        let gui = Rect {
+            x: c.x + 40,
+            y: c.y + 40,
+            w: 300,
+            h: 200,
+        };
+        let mut sim = Sim::new(c, s, &panels(&[gui]), (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        let base = sim.transitions;
+        let gcx = gui.x + gui.w / 2;
+        let gcy = gui.y + gui.h / 2;
+        let (tx, ty) = map_content_to_source(c, s, gcx as f64, gcy as f64);
+        for _ in 0..600 {
+            let dx = (tx - sim.cursor.0).signum() * 4;
+            let dy = (ty - sim.cursor.1).signum() * 4;
+            sim.hand(dx, dy, 16);
+            if (sim.cursor.0 - tx).abs() <= 2 && (sim.cursor.1 - ty).abs() <= 2 {
+                break;
+            }
+        }
+        assert!(sim.g.engaged, "GUI approach disengaged");
+        let (vx, vy) = (sim.g.virt.0.round() as i32, sim.g.virt.1.round() as i32);
+        assert!(
+            gui.contains(vx, vy),
+            "virtual cursor not over GUI: ({vx},{vy})"
+        );
+        for _ in 0..40 {
+            sim.hand(2, 2, 16);
+            sim.hand(-2, -2, 16);
+            assert!(sim.g.engaged, "GUI hover disengaged");
+        }
+        assert_eq!(sim.transitions, base, "GUI hover oscillated");
+    }
+
+    #[test]
+    fn authoritative_top_hwnd_wins_overlap_independent_of_zone_order() {
+        let gui = NoEngageRect::new(Rect {
+            x: 100,
+            y: 100,
+            w: 320,
+            h: 200,
+        })
+        .with_hwnd(0x1111);
+        let panel = panel_no_engage_rect(Rect {
+            x: 160,
+            y: 120,
+            w: 180,
+            h: 40,
+        })
+        .with_hwnd(0x2222);
+
+        let zones = vec![gui, panel];
+        assert_eq!(tracked_ui_for_top_hwnd(&zones, 0x2222), Some(panel));
+        assert_eq!(tracked_ui_for_top_hwnd(&zones, 0x1111), Some(gui));
+
+        let reversed = vec![panel, gui];
+        assert_eq!(tracked_ui_for_top_hwnd(&reversed, 0x2222), Some(panel));
+        assert_eq!(tracked_ui_for_top_hwnd(&reversed, 0x1111), Some(gui));
+        assert_eq!(tracked_ui_for_top_hwnd(&reversed, 0x3333), None);
+    }
+
+    #[test]
+    fn ui_click_has_no_margin_or_previous_hover_grace() {
+        let now = std::time::Instant::now();
+        let gui = Rect {
+            x: 100,
+            y: 100,
+            w: 320,
+            h: 200,
+        };
+        let mut g = State {
+            active: true,
+            engaged: true,
+            content: Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            src: Rect {
+                x: 600,
+                y: 200,
+                w: 640,
+                h: 360,
+            },
+            no_engage: vec![NoEngageRect::new(gui).with_hwnd(0x4444)],
+            virt: ((gui.x + 40) as f64, (gui.y + 40) as f64),
+            ..Default::default()
+        };
+
+        let hover = note_ui_hover(&mut g, now).expect("hover over GUI");
+        assert_eq!(hover.hit.hwnd, 0x4444);
+
+        // The very next visible point outside the window is source/other-window
+        // territory. No invisible click margin and no previous-hover latch.
+        g.virt = ((gui.x - 1) as f64, (gui.y + 40) as f64);
+        assert!(ui_click_target_from_virtual(&mut g, now).is_none());
+
+        g.virt = ((gui.x + gui.w) as f64, (gui.y + 40) as f64);
+        assert!(ui_click_target_from_virtual(&mut g, now).is_none());
+    }
+
+    #[test]
+    fn engaged_click_ignores_hidden_real_source_coordinate() {
+        let now = std::time::Instant::now();
+        let gui = Rect {
+            x: 37,
+            y: 33,
+            w: 896,
+            h: 859,
+        };
+        let mut g = State {
+            active: true,
+            engaged: true,
+            fullscreen: true,
+            content: Rect {
+                x: 341,
+                y: 0,
+                w: 1238,
+                h: 1080,
+            },
+            src: Rect {
+                x: 1228,
+                y: 160,
+                w: 1468,
+                h: 825,
+            },
+            no_engage: vec![NoEngageRect::new(gui).with_hwnd(0x7777)],
+            // Visible cursor is NOT over GUI; raw event coordinates below are.
+            virt: (1500.0, 900.0),
+            ..Default::default()
+        };
+
+        assert!(
+            ui_click_target_for_event(&mut g, 192, 149, now).is_none(),
+            "hidden source-space raw coordinates must never steal visible UI ownership"
+        );
+    }
+
+    #[test]
+    fn native_gui_hold_blocks_engage_without_blocking_content_button_hold() {
+        let now = std::time::Instant::now();
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 640,
+            y: 260,
+            w: 640,
+            h: 360,
+        };
+        let mut g = State {
+            active: true,
+            engaged: false,
+            content,
+            src,
+            buttons_down: BTN_LEFT,
+            native_ui_hold_bits: BTN_LEFT,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            plan_engage(&g, 900, 500, now),
+            None,
+            "a button gesture that started on Neo's native GUI must never arm source ownership"
+        );
+
+        // Keep the physical button held but mark it as content-originated. This
+        // preserves direct source click/drag behavior.
+        g.native_ui_hold_bits = 0;
+        assert!(
+            plan_engage(&g, 900, 500, now + std::time::Duration::from_millis(1)).is_some(),
+            "a content-originated held button must not be globally blocked"
+        );
+    }
+
+    #[test]
+    fn ui_hold_blocks_only_while_the_physical_gesture_is_active() {
+        let now = std::time::Instant::now();
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 640,
+            y: 260,
+            w: 640,
+            h: 360,
+        };
+        let mut g = State {
+            active: true,
+            engaged: false,
+            content,
+            src,
+            ui_hold_bits: BTN_LEFT,
+            ..Default::default()
+        };
+
+        assert_eq!(plan_engage(&g, 900, 500, now), None);
+        g.ui_hold_bits = 0;
+        assert!(
+            plan_engage(&g, 900, 500, now + std::time::Duration::from_millis(1)).is_some(),
+            "button-up must remove UI ownership immediately; no time-based sticky grace"
+        );
+    }
+
+    #[test]
+    fn stale_ui_button_is_released_by_watchdog_without_stopping_capture() {
+        let now = std::time::Instant::now();
+        let mut g = State {
+            active: true,
+            buttons_down: BTN_LEFT,
+            ui_hold_bits: BTN_LEFT,
+            swallow_up: BTN_LEFT,
+            last_button_event: Some(
+                now - std::time::Duration::from_millis(STALE_BUTTON_WATCHDOG_MS + 1),
+            ),
+            ..Default::default()
+        };
+        let stale = reconcile_stale_buttons_with_physical(&mut g, now, 0);
+        assert_eq!(stale, BTN_LEFT);
+        assert_eq!(g.buttons_down, 0);
+        assert_eq!(g.ui_hold_bits, 0);
+        assert_eq!(g.swallow_up, 0);
+    }
+
+    #[test]
+    fn panel_over_gui_overlap_stays_engaged_no_churn() {
+        // panel and GUI both no-engage AND overlapping: sweeping the overlap and
+        // either side must never disengage / oscillate (stays confined; clicks
+        // are redirected in the hook).
+        let (c, s) = win();
+        let gui = Rect {
+            x: c.x + 60,
+            y: c.y + 60,
+            w: 400,
+            h: 260,
+        };
+        let panel = Rect {
+            x: c.x + 200,
+            y: c.y + 40,
+            w: 220,
+            h: 40,
+        }; // overlaps gui top
+        let mut sim = Sim::new(c, s, &panels(&[gui, panel]), (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        let base = sim.transitions;
+        // drive into the overlap region (panel∩gui)
+        let ox = panel.x + panel.w / 2;
+        let oy = gui.y + 10;
+        let (tx, ty) = map_content_to_source(c, s, ox as f64, oy as f64);
+        for _ in 0..600 {
+            let dx = (tx - sim.cursor.0).signum() * 4;
+            let dy = (ty - sim.cursor.1).signum() * 4;
+            sim.hand(dx, dy, 16);
+            if (sim.cursor.0 - tx).abs() <= 2 && (sim.cursor.1 - ty).abs() <= 2 {
+                break;
+            }
+        }
+        assert!(sim.g.engaged, "overlap approach disengaged");
+        // sweep across the whole overlap + both edges; never disengage
+        for k in 0..80 {
+            let d = if k % 2 == 0 { 3 } else { -3 };
+            sim.hand(d, d, 16);
+            assert!(sim.g.engaged, "overlap sweep disengaged at k={k}");
+        }
+        assert_eq!(sim.transitions, base, "overlap hover oscillated");
+    }
+
+    #[test]
+    fn window_move_keeps_engagement_and_tracks() {
+        // windowed: the source window is dragged (its own title bar), so the
+        // engine feeds new geometry every tick. Engagement must survive and the
+        // cursor keep tracking — no fling, no stray disengage.
+        let (mut c, mut s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        for step in 0..60 {
+            // move both source and content by the same delta (window drag)
+            let d = if step < 30 { 6 } else { -6 };
+            s = Rect {
+                x: s.x + d,
+                y: s.y + d / 2,
+                ..s
+            };
+            c = Rect {
+                x: c.x + d,
+                y: c.y + d / 2,
+                ..c
+            };
+            sim.set_geometry(c, s, &[]);
+            // a small in-source hand move each tick
+            sim.hand(2, 1, 16);
+            assert!(sim.g.engaged, "window move disengaged at step {step}");
+            // cursor stays confined to the (moved) source
+            assert!(
+                sim.cursor.0 >= s.x && sim.cursor.0 < s.x + s.w,
+                "cursor left source during move: {:?} src={s:?}",
+                sim.cursor
+            );
+        }
+    }
+
+    #[test]
+    fn button_held_drag_survives_edge_and_geometry_move() {
+        // hold left button and drag hard against an edge WHILE the window moves:
+        // a source drag must never disengage.
+        let (mut c, mut s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        sim.button(BTN_LEFT, true);
+        for step in 0..80 {
+            sim.hand(28, 4, 16); // shove toward+past the right edge
+            if step % 5 == 0 {
+                s = Rect { x: s.x + 3, ..s };
+                c = Rect { x: c.x + 3, ..c };
+                sim.set_geometry(c, s, &[]);
+            }
+            assert!(sim.g.engaged, "held-button drag disengaged at step {step}");
+        }
+        sim.button(BTN_LEFT, false);
+        // after releasing at the edge, a further push should now be allowed to
+        // exit (no longer a drag).
+        let mut exited = false;
+        for _ in 0..80 {
+            sim.hand(28, 0, 16);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited, "could not exit after releasing the drag");
+    }
+
+    #[test]
+    fn rapid_edge_tapping_does_not_oscillate() {
+        // repeatedly tap the edge (in-out-in) fast: must not thrash engagement.
+        let (c, s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        let base = sim.transitions;
+        for _ in 0..60 {
+            sim.hand(40, 0, 8); // toward edge
+            sim.hand(-40, 0, 8); // back in
+        }
+        // at most a handful of transitions across 60 taps (each brief tap must
+        // NOT trigger the sustained-push exit)
+        assert!(
+            sim.transitions - base <= 2,
+            "rapid tapping oscillated: {} transitions",
+            sim.transitions - base
+        );
+        assert!(sim.g.engaged, "ended disengaged after returning inside");
+    }
+
+    #[test]
+    fn full_workflow_engage_wiggle_exit_reengage() {
+        let (c, s) = win();
+        let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
+        sim.hand(0, 0, 16);
+        assert!(sim.g.engaged);
+        for _ in 0..50 {
+            sim.hand(5, 3, 16);
+            sim.hand(-4, -2, 16);
+            assert!(sim.g.engaged, "interior wiggle disengaged");
+        }
+        let mut exited = false;
+        for _ in 0..80 {
+            sim.hand(0, 30, 16);
+            if !sim.g.engaged {
+                exited = true;
+                break;
+            }
+        }
+        assert!(exited);
+        assert!(sim.cursor.1 >= c.y + c.h - 1);
+        sim.t += std::time::Duration::from_millis(1200);
+        let mut reengaged = false;
+        for _ in 0..200 {
+            sim.hand(0, -20, 16);
+            if sim.g.engaged {
+                reengaged = true;
+                break;
+            }
+        }
+        assert!(reengaged, "could not re-engage after coming back");
+    }
+
+    #[test]
+    fn short_engage_disengage_extends_reenter_cooldown() {
+        let now = std::time::Instant::now();
+        let mut st = State {
+            last_engage_at: Some(now - std::time::Duration::from_millis(OSC_SHORT_MS / 2)),
+            ..Default::default()
+        };
+        mark_disengage(&mut st, now);
+        assert_eq!(st.oscillations, 1);
+        let cooldown = reenter_cooldown(now, st.oscillations);
+        assert!(
+            cooldown.duration_since(now)
+                >= std::time::Duration::from_millis(REENTER_COOLDOWN_MS * 2)
+        );
+
+        st.last_engage_at = Some(now - std::time::Duration::from_millis(OSC_SHORT_MS + 50));
+        mark_disengage(&mut st, now);
+        assert_eq!(st.oscillations, 0);
+    }
+    #[test]
+    fn exact_native_gui_ownership_has_no_hover_deadband() {
+        let gui = NoEngageRect::new(Rect {
+            x: 100,
+            y: 100,
+            w: 300,
+            h: 200,
+        })
+        .with_hwnd(0x5555);
+        let zones = vec![gui];
+        assert!(hit_ui_for_cursor_ownership(&zones, 100, 100).is_some());
+        assert!(hit_ui_for_cursor_ownership(&zones, 399, 299).is_some());
+        assert!(hit_ui_for_cursor_ownership(&zones, 99, 150).is_none());
+        assert!(hit_ui_for_cursor_ownership(&zones, 400, 150).is_none());
+    }
+
+    #[test]
+    fn panel_ownership_is_exact_visible_rect_with_no_halo() {
+        let panel = panel_no_engage_rect(Rect {
+            x: 500,
+            y: 10,
+            w: 300,
+            h: 33,
+        })
+        .with_hwnd(0x2222);
+        let zones = vec![panel];
+        assert_eq!(panel.rect, panel.land);
+        assert_eq!(PANEL_NO_ENGAGE_HALO_PX, 0);
+        assert!(hit_ui_for_cursor_ownership(&zones, 500, 10).is_some());
+        assert!(hit_ui_for_cursor_ownership(&zones, 799, 42).is_some());
+        assert!(hit_ui_for_cursor_ownership(&zones, 499, 20).is_none());
+        assert!(hit_ui_for_cursor_ownership(&zones, 800, 20).is_none());
+        assert!(hit_ui_for_cursor_ownership(&zones, 600, 9).is_none());
+        assert!(hit_ui_for_cursor_ownership(&zones, 600, 43).is_none());
+    }
+
+    #[test]
+    fn repeated_panel_crossings_never_create_a_spatial_latch() {
+        let panel = panel_no_engage_rect(Rect {
+            x: 500,
+            y: 100,
+            w: 300,
+            h: 60,
+        })
+        .with_hwnd(0x2222);
+        let zones = vec![panel];
+
+        // 4,000 left<->right traversals. Ownership must be a pure function of
+        // the current point; no previous owner or crossing speed may alter it.
+        for pass in 0..4000 {
+            if pass % 2 == 0 {
+                for x in 450..850 {
+                    assert_eq!(
+                        hit_ui_for_cursor_ownership(&zones, x, 130).is_some(),
+                        (500..800).contains(&x),
+                        "left->right pass={pass} x={x}"
+                    );
+                }
+            } else {
+                for x in (450..850).rev() {
+                    assert_eq!(
+                        hit_ui_for_cursor_ownership(&zones, x, 130).is_some(),
+                        (500..800).contains(&x),
+                        "right->left pass={pass} x={x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_gui_crossings_never_create_a_spatial_latch() {
+        let gui = NoEngageRect::new(Rect {
+            x: 200,
+            y: 200,
+            w: 600,
+            h: 500,
+        })
+        .with_hwnd(0x3333);
+        let zones = vec![gui];
+        for pass in 0..3000 {
+            let y = 150 + (pass % 600) as i32;
+            for x in (100..900).step_by(7) {
+                let inside = (200..800).contains(&x) && (200..700).contains(&y);
+                assert_eq!(
+                    hit_ui_for_cursor_ownership(&zones, x, y).is_some(),
+                    inside,
+                    "pass={pass} point=({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_overlap_selection_survives_repeated_z_order_changes() {
+        let gui = NoEngageRect::new(Rect {
+            x: 100,
+            y: 100,
+            w: 700,
+            h: 500,
+        })
+        .with_hwnd(0x1111);
+        let panel = panel_no_engage_rect(Rect {
+            x: 300,
+            y: 150,
+            w: 300,
+            h: 80,
+        })
+        .with_hwnd(0x2222);
+        let zones = vec![gui, panel];
+        for i in 0..100_000 {
+            let top = if i & 1 == 0 { 0x1111 } else { 0x2222 };
+            let expected = if top == 0x1111 { gui } else { panel };
+            assert_eq!(tracked_ui_for_top_hwnd(&zones, top), Some(expected));
+        }
+    }
+
+    #[test]
+    fn moving_gui_geometry_cannot_break_active_native_drag_ownership() {
+        let now = std::time::Instant::now();
+        let mut g = State {
+            active: true,
+            engaged: false,
+            content: Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            src: Rect {
+                x: 640,
+                y: 260,
+                w: 640,
+                h: 360,
+            },
+            native_ui_hold_bits: BTN_LEFT,
+            native_gui_owner_hwnd: 0x1111,
+            ..Default::default()
+        };
+
+        // Model a title-bar drag with thousands of geometry publications. The
+        // physical gesture latch, not a moving rectangle, prevents source warp.
+        for i in 0..20_000 {
+            g.no_engage = vec![
+                NoEngageRect::new(Rect {
+                    x: (i % 1200) as i32 - 200,
+                    y: (i % 700) as i32 - 100,
+                    w: 900,
+                    h: 700,
+                })
+                .with_hwnd(0x1111),
+            ];
+            assert_eq!(
+                plan_engage(
+                    &g,
+                    900,
+                    500,
+                    now + std::time::Duration::from_micros(i as u64)
+                ),
+                None,
+                "native drag must retain ownership at iteration {i}"
+            );
+        }
+    }
+}
