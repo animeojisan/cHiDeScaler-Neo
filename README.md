@@ -23,9 +23,6 @@ The bundled `presets.json`, GLSL shaders, and ONNX models are kept together so t
 
 **GPU Load** is a reference value and does not directly represent a percentage of the GPU's maximum theoretical performance.
 
-### Currently frozen
-
-HDR → SDR / HDR highlight protection and some experimental implementations remain disabled for later review.
 
 ## Build
 
@@ -77,9 +74,6 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 
 GUIの **GPU負荷率は参考値** です。GPUの最大演算性能をそのまま何％消費しているかを示す値ではありません。
 
-## 現在凍結中
-
-HDR → SDR / HDR白飛び防止処理など、一部の実装は将来の再検討用としてコードを保持したまま現在は無効化しています。
 
 ## ビルド
 
