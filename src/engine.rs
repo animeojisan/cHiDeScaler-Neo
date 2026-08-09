@@ -6006,7 +6006,9 @@ fn engine_main(
                             }
                             tex
                         }
-                        Ok(None) | Err(_) => upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms),
+                        Ok(None) | Err(_) => {
+                            upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms)
+                        }
                     }
                 } else {
                     upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms)
@@ -7944,11 +7946,7 @@ fn save_screenshot_async(path: std::path::PathBuf, w: u32, h: u32, rgba: Vec<u8>
 /// Diagnostic wrapper for the capture-buffer -> GL texture submission.
 /// The measurement is CPU-side wall time around the existing upload path and
 /// does not add synchronization or change residency/pacing behavior.
-fn upload_frame_timed(
-    gc: &mut GlContext,
-    frame: &FrameBuf,
-    last_ms: &mut f64,
-) -> GpuTex {
+fn upload_frame_timed(gc: &mut GlContext, frame: &FrameBuf, last_ms: &mut f64) -> GpuTex {
     let started = Instant::now();
     let tex = upload_frame(gc, frame);
     *last_ms = started.elapsed().as_secs_f64() * 1000.0;
