@@ -3,7 +3,7 @@
 
 # cHiDeScaler-Neo
 
-**AI Upscaler \& Frame Interpolator for Windows**
+**AI Upscaler & Frame Interpolator for Windows**
 
 cHiDeScaler-Neo captures a Windows application window and applies real-time GLSL / ONNX video processing.
 
@@ -32,20 +32,20 @@ HDR → SDR / HDR highlight protection and some experimental implementations rem
 On Windows:
 
 ```bat
-BUILD\_RELEASE.bat
+BUILD_RELEASE.bat
 ```
 
 The standard DirectML runtime files are included under `backends/`. TensorRT is an optional separate backend pack; see [`backends/tensorrt/README.md`](backends/tensorrt/README.md).
 
 ## Acknowledgements / Reference Projects
 
-* [mpv\_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
-* [vs\_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
+* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
+* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Magpie (Blinue)](https://github.com/Blinue/Magpie)
 * [Anime4K (bloc97)](https://github.com/bloc97/Anime4K)
 * [OpenModelDB](https://openmodeldb.info/)
 
-Source / license information for some bundled third-party models and shaders is still being organized and will be added as it is confirmed. See [`THIRD\_PARTY\_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Source / license information for some bundled third-party models and shaders is still being organized and will be added as it is confirmed. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Disclaimer
 
@@ -57,7 +57,7 @@ The author cannot be held responsible for any malfunction, damage, trouble, or o
 
 # cHiDeScaler-Neo
 
-**Windows用 AI アップスケーラー \& フレーム補間**
+**Windows用 AI アップスケーラー & フレーム補間**
 
 cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムにキャプチャし、GLSL / ONNXによる映像処理を適用して拡大表示するWindows用ポータブルアプリケーションです。
 
@@ -86,7 +86,7 @@ HDR → SDR / HDR白飛び防止処理など、一部の実装は将来の再検
 Windowsで、
 
 ```bat
-BUILD\_RELEASE.bat
+BUILD_RELEASE.bat
 ```
 
 を実行してください。
@@ -95,13 +95,13 @@ BUILD\_RELEASE.bat
 
 ## 参考プロジェクト / 謝辞
 
-* [mpv\_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
-* [vs\_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
+* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
+* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Magpie (Blinue)](https://github.com/Blinue/Magpie)
 * [Anime4K (bloc97)](https://github.com/bloc97/Anime4K)
 * [OpenModelDB](https://openmodeldb.info/)
 
-一部の外部モデル / シェーダーは、出所・ライセンス情報を現在整理中です。確認できたものから順次記載を追加します。詳細は [`THIRD\_PARTY\_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。
+一部の外部モデル / シェーダーは、出所・ライセンス情報を現在整理中です。確認できたものから順次記載を追加します。詳細は [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) を参照してください。
 
 ## 免責事項
 
