@@ -335,9 +335,7 @@ fn repair_main_gui_passthrough_if_needed() {
     }
     if crate::platform::win32::window_input_passthrough(hwnd) != wanted {
         crate::platform::win32::set_window_input_passthrough(hwnd, wanted);
-        log::warn!(
-            "gui-input-route race repaired: hwnd={hwnd:#x} passthrough={wanted}"
-        );
+        log::warn!("gui-input-route race repaired: hwnd={hwnd:#x} passthrough={wanted}");
     }
 }
 
@@ -2818,6 +2816,15 @@ fn slow_speed_for_zoom(current: i32, zoom: f64) -> i32 {
 /// hard kill (Task Manager) mid-engagement can be healed on the next start
 /// (in-process restore paths cover every clean exit).
 fn speed_backup_path() -> std::path::PathBuf {
+    crate::core::config::app_dir()
+        .join("cache")
+        .join("chidescaler_neo_ptr_speed.bak")
+}
+
+/// v343f and earlier stored the crash-recovery marker in %TEMP%.
+/// Never write there again, but heal/remove an old marker once so upgrades
+/// cannot leave a previously slowed pointer behind.
+fn legacy_speed_backup_path() -> std::path::PathBuf {
     std::env::temp_dir().join("chidescaler_neo_ptr_speed.bak")
 }
 
@@ -2833,8 +2840,24 @@ fn slow_mouse_for_zoom(zoom: f64) {
     let cur = get_mouse_speed();
     let slowed = slow_speed_for_zoom(cur, zoom);
     if slowed != cur {
+        let backup = speed_backup_path();
+        if let Some(parent) = backup.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                log::warn!(
+                    "pointer-speed adjustment skipped: portable backup directory unavailable path={} error={error}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        if let Err(error) = std::fs::write(&backup, cur.to_string()) {
+            log::warn!(
+                "pointer-speed adjustment skipped: portable backup unavailable path={} error={error}",
+                backup.display()
+            );
+            return;
+        }
         SAVED_MOUSE_SPEED.store(cur, Ordering::Release);
-        let _ = std::fs::write(speed_backup_path(), cur.to_string());
         set_mouse_speed(slowed);
     }
 }
@@ -2851,15 +2874,19 @@ fn restore_mouse_speed() {
 /// If a previous run was hard-killed while it had the pointer slowed, restore
 /// the user's speed from the backup file. Called once at hook startup.
 fn heal_leftover_mouse_speed() {
-    let p = speed_backup_path();
-    if let Ok(s) = std::fs::read_to_string(&p) {
-        if let Ok(v) = s.trim().parse::<i32>() {
-            if (1..=20).contains(&v) {
-                set_mouse_speed(v);
-                log::warn!("restored pointer speed {v} left slowed by a previous run");
+    for p in [speed_backup_path(), legacy_speed_backup_path()] {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = s.trim().parse::<i32>() {
+                if (1..=20).contains(&v) {
+                    set_mouse_speed(v);
+                    log::warn!(
+                        "restored pointer speed {v} left slowed by a previous run path={}",
+                        p.display()
+                    );
+                }
             }
+            let _ = std::fs::remove_file(&p);
         }
-        let _ = std::fs::remove_file(&p);
     }
 }
 
@@ -3296,10 +3323,8 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
             g.native_gui_settle = None;
         } else if now <= settle.until {
             if !settle.reasserted {
-                let (_, actual) = warp_unclipped_verified(
-                    settle.target,
-                    "native GUI stale-source quarantine",
-                );
+                let (_, actual) =
+                    warp_unclipped_verified(settle.target, "native GUI stale-source quarantine");
                 settle.target = actual;
                 settle.reasserted = true;
                 log::warn!(
@@ -3313,10 +3338,8 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
             g.native_gui_settle = Some(settle);
             return true;
         } else {
-            let (_, actual) = warp_unclipped_verified(
-                settle.target,
-                "native GUI settle timeout recovery",
-            );
+            let (_, actual) =
+                warp_unclipped_verified(settle.target, "native GUI settle timeout recovery");
             g.native_gui_settle = None;
             g.last_set = actual;
             g.last_hw = actual;
@@ -4162,7 +4185,10 @@ impl InputSystem {
             let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
         if let Some(h) = self.handle.take() {
-            match self.done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            match self
+                .done_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
                 Ok(()) => {
                     let _ = h.join();
                     log::debug!("mouse-hook shutdown complete");
@@ -6104,10 +6130,7 @@ mod tests {
         for k in 0..80 {
             sim.hand(2, 0, 16);
             sim.hand(-2, 0, 16);
-            assert!(
-                !sim.g.engaged,
-                "post-exit wobble re-engaged at k={k}"
-            );
+            assert!(!sim.g.engaged, "post-exit wobble re-engaged at k={k}");
         }
         assert_eq!(sim.transitions, base, "post-exit edge zone oscillated");
         // A deliberate push inward DOES re-engage (normal use preserved).
