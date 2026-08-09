@@ -1,12 +1,10 @@
-# Language code reference
+# Language Code Reference
 
-This table is shared by the English and Japanese locale guides.
-Language names are written in their own language wherever practical.
+This is a reference list of language tags that can be used when adding locale files to cHiDeScaler-Neo.
 
-`短縮表示` is Neo's recommended short label for the Language button and is not
-an official Windows locale code.
+Language names are written in their native form wherever practical.
 
-| 言語名（各言語での表記） | 言語タグ | 短縮表示 |
+| Language name | Language tag | Short label |
 |---|---|---|
 | العربية | `ar-SA` | `AR` |
 | euskara | `eu-ES` | `EU` |
@@ -97,5 +95,5 @@ an official Windows locale code.
 | valencià | `ca-ES-valencia` | `VAL` |
 | Cymraeg | `cy-GB` | `CY` |
 
-> 対象: Windows 11で利用できる言語パックおよびLanguage Interface Pack（LIP）。廃止済みの旧タグは除外しています。
-> `短縮表示` はNeoのLanguageボタン用の推奨例であり、Windows公式コードではありません。
+> Scope: language packs and Language Interface Packs (LIP) available for Windows 11. Deprecated legacy tags are excluded.  
+> `Short label` is Neo's recommended compact label for the Language button. It is not an official Windows locale code.
