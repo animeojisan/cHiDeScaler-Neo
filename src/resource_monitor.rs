@@ -291,11 +291,18 @@ fn physical_engine_key(name: &str) -> String {
 fn compact_engine_key(key: &str) -> String {
     // Keep enough identity to compare adapters and engine type, but avoid
     // dumping very long PDH instance strings into every line.
-    let eng = key.find("_eng_").map(|index| &key[index + 1..]).unwrap_or(key);
+    let eng = key
+        .find("_eng_")
+        .map(|index| &key[index + 1..])
+        .unwrap_or(key);
     let phys = token_value(key, "phys_").unwrap_or("?");
     let luid = key
         .find("luid_")
-        .and_then(|start| key[start + 5..].find("_phys_").map(|end| &key[start + 5..start + 5 + end]))
+        .and_then(|start| {
+            key[start + 5..]
+                .find("_phys_")
+                .map(|end| &key[start + 5..start + 5 + end])
+        })
         .unwrap_or("?");
     format!("luid={luid}/phys={phys}/{eng}")
 }
@@ -337,4 +344,3 @@ fn query_process_name(pid: u32) -> Option<String> {
 fn filetime(value: FILETIME) -> u64 {
     (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
-
