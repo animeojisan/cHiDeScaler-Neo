@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon_1024.png" width="220" alt="cHiDeScaler-Neo">
+</p>
+
 <details>
 <summary>English</summary>
 
