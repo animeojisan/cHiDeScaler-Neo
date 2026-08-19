@@ -23,13 +23,18 @@ The bundled `presets.json`, GLSL shaders, and ONNX models are kept together so t
 
 **GPU Load** is a reference value and does not directly represent a percentage of the GPU's maximum theoretical performance.
 
+**HDR is not supported.** cHiDeScaler-Neo is designed for SDR video processing and output.
 
 ## Build
 
-On Windows:
+Requirements:
+
+* Windows 11 (64-bit)
+* Rust toolchain with `cargo`
+* MSVC-compatible Windows build tools
 
 ```bat
-BUILD_RELEASE.bat
+cargo build --release --bin chidescaler-neo
 ```
 
 The standard DirectML runtime files are included under `backends/`. TensorRT is an optional separate backend pack; see [`backends/tensorrt/README.md`](backends/tensorrt/README.md).
@@ -75,16 +80,19 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 
 GUIの **GPU負荷率は参考値** です。GPUの最大演算性能をそのまま何％消費しているかを示す値ではありません。
 
+**HDRには対応していません。** cHiDeScaler-Neo はSDR映像の処理・出力を前提としています。
 
 ## ビルド
 
-Windowsで、
+必要環境：
+
+* Windows 11（64-bit）
+* `cargo` を含むRustツールチェーン
+* MSVC互換のWindowsビルドツール
 
 ```bat
-BUILD_RELEASE.bat
+cargo build --release --bin chidescaler-neo
 ```
-
-を実行してください。
 
 標準のDirectML動作に必要なランタイムは `backends/` に同梱しています。TensorRTは別途追加するオプションバックエンドです。詳細は [`backends/tensorrt/README.md`](backends/tensorrt/README.md) を参照してください。
 
@@ -103,4 +111,3 @@ BUILD_RELEASE.bat
 
 本ソフトウェアは個人制作によるものです。ご利用は各自の判断と責任でお願いいたします。  
 本ソフトウェアの導入、設定、使用により生じたいかなる不具合、損害、トラブル等についても作者は責任を負いかねます。
-
