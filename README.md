@@ -36,9 +36,10 @@ The standard DirectML runtime files are included under `backends/`. TensorRT is 
 
 ## Acknowledgements / Reference Projects
 
-* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
-* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Magpie (Blinue)](https://github.com/Blinue/Magpie)
+* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
+* [mpv-AnimeJaNai (the-database)](https://github.com/the-database/mpv-AnimeJaNai)
+* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Anime4K (bloc97)](https://github.com/bloc97/Anime4K)
 * [OpenModelDB](https://openmodeldb.info/)
 
@@ -89,9 +90,10 @@ BUILD_RELEASE.bat
 
 ## 参考プロジェクト / 謝辞
 
-* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
-* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Magpie (Blinue)](https://github.com/Blinue/Magpie)
+* [mpv_PlayKit (hooke007)](https://github.com/hooke007/mpv_PlayKit)
+* [mpv-AnimeJaNai (the-database)](https://github.com/the-database/mpv-AnimeJaNai)
+* [vs_temporalfix (pifroggi)](https://github.com/pifroggi/vs_temporalfix)
 * [Anime4K (bloc97)](https://github.com/bloc97/Anime4K)
 * [OpenModelDB](https://openmodeldb.info/)
 
