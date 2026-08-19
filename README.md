@@ -11,12 +11,12 @@ cHiDeScaler-Neo captures a Windows application window and applies real-time GLSL
 
 * Windows Graphics Capture (WGC)
 * GLSL / ONNX filter chains and presets
+* User-addable ONNX models and mpv-compatible GLSL shaders
 * DirectML ONNX backend
 * Optional TensorRT backend for GeForce RTX 20 / 30 / 40 / 50 Series
 * RIFE / DRBA frame interpolation (x2–x5)
 * FPS limit / duplicate-frame reduction
 * Draw Stabilization / VSync / capture-resolution controls
-* Mini / Basic / Full GUI
 * Multi-language GUI and portable configuration
 
 The bundled `presets.json`, GLSL shaders, and ONNX models are kept together so the included presets can resolve their required files.
@@ -68,12 +68,12 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 
 * Windows Graphics Capture（WGC）
 * GLSL / ONNXフィルターチェーンとプリセット
+* ユーザーによるONNXモデル / mpv互換GLSLシェーダーの追加
 * DirectML ONNXバックエンド
 * GeForce RTX 20 / 30 / 40 / 50シリーズ向けオプションTensorRTバックエンド
 * RIFE / DRBA フレーム補間（x2～x5）
 * FPS上限 / 重複フレーム削減
 * 描画安定化 / VSync / キャプチャ解像度設定
-* Mini / Basic / Full GUI
 * 多言語GUI / ポータブル設定
 
 同梱 `presets.json` から必要なファイルを参照できるよう、現在使用しているGLSLシェーダー / ONNXモデルは同じ構成で維持しています。
