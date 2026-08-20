@@ -12,20 +12,20 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `admin.restart_failed` | Could not restart as administrator. Allow the Windows confirmation prompt and try again. |
 | `admin.restart_instruction` | Restart cHiDeScaler-Neo as administrator, then select the window again. |
 | `admin.target_elevated` | The selected window is running with administrator permission. |
-| `browser.hw_title` | HW Acceleration |
-| `browser.launch_failed` |  was not found or could not be launched |
-| `browser.launch_help` | Launch a dedicated browser with GPU video decoding disabled. Normal settings are unchanged; profile and cache stay in this tool. |
-| `browser.launch_sw` | Launch with HW decode OFF |
-| `browser.launched` |  launched |
 | `capture.click_target` | (Click the window to magnify) |
 | `capture.client_help` | Capture only the window contents; applies next start |
+| `capture.client_forced_help` | Capture resolution forces client-area-only capture until Auto is selected |
 | `capture.resolution_failed` | The source window cannot keep the requested capture resolution. Select Auto or a supported size. Capture was not started. |
 | `capture.running` | ● Running |
 | `capture.short` | Capture: |
 | `capture.size` | Capture size: |
 | `capture.size_help` | Auto keeps the current source size. A preset/custom value resizes the source client area. |
 | `capture.size_select_help` | Select the capture resolution. Auto keeps the current source size. |
+| `capture.fullscreen_notice_title` | Capture resolution |
+| `capture.fullscreen_notice_body` | Capture resolution is temporarily disabled while the source is fullscreen. Neo follows the source resolution reported by WGC. Your selected capture resolution will be applied again automatically after the source returns to windowed mode. |
 | `capture.start` | ▶ Start |
+| `capture.preparing` | Preparing… |
+| `capture.stopping` | Stopping… |
 | `capture.stop` | Stop |
 | `capture.stop_icon` | ■ Stop |
 | `capture.target` | 🎯 Target: |
@@ -56,6 +56,8 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `filter.none` | (No filters found) |
 | `filter.reorder_help` | (Hold and drag to reorder) |
 | `filter.toggle` | Enable/Disable |
+| `glsl_overload.lighter_filter_help` | Switch to a lighter filter to clear this warning. |
+| `glsl_overload.pause` | The filter is overloaded. Processing is paused while you use the GUI to protect responsiveness. |
 | `hdr.help` | Reduces blown highlights in HDR video. Applies next start. |
 | `hotkey.edit_help` | Hold Ctrl, Alt, or Shift and press a letter, number, function key, or navigation key. |
 | `hotkey.error.conflict` | This shortcut is already used by Windows or another application. |
@@ -70,7 +72,7 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `hotkey.error.win_blocked` | Win-key combinations are blocked because they conflict with Windows shortcuts. |
 | `hotkey.rules` | Two or three keys total. Modifier-only, Win-key, and reserved shortcuts are blocked. |
 | `interpolation.factor_help` | Output multiplier for frame-interpolation filters. x4/x5 target high-refresh displays and are limited automatically by the monitor refresh rate. |
-| `log.help` | Write cHiDeScaler-Neo.log for troubleshooting |
+| `log.help` | Write bounded rotating cHiDeScaler-Neo.log diagnostics for troubleshooting |
 | `panel.gui_topmost_disable_help` | Stop keeping the Neo GUI always on top. |
 | `panel.gui_topmost_enable_help` | Keep the Neo GUI always on top. |
 | `panel.keep_visible` | Keep visible |
@@ -113,7 +115,7 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `shortcut.panel` | Panel |
 | `shortcut.start_stop` | Start/Stop |
 | `shortcut.title` | Shortcuts |
-| `smooth.help` | Stabilizes presentation timing to reduce cadence-related stutter. Off prioritizes low latency and processes frames immediately. Separate from VSync. |
+| `smooth.help` | Stabilizes presentation timing to prioritize smooth scrolling and motion. Separate from VSync; if tearing or split-frame artifacts are noticeable, try VSync as well. |
 | `stats.help` | Total is the measured time from capture arrival to presentation.<br>Delay frames are total ms divided by the source frame interval. |
 | `stats.main` | Input: {in_w}x{in_h} → Internal: {internal_w}x{internal_h} → Output: {out_w}x{out_h}   Total: {total_ms}ms / Delay: {lag_frames} frames   Present: {present_fps}fps / Capture: {capture_fps}fps |
 | `stats.monitor` | Monitor: {width}x{height} @ {refresh}Hz |
@@ -123,4 +125,4 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `tensorrt.pack_required` | The separately distributed TensorRT Backend Pack is required. |
 | `tensorrt.preparing_label` | TensorRT (preparing) |
 | `tensorrt.unavailable_help` | The TensorRT backend is currently unavailable. Check cHiDeScaler-Neo.log for details. |
-| `vsync.help` | Sync presentation to the monitor refresh rate |
+| `vsync.help` | Synchronizes presentation to the monitor refresh to reduce tearing or split-frame artifacts; scrolling may feel less smooth on some systems. |

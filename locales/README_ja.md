@@ -40,5 +40,5 @@ cHiDeScaler-Neo のGUI翻訳ファイルを格納するフォルダです。
 
 ## 関連資料
 
-- [`LANGUAGE_CODES.md`](LANGUAGE_CODES.md) — 言語コード一覧
+- [`LANGUAGE_CODES_ja.md`](LANGUAGE_CODES_ja.md) — 言語コード一覧
 - [`TRANSLATION_KEYS.md`](TRANSLATION_KEYS.md) — 現在の翻訳キーと英語基準文
