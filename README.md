@@ -25,8 +25,6 @@ cHiDeScaler-Neo captures a Windows application window and applies real-time GLSL
 
 The bundled `presets.json`, GLSL shaders, and ONNX models are kept together so the included presets can resolve their required files.
 
-**GPU Load** is a reference value and does not directly represent a percentage of the GPU's maximum theoretical performance.
-
 **HDR is not supported.** cHiDeScaler-Neo is designed for SDR video processing and output.
 
 ## Build
@@ -81,8 +79,6 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 * 多言語GUI / ポータブル設定
 
 同梱 `presets.json` から必要なファイルを参照できるよう、現在使用しているGLSLシェーダー / ONNXモデルは同じ構成で維持しています。
-
-GUIの **GPU負荷率は参考値** です。GPUの最大演算性能をそのまま何％消費しているかを示す値ではありません。
 
 **HDRには対応していません。** cHiDeScaler-Neo はSDR映像の処理・出力を前提としています。
 
