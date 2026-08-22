@@ -68,6 +68,10 @@ pub struct Shared {
     pub client_only: AtomicBool,
     pub hwnd: std::sync::atomic::AtomicIsize,
     pub hdr: AtomicBool,
+    /// Stable raw WGC geometry for monitor-cover fullscreen sessions. When
+    /// present, only a +/-1px compositor drift is normalized; material size
+    /// changes are left untouched for the engine's normal resize path.
+    pub pixel_exact_raw_hint: Option<(u32, u32)>,
 }
 
 struct Handler {
@@ -79,6 +83,7 @@ struct Handler {
     last_crop_log: Option<(u32, u32, u32, u32, u32, u32)>,
     last_pad_log: Option<(u32, u32, u32, u32)>,
     last_missing_crop_log: Option<(u32, u32)>,
+    last_pixel_lock_log: Option<(u32, u32, u32, u32)>,
     diag_frames: u32,
     diag_callback_ms: f64,
     diag_callback_max_ms: f64,
@@ -137,6 +142,52 @@ fn client_crop_for_frame(
     best.map(|(_, crop)| crop)
 }
 
+/// Extend only the right/bottom edge by replicating the nearest source pixel.
+/// This is used by the fullscreen pixel-geometry lock before the ordinary
+/// even-size pad, so a transient -1px WGC content-size drift never triggers a
+/// rescale or changes the sampling origin.
+fn pad_edge_to_size(
+    data: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    target_width: u32,
+    target_height: u32,
+    bytes_per_pixel: usize,
+) -> (u32, u32) {
+    if width == 0
+        || height == 0
+        || bytes_per_pixel == 0
+        || target_width < width
+        || target_height < height
+    {
+        return (width, height);
+    }
+    let old_row = width as usize * bytes_per_pixel;
+    let new_row = target_width as usize * bytes_per_pixel;
+    if target_width != width {
+        data.resize(new_row * height as usize, 0);
+        for y in (0..height as usize).rev() {
+            let src = y * old_row;
+            let dst = y * new_row;
+            data.copy_within(src..src + old_row, dst);
+            let last = dst + old_row - bytes_per_pixel;
+            for x in width as usize..target_width as usize {
+                let out = dst + x * bytes_per_pixel;
+                data.copy_within(last..last + bytes_per_pixel, out);
+            }
+        }
+    }
+    if target_height != height {
+        let old_len = new_row * height as usize;
+        data.resize(new_row * target_height as usize, 0);
+        for y in height as usize..target_height as usize {
+            let dst = y * new_row;
+            data.copy_within(old_len - new_row..old_len, dst);
+        }
+    }
+    (target_width, target_height)
+}
+
 /// Preserve every captured source pixel while satisfying even-sized ONNX and
 /// shader pipelines. Repeat only the nearest edge pixel; black padding would
 /// create an artificial high-contrast boundary for sharpening/CNN filters.
@@ -151,26 +202,14 @@ fn pad_edge_to_even(
     }
     let padded_width = width + width % 2;
     let padded_height = height + height % 2;
-    let old_row = width as usize * bytes_per_pixel;
-    let new_row = padded_width as usize * bytes_per_pixel;
-    if padded_width != width {
-        data.resize(new_row * height as usize, 0);
-        for y in (0..height as usize).rev() {
-            let src = y * old_row;
-            let dst = y * new_row;
-            data.copy_within(src..src + old_row, dst);
-            data.copy_within(
-                dst + old_row - bytes_per_pixel..dst + old_row,
-                dst + old_row,
-            );
-        }
-    }
-    if padded_height != height {
-        let old_len = new_row * height as usize;
-        data.resize(old_len + new_row, 0);
-        data.copy_within(old_len - new_row..old_len, old_len);
-    }
-    (padded_width, padded_height)
+    pad_edge_to_size(
+        data,
+        width,
+        height,
+        padded_width,
+        padded_height,
+        bytes_per_pixel,
+    )
 }
 
 impl Handler {
@@ -178,6 +217,7 @@ impl Handler {
         &mut self,
         frame: &Frame<'_>,
         crop: Option<ClientCrop>,
+        raw_lock_size: Option<(u32, u32)>,
         destination: &mut Vec<u8>,
     ) -> Result<(i32, i32)> {
         let (x0, y0, x1, y1) = crop
@@ -265,6 +305,11 @@ impl Handler {
         unsafe {
             frame.device_context().Unmap(staging, 0);
         }
+        let (width, height) = if let Some((lock_w, lock_h)) = raw_lock_size {
+            pad_edge_to_size(destination, width, height, lock_w, lock_h, bytes_per_pixel)
+        } else {
+            (width, height)
+        };
         let (width, height) = pad_edge_to_even(destination, width, height, bytes_per_pixel);
         Ok((width as i32, height as i32))
     }
@@ -318,6 +363,7 @@ impl GraphicsCaptureApiHandler for Handler {
             last_crop_log: None,
             last_pad_log: None,
             last_missing_crop_log: None,
+            last_pixel_lock_log: None,
             diag_frames: 0,
             diag_callback_ms: 0.0,
             diag_callback_max_ms: 0.0,
@@ -340,11 +386,62 @@ impl GraphicsCaptureApiHandler for Handler {
         let source_time_100ns = frame.timestamp().ok().map(|t| t.Duration);
         let full_w = frame.width();
         let full_h = frame.height();
+        let hwnd = self.shared.hwnd.load(Ordering::Relaxed);
+        // Monitor-cover fullscreen sessions have a stable session-origin
+        // geometry. WGC/DWM can nevertheless report a one-pixel content-size
+        // drift while the source HWND itself has not resized. Normalize only
+        // that +/-1px WGC-only drift. If the HWND outer rect really changed,
+        // even by one pixel, leave it authoritative for the engine's normal
+        // source-resize path. The Win32 rect query therefore runs only on an
+        // actual +/-1px mismatch, not on every capture callback.
+        let pixel_lock = self
+            .shared
+            .pixel_exact_raw_hint
+            .and_then(|(lock_w, lock_h)| {
+                let dw = full_w.abs_diff(lock_w);
+                let dh = full_h.abs_diff(lock_h);
+                if dw > 1 || dh > 1 {
+                    return None;
+                }
+                if (full_w, full_h) == (lock_w, lock_h) {
+                    return Some((lock_w, lock_h));
+                }
+                let source_still_locked = crate::platform::win32::window_rect(hwnd)
+                    .is_some_and(|(_, _, w, h)| w == lock_w as i32 && h == lock_h as i32);
+                source_still_locked.then_some((lock_w, lock_h))
+            });
+        let pixel_lock_crop = pixel_lock.and_then(|(lock_w, lock_h)| {
+            if full_w > lock_w || full_h > lock_h {
+                Some(ClientCrop {
+                    x0: 0,
+                    y0: 0,
+                    x1: full_w.min(lock_w),
+                    y1: full_h.min(lock_h),
+                    reference: "fullscreen-pixel-lock",
+                })
+            } else {
+                None
+            }
+        });
+        if let Some((lock_w, lock_h)) = pixel_lock {
+            if (full_w, full_h) != (lock_w, lock_h) {
+                let key = (full_w, full_h, lock_w, lock_h);
+                if self.last_pixel_lock_log != Some(key) {
+                    log::info!(
+                        "wgc-pixel-exact-normalize: observed={}x{} locked={}x{} action=right/bottom-only trim-or-edge-replicate no-resize",
+                        full_w,
+                        full_h,
+                        lock_w,
+                        lock_h
+                    );
+                    self.last_pixel_lock_log = Some(key);
+                }
+            }
+        }
         // WGC frame bounds vary by window type. Most windows match DWM's
         // extended frame, while some PIP windows match the Win32 outer rect.
         // Select the coordinate reference whose dimensions match this frame.
         let client_only = self.shared.client_only.load(Ordering::Relaxed);
-        let hwnd = self.shared.hwnd.load(Ordering::Relaxed);
         let cache_key_matches = self.crop_cache.is_some_and(|cached| {
             cached.0 == full_w && cached.1 == full_h && cached.2 == client_only && cached.3 == hwnd
         });
@@ -376,13 +473,15 @@ impl GraphicsCaptureApiHandler for Handler {
             );
             self.last_missing_crop_log = Some((full_w, full_h));
         }
-        let base_size = client_crop
-            .map(|crop| (crop.x1 - crop.x0, crop.y1 - crop.y0))
-            .unwrap_or((full_w, full_h));
-        let crop = client_crop;
+        let base_size = pixel_lock.unwrap_or_else(|| {
+            client_crop
+                .map(|crop| (crop.x1 - crop.x0, crop.y1 - crop.y0))
+                .unwrap_or((full_w, full_h))
+        });
+        let crop = pixel_lock_crop.or(client_crop);
         if let Some(crop) = crop {
             let key = (full_w, full_h, crop.x0, crop.y0, crop.x1, crop.y1);
-            if self.last_crop_log != Some(key) {
+            if crop.reference != "fullscreen-pixel-lock" && self.last_crop_log != Some(key) {
                 log::info!(
                     "wgc-client-crop: frame={}x{} reference={} crop=({}, {})-({}, {}) result={}x{}",
                     full_w,
@@ -408,7 +507,7 @@ impl GraphicsCaptureApiHandler for Handler {
             .unwrap()
             .pop()
             .unwrap_or_else(|| std::mem::take(&mut self.scratch));
-        let (w, h) = self.copy_frame_to_vec(frame, valid_crop, &mut frame_data)?;
+        let (w, h) = self.copy_frame_to_vec(frame, valid_crop, pixel_lock, &mut frame_data)?;
         let pad_key = (base_size.0, base_size.1, w as u32, h as u32);
         if (w as u32, h as u32) != base_size && self.last_pad_log != Some(pad_key) {
             log::info!(
@@ -454,34 +553,49 @@ impl GraphicsCaptureApiHandler for Handler {
             self.scratch = frame_data;
         }
         self.shared.ready.notify_all();
-        let callback_ms = received_at.elapsed().as_secs_f64() * 1000.0;
-        self.diag_frames += 1;
-        self.diag_callback_ms += callback_ms;
-        self.diag_callback_max_ms = self.diag_callback_max_ms.max(callback_ms);
-        if let Some(previous) = self.last_received_at.replace(received_at) {
-            let interval_ms = received_at.duration_since(previous).as_secs_f64() * 1000.0;
-            self.diag_arrival_ms += interval_ms;
-            self.diag_arrival_max_ms = self.diag_arrival_max_ms.max(interval_ms);
-        }
-        if let Some(current) = source_time_100ns {
-            if let Some(previous) = self.last_source_time_100ns.replace(current) {
-                let interval_ms = current.saturating_sub(previous) as f64 / 10_000.0;
-                self.diag_source_ms += interval_ms;
-                self.diag_source_max_ms = self.diag_source_max_ms.max(interval_ms);
+        if crate::logging::diagnostics_enabled() {
+            let callback_ms = received_at.elapsed().as_secs_f64() * 1000.0;
+            self.diag_frames += 1;
+            self.diag_callback_ms += callback_ms;
+            self.diag_callback_max_ms = self.diag_callback_max_ms.max(callback_ms);
+            if let Some(previous) = self.last_received_at.replace(received_at) {
+                let interval_ms = received_at.duration_since(previous).as_secs_f64() * 1000.0;
+                self.diag_arrival_ms += interval_ms;
+                self.diag_arrival_max_ms = self.diag_arrival_max_ms.max(interval_ms);
             }
-        }
-        if self.diag_frames >= 120 {
-            let intervals = (self.diag_frames - 1).max(1) as f64;
-            log::info!(
-                "wgc-callback: frames={} callback_avg_ms={:.2} callback_max_ms={:.2} arrival_avg_ms={:.2} arrival_max_ms={:.2} source_avg_ms={:.2} source_max_ms={:.2}",
-                self.diag_frames,
-                self.diag_callback_ms / self.diag_frames as f64,
-                self.diag_callback_max_ms,
-                self.diag_arrival_ms / intervals,
-                self.diag_arrival_max_ms,
-                self.diag_source_ms / intervals,
-                self.diag_source_max_ms
-            );
+            if let Some(current) = source_time_100ns {
+                if let Some(previous) = self.last_source_time_100ns.replace(current) {
+                    let interval_ms = current.saturating_sub(previous) as f64 / 10_000.0;
+                    self.diag_source_ms += interval_ms;
+                    self.diag_source_max_ms = self.diag_source_max_ms.max(interval_ms);
+                }
+            }
+            if self.diag_frames >= 120 {
+                let intervals = (self.diag_frames - 1).max(1) as f64;
+                log::debug!(
+                    "wgc-callback: frames={} callback_avg_ms={:.2} callback_max_ms={:.2} arrival_avg_ms={:.2} arrival_max_ms={:.2} source_avg_ms={:.2} source_max_ms={:.2}",
+                    self.diag_frames,
+                    self.diag_callback_ms / self.diag_frames as f64,
+                    self.diag_callback_max_ms,
+                    self.diag_arrival_ms / intervals,
+                    self.diag_arrival_max_ms,
+                    self.diag_source_ms / intervals,
+                    self.diag_source_max_ms
+                );
+                self.diag_frames = 0;
+                self.diag_callback_ms = 0.0;
+                self.diag_callback_max_ms = 0.0;
+                self.diag_arrival_ms = 0.0;
+                self.diag_arrival_max_ms = 0.0;
+                self.diag_source_ms = 0.0;
+                self.diag_source_max_ms = 0.0;
+            }
+        } else if self.diag_frames != 0
+            || self.last_received_at.is_some()
+            || self.last_source_time_100ns.is_some()
+        {
+            // Reset once when diagnostics are turned off; do not add per-frame
+            // writes to the default lightweight capture callback.
             self.diag_frames = 0;
             self.diag_callback_ms = 0.0;
             self.diag_callback_max_ms = 0.0;
@@ -489,6 +603,8 @@ impl GraphicsCaptureApiHandler for Handler {
             self.diag_arrival_max_ms = 0.0;
             self.diag_source_ms = 0.0;
             self.diag_source_max_ms = 0.0;
+            self.last_received_at = None;
+            self.last_source_time_100ns = None;
         }
         Ok(())
     }
@@ -521,6 +637,19 @@ impl WgcSource {
         client_only: bool,
         hdr: bool,
     ) -> Result<Self> {
+        Self::start_fmt_with_pixel_lock(hwnd, fps_cap, client_only, hdr, None)
+    }
+
+    /// Start WGC with an optional stable raw-geometry hint. The hint is used
+    /// only to normalize +/-1px fullscreen compositor drift; larger geometry
+    /// changes remain visible to the engine.
+    pub fn start_fmt_with_pixel_lock(
+        hwnd: isize,
+        fps_cap: Option<u32>,
+        client_only: bool,
+        hdr: bool,
+        pixel_exact_raw_hint: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let shared = Arc::new(Shared {
             buf: Mutex::new(FrameBuf::default()),
             queue: Mutex::new(VecDeque::new()),
@@ -533,6 +662,7 @@ impl WgcSource {
             client_only: AtomicBool::new(client_only),
             hwnd: std::sync::atomic::AtomicIsize::new(hwnd),
             hdr: AtomicBool::new(false),
+            pixel_exact_raw_hint,
         });
         // No is_valid() pre-check: it rejects same-process/tool windows that
         // WGC can actually capture. Real incompatibility (shell/UWP windows)
@@ -587,6 +717,7 @@ impl WgcSource {
             client_only: AtomicBool::new(false),
             hwnd: std::sync::atomic::AtomicIsize::new(0),
             hdr: AtomicBool::new(false),
+            pixel_exact_raw_hint: None,
         });
         // As with window capture, keep WGC native delivery open to high-Hz
         // sources and apply optional rate limiting in the engine before HDR-to-SDR and the filter chain.

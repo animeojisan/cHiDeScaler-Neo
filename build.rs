@@ -22,13 +22,13 @@ fn main() {
         res.set("LegalCopyright", "(c) 2026 cHiDeScaler-Neo project");
         res.set("OriginalFilename", "cHiDeScaler-Neo.exe");
         res.set("InternalName", "chidescaler-neo");
-        res.set("ProductVersion", "0.7.7.0");
-        res.set("FileVersion", "0.7.7.0");
+        res.set("ProductVersion", "0.99.0.0");
+        res.set("FileVersion", "0.99.0.0");
         res.set_version_info(
             winresource::VersionInfo::PRODUCTVERSION,
-            0x0000_0007_0007_0000,
+            0x0000_0063_0000_0000,
         );
-        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0007_0007_0000);
+        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0063_0000_0000);
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon resource compile failed: {e}");
         }

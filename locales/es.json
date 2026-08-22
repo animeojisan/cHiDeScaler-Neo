@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "Alternativa DirectML: {count} filtro(s)",
   "tensorrt.pack_required": "Se necesita el TensorRT Backend Pack distribuido por separado.",
   "tensorrt.unavailable_help": "El backend TensorRT no está disponible en este momento. Consulte cHiDeScaler-Neo.log para obtener más detalles.",
+  "glsl_overload.auto_stop": "Rendimiento insuficiente. La ampliación se detendrá.",
   "glsl_overload.pause": "El filtro está sobrecargado. El procesamiento se pausa mientras usas la interfaz para mantener la respuesta.",
   "glsl_overload.lighter_filter_help": "Cambia a un filtro más ligero para quitar esta advertencia.",
   "capture.fullscreen_notice_title": "Resolución de captura",

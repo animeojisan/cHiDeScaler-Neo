@@ -17,7 +17,7 @@ use glow::HasContext;
 use half::f16;
 use rayon::prelude::*;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -39,6 +39,12 @@ const LOAD_REDUCTION_QUEUE_MAX: usize = 2;
 const NEOFLOW_FULL_DELAY_FRAMES: f64 = 5.0;
 const NEOFLOW_HARD_SKIP_DELAY_FRAMES: f64 = 5.25;
 const IDLE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+// A capture-size change resizes the foreign HWND on the GUI thread before the
+// render command can be dequeued. During that tiny hand-off window a normal
+// PIP/mpv window can already cover the monitor and look exactly like a source
+// fullscreen toggle. Give the geometry command time to arrive before deciding
+// that monitor coverage is application-owned.
+const FULLSCREEN_ENTER_GEOMETRY_GRACE: Duration = Duration::from_millis(400);
 // Temporarily frozen: capture the cadence exactly as WGC/the source app
 // presents it, including browser-video fullscreen. The detector remains
 // dormant for a possible later opt-in design.
@@ -46,6 +52,96 @@ const AUTO_CONTENT_CADENCE_ENABLED: bool = false;
 /// A half-second at 30fps (quarter-second at 60fps) proves a genuinely held
 /// picture without weakening any of the motion/zoom/fade comparisons.
 const STRICT_STATIC_HOLD_FRAMES: u16 = 15;
+
+// DirectML RIFE becomes both impractically expensive and, on the reproduced
+// NVIDIA path, can return corrupted high-resolution midpoints when a preceding
+// upscale chain raises its input to ~1920p.  Match the proven mpv/VapourSynth
+// practice: cap only DirectML RIFE input height, preserve aspect ratio, and let
+// the ordinary post-chain/final display scaler handle the capped result.
+// TensorRT/CUDA and non-RIFE interpolation are intentionally untouched.
+const DIRECTML_RIFE_MAX_HEIGHT: i32 = 1440;
+
+// v348b-v348e: low-end responsiveness guard for filter chains containing GLSL.
+// The GUI owns the existing PDH sampler; the render library receives only its
+// latest coarse percentage via this atomic handoff. v348c added GUI-priority
+// admission after overload is proven; v348d also covers ordinary ONNX+GLSL.
+// v348e extends protection to interpolation routes only when post-interpolation
+// GLSL exists, without changing healthy interpolation scheduling. Keep
+// resource_monitor binary-local exactly as in v347.
+const GLSL_GUARD_SOFT_GPU_PERCENT: f32 = 86.0;
+const GLSL_GUARD_HARD_GPU_PERCENT: f32 = 94.0;
+const GLSL_GUARD_RELEASE_GPU_PERCENT: f32 = 82.0;
+// v348h: once a processed frame proves that saturation is also missing the
+// presentation deadline, do not leave the GUI sluggish for another half
+// second before arming protection. Mild/transient misses still use a short
+// confirmation hold; severe misses have a one-frame fast path below.
+const GLSL_GUARD_SOFT_HOLD: Duration = Duration::from_millis(220);
+const GLSL_GUARD_HARD_HOLD: Duration = Duration::from_millis(90);
+const GLSL_GUARD_RELEASE_HOLD: Duration = Duration::from_millis(1200);
+// v348o: a live filter/preset replacement performs resource teardown, texture-pool
+// trimming, provider/shared-buffer reconnects and first-use shader/ONNX warmup.
+// Those transition frames are not representative of steady-state load. Ignore
+// overload admission for roughly one second after each successful chain apply,
+// then judge only the settled frames. A truly catastrophic frame that itself
+// takes longer than the settle window is still judged as soon as it returns.
+const GLSL_GUARD_CHAIN_SETTLE: Duration = Duration::from_millis(1000);
+// After the one-second settle window, keep the one-frame emergency shortcut
+// disabled briefly so steady overload must survive the ordinary 90/220ms
+// confirmation holds. This avoids latching on one last cache/compositor spike
+// exactly at the settle boundary while still reacting at about 1.1-1.2s.
+const GLSL_GUARD_CHAIN_CONFIRM: Duration = Duration::from_millis(300);
+// v348p: capture-resolution changes alter the workload enough that the old
+// guard state/history is no longer evidence for the new geometry. Keep the
+// warning visible while the resized provider/GPU clocks settle, but evaluate
+// the new geometry exactly like a fresh capture session: no old frame-hold, no
+// geometry-independent fast-reconfirm, and the ordinary guard thresholds.
+const GLSL_GUARD_RESOLUTION_RECHECK_SETTLE: Duration = Duration::from_millis(1000);
+const GLSL_GUARD_RESOLUTION_RECHECK_TIMEOUT: Duration = Duration::from_secs(8);
+// Once the existing overload detector has *proven* the current GLSL
+// workload is beyond the machine, give the user a readable warning interval
+// and then use the ordinary Stop route. While that grace period is active,
+// non-interpolation GLSL chains hold the last complete filtered frame instead
+// of continuing to saturate the GPU. This does not alter the overload
+// thresholds or healthy-frame scheduling.
+const GLSL_OVERLOAD_AUTO_STOP_GRACE: Duration = Duration::from_secs(6);
+// GUI GPU usage is still sampled for the ordinary non-interpolation GLSL
+// admission guard. Interpolation chains never omit selected post filters.
+static GUI_GPU_PERCENT_X10: AtomicU32 = AtomicU32::new(u32::MAX);
+
+// v528: the native panel host is positioned by the render thread, while lurk
+// restore is prepared atomically by the GUI thread. During the few milliseconds
+// before Cmd::SetPanelState(chip=false) reaches the render FIFO, the render
+// thread may still hold panel_chipped=true and can otherwise shrink the host
+// back to stale lurk-chip geometry after the GUI has already restored/drawn
+// the full bar.
+// This guard is deliberately narrower than making all panel state lock-free:
+// it only suppresses that stale chip geometry until the queued final state is
+// consumed by the render thread.
+static PANEL_LURK_RESTORE_GEOMETRY_GUARD: AtomicBool = AtomicBool::new(false);
+
+pub fn begin_panel_lurk_restore_geometry_guard() {
+    PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(true, Ordering::Release);
+}
+
+fn panel_lurk_restore_geometry_guard_active() -> bool {
+    PANEL_LURK_RESTORE_GEOMETRY_GUARD.load(Ordering::Acquire)
+}
+
+/// Publish the GUI's already-sampled GPU percentage to the render engine.
+/// This is intentionally a scalar handoff: no PDH object crosses threads or
+/// crate/module boundaries, and the v347 ResourceMonitor lifetime is unchanged.
+pub fn set_gui_gpu_percent(value: Option<f32>) {
+    let raw = value
+        .filter(|value| value.is_finite())
+        .map(|value| (value.clamp(0.0, 100.0) * 10.0).round() as u32)
+        .unwrap_or(u32::MAX);
+    GUI_GPU_PERCENT_X10.store(raw, Ordering::Relaxed);
+}
+
+fn latest_gui_gpu_percent() -> Option<f32> {
+    let raw = GUI_GPU_PERCENT_X10.load(Ordering::Relaxed);
+    (raw != u32::MAX).then_some(raw as f32 / 10.0)
+}
 
 // Safety fallback for an unexpected Rgba16F frame. The normal RGBA8
 // HDR option deliberately requests Rgba8 and uses the lightweight byte-domain
@@ -177,6 +273,10 @@ pub enum Cmd {
         requested: (u32, u32),
         applied: (u32, u32),
     },
+    /// Return a running session to native WGC geometry (Capture size = Auto).
+    /// This also clears any capture-resolution reservation that was suspended
+    /// while the source owned a real fullscreen presentation.
+    ClearCaptureGeometry,
     /// Screen rects (GUI window / control panel) where the cursor must not
     /// engage, so those windows stay clickable above the overlay.
     SetNoEngage(Vec<(i32, i32, i32, i32, isize)>),
@@ -229,6 +329,33 @@ pub struct Status {
     pub target_title: String,
     pub last_error: Option<String>,
     pub warning: Option<String>,
+    /// Live monitor-covering fullscreen state of the selected source. This may
+    /// change after Start when an application uses its own fullscreen button.
+    pub source_live_fullscreen: bool,
+    /// GUI-side live resize intent published before resize_client_area(). This
+    /// closes the small cross-thread window where the foreign HWND already
+    /// covers the monitor but SetCaptureGeometry has not been dequeued yet.
+    pub capture_resolution_resize_intent: Option<(u32, u32)>,
+    /// Incremented once whenever an active capture-resolution reservation is
+    /// suspended because the source entered real fullscreen.
+    pub capture_resolution_fullscreen_notice_seq: u64,
+    /// Incremented after a fullscreen source has stably returned to windowed
+    /// geometry so the GUI can reapply the latest capture-size preference.
+    pub capture_resolution_reapply_seq: u64,
+    /// A GLSL-containing chain has already been proven overloaded and heavy
+    /// filter work is temporarily reduced while the real cursor owns Neo's GUI.
+    /// This is the live protection state only; it may turn off when the pointer
+    /// leaves the GUI.
+    pub glsl_interactive_pause: bool,
+    /// v348h/v348k: user-facing overload notice is latched for the CURRENT
+    /// filter chain. Keep it visible across cursor/GUI ownership changes. It is
+    /// cleared by an actual chain change/Stop, or after a live capture-resolution
+    /// change is measured stably healthy and a full-chain verification frame passes.
+    pub glsl_overload_notice_latched: bool,
+    /// Deadline armed only after the existing overload detector has
+    /// latched the user-facing warning. The GUI dispatches the same ordinary
+    /// Cmd::Stop route when this expires; None means no automatic Stop pending.
+    pub glsl_overload_auto_stop_deadline: Option<Instant>,
     pub chain_errors: Vec<String>,
     pub presented: u64,
     pub overlay_rect: (i32, i32, i32, i32),
@@ -317,6 +444,37 @@ pub struct EngineHandle {
     done_rx: Receiver<()>,
 }
 
+#[derive(Clone)]
+pub struct EngineStopHandle {
+    tx: Sender<Cmd>,
+    pending_chain: Arc<Mutex<Option<Vec<StageSpec>>>>,
+    pending_no_engage: Arc<Mutex<PendingNoEngage>>,
+    stop_requested: Arc<AtomicBool>,
+    status: Arc<Mutex<Status>>,
+}
+
+impl EngineStopHandle {
+    pub fn request_stop(&self, reason: &str) {
+        let active = {
+            let state = self
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.starting || state.running
+        };
+        if !active {
+            return;
+        }
+        *self.pending_chain.lock().unwrap() = None;
+        self.pending_no_engage.lock().unwrap().publish(Vec::new());
+        self.stop_requested.store(true, Ordering::Release);
+        let _ = crate::render::onnx_stage::request_onnx_cancel();
+        let _ = crate::render::onnx_stage::request_tensorrt_cancel();
+        recover_visible_capture_state_now(&self.status, reason);
+        let _ = self.tx.send(Cmd::WakeForStop);
+    }
+}
+
 struct EngineThreadDone(Sender<()>);
 impl Drop for EngineThreadDone {
     fn drop(&mut self) {
@@ -340,6 +498,9 @@ fn emergency_recover_engine_state(
         state.starting = false;
         state.running = false;
         state.stopping = false;
+        state.glsl_interactive_pause = false;
+        state.glsl_overload_notice_latched = false;
+        state.glsl_overload_auto_stop_deadline = None;
         state.overlay_hwnd = 0;
         state.content_rect = (0, 0, 0, 0);
         state.overlay_rect = (0, 0, 0, 0);
@@ -389,6 +550,9 @@ fn recover_visible_capture_state_now(status: &Arc<Mutex<Status>>, reason: &str) 
         state.starting = false;
         state.running = false;
         state.stopping = true;
+        state.glsl_interactive_pause = false;
+        state.glsl_overload_notice_latched = false;
+        state.glsl_overload_auto_stop_deadline = None;
         let overlay_hwnd = state.overlay_hwnd;
         state.overlay_hwnd = 0;
         state.content_rect = (0, 0, 0, 0);
@@ -399,6 +563,11 @@ fn recover_visible_capture_state_now(status: &Arc<Mutex<Status>>, reason: &str) 
             state.source_recovery.take(),
         )
     };
+
+    // Break USER32 helper-owner chains before the overlay is hidden. Otherwise
+    // hiding the overlay can implicitly hide an owned panel/cursor and poison
+    // the next Start, especially when GUI-topmost is OFF.
+    detach_overlay_owned_helpers(overlay_hwnd);
 
     // The overlay HWND is owned by the render thread, but changing the alpha
     // of a top-level Win32 window is thread-safe and avoids waiting behind a
@@ -431,6 +600,15 @@ fn recover_visible_capture_state_now(status: &Arc<Mutex<Status>>, reason: &str) 
 }
 
 impl EngineHandle {
+    pub fn stop_handle(&self) -> EngineStopHandle {
+        EngineStopHandle {
+            tx: self.tx.clone(),
+            pending_chain: self.pending_chain.clone(),
+            pending_no_engage: self.pending_no_engage.clone(),
+            stop_requested: self.stop_requested.clone(),
+            status: self.status.clone(),
+        }
+    }
     pub fn spawn(base_dir: std::path::PathBuf) -> Self {
         let cache_root = base_dir.join("cache").join("TensorRT");
         Self::spawn_with_backend(base_dir, OnnxBackendPreference::DirectML, None, cache_root)
@@ -442,6 +620,7 @@ impl EngineHandle {
         trt_device_id: Option<i32>,
         trt_cache_root: std::path::PathBuf,
     ) -> Self {
+        PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
         let (tx, rx) = channel();
         let (done_tx, done_rx) = channel();
         let pending_chain = Arc::new(Mutex::new(None));
@@ -457,6 +636,11 @@ impl EngineHandle {
         let pending_chain2 = pending_chain.clone();
         let pending_no_engage2 = pending_no_engage.clone();
         let stop_requested2 = stop_requested.clone();
+        // The render thread also needs a sender for the native floating-panel
+        // Stop path. That path is consumed out-of-band before the GUI can turn
+        // it into Cmd::Stop, so it must enqueue the same WakeForStop boundary
+        // token itself or Status::stopping would remain latched forever.
+        let control_tx = tx.clone();
         let thread = std::thread::Builder::new()
             .name("render-engine".into())
             .spawn(move || {
@@ -464,6 +648,7 @@ impl EngineHandle {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     engine_main(
                         rx,
+                        control_tx,
                         pending_chain2,
                         pending_no_engage2,
                         stop_requested2,
@@ -511,6 +696,7 @@ impl EngineHandle {
     pub fn send(&self, cmd: Cmd) {
         match cmd {
             Cmd::Stop => {
+                PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
                 // Do not queue cancellation behind the render thread: a heavy
                 // DirectML/TensorRT Session::Run may currently own that thread.
                 // RunOptions::terminate is cooperative and returns immediately,
@@ -529,6 +715,7 @@ impl EngineHandle {
                 }
             }
             Cmd::Shutdown => {
+                PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
                 *self.pending_chain.lock().unwrap() = None;
                 self.pending_no_engage.lock().unwrap().publish(Vec::new());
                 self.stop_requested.store(true, Ordering::Release);
@@ -554,11 +741,18 @@ impl EngineHandle {
                     }
                     state.starting = true;
                     state.last_error = None;
+                    let fullscreen_origin = source_restore_rect
+                        .map(|rect| win32::is_rect_monitor_fullscreen(hwnd, rect))
+                        .unwrap_or_else(|| win32::is_monitor_fullscreen(hwnd));
+                    state.source_live_fullscreen = fullscreen_origin;
                     state.source_recovery = Some((
                         hwnd,
                         source_restore_rect,
                         source_was_maximized,
-                        win32::is_topmost(hwnd),
+                        // Fullscreen pixel-lock sessions deliberately never
+                        // promote the foreign source HWND, so recovery must
+                        // not issue a matching NOTOPMOST mutation either.
+                        win32::is_topmost(hwnd) || fullscreen_origin,
                     ));
                 }
                 self.stop_requested.store(false, Ordering::Release);
@@ -653,6 +847,10 @@ fn enforce_gui_priority(
     panel_hwnd: isize,
     overlay_hwnd: isize,
 ) {
+    // Exact v235 contract: GUI priority logic has no authority at all when the
+    // GUI is not TOPMOST. This hard split prevents later GUI-topmost fixes from
+    // leaking SetWindowPos/DWM side effects into the historically stable OFF
+    // path. The ordinary panel block below retains its own v235-style repair.
     if !gui_topmost
         || gui_hwnd == 0
         || !win32::is_window_valid(gui_hwnd)
@@ -660,16 +858,35 @@ fn enforce_gui_priority(
     {
         return;
     }
-    let below_panel = panel_hwnd != 0
+
+    // GUI-topmost ON keeps the modern stable hierarchy.
+    win32::normalize_neo_topmost_stack(gui_hwnd, true, panel_hwnd, overlay_hwnd);
+    crate::input::keep_cursor_sprite_on_top();
+}
+
+fn reposition_overlay_for_gui_mode(
+    overlay: &mut OverlayWindow,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    gui_topmost: bool,
+) {
+    if gui_topmost {
+        overlay.reposition(x, y, w, h);
+    } else {
+        overlay.reposition_v235_topmost(x, y, w, h);
+    }
+}
+
+fn detach_overlay_owned_helpers(overlay_hwnd: isize) {
+    crate::input::detach_cursor_sprite_owner();
+    let panel_hwnd = win32::panel_gdi_host_hwnd();
+    if panel_hwnd != 0
         && win32::is_window_valid(panel_hwnd)
-        && win32::is_window_visible(panel_hwnd)
-        && !win32::window_is_above(gui_hwnd, panel_hwnd);
-    let below_overlay = overlay_hwnd != 0
-        && win32::is_window_valid(overlay_hwnd)
-        && !win32::window_is_above(gui_hwnd, overlay_hwnd);
-    if below_panel || below_overlay {
-        win32::raise_topmost(gui_hwnd);
-        crate::input::keep_cursor_sprite_on_top();
+        && (overlay_hwnd == 0 || win32::window_owner(panel_hwnd) == overlay_hwnd)
+    {
+        win32::set_panel_overlay_owner(panel_hwnd, overlay_hwnd, false);
     }
 }
 
@@ -1207,8 +1424,140 @@ fn compositor_signatures_match(a: &FrameSignature, b: &FrameSignature) -> bool {
     sum * 20 <= a.luma.len() as u32
 }
 
+/// Choose the native input coordinate space that corresponds to the WGC frame.
+///
+/// Client-only capture intentionally maps to the client rect. Full-window WGC
+/// can use either DWM extended-frame bounds or the Win32 outer rect depending
+/// on window type; choose the candidate whose dimensions best match the actual
+/// captured/display aspect (allowing the existing right/bottom even-pad row).
+fn source_input_reference_rect(
+    hwnd: isize,
+    client_only: bool,
+    frame_size: (i32, i32),
+) -> Option<((i32, i32, i32, i32), bool, &'static str)> {
+    if client_only {
+        return win32::client_rect_on_screen(hwnd).map(|r| (r, false, "client"));
+    }
+
+    let (fw, fh) = frame_size;
+    let mut best: Option<(i64, (i32, i32, i32, i32), &'static str)> = None;
+    for (kind, candidate) in [
+        ("dwm", win32::extended_frame_bounds(hwnd)),
+        ("outer", win32::window_rect(hwnd)),
+    ] {
+        let Some(rect @ (_, _, rw, rh)) = candidate else {
+            continue;
+        };
+        if rw <= 0 || rh <= 0 {
+            continue;
+        }
+        let score = (rw as i64 - fw as i64).abs() + (rh as i64 - fh as i64).abs();
+        if best.is_none_or(|(best_score, _, _)| score < best_score) {
+            best = Some((score, rect, kind));
+        }
+    }
+
+    if let Some((_, rect, kind)) = best {
+        return Some((rect, true, kind));
+    }
+
+    // Defensive fallback for unusual windows where DWM/outer geometry cannot
+    // be queried. This preserves operability rather than retaining stale input.
+    win32::client_rect_on_screen(hwnd).map(|r| (r, false, "client-fallback"))
+}
+
+/// Position changes do not alter the WGC surface.  Keep the fullscreen/resize
+/// watchdog strictly size-based so ordinary title-bar dragging can never arm
+/// a capture restart.
+fn rect_size_changed(previous: (i32, i32, i32, i32), next: (i32, i32, i32, i32)) -> bool {
+    previous.2 != next.2 || previous.3 != next.3
+}
+
+/// Compare a delivered WGC frame with the native rectangle that actually
+/// corresponds to that capture mode.  A one-pixel right/bottom even pad is
+/// expected and must not be treated as stale geometry.
+fn frame_size_mismatches_reference(frame: (i32, i32), reference: (i32, i32, i32, i32)) -> bool {
+    (frame.0 - reference.2).abs() > 2 || (frame.1 - reference.3).abs() > 2
+}
+
+fn should_enter_live_fullscreen(
+    source_monitor_fullscreen: bool,
+    live_monitor_fullscreen: bool,
+    capture_canvas: Option<(i32, i32)>,
+    monitor_size: (i32, i32),
+    source_presentation_signature: Option<(u32, u32, bool)>,
+    live_presentation_signature: Option<(u32, u32, bool)>,
+    capture_resize_intent: Option<(u32, u32)>,
+    recent_geometry_change: bool,
+) -> bool {
+    if !live_monitor_fullscreen {
+        return false;
+    }
+    if source_monitor_fullscreen {
+        return true;
+    }
+
+    // Fullscreen buttons/F11 commonly remove normal window chrome or change
+    // maximized presentation state. That is source-owned even when the user's
+    // requested capture canvas happens to equal the monitor resolution.
+    let presentation_changed = source_presentation_signature
+        .zip(live_presentation_signature)
+        .is_some_and(|(origin, live)| origin != live);
+    if presentation_changed {
+        return true;
+    }
+
+    // resize_client_area() runs before SetCaptureGeometry reaches this thread.
+    // The GUI publishes the requested dimensions synchronously before touching
+    // the foreign HWND, so even a very fast WGC resize cannot be mistaken for
+    // an application-owned fullscreen transition.
+    let resize_intent_targets_monitor = capture_resize_intent.is_some_and(|target| {
+        (target.0 as i32 - monitor_size.0).abs() <= 2
+            && (target.1 as i32 - monitor_size.1).abs() <= 2
+    });
+    if resize_intent_targets_monitor {
+        return false;
+    }
+
+    // Keep a short geometry-only fallback as a second line of defence for
+    // unusual source-window transitions that race the GUI status hand-off. A
+    // genuine source transition with no matching capture-size command is
+    // reconsidered after the grace period.
+    if recent_geometry_change {
+        return false;
+    }
+
+    // The important v471 distinction: a windowed-origin PIP/mpv window that
+    // Neo intentionally resized to the monitor's exact client canvas remains a
+    // normal resizable source. Pixel dimensions alone are not fullscreen state.
+    // If the application later changes its presentation style, the branch above
+    // still detects the real fullscreen transition.
+    let neo_owned_monitor_canvas = capture_canvas.is_some_and(|target| {
+        (target.0 - monitor_size.0).abs() <= 2 && (target.1 - monitor_size.1).abs() <= 2
+    });
+    !neo_owned_monitor_canvas
+}
+
 struct Session {
     hwnd: isize,
+    /// Immutable session-origin monitor coverage. Fullscreen source hiding must
+    /// happen only after the opaque overlay has been committed, otherwise the
+    /// desktop is exposed between the two DWM updates.
+    source_monitor_fullscreen: bool,
+    /// Live fullscreen state. Unlike source_monitor_fullscreen this can change
+    /// after Start.
+    source_live_fullscreen: bool,
+    /// Fullscreen-relevant source chrome/maximize state sampled at session
+    /// start. Geometry alone is insufficient because Neo may intentionally
+    /// resize a normal PIP/mpv window to exactly 1920x1080 on a 1080p monitor.
+    source_presentation_signature: Option<(u32, u32, bool)>,
+    /// Keep the explicit capture canvas reserved, but do not force it onto WGC
+    /// while the source owns a real fullscreen presentation.
+    capture_canvas_suspended_for_fullscreen: bool,
+    /// After fullscreen exit, keep native WGC authoritative until the GUI
+    /// reapplies the user's latest capture-size preference.
+    capture_resolution_reapply_pending: bool,
+    fullscreen_exit_candidate_since: Option<Instant>,
     browser_fullscreen_cadence: bool,
     source: WgcSource,
     chain: FilterChain,
@@ -1230,6 +1579,10 @@ struct Session {
     source_restart_last: Instant,
     last_tex: Option<GpuTex>,
     last_present: Instant,
+    // Start of the most recent SwapBuffers call. Interpolation pacing must
+    // anchor to submission time, not completion time, because a healthy DWM
+    // path may block inside SwapBuffers for several milliseconds.
+    last_present_started: Instant,
     frame: FrameBuf,
     /// A live chain replacement must process the cached source even when a
     /// static PIP does not emit another WGC frame.
@@ -1292,6 +1645,32 @@ struct Session {
     monitor_rect: (i32, i32, i32, i32),
     /// windowed mode: overlay tracks source-window movement by delta
     last_src_pos: Option<(i32, i32)>,
+    /// A real source title-bar/button drag is in progress. While held, the
+    /// hidden source must be allowed to move naturally; repeatedly rebasing it
+    /// fights the native move loop and eventually corrupts the input mapping.
+    source_drag_active: bool,
+    /// Chromium PIP/custom-frame windows can move from a drag that begins
+    /// entirely in the client area, so input.rs never sees a native caption
+    /// drag. Track that separately and rebase the hidden source exactly once
+    /// after button-up; otherwise its client rect can remain beyond the
+    /// desktop while ClipCursor still uses the full source rect, making the
+    /// lower/right part of the magnified view physically unreachable.
+    source_client_drag_active: bool,
+    /// Recovery latch for an unowned client-only move.  A provider/input
+    /// transition can clear SOURCE_CLIENT_DRAG_OWNER_HWND while Chromium is
+    /// still inside the same physical LEFT move loop.  In that case the hidden
+    /// source may continue moving off-desktop even though the visual follower
+    /// is correctly suppressed.  Rebase it once after LEFT is released so the
+    /// existing v423-v430 cursor reachability guarantees are not bypassed.
+    source_client_unowned_rebase_pending: bool,
+    /// Visual authority for a client-only window drag. The source HWND may hit
+    /// Chromium/Windows off-screen constraints (observed x=-284 for a 640px
+    /// PIP) while the user's raw WH_MOUSE_LL coordinate keeps travelling. Once
+    /// a native client move proves that this gesture is a window drag, keep the
+    /// overlay anchored to raw LEFT-down -> current movement instead of the
+    /// source HWND's potentially clamped per-frame delta.
+    source_client_drag_raw_origin: Option<(i32, i32)>,
+    source_client_drag_overlay_origin: Option<(i32, i32)>,
     arrival_interval: f64,
     last_arrival: Instant,
     /// set once the 3s frame-starvation watchdog released the cursor
@@ -1354,6 +1733,11 @@ struct Session {
     /// Results received during a short deadline-driven wait are staged here
     /// and consumed by the ordinary validation/import path on the next drain.
     gpu_interp_result_stash: std::collections::VecDeque<GpuInterpResult>,
+    /// x4/x5 scheduling handshake: release the next provider timestep only
+    /// after the current output's GL post-chain has been submitted. This
+    /// prioritizes the frame that is about to be presented without waiting
+    /// through SwapBuffers before the next unique RIFE/DRBA invocation starts.
+    gpu_interp_permit_after_post_submit: Option<(u64, u64)>,
     gpu_interp_pair_id: u64,
     gpu_interp_active_logged: bool,
     /// Cursor mapping stays released while a newly-selected interpolation
@@ -1375,6 +1759,9 @@ struct Session {
     /// Suppress per-frame file logging for the correctness-first pre-chain
     /// readback route. Log only when its geometry or stage count changes.
     pre_chain_route_log_key: Option<(i32, i32, i32, i32, usize)>,
+    /// DirectML RIFE has a fixed safety/performance input-height cap. Keep the
+    /// diagnostic one-shot per source/limited geometry and chain position.
+    dml_rife_limit_log_key: Option<(i32, i32, i32, i32, usize)>,
     /// source client rect as of the previous tick (geometry-change detection)
     last_client_rect: Option<(i32, i32, i32, i32)>,
     last_process_ms: f64,
@@ -1397,10 +1784,540 @@ struct Session {
     /// present gives us a trustworthy DWM/vblank phase sample; a non-blocking
     /// present leaves the manual deadline as the authority.
     last_present_block_ms: f64,
+    /// Diagnostic-only compositor pressure accumulator. It correlates long
+    /// overlay SwapBuffers waits with the GUI-side `panel-frame-diag` timeline
+    /// without changing any presentation or pacing decision.
+    compositor_pressure_window_started: Instant,
+    compositor_pressure_samples: u32,
+    compositor_pressure_max_ms: f64,
+    compositor_pressure_sum_ms: f64,
     last_filter_retry_log: Option<Instant>,
     metric_seq: u64,
     last_metrics_log: Instant,
     phase_diag_samples: u8,
+    glsl_guard: GlslResponsivenessGuard,
+    /// GLSL-containing chains that were already proven
+    /// overloaded during this capture session. This survives chain edits so
+    /// re-selecting the same heavy chain
+    /// can be recognized after a single verification frame instead of another
+    /// long saturation window. It is discarded on Stop because Session is.
+    glsl_overload_history: std::collections::VecDeque<String>,
+    glsl_overload_hint: bool,
+    /// v348o: chain/preset replacement settle window. Guard observations made
+    /// before this instant are discarded because provider/shader/cache setup
+    /// can make the first replacement frames much slower than steady state.
+    glsl_chain_settle_until: Option<Instant>,
+    glsl_chain_immediate_until: Option<Instant>,
+    /// v348k: a live capture-resolution change may make the current chain
+    /// healthy without changing any filters. While the user remains in the
+    /// GUI, admit guarded validation frames and clear the latched warning only
+    /// after the new geometry is stably healthy and one final full-chain frame
+    /// also passes.
+    glsl_resolution_recheck_active: bool,
+    glsl_resolution_recheck_started: Option<Instant>,
+    glsl_resolution_recheck_healthy_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlslGuardMode {
+    Off,
+    Soft,
+    Hard,
+}
+
+struct GlslResponsivenessGuard {
+    mode: GlslGuardMode,
+    overload_since: Option<Instant>,
+    hard_overload_since: Option<Instant>,
+    healthy_since: Option<Instant>,
+    admission_phase: u8,
+    last_log: Instant,
+    skipped_since_log: u32,
+}
+
+impl Default for GlslResponsivenessGuard {
+    fn default() -> Self {
+        Self {
+            mode: GlslGuardMode::Off,
+            overload_since: None,
+            hard_overload_since: None,
+            healthy_since: None,
+            admission_phase: 0,
+            last_log: Instant::now() - Duration::from_secs(5),
+            skipped_since_log: 0,
+        }
+    }
+}
+
+impl GlslResponsivenessGuard {
+    fn set_mode(&mut self, next: GlslGuardMode, gpu: f32, frame_ms: f64, budget_ms: f64) {
+        if self.mode == next {
+            return;
+        }
+        self.mode = next;
+        self.admission_phase = 0;
+        log::info!(
+            "glsl-responsiveness-guard: mode={:?} gpu={:.1}% frame_ms={:.2} budget_ms={:.2} action={}",
+            next,
+            gpu,
+            frame_ms,
+            budget_ms,
+            match next {
+                GlslGuardMode::Off => "normal-all-frames",
+                GlslGuardMode::Soft => "process-1-of-2-hold-last-complete-frame",
+                GlslGuardMode::Hard => "process-1-of-3-hold-last-complete-frame",
+            }
+        );
+        self.last_log = Instant::now();
+    }
+
+    fn reset(&mut self) {
+        self.mode = GlslGuardMode::Off;
+        self.overload_since = None;
+        self.hard_overload_since = None;
+        self.healthy_since = None;
+        self.admission_phase = 0;
+        self.skipped_since_log = 0;
+    }
+
+    fn observe_processed(
+        &mut self,
+        eligible: bool,
+        gpu: Option<f32>,
+        frame_ms: f64,
+        present_ms: f64,
+        budget_ms: f64,
+        allow_immediate: bool,
+    ) {
+        if !eligible {
+            self.reset();
+            return;
+        }
+        let Some(gpu) = gpu else {
+            return;
+        };
+        let budget_ms = budget_ms.clamp(4.0, 1000.0);
+        let soft_deadline_miss = frame_ms >= budget_ms * 1.75 || present_ms >= budget_ms * 1.25;
+        let hard_deadline_miss = frame_ms >= budget_ms * 2.25 || present_ms >= budget_ms * 1.50;
+        let soft_overload = gpu >= GLSL_GUARD_SOFT_GPU_PERCENT && soft_deadline_miss;
+        let hard_overload = gpu >= GLSL_GUARD_HARD_GPU_PERCENT && hard_deadline_miss;
+
+        // v348h fast path: a single *severe* saturated frame is enough evidence.
+        // This intentionally requires BOTH GPU saturation and a large deadline
+        // miss so shader compilation/CPU stalls on otherwise healthy hardware do
+        // not latch the low-end guard. It cannot interrupt a GLSL frame already
+        // executing, but it removes the old extra 250-500ms confirmation delay
+        // immediately after that first bad frame returns.
+        let immediate_hard = gpu >= GLSL_GUARD_HARD_GPU_PERCENT
+            && ((frame_ms >= 120.0 && frame_ms >= budget_ms * 3.0)
+                || (present_ms >= 80.0 && present_ms >= budget_ms * 2.0));
+        let immediate_soft = gpu >= GLSL_GUARD_SOFT_GPU_PERCENT
+            && ((frame_ms >= 90.0 && frame_ms >= budget_ms * 2.0)
+                || (present_ms >= 60.0 && present_ms >= budget_ms * 1.5));
+        if allow_immediate && immediate_hard {
+            self.overload_since = Some(Instant::now());
+            self.hard_overload_since = Some(Instant::now());
+            self.healthy_since = None;
+            self.set_mode(GlslGuardMode::Hard, gpu, frame_ms, budget_ms);
+            return;
+        }
+        if allow_immediate && immediate_soft {
+            self.overload_since = Some(Instant::now());
+            self.hard_overload_since = None;
+            self.healthy_since = None;
+            self.set_mode(GlslGuardMode::Soft, gpu, frame_ms, budget_ms);
+            return;
+        }
+
+        if hard_overload {
+            let since = self.hard_overload_since.get_or_insert_with(Instant::now);
+            self.overload_since.get_or_insert_with(Instant::now);
+            self.healthy_since = None;
+            if since.elapsed() >= GLSL_GUARD_HARD_HOLD {
+                self.set_mode(GlslGuardMode::Hard, gpu, frame_ms, budget_ms);
+            }
+            return;
+        }
+        self.hard_overload_since = None;
+
+        if soft_overload {
+            let since = self.overload_since.get_or_insert_with(Instant::now);
+            self.healthy_since = None;
+            if since.elapsed() >= GLSL_GUARD_SOFT_HOLD {
+                self.set_mode(GlslGuardMode::Soft, gpu, frame_ms, budget_ms);
+            }
+            return;
+        }
+
+        self.overload_since = None;
+        if self.mode == GlslGuardMode::Off {
+            self.healthy_since = None;
+            return;
+        }
+
+        let healthy = gpu <= GLSL_GUARD_RELEASE_GPU_PERCENT
+            && frame_ms <= budget_ms * 1.35
+            && present_ms <= budget_ms * 1.10;
+        if healthy {
+            let since = self.healthy_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= GLSL_GUARD_RELEASE_HOLD {
+                self.set_mode(GlslGuardMode::Off, gpu, frame_ms, budget_ms);
+                self.healthy_since = None;
+            }
+        } else {
+            self.healthy_since = None;
+        }
+    }
+
+    fn should_skip_frame(&mut self) -> bool {
+        match self.mode {
+            GlslGuardMode::Off => false,
+            GlslGuardMode::Soft => {
+                self.admission_phase = (self.admission_phase + 1) % 2;
+                self.admission_phase != 0
+            }
+            GlslGuardMode::Hard => {
+                self.admission_phase = (self.admission_phase + 1) % 3;
+                self.admission_phase != 0
+            }
+        }
+    }
+
+    fn note_skipped(&mut self, gpu: Option<f32>) {
+        self.skipped_since_log = self.skipped_since_log.saturating_add(1);
+        if self.last_log.elapsed() >= Duration::from_secs(1) {
+            log::info!(
+                "glsl-responsiveness-frame-hold: mode={:?} skipped={} gpu={:.1}% action=keep-last-complete-frame",
+                self.mode,
+                self.skipped_since_log,
+                gpu.unwrap_or(-1.0)
+            );
+            self.skipped_since_log = 0;
+            self.last_log = Instant::now();
+        }
+    }
+}
+
+fn interp_post_glsl_start(s: &Session) -> Option<usize> {
+    let interp_index = s.chain.interp_index()?;
+    let start = (interp_index + 1).min(s.chain.stage_count());
+    let post = s.chain.stages.iter().skip(start).collect::<Vec<_>>();
+    let first_glsl = post
+        .iter()
+        .position(|stage| stage.kind() == StageKind::Glsl)?;
+    // Bypass is dependency-safe only when GLSL forms the trailing suffix. A
+    // later ONNX stage could depend on a GLSL resize/transform, so do not alter
+    // such a route automatically. ONNX-before-GLSL remains safe and is kept.
+    post.iter()
+        .skip(first_glsl)
+        .all(|stage| stage.kind() == StageKind::Glsl)
+        .then_some(start)
+}
+
+fn glsl_guard_eligible(s: &Session) -> bool {
+    // v348e: ordinary GLSL and ONNX+GLSL chains stay protected exactly as in
+    // v348d. Interpolation routes become eligible only when GLSL exists AFTER
+    // the interpolation stage. Pre-interpolation GLSL is deliberately not
+    // bypassed because changing the interpolator input would alter semantics.
+    if !s.chain.has_glsl() {
+        return false;
+    }
+    if !s.chain.has_interp() {
+        return true;
+    }
+    interp_post_glsl_start(s).is_some()
+}
+
+fn glsl_chain_key(chain: &FilterChain) -> String {
+    chain
+        .stages
+        .iter()
+        .map(|stage| stage.name())
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+fn remember_glsl_overload(s: &mut Session) {
+    if !glsl_guard_eligible(s) {
+        return;
+    }
+    let key = glsl_chain_key(&s.chain);
+    if key.is_empty() || s.glsl_overload_history.iter().any(|known| known == &key) {
+        return;
+    }
+    const MAX_HISTORY: usize = 8;
+    if s.glsl_overload_history.len() >= MAX_HISTORY {
+        s.glsl_overload_history.pop_front();
+    }
+    log::info!(
+        "glsl-responsiveness-history: action=remember-overloaded-chain stages={:?}",
+        s.chain
+            .stages
+            .iter()
+            .map(|stage| stage.name())
+            .collect::<Vec<_>>()
+    );
+    s.glsl_overload_history.push_back(key);
+}
+
+fn glsl_guard_budget_ms(s: &Session) -> f64 {
+    s.cadence
+        .period_s()
+        .map(|seconds| seconds * 1000.0)
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .or_else(|| {
+            s.fps_cap
+                .filter(|fps| *fps > 0)
+                .map(|fps| 1000.0 / fps as f64)
+        })
+        .or_else(|| {
+            s.monitor_refresh_hz
+                .filter(|hz| hz.is_finite() && *hz > 1.0)
+                .map(|hz| 1000.0 / hz)
+        })
+        .unwrap_or(1000.0 / 60.0)
+}
+
+fn update_glsl_guard_after_processed(s: &mut Session, status: &Arc<Mutex<Status>>) {
+    let eligible = glsl_guard_eligible(s);
+    let gpu = latest_gui_gpu_percent();
+    let frame_ms = s.last_process_ms.max(0.0);
+    let present_ms = s.last_present_call_ms.max(s.last_present_block_ms).max(0.0);
+    let budget_ms = glsl_guard_budget_ms(s);
+    let before = s.glsl_guard.mode;
+
+    // v348o: chain replacement is a transient workload, not steady-state load.
+    // Discard observations during the settle window instead of teaching the
+    // overload history from shader/provider/cache warmup. This is intentionally
+    // time-based: if one catastrophic processed frame itself takes >1s, this
+    // check runs after the deadline and the frame is judged immediately.
+    let now = Instant::now();
+    if eligible {
+        if let Some(until) = s.glsl_chain_settle_until {
+            if now < until {
+                s.glsl_guard.reset();
+                return;
+            }
+            s.glsl_chain_settle_until = None;
+            // Start post-transition confirmation from a clean sample boundary.
+            s.glsl_guard.reset();
+            log::info!(
+                "glsl-responsiveness-settle: phase=complete action=begin-steady-state-evaluation"
+            );
+        }
+    } else {
+        s.glsl_chain_settle_until = None;
+        s.glsl_chain_immediate_until = None;
+    }
+
+    // v348p: while a latched warning is being re-evaluated after a capture
+    // resolution change, do not let the *old* Soft/Hard admission state keep
+    // skipping frames.  Run the full new geometry for one second, then feed
+    // those settled frames into the ordinary fresh-session guard below.
+    if s.glsl_resolution_recheck_active {
+        let started = s
+            .glsl_resolution_recheck_started
+            .get_or_insert_with(Instant::now);
+        if started.elapsed() < GLSL_GUARD_RESOLUTION_RECHECK_SETTLE {
+            s.glsl_guard.reset();
+            return;
+        }
+    }
+
+    let allow_immediate = match s.glsl_chain_immediate_until {
+        Some(until) if now < until => false,
+        Some(_) => {
+            s.glsl_chain_immediate_until = None;
+            true
+        }
+        None => true,
+    };
+
+    // If the user re-selects a chain that was already proven overloaded during
+    // this capture session, require one *settled and GPU-saturated* verification
+    // frame. v348n accepted frame time alone here, so a cache/provider transition
+    // spike could poison the history and later fast-reconfirm a healthy preset.
+    if eligible && allow_immediate && s.glsl_overload_hint && before == GlslGuardMode::Off {
+        let budget = budget_ms.clamp(4.0, 1000.0);
+        let gpu_value = gpu.unwrap_or(-1.0);
+        let severe = gpu_value >= GLSL_GUARD_SOFT_GPU_PERCENT
+            && frame_ms >= 80.0
+            && frame_ms >= budget * 2.0;
+        if severe {
+            let next = if gpu_value >= GLSL_GUARD_HARD_GPU_PERCENT
+                && (frame_ms >= budget * 2.25 || present_ms >= budget * 1.50)
+            {
+                GlslGuardMode::Hard
+            } else {
+                GlslGuardMode::Soft
+            };
+            s.glsl_guard.set_mode(next, gpu_value, frame_ms, budget);
+            s.glsl_overload_hint = false;
+            remember_glsl_overload(s);
+            {
+                let mut state = status.lock().unwrap();
+                if !state.glsl_overload_notice_latched {
+                    state.glsl_overload_notice_latched = true;
+                    log::info!("glsl-overload-notice: latched=true reason=fast-reconfirm");
+                }
+                if state.glsl_overload_auto_stop_deadline.is_none() {
+                    state.glsl_overload_auto_stop_deadline =
+                        Some(Instant::now() + GLSL_OVERLOAD_AUTO_STOP_GRACE);
+                    log::info!(
+                        "glsl-overload-auto-stop: armed grace_ms={} reason=fast-reconfirm action=warn-then-normal-stop",
+                        GLSL_OVERLOAD_AUTO_STOP_GRACE.as_millis()
+                    );
+                }
+            }
+            log::info!(
+                "glsl-responsiveness-history: action=fast-reconfirm mode={next:?} gpu={gpu_value:.1}% frame_ms={frame_ms:.2} budget_ms={budget:.2}"
+            );
+            return;
+        }
+        if frame_ms <= budget * 1.35 && present_ms <= budget * 1.10 {
+            s.glsl_overload_hint = false;
+            log::info!(
+                "glsl-responsiveness-history: action=clear-hint reason=current-load-healthy frame_ms={frame_ms:.2} budget_ms={budget:.2}"
+            );
+        }
+    }
+
+    s.glsl_guard.observe_processed(
+        eligible,
+        gpu,
+        frame_ms,
+        present_ms,
+        budget_ms,
+        allow_immediate,
+    );
+    if s.glsl_guard.mode != GlslGuardMode::Off {
+        let mut state = status.lock().unwrap();
+        if !state.glsl_overload_notice_latched {
+            state.glsl_overload_notice_latched = true;
+            log::info!(
+                "glsl-overload-notice: latched=true mode={:?} reason=overload-proven",
+                s.glsl_guard.mode
+            );
+        }
+        if state.glsl_overload_auto_stop_deadline.is_none() {
+            state.glsl_overload_auto_stop_deadline =
+                Some(Instant::now() + GLSL_OVERLOAD_AUTO_STOP_GRACE);
+            log::info!(
+                "glsl-overload-auto-stop: armed grace_ms={} mode={:?} reason=overload-proven action=warn-then-normal-stop",
+                GLSL_OVERLOAD_AUTO_STOP_GRACE.as_millis(),
+                s.glsl_guard.mode
+            );
+        }
+    }
+    if s.glsl_guard.mode != GlslGuardMode::Off && s.glsl_guard.mode != before {
+        remember_glsl_overload(s);
+        s.glsl_overload_hint = false;
+    }
+    update_glsl_resolution_recheck(s, status, gpu, frame_ms, present_ms, budget_ms);
+}
+
+fn clear_glsl_resolution_recheck(s: &mut Session) {
+    s.glsl_resolution_recheck_active = false;
+    s.glsl_resolution_recheck_started = None;
+    s.glsl_resolution_recheck_healthy_since = None;
+}
+
+fn update_glsl_resolution_recheck(
+    s: &mut Session,
+    status: &Arc<Mutex<Status>>,
+    gpu: Option<f32>,
+    frame_ms: f64,
+    present_ms: f64,
+    budget_ms: f64,
+) {
+    if !s.glsl_resolution_recheck_active {
+        return;
+    }
+
+    let notice_still_latched = status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .glsl_overload_notice_latched;
+    if !notice_still_latched {
+        clear_glsl_resolution_recheck(s);
+        return;
+    }
+
+    let started = s
+        .glsl_resolution_recheck_started
+        .get_or_insert_with(Instant::now);
+    let elapsed = started.elapsed();
+    let timed_out = elapsed >= GLSL_GUARD_RESOLUTION_RECHECK_TIMEOUT;
+
+    // The caller suppresses guard admission during this window.  Keep this
+    // branch as an extra safety net in case the update ordering changes later.
+    if elapsed < GLSL_GUARD_RESOLUTION_RECHECK_SETTLE {
+        s.glsl_guard.reset();
+        s.glsl_resolution_recheck_healthy_since = None;
+        return;
+    }
+
+    let Some(gpu) = gpu else {
+        if timed_out {
+            log::info!(
+                "glsl-overload-notice: resolution-recheck-kept reason=gpu-sample-unavailable"
+            );
+            clear_glsl_resolution_recheck(s);
+        }
+        return;
+    };
+
+    let budget = budget_ms.clamp(4.0, 1000.0);
+    // IMPORTANT: use the *same* overload definition as a fresh session.  The
+    // previous v348k/o recovery path required gpu<=82% plus a much tighter
+    // deadline even though a fresh capture is allowed to run at high GPU load
+    // when it is not missing the normal guard deadline.  That mismatch is why
+    // Stop -> Start could be accepted while a live resolution reduction kept
+    // the warning latched forever.
+    let soft_deadline_miss = frame_ms >= budget * 1.75 || present_ms >= budget * 1.25;
+    let overloaded_now = gpu >= GLSL_GUARD_SOFT_GPU_PERCENT && soft_deadline_miss;
+
+    // If the ordinary guard itself reconfirms Soft/Hard on the new geometry,
+    // the warning is genuinely still required.  No special recovery threshold
+    // is allowed to overrule that decision.
+    if s.glsl_guard.mode != GlslGuardMode::Off {
+        log::info!(
+            "glsl-overload-notice: resolution-recheck-kept reason=normal-guard-reconfirmed mode={:?} gpu={gpu:.1}% frame_ms={frame_ms:.2} budget_ms={budget:.2}",
+            s.glsl_guard.mode
+        );
+        clear_glsl_resolution_recheck(s);
+        return;
+    }
+
+    if overloaded_now {
+        s.glsl_resolution_recheck_healthy_since = None;
+    } else {
+        let since = s
+            .glsl_resolution_recheck_healthy_since
+            .get_or_insert_with(Instant::now);
+        if since.elapsed() >= GLSL_GUARD_RELEASE_HOLD {
+            let mut state = status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.glsl_overload_notice_latched {
+                state.glsl_overload_notice_latched = false;
+                state.glsl_overload_auto_stop_deadline = None;
+                log::info!(
+                    "glsl-overload-notice: latched=false reason=capture-resolution-fresh-equivalent gpu={gpu:.1}% frame_ms={frame_ms:.2} budget_ms={budget:.2}"
+                );
+            }
+            drop(state);
+            clear_glsl_resolution_recheck(s);
+            return;
+        }
+    }
+
+    if timed_out {
+        log::info!(
+            "glsl-overload-notice: resolution-recheck-kept reason=new-geometry-not-stably-accepted gpu={gpu:.1}% frame_ms={frame_ms:.2} budget_ms={budget:.2}"
+        );
+        clear_glsl_resolution_recheck(s);
+    }
 }
 
 /// FPS-cap diagnostics separate upstream delivery limits from local decimation:
@@ -1528,11 +2445,6 @@ struct CadenceEstimator {
     /// must not be trimmed like delivery jitter.
     content_aware: bool,
     forced_period_s: Option<f64>,
-    /// A sustained new interval regime (for example a game switching from a
-    /// 60fps play section to a 30fps cutscene). Isolated long/short WGC gaps
-    /// never replace the established cadence.
-    regime_candidate: Option<i64>,
-    regime_hits: u8,
 }
 
 impl CadenceEstimator {
@@ -1548,51 +2460,19 @@ impl CadenceEstimator {
             let dt = t - prev;
             if dt <= 0 || dt >= 5_000_000 {
                 self.intervals.clear();
-                self.regime_candidate = None;
-                self.regime_hits = 0;
             } else {
                 let steps = seq
                     .saturating_sub(self.prev_seq.unwrap_or(seq.saturating_sub(1)))
                     .max(1);
-                let interval = dt / steps as i64;
-                let established = self
-                    .period_s()
-                    .map(|period| (period * 10_000_000.0).round() as i64);
-                let changed = self.forced_period_s.is_none()
-                    && self.intervals.len() >= 16
-                    && established.is_some_and(|old| {
-                        ((interval - old).unsigned_abs() as f64 / old.max(1) as f64) >= 0.18
-                    });
-                if changed {
-                    let same_candidate = self.regime_candidate.is_some_and(|candidate| {
-                        ((interval - candidate).unsigned_abs() as f64
-                            / candidate.unsigned_abs().max(1) as f64)
-                            <= 0.08
-                    });
-                    if same_candidate {
-                        self.regime_hits = self.regime_hits.saturating_add(1);
-                    } else {
-                        self.regime_candidate = Some(interval);
-                        self.regime_hits = 1;
-                    }
-                } else {
-                    self.regime_candidate = None;
-                    self.regime_hits = 0;
-                }
-
-                if self.regime_hits >= 6 {
-                    let new_interval = self.regime_candidate.unwrap_or(interval);
-                    self.intervals.clear();
-                    self.intervals.extend(std::iter::repeat_n(new_interval, 16));
-                    self.regime_candidate = None;
-                    self.regime_hits = 0;
-                    log::info!(
-                        "source cadence regime switched: new_period_ms={:.2}",
-                        new_interval as f64 / 10_000.0
-                    );
-                } else {
-                    self.intervals.push_back(interval);
-                }
+                // v515 regression fix: restore the v454/v235 rolling cadence
+                // estimator. A short burst of compositor-rate callbacks must
+                // not replace an already converged video cadence. At heavy
+                // 1080p interpolation load that eager regime switch could
+                // reinterpret transient delivery timing as source timing and
+                // destabilize interpolation phases until a seek/restart.
+                // Genuine rate changes still converge naturally through the
+                // rolling 120-sample history.
+                self.intervals.push_back(dt / steps as i64);
                 while self.intervals.len() > 120 {
                     self.intervals.pop_front();
                 }
@@ -1695,8 +2575,6 @@ impl CadenceEstimator {
         self.intervals.clear();
         self.content_aware = false;
         self.forced_period_s = None;
-        self.regime_candidate = None;
-        self.regime_hits = 0;
     }
 
     fn force_period(&mut self, period_s: f64) {
@@ -1785,9 +2663,49 @@ fn refresh_limited_output_ratio(
     // monitor. x2 must remain exactly two outputs per source interval (24p ->
     // 48fps). Expanding x2 to 2.5x made the same RIFE chain alternate between
     // 60fps and a 42-50fps overload state depending on downstream cost.
-    // x3 may still be display-limited to 2.5x on a 60Hz monitor.
+    // Refresh-limited callers such as NeoFlow may still use 2.5x on a
+    // 60Hz monitor. ONNX x3 reaches this helper only through its explicit
+    // onnx_x3_60hz_mode() branch; every other refresh stays strict integer.
     let display_ratio = refresh * period;
     display_ratio.clamp(1.0, requested as f64)
+}
+
+/// Return true only for a monitor that is genuinely operating in the 60 Hz
+/// family. Windows commonly reports 59.94 or 60.00 Hz, so keep a narrow
+/// tolerance around 60 while deliberately excluding 59/61/75/120 Hz modes.
+///
+/// This predicate is the hard boundary for ONNX x3's 60fps adaptation. No
+/// fractional x3 state is allowed to leak into any other refresh rate.
+fn onnx_x3_60hz_mode(refresh_hz: Option<f64>) -> bool {
+    refresh_hz.is_some_and(|refresh| {
+        refresh.is_finite() && (refresh - 60.0).abs() <= 0.75
+    })
+}
+
+/// ONNX x3 has two explicitly separated contracts.
+///
+/// * 59.94/60.00 Hz monitor: keep the established refresh-limited path so a
+///   24p source targets 60fps (2.5x), 25p targets 60fps (2.4x), and 30p
+///   targets 60fps (2.0x).
+/// * Every other monitor refresh: strict integer x3, always 1/3, 2/3,
+///   endpoint. The 60 Hz fractional accumulator is never consulted.
+///
+/// The explicit refresh predicate prevents startup/source-cadence noise from
+/// accidentally selecting the 60 Hz path on 75/120/144/165/240 Hz displays.
+fn onnx_output_ratio(
+    requested: u32,
+    source_period_s: Option<f64>,
+    refresh_hz: Option<f64>,
+) -> f64 {
+    if requested == 3 {
+        if onnx_x3_60hz_mode(refresh_hz) {
+            refresh_limited_output_ratio(requested, source_period_s, refresh_hz)
+        } else {
+            3.0
+        }
+    } else {
+        refresh_limited_output_ratio(requested, source_period_s, refresh_hz)
+    }
 }
 
 #[derive(Default)]
@@ -1796,6 +2714,26 @@ struct FlowOutputCadence {
     phase_step: f64,
     next_present: Option<Instant>,
     present_period_s: f64,
+    /// Actual back-buffer submission phase. Startup cadence estimation can
+    /// move from a temporary 22-30fps estimate to the locked 24fps clock;
+    /// rebasing from this timestamp keeps that transition on the compositor
+    /// phase already proven to work instead of anchoring to an arbitrary loop
+    /// iteration.
+    last_present_started: Option<Instant>,
+}
+
+/// Multi-slot interpolation releases the next provider timestep after the
+/// current output's GL work has been submitted. Integer x3/x4/x5 share the
+/// same cooperative scheduling rule; x3's direct-output detach is synchronized
+/// before this release so provider work does not race the copy.
+fn gpu_interp_slot_policy(factor: u32, timestep_count: usize) -> (bool, bool) {
+    if factor == 3 && timestep_count >= 2 {
+        (true, true)
+    } else if factor >= 4 && timestep_count >= 3 {
+        (true, true)
+    } else {
+        (false, false)
+    }
 }
 
 impl FlowOutputCadence {
@@ -1835,6 +2773,65 @@ impl FlowOutputCadence {
         self.wait_for_present_with_lead(overlay, period_s, vsync_on, smooth, 0.0);
     }
 
+    /// Reserve one output slot on an absolute interpolation clock.
+    ///
+    /// Two details are intentionally handled here rather than in SwapBuffers:
+    ///
+    /// 1. During startup the cadence estimator may briefly report a temporary
+    ///    source period before locking to 24/30fps.  Keeping deadlines created
+    ///    from that temporary period was enough to make identical 4K x2
+    ///    sessions start either near 48fps or around 44-46fps.  A material
+    ///    period change therefore rebases from the *actual previous submit*
+    ///    phase, not from an arbitrary render-loop timestamp.
+    /// 2. If a compositor/provider stall misses one or more complete output
+    ///    slots, advance along the existing phase grid instead of setting the
+    ///    clock to `now`.  Re-anchoring to `now` permanently changed the DWM
+    ///    phase and could turn a transient x4 miss into a sustained 89-94fps
+    ///    state.  Phase-preserving advancement recovers the target clock
+    ///    without presenting a burst of every missed slot.
+    fn reserve_present_deadline(&mut self, now: Instant, period_s: f64) -> Instant {
+        let period = Duration::from_secs_f64(period_s);
+        let period_changed = self.present_period_s.is_finite()
+            && self.present_period_s > 0.0
+            && ((period_s - self.present_period_s).abs() / self.present_period_s.max(period_s))
+                > 0.01;
+
+        if period_changed {
+            let old_period_ms = self.present_period_s * 1000.0;
+            let anchor = self
+                .last_present_started
+                .and_then(|started| started.checked_add(period))
+                .unwrap_or(now);
+            self.next_present = Some(anchor);
+            log::debug!(
+                "interp-cadence-period-rebase: old_ms={:.3} new_ms={:.3} anchor=last-submit-phase",
+                old_period_ms,
+                period_s * 1000.0
+            );
+        }
+
+        // Causal interpolation receives endpoint B one source period after A,
+        // so the first in-between is already due when the pair becomes
+        // available. Present that first real model output immediately; only
+        // subsequent outputs wait for their 1/factor slots.
+        let mut deadline = self.next_present.unwrap_or(now);
+        if now > deadline + period {
+            let late_s = now.duration_since(deadline).as_secs_f64();
+            let elapsed_slots = (late_s / period_s).floor().max(1.0);
+            deadline = deadline + period.mul_f64(elapsed_slots);
+            log::debug!(
+                "interp-cadence-phase-recover: late_ms={:.3} skipped_clock_slots={} period_ms={:.3}",
+                late_s * 1000.0,
+                elapsed_slots as u64,
+                period_s * 1000.0
+            );
+        }
+
+        self.next_present = Some(deadline + period);
+        self.present_period_s = period_s;
+        deadline
+    }
+
     /// Start post-processing slightly before the presentation slot. GPU
     /// interpolation can then compute later, unique timesteps on its worker
     /// while the render thread prepares and displays the earliest ready slot.
@@ -1849,58 +2846,74 @@ impl FlowOutputCadence {
         if !smooth || vsync_on || !period_s.is_finite() || period_s <= 0.0 {
             return;
         }
-        let period = Duration::from_secs_f64(period_s);
         let now = Instant::now();
-        // Causal interpolation receives endpoint B one source period after A,
-        // so the first in-between is already due when the pair becomes
-        // available. Present that first real model output immediately; only
-        // subsequent outputs wait for their 1/factor slots.
-        let mut deadline = self.next_present.unwrap_or(now);
-        if now > deadline + period.mul_f64(1.5) {
-            deadline = now;
-        }
-        let lead = Duration::from_secs_f64(lead_s.clamp(0.0, period_s * 0.85));
+        let deadline = self.reserve_present_deadline(now, period_s);
+        let lead = Duration::from_secs_f64(lead_s.clamp(0.0, period_s * 0.90));
         let prepare_at = deadline.checked_sub(lead).unwrap_or(deadline);
         wait_until_with_pump(overlay, prepare_at);
-        self.next_present = Some(deadline + period);
+        // reserve_present_deadline already advanced next_present by one exact
+        // period.  Never anchor it to the post-SwapBuffers completion time.
         self.present_period_s = period_s;
     }
 
-    /// Re-anchor only when SwapBuffers actually blocked. In that case the
-    /// returned timestamp is a much better sample of the compositor/vblank
-    /// phase than the provider-completion time that seeded the first x4/x5
-    /// deadline. This correction is interpolation-local: the main smooth
-    /// pacer and its cadence/jitter suppression are left untouched.
+    /// Keep the interpolation presentation clock phase-locked without
+    /// feeding normal SwapBuffers/DWM wait time back into the next interval.
     ///
-    /// We deliberately do not re-anchor a non-blocking present because it may
-    /// return before the intended display slot; the manual clock remains more
-    /// accurate in that case.
+    /// `present_started_at` is the instant the back buffer was submitted. A
+    /// healthy compositor may then block inside SwapBuffers for 2-8 ms, but
+    /// that wait is *inside* the current presentation and must not be added to
+    /// the next x2/x3/x4/x5 slot. The old code anchored to the completion
+    /// timestamp and therefore turned, for example, 20.833 ms x2 slots into
+    /// roughly 23 ms slots on AMD.
+    ///
+    /// A genuinely late submission advances to a future slot on the same
+    /// absolute phase grid. This avoids both burst catch-up and a permanent
+    /// cadence shift caused by a random compositor return timestamp.
     fn observe_blocking_present(
         &mut self,
-        presented_at: Instant,
+        present_started_at: Instant,
+        _present_completed_at: Instant,
         period_s: f64,
         present_block_s: f64,
     ) -> bool {
-        if !period_s.is_finite()
-            || period_s <= 0.0
-            || !present_block_s.is_finite()
-            || present_block_s < 0.000_5
-        {
+        if !period_s.is_finite() || period_s <= 0.0 {
+            return false;
+        }
+        self.last_present_started = Some(present_started_at);
+        if !present_block_s.is_finite() || present_block_s < 0.000_5 {
             return false;
         }
         let period = Duration::from_secs_f64(period_s);
         let Some(next) = self.next_present else {
-            self.next_present = Some(presented_at + period);
+            self.next_present = Some(present_started_at + period);
             self.present_period_s = period_s;
             return true;
         };
         let scheduled = next.checked_sub(period).unwrap_or(next);
-        // Ignore sub-millisecond phase noise. Correct only a meaningful late
-        // present; this keeps Draw Stabilization's steady clock intact while
-        // escaping the ~10 ms (100 fps) slot seen on a 120 Hz monitor.
-        let late = presented_at.saturating_duration_since(scheduled);
-        if presented_at >= scheduled && late > Duration::from_micros(500) {
-            self.next_present = Some(presented_at + period);
+        // Compare the *submission* to the scheduled slot. SwapBuffers return
+        // time is deliberately ignored here; otherwise a stable compositor
+        // block is accumulated once per output and lower multipliers can run
+        // slower than higher multipliers.
+        let late = present_started_at.saturating_duration_since(scheduled);
+        // Normal dispatch noise must not move the cadence clock on every
+        // output. If a genuinely large stall spans multiple slots, keep the
+        // original phase grid and advance `next_present` to its first future
+        // slot. Anchoring to `present_started_at + period` made the new phase
+        // depend on a random DWM/driver return time and could leave x2/x4 in a
+        // persistently slower lock state until resolution change or restart.
+        let recovery_threshold = period.mul_f64(2.0);
+        if present_started_at >= scheduled && late > recovery_threshold {
+            let late_to_next_s = present_started_at
+                .saturating_duration_since(next)
+                .as_secs_f64();
+            let advance_slots = if present_started_at < next {
+                0.0
+            } else {
+                (late_to_next_s / period_s).floor() + 1.0
+            };
+            if advance_slots > 0.0 {
+                self.next_present = Some(next + period.mul_f64(advance_slots));
+            }
             self.present_period_s = period_s;
             return true;
         }
@@ -1918,14 +2931,31 @@ impl FlowOutputCadence {
 /// endpoint. A fractional/stale cadence accumulator must never turn it into
 /// two synthetic frames. That doubled RIFE inference after a preset-loaded
 /// pre-ONNX stage, while toggling the same stage rebuilt a clean 1-mid route.
-/// x3-x5 use an exact grid when the monitor can display the full multiplier;
-/// refresh-limited cases keep the fractional cadence accumulator.
+/// x3 uses fractional cadence only behind the explicit 59.94/60.00Hz mode;
+/// on every other refresh it is a strict integer grid. x4-x5 keep the existing
+/// exact-grid / refresh-limited behavior.
 fn onnx_interpolation_phases(
     factor: u32,
     output_ratio: f64,
+    x3_60hz_mode: bool,
     cadence: &mut FlowOutputCadence,
 ) -> Vec<f32> {
     let factor = factor.clamp(2, 5);
+    if factor == 3 {
+        if x3_60hz_mode {
+            // 60 Hz is the one intentional exception: use the refresh-limited
+            // cadence so 24p -> 60fps can alternate 3,2,3,2... outputs. This
+            // state is reachable only behind onnx_x3_60hz_mode().
+            return cadence.phases(output_ratio);
+        }
+        // Every non-60Hz monitor is strict integer x3. Clear any previous
+        // fractional phase state (for example after moving the source window
+        // from a 60Hz monitor to a 120Hz monitor) before producing the fixed
+        // 1/3, 2/3, endpoint timeline.
+        cadence.next_phase = None;
+        cadence.phase_step = 0.0;
+        return vec![1.0 / 3.0, 2.0 / 3.0, 1.0];
+    }
     // When the monitor can display the complete integer multiplier, use an
     // exact fixed phase grid. Carrying a fractional cadence accumulator into
     // 24p/120Hz x5 produced shifted phases such as 0.026/0.276/... and could
@@ -2101,6 +3131,21 @@ impl SmoothPacer {
         if now > deadline + Duration::from_millis(1) {
             self.next_present = Some(now + Duration::from_secs_f64(period_s));
         }
+    }
+
+    /// The no-new-WGC-frame safety path can re-present the last filtered
+    /// texture after a genuinely missed source slot. That present is outside
+    /// the normal paced processing path, so the old manual deadline must not
+    /// survive it; otherwise the next real source frame can be presented only
+    /// a few milliseconds later as a catch-up burst.
+    fn reanchor_after_gap_fill_present(&mut self, now: Instant, period_s: Option<f64>) {
+        if self.compositor_paced {
+            return;
+        }
+        let Some(period_s) = period_s.filter(|p| p.is_finite() && *p > 0.0) else {
+            return;
+        };
+        self.next_present = Some(now + Duration::from_secs_f64(period_s));
     }
 
     fn reset(&mut self) {
@@ -2466,7 +3511,14 @@ struct GpuInterpResult {
 struct PendingGpuInterp {
     generation: u64,
     pair_id: u64,
+    /// User-selected interpolation factor.  Keep this explicit so narrow
+    /// factor-specific safety workarounds never leak into x2/x4/x5.
+    factor: u32,
     cooperative_slots: bool,
+    /// x4/x5 release the next unique inference after the current output's
+    /// post-GLSL commands are submitted but before SwapBuffers. x3 leaves this
+    /// false and releases only after present to avoid DirectML/GL contention.
+    permit_next_after_post_submit: bool,
     stage: Arc<Mutex<crate::render::onnx_stage::OnnxStage>>,
     /// Exact metric identity from the executable FilterChain, including the
     /// original file extension, duplicate suffix and active provider.  Do not
@@ -2489,11 +3541,13 @@ struct PendingGpuInterp {
     start_source_time_100ns: Option<i64>,
     output_period: f64,
     out_size: (i32, i32),
-    /// Set when the provider job is actually submitted. Fast steady-state jobs
-    /// reserve temporal order; only a genuinely long cold build may fall back
-    /// to live real-frame passthrough.
+    /// Set when the provider job is actually submitted. Keep the current
+    /// filtered frame on screen until this exact provider result is ready;
+    /// never substitute an unfiltered/live frame while editing a preset.
     submitted_at: Instant,
-    bypassed_newer: bool,
+    /// One-shot diagnostic proving whether the render thread is still cycling
+    /// while a provider invocation is unusually slow.
+    slow_wait_logged: bool,
 }
 
 struct PendingGpuPack {
@@ -2503,29 +3557,21 @@ struct PendingGpuPack {
     pending: PendingGpuInterp,
 }
 
-/// A normal DirectML/TensorRT inference completes well below one source period.
-/// Hold temporal order for that fast path. If a cold TensorRT engine build takes
-/// materially longer, show live real frames until the one warm-up result returns.
-const GPU_INTERP_LIVE_BYPASS_AFTER: Duration = Duration::from_millis(100);
-// TensorRT can spend several seconds inside a cold shape/profile build. A
-// 500ms teardown detached the worker while its stage still owned CUDA/D3D12
-// mappings, allowing later sessions to accumulate resources and race native
-// provider code. Allow enough time for cold backend initialization.
+// TensorRT can spend several seconds inside a cold provider call. Keep the
+// worker teardown timeout generous, but never hide that delay by substituting
+// a different (unfiltered) live frame.
 const GPU_INTERP_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl GpuInterpWorker {
     fn spawn(stage: Arc<Mutex<crate::render::onnx_stage::OnnxStage>>) -> Self {
         let stage_ptr = Arc::as_ptr(&stage) as usize;
         let (job_tx, job_rx) = sync_channel::<GpuInterpJob>(2);
-        // x4/x5 can cooperatively schedule one provider invocation into the
-        // idle part of each output slot. The render thread grants the next
-        // permit only after the current unique frame has actually presented,
-        // avoiding TensorRT/DirectML contention with the final GL scaler.
+        // x3/x4/x5 cooperatively schedule one provider invocation per output.
         let (permit_tx, permit_rx) = channel::<GpuInterpPermit>();
-        // Bound one source pair of genuinely different model outputs. x2/x3
-        // may stream ahead, while x4/x5 deliberately keep only the current
-        // cooperative result active until its GL present has completed. The
-        // queue never duplicates or re-presents an interpolation result.
+        // Bound one source pair of genuinely different model outputs. x2 has
+        // one midpoint; x3/x4/x5 use cooperative permits when more than one
+        // unique midpoint is required. The queue never duplicates or
+        // re-presents an interpolation result.
         let (result_tx, result_rx) = sync_channel::<GpuInterpResult>(5);
         let (done_tx, done_rx) = channel();
         let thread = std::thread::Builder::new()
@@ -2535,14 +3581,32 @@ impl GpuInterpWorker {
                 while let Ok(job) = job_rx.recv() {
                     let pair_started = Instant::now();
                     for index in 0..job.count {
+                        let lock_started = Instant::now();
                         let result = stage
                             .lock()
                             .map_err(|_| "stage mutex poisoned".to_string())
                             .and_then(|mut stage| {
-                                stage
+                                let lock_wait_ms =
+                                    lock_started.elapsed().as_secs_f64() * 1000.0;
+                                let provider_started = Instant::now();
+                                let result = stage
                                     .run_prepared_interp_gpu_slot(index)
                                     .map(|(run_ms, _)| run_ms)
-                                    .map_err(|error| format!("{error:#}"))
+                                    .map_err(|error| format!("{error:#}"));
+                                let provider_wall_ms =
+                                    provider_started.elapsed().as_secs_f64() * 1000.0;
+                                if lock_wait_ms >= 25.0 || provider_wall_ms >= 50.0 {
+                                    log::warn!(
+                                        "interp-gpu-worker-slow: pair={} generation={} slot={}/{} stage_lock_wait_ms={:.2} provider_wall_ms={:.2}",
+                                        job.pair_id,
+                                        job.generation,
+                                        index + 1,
+                                        job.count,
+                                        lock_wait_ms,
+                                        provider_wall_ms
+                                    );
+                                }
+                                result
                             });
                         let (run_ms, status) = match result {
                             Ok(run_ms) => (run_ms, Ok(())),
@@ -2577,14 +3641,11 @@ impl GpuInterpWorker {
                             break;
                         }
                         if job.cooperative_slots && index + 1 < job.count {
-                            // Do not launch the next RIFE/DRBA invocation while
-                            // OpenGL is scaling/presenting the frame we just
-                            // produced. On the 854x480 RIFE Lite field trace,
-                            // that overlap stretched a nominal 8.33 ms slot to
-                            // about 9-10 ms even though total GPU utilisation
-                            // was not saturated. Wait for the render thread to
-                            // finish the present, then use the remainder of the
-                            // slot for the next genuinely unique timestep.
+                            // The render thread releases the next integer-factor
+                            // slot after this frame's GL work has been submitted
+                            // but before SwapBuffers. x3 follows the same simple
+                            // cooperative rule as x4/x5; its direct 1:1 detach is
+                            // completed explicitly before this point.
                             loop {
                                 match permit_rx.recv() {
                                     Ok(permit)
@@ -2634,10 +3695,12 @@ impl GpuInterpWorker {
             });
         }
     }
+}
 
+impl GpuInterpWorker {
     fn shutdown(&mut self) -> bool {
         self.job_tx.take();
-        // A cooperative x4/x5 worker may be sleeping between unique slots.
+        // A cooperative x3/x4/x5 worker may be sleeping between unique slots.
         // Closing this channel wakes it immediately; Stop never waits for a
         // presentation deadline merely to release the provider thread.
         self.permit_tx.take();
@@ -2789,7 +3852,15 @@ fn apply_chain_update(
     status: &Arc<Mutex<Status>>,
 ) {
     let old_interp = s.chain.interp_key();
-    let (chain, errs) = FilterChain::from_specs(factory, specs);
+    let old_interp_pre = s
+        .chain
+        .interpolation_plan()
+        .map(|(pre, _interp, _post)| pre);
+    let (mut chain, errs) = FilterChain::from_specs(factory, specs);
+    // A warm TensorRT Session may be reused from StageFactory. Per-capture
+    // temporal/packing state must never cross the session boundary even though
+    // the expensive ORT/TensorRT execution session remains resident.
+    chain.reset_backend_runtime_state();
     let requested = specs.iter().filter(|spec| spec.enabled).count();
     if requested > 0 && chain.stages.is_empty() {
         log::error!(
@@ -2820,9 +3891,17 @@ fn apply_chain_update(
         gc.recycle(frame.tex);
     }
     s.gpu_interp_result_stash.clear();
+    s.gpu_interp_permit_after_post_submit = None;
     s.interp_generation = s.interp_generation.saturating_add(1);
     s.gpu_interp_active_logged = false;
     let new_interp = chain.interp_key();
+    let new_interp_pre = chain
+        .interpolation_plan()
+        .map(|(pre, _interp, _post)| pre);
+    let directml_interp_pre_route_changed = old_interp.is_some()
+        && old_interp.as_ref() == new_interp.as_ref()
+        && chain.interp_provider() == Some(crate::render::onnx_stage::OnnxProvider::DirectML)
+        && old_interp_pre != new_interp_pre;
     if old_interp.is_some() || new_interp.is_some() {
         // Interpolators keep different history and pacing state. Carrying a
         // RIFE queue/deadline across a chain reorder is also invalid even when
@@ -2865,19 +3944,101 @@ fn apply_chain_update(
         )
     });
     s.chain.prepare_gpu_transition(gc);
+    if directml_interp_pre_route_changed {
+        // The candidate chain was intentionally validated before touching the
+        // running chain, so its DirectML interpolator may still share the warm
+        // StageFactory session with the old route. Retire the old bridge first,
+        // then replace only that interpolation session. This mirrors the
+        // Stop/Start recovery path without disturbing TensorRT or unrelated
+        // ONNX stages.
+        log::info!(
+            "directml-interp-session-rebuild: reason=pre-chain-route-changed old_pre={old_interp_pre:?} new_pre={new_interp_pre:?}"
+        );
+        if let Err(error) = chain.rebuild_directml_interpolation_session(factory) {
+            // The already-validated candidate remains usable if recreation
+            // fails; its bridge was retired above and can be rebuilt normally.
+            // Prefer a recoverable warning over rejecting the whole live edit.
+            log::warn!(
+                "directml-interp-session-rebuild-failed: {error:#}; action=continue-with-validated-session"
+            );
+        }
+    }
+    gc.clear_gpu_timers();
     gc.clear_temporal_shader_storage();
     if let Some((old, width, height, rgba)) = transition_snapshot {
         gc.recycle(old);
         s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
     }
+    let previous_glsl_key = glsl_chain_key(&s.chain);
+    let next_glsl_key = glsl_chain_key(&chain);
+    let filter_chain_changed = previous_glsl_key != next_glsl_key;
+    let next_glsl_overload_hint = !next_glsl_key.is_empty()
+        && s.glsl_overload_history
+            .iter()
+            .any(|known| known == &next_glsl_key);
     s.chain = chain;
+    // A newly-selected chain gets a clean live admission state. A bounded
+    // same-session history survives only as a one-frame re-check hint; it never
+    // directly throttles a replacement chain.
+    s.glsl_guard.reset();
+    s.glsl_overload_hint = next_glsl_overload_hint;
+    s.glsl_chain_settle_until = None;
+    s.glsl_chain_immediate_until = None;
+    s.glsl_resolution_recheck_active = false;
+    s.glsl_resolution_recheck_started = None;
+    s.glsl_resolution_recheck_healthy_since = None;
+    {
+        let mut state = status.lock().unwrap();
+        state.glsl_interactive_pause = false;
+        if filter_chain_changed {
+            if state.glsl_overload_notice_latched {
+                state.glsl_overload_notice_latched = false;
+                log::info!("glsl-overload-notice: latched=false reason=filter-chain-changed");
+            }
+            if state.glsl_overload_auto_stop_deadline.take().is_some() {
+                log::info!(
+                    "glsl-overload-auto-stop: cancelled reason=filter-chain-changed"
+                );
+            }
+        }
+    }
+    if next_glsl_overload_hint {
+        log::info!(
+            "glsl-responsiveness-history: action=arm-fast-recheck stages={:?}",
+            s.chain
+                .stages
+                .iter()
+                .map(|stage| stage.name())
+                .collect::<Vec<_>>()
+        );
+    }
     // Chain edits can leave large shader working sets in the free-texture pool.
     // Keep the same bounded warm cache used by geometry transitions instead of
     // waiting for a later source resize to reclaim gigabytes of stale textures.
     // This touches only recycled/free textures and never runs on the frame path.
     gc.trim_transient_pool(2);
+    if glsl_guard_eligible(s) {
+        let guard_arm = Instant::now();
+        s.glsl_chain_settle_until = Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE);
+        s.glsl_chain_immediate_until =
+            Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE + GLSL_GUARD_CHAIN_CONFIRM);
+        log::info!(
+            "glsl-responsiveness-settle: phase=armed duration_ms={} confirm_ms={} stages={:?}",
+            GLSL_GUARD_CHAIN_SETTLE.as_millis(),
+            GLSL_GUARD_CHAIN_CONFIRM.as_millis(),
+            s.chain
+                .stages
+                .iter()
+                .map(|stage| stage.name())
+                .collect::<Vec<_>>()
+        );
+    }
     let usage = s.chain.onnx_backend_usage();
     s.chain_reprocess_pending = !s.frame.data.is_empty();
+    // A filter-chain edit changes the meaning of the cached output even when
+    // the source pixels are byte-identical. Never allow duplicate/cadence
+    // reuse from the previous chain to win over the forced reprocess.
+    s.duplicate_signature = None;
     s.smooth_content_signature = None;
     s.smooth_content_seq = 0;
     s.smooth_content_unique_since_duplicate = 4;
@@ -2937,6 +4098,7 @@ fn reset_gpu_interp_for_backend_switch(
         gc.recycle(frame.tex);
     }
     s.gpu_interp_result_stash.clear();
+    s.gpu_interp_permit_after_post_submit = None;
     s.interp_generation = s.interp_generation.saturating_add(1);
     s.gpu_interp_pair_id = 0;
     s.gpu_interp_active_logged = false;
@@ -2961,6 +4123,7 @@ fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext,
         gc.recycle(frame.tex);
     }
     s.gpu_interp_result_stash.clear();
+    s.gpu_interp_permit_after_post_submit = None;
     s.interp_generation = s.interp_generation.saturating_add(1);
     s.gpu_interp_pair_id = 0;
     s.gpu_interp_active_logged = false;
@@ -3153,6 +4316,7 @@ fn switch_onnx_backend(
     s.present_cadence = PresentCadence::default();
 
     s.chain.prepare_gpu_transition(gc);
+    gc.clear_gpu_timers();
     gc.clear_temporal_shader_storage();
     if let Some((old, width, height, rgba)) = transition_snapshot {
         gc.recycle(old);
@@ -3250,6 +4414,13 @@ fn gpu_interp_present_lead_s(
         return 0.0;
     }
     let compute_s = (last_compute_ms / 1000.0).max(0.0);
+    // GLSL is submitted asynchronously, so its real GPU duration is commonly
+    // paid inside SwapBuffers rather than `last_compute_ms`. Subtract the
+    // normal lightweight compositor floor and start the next output early by
+    // the remaining GPU tail. Without this, adding even one post-RIFE shader
+    // waits until the nominal slot to submit work and then misses that slot by
+    // another 5-10 ms on AMD.
+    let gpu_tail_s = ((last_present_block_ms - 1.25).max(0.0) / 1000.0).min(output_period_s * 0.75);
     // A small submit margin gives DWM time to accept the already-filtered back
     // buffer before the target vblank. Keep it bounded so we never turn x5
     // into busy waiting for most of the 8.33 ms interval.
@@ -3258,7 +4429,51 @@ fn gpu_interp_present_lead_s(
     } else {
         0.000_50
     };
-    (compute_s + submit_margin_s).clamp(0.0, output_period_s * 0.90)
+    (compute_s + gpu_tail_s + submit_margin_s).clamp(0.0, output_period_s * 0.90)
+}
+
+fn provider_uses_gpu_x3_mid_detach(
+    provider: crate::render::onnx_stage::OnnxProvider,
+) -> bool {
+    matches!(
+        provider,
+        crate::render::onnx_stage::OnnxProvider::DirectML
+            | crate::render::onnx_stage::OnnxProvider::TensorRT
+    )
+}
+
+fn should_detach_gpu_x3_midpoint(
+    overlay: &OverlayWindow,
+    s: &Session,
+    pending: &PendingGpuInterp,
+    mid: GpuTex,
+) -> bool {
+    // Keep this workaround narrower than the observed failure: x3, one
+    // interpolation ONNX stage only.  Any additional GLSL/ONNX stage already
+    // establishes a separate output texture/lifetime and must stay untouched.
+    if pending.factor != 3
+        || s.chain.stage_count() != 1
+        || pending.post_chain_start != s.chain.stage_count()
+    {
+        return false;
+    }
+    if !provider_uses_gpu_x3_mid_detach(pending.stage.lock().unwrap().provider) {
+        return false;
+    }
+
+    // Mirror process_and_present_from's final viewport calculation.  The bug
+    // condition is specifically the no-post, no-geometric-resample route: a
+    // generated GPU-resident interpolation midpoint already has exactly the
+    // final content size.
+    let desired_overlay = overlay_geometry(s, overlay);
+    let (vw, vh) = (desired_overlay.2, desired_overlay.3);
+    let display_aspect = if s.display_aspect.0 > 0 && s.display_aspect.1 > 0 {
+        s.display_aspect
+    } else {
+        (mid.w(), mid.h())
+    };
+    let (dw, dh) = fit_aspect_inside(display_aspect, (vw, vh));
+    mid.w() == dw && mid.h() == dh
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3313,17 +4528,6 @@ fn drain_gpu_interp_stream(
         }
         pending.completed_outputs = pending.completed_outputs.saturating_add(1);
         pending.run_ms_total += done.run_ms;
-        if pending.bypassed_newer {
-            // A cold provider may be put into live-bypass while a cooperative
-            // x4/x5 worker is parked between slots. Let it drain every real
-            // model invocation so teardown can reclaim the bank cleanly.
-            if pending.cooperative_slots && done.index + 1 < pending.timesteps.len() {
-                if let Some(worker) = s.gpu_interp_worker.as_ref() {
-                    worker.permit_next_slot(pending.generation, pending.pair_id);
-                }
-            }
-            continue;
-        }
         let Some(slot) = pending.output_slots.get(done.index).copied() else {
             failure = Some(format!(
                 "interpolation output slot {} is missing",
@@ -3378,26 +4582,9 @@ fn drain_gpu_interp_stream(
         return true;
     }
 
-    if pending.bypassed_newer {
-        if pending.completed_outputs >= pending.timesteps.len() {
-            log::info!(
-                "interp-gpu-result-discarded: pair={} generation={} reason=cold-provider-live-bypass",
-                pending.pair_id,
-                pending.generation
-            );
-            recycle_pending_gpu_outputs(gc, &mut pending);
-            while let Some(old) = s.gpu_interp_hist.pop_front() {
-                gc.recycle(old.tex);
-            }
-            return true;
-        }
-        s.gpu_interp_pending = Some(pending);
-        return progressed;
-    }
-
     if pending.next_output_index < pending.timesteps.len() {
         let index = pending.next_output_index;
-        if let Some(mid) = pending.ready_outputs[index].take() {
+        if let Some(mut mid) = pending.ready_outputs[index].take() {
             let lead_s = gpu_interp_present_lead_s(
                 s.last_compute_ms,
                 s.last_present_block_ms,
@@ -3410,6 +4597,48 @@ fn drain_gpu_interp_stream(
                 s.smooth_pacing,
                 lead_s,
             );
+
+            if should_detach_gpu_x3_midpoint(overlay, s, &pending, mid) {
+                match crate::render::scaler::detach_identity(gc, mid) {
+                    Ok(detached) => {
+                        if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                            log::info!(
+                                "interp-gpu-x3-mid-detach: pair={} generation={} slot={}/{} size={}x{} path=gpu-identity-f16 reason=glsl-parity-direct-1to1-no-post",
+                                pending.pair_id,
+                                pending.generation,
+                                index + 1,
+                                pending.timesteps.len(),
+                                mid.w(),
+                                mid.h()
+                            );
+                        }
+                        mid = detached;
+                        // Keep the same completion boundary used by v522, but
+                        // the detach target is now F16 to mirror a real GLSL
+                        // render pass. Complete this tiny handoff before the next
+                        // provider invocation so DML/TensorRT cannot contend with
+                        // the copy. Final back-buffer draw/SwapBuffers remains
+                        // overlapped.
+                        gc.finish();
+                    }
+                    Err(error) => {
+                        // Without a detached texture, keep this pair on the
+                        // conservative post-present permit path so a failed
+                        // safety copy can never reintroduce the old output
+                        // lifetime race.
+                        pending.permit_next_after_post_submit = false;
+                        if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                            log::warn!(
+                                "interp-gpu-x3-mid-detach-fallback: pair={} generation={} slot={}/{} reason={error:#}",
+                                pending.pair_id,
+                                pending.generation,
+                                index + 1,
+                                pending.timesteps.len()
+                            );
+                        }
+                    }
+                }
+            }
             let now = Instant::now();
             let timing = FrameTiming::from_interpolated(
                 &pending.frame,
@@ -3419,6 +4648,16 @@ fn drain_gpu_interp_stream(
             );
             let mut keep = pending.history_keep.clone();
             keep.extend(pending.ready_outputs.iter().flatten().copied());
+            if pending.permit_next_after_post_submit
+                && pending.cooperative_slots
+                && index + 1 < pending.timesteps.len()
+            {
+                // Do not let the next DirectML/TensorRT timestep jump ahead of
+                // this frame's GL post-chain. process_and_present_from releases
+                // the permit immediately after all GL work for this output has
+                // been submitted, before any compositor wait/SwapBuffers.
+                s.gpu_interp_permit_after_post_submit = Some((pending.generation, pending.pair_id));
+            }
             let presented_before = status.lock().unwrap().presented;
             process_and_present_from(
                 gc,
@@ -3441,6 +4680,7 @@ fn drain_gpu_interp_stream(
             let phase_corrected = s.smooth_pacing
                 && !vsync_on
                 && s.flow_output_cadence.observe_blocking_present(
+                    s.last_present_started,
                     last_present,
                     pending.output_period,
                     last_present_block_s,
@@ -3468,11 +4708,12 @@ fn drain_gpu_interp_stream(
                 s.gpu_interp_active_logged = true;
             }
             pending.next_output_index += 1;
-            // Only now, after GL scaling + SwapBuffers have completed, grant the
-            // provider permission to launch the next distinct timestep. This uses
-            // the otherwise idle tail of the 8.33 ms slot instead of making RIFE
-            // and the display scaler fight for the GPU at the same instant.
-            if pending.cooperative_slots && pending.next_output_index < pending.timesteps.len() {
+            // Multi-slot jobs normally release from process_and_present_from
+            // after post-chain submission, overlapping only compositor wait.
+            if pending.cooperative_slots
+                && !pending.permit_next_after_post_submit
+                && pending.next_output_index < pending.timesteps.len()
+            {
                 if let Some(worker) = s.gpu_interp_worker.as_ref() {
                     worker.permit_next_slot(pending.generation, pending.pair_id);
                 }
@@ -3490,14 +4731,18 @@ fn drain_gpu_interp_stream(
                 .ready_outputs
                 .get(pending.next_output_index)
                 .is_none_or(|slot| slot.is_none());
+        // Keep the provider wait inside one output slot, but do not cut the
+        // common ~10.5-11 ms 720p RIFE x2/x3 result off at an arbitrary 10 ms
+        // boundary. Missing that result by <1 ms forced another full engine
+        // iteration and made startup phase depend on loop/driver timing. The
+        // wait still pumps Win32 messages every 0.5 ms and remains capped well
+        // below a 60 Hz frame.
         let wait_budget =
-            Duration::from_secs_f64((pending.output_period * 0.95).clamp(0.0005, 0.010));
+            Duration::from_secs_f64((pending.output_period * 0.95).clamp(0.0005, 0.012));
         s.gpu_interp_pending = Some(pending);
 
         // If the next unique slot is still cooking, wait only inside its
-        // presentation budget while pumping Win32 messages. Cooperative x4/x5
-        // has no GL/provider overlap here: the next provider slot starts only
-        // after the preceding present grants its permit.
+        // presentation budget while pumping Win32 messages.
         if waiting_for_provider {
             if let Some(worker) = s.gpu_interp_worker.as_ref() {
                 if let Some(result) = wait_for_gpu_interp_result(overlay, worker, wait_budget) {
@@ -3516,15 +4761,26 @@ fn drain_gpu_interp_stream(
     }
 
     if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+        // Diagnostics only: keep the proven v349e timing path unchanged.
+        // These values let us compare x4/x5 cadence without feeding any
+        // historical/driver/vendor-specific estimate back into scheduling.
+        let raw_lead_ms = gpu_interp_present_lead_s(
+            s.last_compute_ms,
+            s.last_present_block_ms,
+            pending.output_period,
+        ) * 1000.0;
         log::info!(
-            "interp-gpu-stream-pair: pair={} generation={} unique_mids={} phases={:?} inference_ms={:.2} wall_ms={:.2} real_endpoint={}",
+            "interp-gpu-stream-pair: pair={} generation={} unique_mids={} phases={:?} inference_ms={:.2} wall_ms={:.2} real_endpoint={} target_fps={:.2} raw_present_block_ms={:.2} raw_lead_ms={:.2}",
             pending.pair_id,
             pending.generation,
             pending.timesteps.len(),
             pending.timesteps,
             pending.run_ms_total,
             pending.submitted_at.elapsed().as_secs_f64() * 1000.0,
-            pending.present_real
+            pending.present_real,
+            1.0 / pending.output_period.max(1e-6),
+            s.last_present_block_ms,
+            raw_lead_ms
         );
     }
 
@@ -3570,36 +4826,39 @@ fn drain_gpu_interp_stream(
         let _ = s.smooth_pacing
             && !vsync_on
             && s.flow_output_cadence.observe_blocking_present(
+                s.last_present_started,
                 last_present,
                 pending.output_period,
                 last_present_block_s,
             );
     }
 
-    let residency = crate::render::onnx_stage::interp_residency_snapshot();
-    if residency.gpu_output_frames > 0
-        && residency.gpu_output_frames % 300 < pending.timesteps.len() as u64
-    {
-        log::info!(
-            "interp-gpu-residency: input_frames={} output_frames={} cpu_readbacks={} cpu_uploads={} cpu_pack_frames={} cpu_output_conversions={} cpu_fallback_frames={} violations={} result={}",
-            residency.gpu_input_frames,
-            residency.gpu_output_frames,
-            residency.cpu_frame_readbacks,
-            residency.cpu_frame_uploads,
-            residency.cpu_pack_frames,
-            residency.cpu_output_conversions,
-            residency.cpu_fallback_frames,
-            residency.violations,
-            if residency.cpu_frame_readbacks == 0
-                && residency.cpu_frame_uploads == 0
-                && residency.cpu_pack_frames == 0
-                && residency.cpu_output_conversions == 0
-            {
-                "full"
-            } else {
-                "violation"
-            }
-        );
+    if crate::logging::diagnostics_enabled() {
+        let residency = crate::render::onnx_stage::interp_residency_snapshot();
+        if residency.gpu_output_frames > 0
+            && residency.gpu_output_frames % 300 < pending.timesteps.len() as u64
+        {
+            log::debug!(
+                "interp-gpu-residency: input_frames={} output_frames={} cpu_readbacks={} cpu_uploads={} cpu_pack_frames={} cpu_output_conversions={} cpu_fallback_frames={} violations={} result={}",
+                residency.gpu_input_frames,
+                residency.gpu_output_frames,
+                residency.cpu_frame_readbacks,
+                residency.cpu_frame_uploads,
+                residency.cpu_pack_frames,
+                residency.cpu_output_conversions,
+                residency.cpu_fallback_frames,
+                residency.violations,
+                if residency.cpu_frame_readbacks == 0
+                    && residency.cpu_frame_uploads == 0
+                    && residency.cpu_pack_frames == 0
+                    && residency.cpu_output_conversions == 0
+                {
+                    "full"
+                } else {
+                    "violation"
+                }
+            );
+        }
     }
     true
 }
@@ -3614,11 +4873,57 @@ fn apply_interp_factor_now(
     let previous = *current;
     *current = next;
     if let Some(s) = s {
+        let factor_changed = previous != next;
+
+        // A live x4 <-> x5 transition used to keep the same cooperative GPU
+        // worker (and, when its capacity was already large enough, the same
+        // DirectML interpolation bridge).  The old permit/result scheduling
+        // state could then survive the multiplier change: 24p x5 had enough
+        // raw GPU headroom for 120fps, yet the presentation clock recovered a
+        // missed 8.333ms slot every few outputs and settled around 111-116fps
+        // until Stop/Start created a fresh worker.  Multiplier changes are a
+        // natural interpolation ownership boundary, so rebuild only that
+        // sub-pipeline while leaving WGC, the filter chain, and source cadence
+        // alive.  This mirrors the clean part of Stop/Start without flashing
+        // or dropping GPU residency for the rest of the application.
+        if factor_changed {
+            if let Some(mut worker) = s.gpu_interp_worker.take() {
+                let _ = worker.shutdown();
+            }
+            if let Some(crate::render::chain::InterpHandle::Onnx { stage, .. }) =
+                s.chain.interp_stage()
+            {
+                gc.finish();
+                let mut stage = stage.lock().unwrap_or_else(|poisoned| {
+                    log::error!("onnx-stage-lock-poisoned: action=recover-for-factor-transition");
+                    poisoned.into_inner()
+                });
+                stage.retire_interp_gpu_bridges(gc);
+                stage.reset_interp_pack_cache();
+            }
+            s.gpu_interp_pair_id = 0;
+            // Old x4 present/GL-tail timings are not valid preparation hints
+            // for the shorter x5 slot (and vice versa).  Starting those hints
+            // clean is what Stop/Start already does.
+            s.last_compute_ms = 0.0;
+            s.last_present_block_ms = 0.0;
+            s.last_present_call_ms = 0.0;
+            s.last_pacer_wait_ms = 0.0;
+            s.smooth_pacer.reset();
+            s.paced_present_deadline = None;
+            log::info!(
+                "interp-gpu-factor-transition-reset: previous=x{} next=x{} worker=stopped bridge=retired pair_id=0 timing=reset",
+                previous,
+                next
+            );
+        }
+
         s.hist.clear();
         while let Some(frame) = s.gpu_interp_hist.pop_front() {
             gc.recycle(frame.tex);
         }
         s.gpu_interp_result_stash.clear();
+        s.gpu_interp_permit_after_post_submit = None;
         s.interp_generation = s.interp_generation.saturating_add(1);
         s.flow_output_cadence.reset();
         s.interp_present_deadline = None;
@@ -3633,8 +4938,228 @@ fn apply_interp_factor_now(
     );
 }
 
+fn drag_source_reference_rect(
+    hwnd: isize,
+    reference_kind: &'static str,
+) -> Option<(i32, i32, i32, i32)> {
+    // Keep one coordinate family for the whole gesture. Falling from DWM to
+    // client coordinates mid-drag changes the non-client offset and appears as
+    // a fake window move, which is enough to shift the visible grab point.
+    match reference_kind {
+        "dwm" => win32::extended_frame_bounds(hwnd),
+        "outer" => win32::window_rect(hwnd),
+        "client" | "client-fallback" => win32::client_rect_on_screen(hwnd),
+        _ => None,
+    }
+}
+
+fn drag_overlay_target(
+    source_start: (i32, i32),
+    source_now: (i32, i32),
+    overlay_start: (i32, i32, i32, i32),
+    monitor_rect: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (mx, my, mw, mh) = monitor_rect;
+    let dx = source_now.0.saturating_sub(source_start.0);
+    let dy = source_now.1.saturating_sub(source_start.1);
+    (
+        clamp_axis_to_bounds(overlay_start.0.saturating_add(dx), overlay_start.2, mx, mw),
+        clamp_axis_to_bounds(overlay_start.1.saturating_add(dy), overlay_start.3, my, mh),
+    )
+}
+
+struct DragFollower {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DragFollower {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        source_hwnd: isize,
+        overlay_hwnd: isize,
+        panel_hwnd: isize,
+        source_start: (i32, i32, i32, i32),
+        source_reference_kind: &'static str,
+        overlay_start: (i32, i32, i32, i32),
+        panel_start: Option<(i32, i32, i32, i32)>,
+        monitor_rect: (i32, i32, i32, i32),
+        drag_epoch: u64,
+    ) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("neo-window-drag-follow".into())
+            .spawn(move || {
+                let mut last_source = (source_start.0, source_start.1);
+                let mut last_source_size = (source_start.2, source_start.3);
+                let mut last_overlay = (overlay_start.0, overlay_start.1);
+                let mut samples: u64 = 0;
+                let mut moves: u64 = 0;
+                let mut geometry_changes: u64 = 0;
+                let started = Instant::now();
+                let mut last_diag = Instant::now() - Duration::from_secs(1);
+
+                while !thread_stop.load(Ordering::Acquire)
+                    && crate::input::source_caption_drag_active()
+                    && crate::input::source_caption_drag_epoch() == drag_epoch
+                {
+                    if let Some((sx, sy, sw, sh)) =
+                        drag_source_reference_rect(source_hwnd, source_reference_kind)
+                    {
+                        samples = samples.saturating_add(1);
+                        if (sw, sh) != last_source_size {
+                            geometry_changes = geometry_changes.saturating_add(1);
+                            last_source_size = (sw, sh);
+                        }
+                        last_source = (sx, sy);
+
+                        // Derive every overlay position from the drag's START
+                        // geometry. Never integrate the previous delta. This is
+                        // idempotent and, critically, does not accumulate a
+                        // clamp history when the hidden source travels farther
+                        // than the visible overlay can move at a monitor edge.
+                        let (nx, ny) = drag_overlay_target(
+                            (source_start.0, source_start.1),
+                            (sx, sy),
+                            overlay_start,
+                            monitor_rect,
+                        );
+                        // Move + readback + anchored sprite publication is one
+                        // generation-scoped transaction. BUTTON-UP takes the
+                        // same guard, so this closure can never move the overlay
+                        // after the drag contract has already ended.
+                        let previous_overlay = last_overlay;
+                        let mut observed_overlay = previous_overlay;
+                        let committed = crate::input::commit_source_caption_drag_overlay_update(
+                            drag_epoch,
+                            || {
+                                let actual_before = win32::window_rect(overlay_hwnd)
+                                    .map(|r| (r.0, r.1))
+                                    .unwrap_or(previous_overlay);
+                                if (nx, ny) != actual_before {
+                                    win32::set_window_rect(
+                                        overlay_hwnd,
+                                        nx,
+                                        ny,
+                                        overlay_start.2,
+                                        overlay_start.3,
+                                    );
+                                }
+                                let actual_overlay = win32::window_rect(overlay_hwnd)
+                                    .map(|r| (r.0, r.1))
+                                    .unwrap_or((nx, ny));
+                                observed_overlay = actual_overlay;
+                                if actual_overlay == previous_overlay {
+                                    return None;
+                                }
+
+                                if panel_hwnd != 0 {
+                                    if let Some((px, py, pw, ph)) = panel_start {
+                                        let pnx = px.saturating_add(
+                                            actual_overlay.0 - overlay_start.0,
+                                        );
+                                        let pny = py.saturating_add(
+                                            actual_overlay.1 - overlay_start.1,
+                                        );
+                                        win32::set_window_rect(panel_hwnd, pnx, pny, pw, ph);
+                                    }
+                                }
+                                Some(actual_overlay)
+                            },
+                        );
+                        if committed && observed_overlay != previous_overlay {
+                            last_overlay = observed_overlay;
+                            moves = moves.saturating_add(1);
+                        } else if !committed
+                            && (!crate::input::source_caption_drag_active()
+                                || crate::input::source_caption_drag_epoch() != drag_epoch)
+                        {
+                            break;
+                        }
+
+                        if last_diag.elapsed() >= Duration::from_millis(250) {
+                            log::debug!(
+                                "source-drag-follower-sample: epoch={} reference={} source=({sx},{sy}) source_size={}x{} overlay=({},{}) samples={} moves={} geometry_changes={}",
+                                drag_epoch,
+                                source_reference_kind,
+                                sw,
+                                sh,
+                                last_overlay.0,
+                                last_overlay.1,
+                                samples,
+                                moves,
+                                geometry_changes
+                            );
+                            last_diag = Instant::now();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                log::info!(
+                    "source-drag-follower-stop: epoch={} reference={} samples={} moves={} geometry_changes={} elapsed_ms={} final_source=({},{}) final_overlay=({},{}) active={} current_epoch={}",
+                    drag_epoch,
+                    source_reference_kind,
+                    samples,
+                    moves,
+                    geometry_changes,
+                    started.elapsed().as_millis(),
+                    last_source.0,
+                    last_source.1,
+                    last_overlay.0,
+                    last_overlay.1,
+                    crate::input::source_caption_drag_active(),
+                    crate::input::source_caption_drag_epoch()
+                );
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+    }
+}
+
+fn stop_drag_follower(slot: &mut Option<DragFollower>) {
+    if let Some(mut follower) = slot.take() {
+        follower.stop_and_join();
+    }
+}
+
+fn resume_provider_transition_after_interpolated_present(
+    input: &crate::input::InputSystem,
+    s: &mut Session,
+    route: &'static str,
+) {
+    if !s.provider_transition_input_suspended {
+        return;
+    }
+    input.set_transition_suspended(false);
+    s.provider_transition_input_suspended = false;
+    s.provider_transition_input_suspended_since = None;
+    s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+    log::info!(
+        "provider-transition-ready: first-interpolated-frame-presented route={} input=resume-after-120ms",
+        route
+    );
+}
+
 fn engine_main(
     rx: Receiver<Cmd>,
+    control_tx: Sender<Cmd>,
     pending_chain: Arc<Mutex<Option<Vec<StageSpec>>>>,
     pending_no_engage: Arc<Mutex<PendingNoEngage>>,
     stop_requested: Arc<AtomicBool>,
@@ -3673,6 +5198,8 @@ fn engine_main(
         initial_trt_cache_root,
     );
     let mut session: Option<Session> = None;
+    let mut drag_follower: Option<DragFollower> = None;
+    let mut drag_session_epoch: Option<u64> = None;
     let mut input = crate::input::InputSystem::start();
     let mut no_engage_rects: Vec<(i32, i32, i32, i32, isize)> = Vec::new();
     let mut input_autohide_secs: f32 = 3.0;
@@ -3692,6 +5219,9 @@ fn engine_main(
     let mut duplicate_frame_reduction_on = false;
     let mut panel_chipped = false;
     let mut last_panel_raise_check = Instant::now() - Duration::from_secs(1);
+    let mut last_helper_compositor_diag = Instant::now() - Duration::from_secs(3);
+    let mut last_source_window_poll = Instant::now() - Duration::from_millis(250);
+    let mut last_source_visible_windows: Vec<isize> = Vec::new();
     let mut gui_priority_hwnd: isize = 0;
     let mut gui_priority_topmost = false;
     let mut deferred_backend_switch: Option<(
@@ -3704,6 +5234,30 @@ fn engine_main(
     log::info!("render engine ready (persistent GL context)");
 
     loop {
+        if crate::input::take_panel_stop_action() {
+            log::info!("panel-priority-direct-dispatch: action=stop");
+            *pending_chain.lock().unwrap() = None;
+            pending_no_engage.lock().unwrap().publish(Vec::new());
+            stop_requested.store(true, Ordering::Release);
+            let _ = crate::render::onnx_stage::request_onnx_cancel();
+            let _ = crate::render::onnx_stage::request_tensorrt_cancel();
+            recover_visible_capture_state_now(&status, "control-panel-priority");
+
+            // Native panel Stop bypasses EngineHandle::send(Cmd::Stop), so no
+            // WakeForStop token would otherwise exist. Enqueue it *after* the
+            // direct click is observed: every older queued command remains on
+            // the pre-Stop side of the boundary, while the WakeForStop arm
+            // clears Status::stopping only after those stale commands drain.
+            if control_tx.send(Cmd::WakeForStop).is_err() {
+                status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .stopping = false;
+                log::warn!("panel-stop-boundary-enqueue-failed: stopping latch cleared");
+            } else {
+                log::debug!("panel-stop-boundary-enqueued");
+            }
+        }
         // Stop has an out-of-band priority lane. A normal mpsc Stop command
         // can sit behind geometry/panel/backend messages; after a cancelled
         // inference unwinds, visible/session teardown must run before any of
@@ -3714,8 +5268,10 @@ fn engine_main(
             *pending_chain.lock().unwrap() = None;
             input.set_transition_suspended(false);
             input.release();
+            stop_drag_follower(&mut drag_follower);
+            drag_session_epoch = None;
             stop_session(&mut session, &mut overlay, &mut gc, &status);
-            factory.clear_onnx_cache();
+            factory.retain_tensorrt_sessions_for_capture_restart();
             // Keep Start locked until the WakeForStop token reaches the head
             // of the queue. Every command before that token predates Stop and
             // must not become live again if the user clicks Start quickly.
@@ -3811,7 +5367,7 @@ fn engine_main(
                     input.set_transition_suspended(false);
                     input.release();
                     stop_session(&mut session, &mut overlay, &mut gc, &status);
-                    factory.clear_onnx_cache();
+                    factory.retain_tensorrt_sessions_for_capture_restart();
                 }
                 Cmd::WakeForStop => {
                     // Idle engines wake inside recv_timeout before the loop's
@@ -3824,12 +5380,17 @@ fn engine_main(
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
-                        factory.clear_onnx_cache();
+                        factory.retain_tensorrt_sessions_for_capture_restart();
                     }
                     status
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .stopping = false;
+                    // The panel Stop can arrive without an egui frame. Wake the
+                    // real GUI HWND at the exact idle boundary so the main
+                    // Start/Stop control repaints immediately instead of
+                    // waiting for the 250 ms idle heartbeat.
+                    crate::platform::win32::wake_main_gui_for_panel_action(false);
                     // All commands queued before Stop have now been drained and
                     // the old session has been released. Clear the cooperative
                     // cancellation epoch so an idle TensorRT checkbox switch is
@@ -3887,15 +5448,24 @@ fn engine_main(
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         state.starting = true;
                         state.stopping = false;
+                        let fullscreen_origin = source_restore_rect
+                            .map(|rect| win32::is_rect_monitor_fullscreen(hwnd, rect))
+                            .unwrap_or_else(|| win32::is_monitor_fullscreen(hwnd));
                         state.source_recovery = Some((
                             hwnd,
                             source_restore_rect,
                             source_was_maximized,
-                            win32::is_topmost(hwnd),
+                            // Fullscreen pixel-lock sessions deliberately never
+                            // promote the foreign source HWND, so recovery must
+                            // not issue a matching NOTOPMOST mutation either.
+                            win32::is_topmost(hwnd) || fullscreen_origin,
                         ));
                     }
                     factory.set_gpu_adapter(gpu_adapter);
-                    factory.clear_onnx_cache();
+                    // Keep a previously warmed TensorRT ORT session across a normal
+                    // Stop -> Start. DirectML remains recreate-on-start, matching
+                    // its existing shape-specialization safety behavior.
+                    factory.retain_tensorrt_sessions_for_capture_restart();
                     match start_session(
                         hwnd,
                         &specs,
@@ -3935,7 +5505,9 @@ fn engine_main(
                                 s.provider_transition_input_suspended_since = Some(Instant::now());
                             }
                             let rect = overlay_geometry(&s, &overlay);
-                            overlay.reposition(rect.0, rect.1, rect.2, rect.3);
+                            reposition_overlay_for_gui_mode(
+                                &mut overlay, rect.0, rect.1, rect.2, rect.3, gui_priority_topmost,
+                            );
                             log::info!("overlay reveal deferred until first valid filtered frame");
                             enforce_gui_priority(
                                 gui_priority_hwnd,
@@ -3986,6 +5558,7 @@ fn engine_main(
                             g.chain_errors = errs;
                             g.last_error = None;
                             g.warning = warning;
+                            g.source_live_fullscreen = s.source_live_fullscreen;
                             g.presented = 0;
                             g.overlay_hwnd = overlay.hwnd().0 as isize;
                             g.hidden_src = s.hid_source.map(|wl| (s.hwnd, wl));
@@ -3993,7 +5566,11 @@ fn engine_main(
                                 s.hwnd,
                                 s.source_restore_rect,
                                 s.source_was_maximized,
-                                s.src_was_topmost,
+                                // `true` here means recovery must leave the
+                                // z-order alone. Fullscreen sessions were not
+                                // promoted, even when the source originally
+                                // was not TOPMOST.
+                                s.src_was_topmost || s.source_monitor_fullscreen,
                             ));
                             g.onnx_tensorrt_stages = usage.tensorrt;
                             g.onnx_cuda_stages = usage.cuda;
@@ -4150,6 +5727,11 @@ fn engine_main(
                             if mode_changed {
                                 s.placed = false;
                             }
+                            s.source_drag_active = false;
+                            s.source_client_drag_active = false;
+                            s.source_client_unowned_rebase_pending = false;
+                            s.source_client_drag_raw_origin = None;
+                            s.source_client_drag_overlay_origin = None;
                             if mode == ScaleMode::Fixed {
                                 s.last_src_pos = keep_source_window_reachable(s.hwnd);
                             } else {
@@ -4171,9 +5753,87 @@ fn engine_main(
                     }
                 }
                 Cmd::SetCaptureGeometry { requested, applied } => {
+                    status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .capture_resolution_resize_intent = None;
                     if let Some(s) = session.as_mut() {
+                        let normalized_applied = normalize_capture_client_size(applied);
+                        if normalized_applied != applied {
+                            log::info!(
+                                "capture-geometry-even-normalize: requested={}x{} applied={}x{} normalized={}x{} reason=wgc-even-frame-contract",
+                                requested.0,
+                                requested.1,
+                                applied.0,
+                                applied.1,
+                                normalized_applied.0,
+                                normalized_applied.1
+                            );
+                        }
+                        let applied = normalized_applied;
                         let target = (applied.0 as i32, applied.1 as i32);
+                        s.capture_canvas_suspended_for_fullscreen = false;
+                        s.capture_resolution_reapply_pending = false;
+                        s.fullscreen_exit_candidate_since = None;
                         let previous = s.in_size;
+                        let overload_notice_latched = status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .glsl_overload_notice_latched;
+
+                        // The same filter chain can have completely different
+                        // admission behavior at a different capture size.  A
+                        // user capture-resolution command therefore starts a
+                        // new workload context even when the WGC auto-follow
+                        // reached the target before this command was dequeued.
+                        if !s.glsl_overload_history.is_empty() || s.glsl_overload_hint {
+                            log::info!(
+                                "glsl-responsiveness-history: action=clear reason=capture-resolution-context-changed entries={}",
+                                s.glsl_overload_history.len()
+                            );
+                        }
+                        s.glsl_overload_history.clear();
+                        s.glsl_overload_hint = false;
+
+                        if overload_notice_latched && glsl_guard_eligible(s) {
+                            s.glsl_resolution_recheck_active = true;
+                            s.glsl_resolution_recheck_started = Some(Instant::now());
+                            s.glsl_resolution_recheck_healthy_since = None;
+
+                            // Workload history is geometry-specific.  Carrying a
+                            // 1920x1080/1440x810 overload hint into 1280x720 (or
+                            // lower) can fast-reconfirm a warning that a clean
+                            // Stop -> Start would never raise.  Treat the new
+                            // capture size as a fresh admission context.
+                            s.glsl_guard.reset();
+                            s.glsl_chain_settle_until = None;
+                            s.glsl_chain_immediate_until = None;
+
+                            // Geometry changes already reset temporal state.
+                            // Interpolation never suppresses selected post filters,
+                            // so there is no GUI-dependent interpolation pause to clear.
+                            {
+                                let mut state = status
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                state.glsl_interactive_pause = false;
+                                if state.glsl_overload_auto_stop_deadline.take().is_some() {
+                                    log::info!(
+                                        "glsl-overload-auto-stop: cancelled reason=capture-resolution-recheck"
+                                    );
+                                }
+                            }
+                            log::info!(
+                                "glsl-overload-notice: resolution-recheck-armed current={}x{} requested={}x{} applied={}x{} settle_ms={} policy=fresh-session-equivalent history=cleared",
+                                previous.0,
+                                previous.1,
+                                requested.0,
+                                requested.1,
+                                applied.0,
+                                applied.1,
+                                GLSL_GUARD_RESOLUTION_RECHECK_SETTLE.as_millis()
+                            );
+                        }
                         // Chromium can deliver the exact new WGC size before
                         // the GUI thread's SetCaptureGeometry command reaches
                         // this loop. If automatic detection already committed
@@ -4204,10 +5864,16 @@ fn engine_main(
                             continue;
                         }
                         input.release();
-                        // Never stretch/crop the retained old framebuffer into
-                        // the new source geometry. The overlay is revealed only
-                        // after a fully filtered exact-size frame is ready.
-                        overlay.hide();
+                        // Keep the last complete magnified frame visible while
+                        // the hidden source HWND changes size.  Hiding the
+                        // overlay here exposed the desktop because the source is
+                        // already visually hidden during capture.  Wrong-size
+                        // WGC transition frames are discarded below, so the
+                        // currently presented framebuffer is a safe transition
+                        // shield until the first fully filtered exact-size frame
+                        // replaces it atomically.
+                        let transition_shield_visible =
+                            overlay.is_visible() && s.last_tex.is_some();
                         s.deferred_capture_resolution = Some((requested, applied));
                         s.capture_resolution_applied = true;
                         s.capture_resolution_wait_started = Some(Instant::now());
@@ -4216,10 +5882,13 @@ fn engine_main(
                         s.capture_resolution_native_fallback = false;
                         s.onnx_geometry_deferred_logged = false;
                         s.capture_canvas = Some(target);
-                        s.display_aspect = target;
+                        // Preserve the currently presented geometry while the
+                        // old complete frame is acting as the transition
+                        // shield. The first exact target-size WGC frame commits
+                        // display_aspect below; Fixed mode then resizes on the
+                        // following tick without ever exposing the desktop.
                         s.pending_resize_size = Some(target);
                         s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
-                        s.placed = false;
                         s.last_geom_change = Some(Instant::now());
                         s.starve_released = false;
                         s.paced_present_deadline = None;
@@ -4252,16 +5921,46 @@ fn engine_main(
                         metrics.reset();
                         win32::request_window_repaint(s.hwnd);
                         log::info!(
-                            "capture-geometry-transition-armed: previous={}x{} requested={}x{} applied={}x{} overlay=hidden input=released queue=flushed onnx_rebuild={} display_aspect={}x{}",
+                            "capture-geometry-transition-armed: previous={}x{} requested={}x{} applied={}x{} overlay_shield={} input=released queue=flushed onnx_rebuild={} display_aspect={}x{}",
                             previous.0,
                             previous.1,
                             requested.0,
                             requested.1,
                             applied.0,
                             applied.1,
+                            transition_shield_visible,
                             s.onnx_geometry_rebuild_pending,
                             s.display_aspect.0,
                             s.display_aspect.1
+                        );
+                    }
+                }
+                Cmd::ClearCaptureGeometry => {
+                    status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .capture_resolution_resize_intent = None;
+                    if let Some(s) = session.as_mut() {
+                        input.release();
+                        s.capture_canvas = None;
+                        s.deferred_capture_resolution = None;
+                        s.capture_resolution_applied = false;
+                        s.capture_resolution_wait_started = None;
+                        s.capture_resolution_repaint_last = None;
+                        s.capture_resolution_nudge_done = false;
+                        s.capture_resolution_native_fallback = false;
+                        s.capture_canvas_suspended_for_fullscreen = false;
+                        s.capture_resolution_reapply_pending = false;
+                        s.fullscreen_exit_candidate_since = None;
+                        if s.in_size.0 > 0 && s.in_size.1 > 0 {
+                            s.display_aspect = s.in_size;
+                        }
+                        s.pending_resize_size = None;
+                        s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+                        log::info!(
+                            "capture-resolution cleared: action=native-wgc-follow current={}x{}",
+                            s.in_size.0,
+                            s.in_size.1
                         );
                     }
                 }
@@ -4329,8 +6028,24 @@ fn engine_main(
                 Cmd::SetPanelState { visible, chip } => {
                     panel_visible = visible;
                     panel_chipped = chip;
-                    // Metadata only. Never mutate the GUI-owned GL viewport
-                    // from the render-engine thread.
+                    // Keep the v528 restore guard through any older queued
+                    // chip=true state. It may have been sent before the GUI
+                    // began the atomic restore and must not re-shrink the host.
+                    // Release the guard only when this thread actually consumes
+                    // the final bar state (chip=false), or when the panel hides.
+                    if !chip || !visible {
+                        PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
+                    }
+                    // Visibility is still owned by the GUI/settings path, but
+                    // helper ownership must be updated immediately. A hidden
+                    // panel cannot remain the cursor sprite's owner or Windows
+                    // may hide the cursor with it.
+                    enforce_gui_priority(
+                        gui_priority_hwnd,
+                        gui_priority_topmost,
+                        panel_hwnd,
+                        overlay.hwnd().0 as isize,
+                    );
                 }
                 Cmd::SetVsync(on) => {
                     vsync_on = on;
@@ -4438,13 +6153,16 @@ fn engine_main(
 
         // -- per-tick work --
         let Some(s) = session.as_mut() else {
+            stop_drag_follower(&mut drag_follower);
+            drag_session_epoch = None;
             // WATCHDOG: no session may ever leave a (stale-frame, possibly
             // fullscreen) overlay on screen. The user hit exactly this with a
             // PIP source: capture died without the stop path, the overlay kept
             // showing its last frame fullscreen and the mouse felt dead.
             if overlay.is_visible() {
                 log::warn!("overlay watchdog: session gone but overlay visible — force hiding");
-                overlay.hide();
+                detach_overlay_owned_helpers(overlay.hwnd().0 as isize);
+                overlay.hide_for_stop();
                 input.release();
             }
             overlay.win.pump_messages();
@@ -4477,7 +6195,22 @@ fn engine_main(
             });
             if now.duration_since(s.source_restart_last) >= Duration::from_millis(250) {
                 s.source_restart_last = now;
-                match WgcSource::start_fmt(s.hwnd, s.fps_cap, s.capture_client_only, false) {
+                let pixel_exact_raw_hint = if s.source_monitor_fullscreen
+                    && s.capture_canvas.is_none()
+                {
+                    s.source_restore_rect
+                        .or_else(|| win32::window_rect(s.hwnd))
+                        .and_then(|(_, _, w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)))
+                } else {
+                    None
+                };
+                match WgcSource::start_fmt_with_pixel_lock(
+                    s.hwnd,
+                    s.fps_cap,
+                    s.capture_client_only,
+                    false,
+                    pixel_exact_raw_hint,
+                ) {
                     Ok(new_source) => {
                         s.source.stop();
                         s.source = new_source;
@@ -4541,37 +6274,106 @@ fn engine_main(
         // differently-sized frame ever arrives, so frame-based detection alone
         // never arms the watchdog and the overlay freezes on its last frame —
         // the "mystery fullscreen ghost" the user hit twice.
+        let pointer_gesture_active = win32::any_mouse_button_down();
         if let Some(rect) = win32::client_rect_on_screen(s.hwnd) {
             if let Some(prev) = s.last_client_rect {
-                if prev != rect {
+                // v371: moving a window changes x/y every tick but does NOT
+                // change the WGC surface geometry. v370 armed the fullscreen
+                // watchdog on any rect inequality, then compared a full-window
+                // WGC frame against CLIENT dimensions. That guaranteed a false
+                // stale-surface restart during ordinary title-bar dragging.
+                let size_changed = rect_size_changed(prev, rect);
+                if size_changed {
                     s.last_geom_change = Some(Instant::now());
+                    log::debug!(
+                        "source-geometry-watchdog-armed: hwnd={:#x} old=({},{} {}x{}) new=({},{} {}x{}) pointer_down={}",
+                        s.hwnd,
+                        prev.0,
+                        prev.1,
+                        prev.2,
+                        prev.3,
+                        rect.0,
+                        rect.1,
+                        rect.2,
+                        rect.3,
+                        pointer_gesture_active
+                    );
                 }
             }
             s.last_client_rect = Some(rect);
         }
+
+        let stale_reference = if !s.frame.data.is_empty() {
+            source_input_reference_rect(s.hwnd, s.capture_client_only, (s.frame.w, s.frame.h))
+        } else {
+            None
+        };
+        let stale_surface_mismatch = stale_reference.is_some_and(|(rect, _, _)| {
+            frame_size_mismatches_reference((s.frame.w, s.frame.h), rect)
+        });
+
+        // If WGC has already converged to the new native size, the geometry
+        // transition is complete.  Disarm immediately; otherwise a static
+        // source can trip the unrelated 3-second starvation release later.
+        if s.last_geom_change.is_some() && !stale_surface_mismatch {
+            if let Some((rect, _, reference)) = stale_reference {
+                log::debug!(
+                    "source-geometry-watchdog-satisfied: hwnd={:#x} frame={}x{} expected={}x{} reference={} action=disarm",
+                    s.hwnd,
+                    s.frame.w,
+                    s.frame.h,
+                    rect.2,
+                    rect.3,
+                    reference
+                );
+            }
+            s.last_geom_change = None;
+            s.starve_released = false;
+        }
         if s.last_geom_change
             .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(250))
-            && s.capture_canvas.is_none()
+            && (s.capture_canvas.is_none()
+                || s.capture_canvas_suspended_for_fullscreen
+                || s.capture_resolution_reapply_pending)
             && s.deferred_capture_resolution.is_none()
-            && !s.frame.data.is_empty()
-            && s.last_client_rect.is_some_and(|rect| {
-                (s.frame.w - rect.2).abs() > 2 || (s.frame.h - rect.3).abs() > 2
-            })
+            && stale_surface_mismatch
+            && !pointer_gesture_active
         {
-            let rect = s.last_client_rect.unwrap();
+            let (rect, _, reference) = stale_reference.expect("mismatch requires reference rect");
             log::warn!(
-                "source geometry changed but WGC retained stale surface: hwnd={:#x} frame={}x{} client={}x{}; restarting WGC in place",
+                "source geometry changed but WGC retained stale surface: hwnd={:#x} frame={}x{} expected={}x{} reference={} client_only={} pointer_down=false; restarting WGC in place",
                 s.hwnd,
                 s.frame.w,
                 s.frame.h,
                 rect.2,
-                rect.3
+                rect.3,
+                reference,
+                s.capture_client_only
             );
             s.display_aspect = (rect.2, rect.3);
             s.last_geom_change = None;
             s.source.stop();
             overlay.win.pump_messages();
             continue;
+        } else if stale_surface_mismatch && pointer_gesture_active {
+            // Never tear down WGC or release source mouse capture in the middle
+            // of a real drag/resize gesture. The size-change watchdog remains
+            // armed and is reconsidered after button-up.
+            if s.last_geom_change
+                .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(250))
+            {
+                let (rect, _, reference) =
+                    stale_reference.expect("mismatch requires reference rect");
+                log::debug!(
+                    "source-geometry-restart-deferred: hwnd={:#x} frame={}x{} expected={}x{} reference={} reason=pointer-gesture-active",
+                    s.hwnd,
+                    s.frame.w,
+                    s.frame.h,
+                    rect.2,
+                    rect.3,
+                    reference
+                );
+            }
         }
 
         // Watchdog is armed ONLY right after a source geometry change (the PIP
@@ -4613,7 +6415,10 @@ fn engine_main(
                     g.warning = Some("ソース変形後にフレームが届かないため停止しました".into());
                     continue;
                 }
-            } else if starved > Duration::from_secs(3) && !s.starve_released {
+            } else if starved > Duration::from_secs(3)
+                && !s.starve_released
+                && !pointer_gesture_active
+            {
                 log::warn!("frame starvation >3s after geometry change: releasing cursor");
                 input.release();
                 s.starve_released = true;
@@ -4648,57 +6453,372 @@ fn engine_main(
             );
         }
 
-        // Windowed mode: dragging the source title bar through the magnified
-        // image moves the overlay by the same delta.  Rebase the hidden source
-        // whenever it reaches a monitor edge so the hardware cursor never runs
-        // out of desktop coordinates before the enlarged overlay reaches the
-        // right/bottom edge.
+        // Windowed source-titlebar drag: input.rs classifies the physical
+        // caption gesture and owns the fixed visual grab anchor. The follower
+        // only mirrors the hidden source HWND position into the overlay. Its
+        // coordinate family and generation are frozen for the whole gesture.
         if s.mode == ScaleMode::Fixed && s.placed {
-            if let Some((sx, sy, sw, sh)) = win32::client_rect_on_screen(s.hwnd) {
-                if let Some((lx, ly)) = s.last_src_pos {
-                    let (dx, dy) = (sx - lx, sy - ly);
-                    if dx != 0 || dy != 0 {
-                        if win32::any_mouse_button_down() {
-                            // A real title-bar drag cannot jump hundreds of
-                            // pixels in one render tick. The previous
-                            // sw.max(256) threshold accepted a -516px GUI
-                            // handoff on a 640px PIP and dragged the overlay
-                            // and hidden source into unrelated browser space.
-                            let max_dx = (sw / 2).clamp(96, 256);
-                            let max_dy = (sh / 2).clamp(96, 256);
-                            let discontinuity = dx.abs() > max_dx || dy.abs() > max_dy;
-                            if discontinuity {
-                                log::info!(
-                                    "source-drag-discontinuity-ignored: delta=({dx},{dy}) source={}x{} threshold=({}, {})",
-                                    sw,
-                                    sh,
-                                    max_dx,
-                                    max_dy
-                                );
-                            } else {
-                                move_windowed_overlay_by_source_delta(&mut overlay, dx, dy);
-                                log::debug!("source-drag-follow: delta=({dx},{dy})");
-                            }
-                            // The source is only the input target while hidden; its absolute
-                            // desktop position is not the magnified window position. Keep it
-                            // on-screen and treat any corrective move as a new drag origin.
-                            s.last_src_pos =
-                                keep_source_window_reachable(s.hwnd).or(Some((sx, sy)));
-                        } else {
-                            log::info!(
-                                "source moved without active drag: delta=({dx},{dy}); keep overlay independent"
-                            );
-                            s.last_src_pos = Some((sx, sy));
-                        }
-                    } else {
-                        s.last_src_pos = Some((sx, sy));
-                    }
+            if let Some(client_rect @ (cx, cy, _cw, _ch)) = win32::client_rect_on_screen(s.hwnd) {
+                let caption_drag = crate::input::source_caption_drag_active();
+                let current_drag_epoch = if caption_drag {
+                    Some(crate::input::source_caption_drag_epoch())
                 } else {
+                    None
+                };
+
+                // A release/re-press can happen faster than one render loop.
+                // If we missed the brief inactive state, the epoch still makes
+                // the generation change explicit: retire the old follower now
+                // and allow the new generation to start in this same tick.
+                if caption_drag && s.source_drag_active && drag_session_epoch != current_drag_epoch
+                {
+                    log::info!(
+                        "source-drag-generation-rollover: previous={:?} current={:?} action=restart-follower",
+                        drag_session_epoch,
+                        current_drag_epoch
+                    );
+                    stop_drag_follower(&mut drag_follower);
+                    s.source_drag_active = false;
+                    drag_session_epoch = None;
+                }
+
+                if !caption_drag && s.source_drag_active {
+                    s.source_drag_active = false;
+                    stop_drag_follower(&mut drag_follower);
+                    drag_session_epoch = None;
+                    let before = win32::window_rect(s.hwnd);
+                    let rebased = keep_source_window_reachable(s.hwnd);
+                    let after_client = win32::client_rect_on_screen(s.hwnd)
+                        .map(|(x, y, _, _)| (x, y))
+                        .or(rebased)
+                        .unwrap_or((cx, cy));
+                    s.last_src_pos = Some(after_client);
+                    log::info!(
+                        "source-drag-session-end: owner=anchored-high-rate-source-follower rebase_once=true before={before:?} client_after={after_client:?}"
+                    );
+                } else {
+                    let drag_reference =
+                        if caption_drag {
+                            source_input_reference_rect(s.hwnd, false, s.display_aspect)
+                                .unwrap_or((client_rect, true, "client-fallback"))
+                        } else {
+                            (client_rect, false, "client")
+                        };
+                    let ((sx, sy, sw, sh), _window_frame, reference_kind) = drag_reference;
+
+                    if caption_drag && !s.source_drag_active {
+                        s.source_drag_active = true;
+                        let overlay_start = overlay.current_rect();
+                        let panel_start = if panel_hwnd != 0 && panel_visible {
+                            win32::window_rect(panel_hwnd)
+                        } else {
+                            None
+                        };
+                        let drag_epoch = crate::input::source_caption_drag_epoch();
+                        drag_session_epoch = Some(drag_epoch);
+                        drag_follower = DragFollower::start(
+                            s.hwnd,
+                            overlay.hwnd().0 as isize,
+                            if panel_visible { panel_hwnd } else { 0 },
+                            (sx, sy, sw, sh),
+                            reference_kind,
+                            overlay_start,
+                            panel_start,
+                            s.monitor_rect,
+                            drag_epoch,
+                        );
+                        // The first fallback delta must use the same coordinate
+                        // family as the follower, not a previous client-space
+                        // snapshot.
+                        s.last_src_pos = Some((sx, sy));
+                        log::info!(
+                            "source-drag-session-begin: epoch={} source=({sx},{sy}) size={}x{} reference={} owner={} caption=true poll_ms=8 anchor=fixed",
+                            drag_epoch,
+                            sw,
+                            sh,
+                            reference_kind,
+                            if drag_follower.is_some() {
+                                "anchored-high-rate-source-follower"
+                            } else {
+                                "engine-follow-fallback"
+                            }
+                        );
+                    }
+
+                    if drag_follower
+                        .as_ref()
+                        .is_some_and(|follower| follower.finished())
+                    {
+                        stop_drag_follower(&mut drag_follower);
+                    }
+
+                    if let Some((lx, ly)) = s.last_src_pos {
+                        let (dx, dy) = (sx - lx, sy - ly);
+                        if dx != 0 || dy != 0 {
+                            if caption_drag {
+                                if drag_follower.is_none() {
+                                    // Thread creation/follower loss only:
+                                    // preserve operability with the v377 engine
+                                    // follower. The visual cursor remains locked
+                                    // by input.rs even on this fallback path.
+                                    let drag_epoch = crate::input::source_caption_drag_epoch();
+                                    let committed =
+                                        crate::input::commit_source_caption_drag_overlay_update(
+                                            drag_epoch,
+                                            || {
+                                                let before = overlay.current_rect();
+                                                move_windowed_overlay_by_source_delta(
+                                                    &mut overlay,
+                                                    dx,
+                                                    dy,
+                                                    gui_priority_topmost,
+                                                );
+                                                let after = overlay.current_rect();
+                                                if (after.0, after.1) != (before.0, before.1) {
+                                                    Some((after.0, after.1))
+                                                } else {
+                                                    None
+                                                }
+                                            },
+                                        );
+                                    if committed {
+                                        log::debug!(
+                                            "source-drag-follow: delta=({dx},{dy}) owner=engine-follow-fallback anchor=fixed epoch={drag_epoch}"
+                                        );
+                                    }
+                                } else if dx.abs() > 256 || dy.abs() > 256 {
+                                    log::debug!(
+                                        "source-drag-observed-large-delta: delta=({dx},{dy}) owner=anchored-high-rate-source-follower"
+                                    );
+                                }
+                            } else if s.capture_client_only && win32::left_mouse_button_down() {
+                                // GetAsyncKeyState alone is not proof that this source owns
+                                // the gesture. A LEFT hold can have started on Neo's GUI or
+                                // desktop, and failed/off-desktop cursor handoffs can release
+                                // source ownership while the physical button is still down.
+                                let source_owned = crate::input::source_client_drag_owns(s.hwnd);
+                                if !source_owned {
+                                    // Always refresh last_src_pos below. This intentionally
+                                    // drops the unowned delta instead of banking it and
+                                    // applying a large catch-up move if ownership returns.
+                                    if s.source_client_drag_active
+                                        || dx.abs() >= 64
+                                        || dy.abs() >= 64
+                                    {
+                                        log::debug!(
+                                            "source-client-drag-follow-suppressed: delta=({dx},{dy}) physical_left=true source_owned=false hwnd={:#x} baseline=refresh",
+                                            s.hwnd
+                                        );
+                                    }
+                                    s.source_client_drag_raw_origin = None;
+                                    s.source_client_drag_overlay_origin = None;
+                                    // Do not fight the native move loop while LEFT is down,
+                                    // but remember if this unowned movement has made the
+                                    // hidden client unreachable.  The old v423 behavior
+                                    // rebased after an owned drag; provider/input transitions
+                                    // can now clear ownership before Chromium finishes moving.
+                                    if client_rect_rebase_delta((sx, sy, sw, sh), s.monitor_rect)
+                                        != (0, 0)
+                                    {
+                                        if !s.source_client_unowned_rebase_pending {
+                                            log::warn!(
+                                                "source-client-unowned-offscreen: hwnd={:#x} client=({sx},{sy},{sw}x{sh}) physical_left=true source_owned=false action=rebase-on-release",
+                                                s.hwnd
+                                            );
+                                        }
+                                        s.source_client_unowned_rebase_pending = true;
+                                    }
+                                } else {
+                                    // A native client-area position change proves that this
+                                    // source-owned LEFT gesture is actually moving the custom
+                                    // frame (Chromium PIP etc.), rather than clicking a control.
+                                    // From this point onward the source HWND is NOT a valid
+                                    // visual movement authority: Windows/Chromium can stop it
+                                    // at an off-screen retention boundary while raw mouse
+                                    // coordinates continue. Arm one absolute raw-coordinate
+                                    // anchor and let the follower below own visual movement.
+                                    if !s.source_client_drag_active {
+                                        s.source_client_drag_active = true;
+                                        let before = overlay.current_rect();
+                                        if let Some((raw_origin, raw_current)) =
+                                            crate::input::source_client_drag_raw_span(s.hwnd)
+                                        {
+                                            s.source_client_drag_raw_origin = Some(raw_origin);
+                                            s.source_client_drag_overlay_origin =
+                                                Some((before.0, before.1));
+                                            log::info!(
+                                                "source-client-drag-session-begin: hwnd={:#x} owner=input-source-left-hold visual_owner=raw-hook-anchor raw_origin=({},{}) raw_current=({},{}) source_delta=({dx},{dy}) clamp=none",
+                                                s.hwnd,
+                                                raw_origin.0,
+                                                raw_origin.1,
+                                                raw_current.0,
+                                                raw_current.1
+                                            );
+                                        } else {
+                                            // Extremely narrow fallback (e.g. an ownership
+                                            // transition raced this geometry sample). Preserve
+                                            // one-frame operability with the already-vetted
+                                            // native delta, but do not create a permanent
+                                            // source-delta follower. A later raw sample will
+                                            // re-anchor without applying banked movement.
+                                            let nx = before.0.saturating_add(dx);
+                                            let ny = before.1.saturating_add(dy);
+                                            if (nx, ny) != (before.0, before.1) {
+                                                reposition_overlay_for_gui_mode(
+                                                    &mut overlay, nx, ny, before.2, before.3, gui_priority_topmost,
+                                                );
+                                            }
+                                            log::warn!(
+                                                "source-client-drag-session-begin: hwnd={:#x} raw_anchor=unavailable fallback=native-delta-once delta=({dx},{dy})",
+                                                s.hwnd
+                                            );
+                                        }
+                                    }
+                                    // Do not mirror dx/dy here. The absolute raw-hook follower
+                                    // below runs even when source geometry does not change,
+                                    // which is exactly the case at Chromium's off-screen wall.
+                                }
+                            } else {
+                                log::info!(
+                                    "source moved without caption drag: delta=({dx},{dy}); keep overlay independent"
+                                );
+                            }
+                        }
+                    }
                     s.last_src_pos = Some((sx, sy));
+
+                    // v426: once a client-only native move has identified a
+                    // window-drag gesture, the visible overlay follows the raw
+                    // WH_MOUSE_LL down->current span, not source HWND deltas.
+                    // This follower runs every engine tick even when sx/sy are
+                    // unchanged, so an OS-clamped hidden PIP cannot create a
+                    // visible movement wall. Absolute-from-origin positioning
+                    // also coalesces interpolation/render stalls without
+                    // accumulating delayed per-frame deltas or overshoot.
+                    if !caption_drag
+                        && s.capture_client_only
+                        && s.source_client_drag_active
+                        && win32::left_mouse_button_down()
+                    {
+                        let source_owned = crate::input::source_client_drag_owns(s.hwnd);
+                        if source_owned {
+                            if let Some((published_origin, raw_current)) =
+                                crate::input::source_client_drag_raw_span(s.hwnd)
+                            {
+                                // If the raw generation changed unexpectedly,
+                                // re-anchor at the current overlay instead of
+                                // mixing two gestures and creating a jump.
+                                if s.source_client_drag_raw_origin != Some(published_origin)
+                                    || s.source_client_drag_overlay_origin.is_none()
+                                {
+                                    let cur = overlay.current_rect();
+                                    let raw_dx = raw_current.0.saturating_sub(published_origin.0);
+                                    let raw_dy = raw_current.1.saturating_sub(published_origin.1);
+                                    // Preserve the current visual position while adopting the
+                                    // newly published generation.  Back-solving the overlay
+                                    // origin prevents the next tick from replaying movement
+                                    // that already happened before this refresh.
+                                    let rebased_overlay_origin = (
+                                        cur.0.saturating_sub(raw_dx),
+                                        cur.1.saturating_sub(raw_dy),
+                                    );
+                                    s.source_client_drag_raw_origin = Some(published_origin);
+                                    s.source_client_drag_overlay_origin =
+                                        Some(rebased_overlay_origin);
+                                    log::debug!(
+                                        "source-client-drag-raw-anchor-refresh: hwnd={:#x} published_origin=({},{}) current=({},{}) overlay=({},{}) rebased_overlay_origin=({},{}) reason=generation-or-anchor-mismatch",
+                                        s.hwnd,
+                                        published_origin.0,
+                                        published_origin.1,
+                                        raw_current.0,
+                                        raw_current.1,
+                                        cur.0,
+                                        cur.1,
+                                        rebased_overlay_origin.0,
+                                        rebased_overlay_origin.1
+                                    );
+                                }
+                                if let (Some(raw_origin), Some(overlay_origin)) = (
+                                    s.source_client_drag_raw_origin,
+                                    s.source_client_drag_overlay_origin,
+                                ) {
+                                    let (nx, ny) = client_drag_overlay_position_from_raw(
+                                        overlay_origin,
+                                        raw_origin,
+                                        raw_current,
+                                    );
+                                    let before = overlay.current_rect();
+                                    if (nx, ny) != (before.0, before.1) {
+                                        reposition_overlay_for_gui_mode(
+                                            &mut overlay, nx, ny, before.2, before.3, gui_priority_topmost,
+                                        );
+                                        let after = overlay.current_rect();
+                                        log::debug!(
+                                            "source-client-drag-follow: raw_delta=({},{}) input=client left_down=true source_owned=true overlay=({},{}) -> ({},{}) owner=raw-hook-anchor native_source=({sx},{sy}) clamp=none",
+                                            raw_current.0.saturating_sub(raw_origin.0),
+                                            raw_current.1.saturating_sub(raw_origin.1),
+                                            before.0,
+                                            before.1,
+                                            after.0,
+                                            after.1
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Ownership cannot return during the same physical
+                            // LEFT hold. Drop visual anchors immediately; the
+                            // button-up path still rebases the hidden source.
+                            s.source_client_drag_raw_origin = None;
+                            s.source_client_drag_overlay_origin = None;
+                        }
+                    }
+
+                    // Client-only PIP/custom-frame drags are not native caption
+                    // drags, so the caption-drag end path above never rebases
+                    // them. Once the physical button is released, restore the
+                    // hidden source to a fully reachable monitor position while
+                    // deliberately leaving the visible overlay where the user
+                    // dropped it. This preserves unrestricted overlay movement
+                    // and prevents ClipCursor/SetCursorPos from targeting source
+                    // pixels beyond the desktop (the observed lower/right wall).
+                    if !caption_drag
+                        && (s.source_client_drag_active || s.source_client_unowned_rebase_pending)
+                        && !win32::left_mouse_button_down()
+                    {
+                        let recovery_reason = if s.source_client_drag_active {
+                            "owned-client-drag-end"
+                        } else {
+                            "unowned-offscreen-move-end"
+                        };
+                        let before = win32::window_rect(s.hwnd);
+                        let rebased = keep_source_window_reachable(s.hwnd);
+                        let after_client = win32::client_rect_on_screen(s.hwnd)
+                            .map(|(x, y, _, _)| (x, y))
+                            .or(rebased)
+                            .unwrap_or((sx, sy));
+                        s.last_src_pos = Some(after_client);
+                        s.source_client_drag_active = false;
+                        s.source_client_unowned_rebase_pending = false;
+                        s.source_client_drag_raw_origin = None;
+                        s.source_client_drag_overlay_origin = None;
+                        log::info!(
+                            "source-client-drag-session-end: rebase_once=true reason={recovery_reason} before={before:?} client_after={after_client:?} overlay_preserved=true"
+                        );
+                    }
                 }
             }
-        } else if let Some((sx, sy, _, _)) = win32::client_rect_on_screen(s.hwnd) {
-            s.last_src_pos = Some((sx, sy));
+        } else {
+            s.source_drag_active = false;
+            s.source_client_drag_active = false;
+            s.source_client_unowned_rebase_pending = false;
+            s.source_client_drag_raw_origin = None;
+            s.source_client_drag_overlay_origin = None;
+            stop_drag_follower(&mut drag_follower);
+            drag_session_epoch = None;
+            if let Some((sx, sy, _, _)) = win32::client_rect_on_screen(s.hwnd) {
+                s.last_src_pos = Some((sx, sy));
+            }
         }
 
         // follow source geometry (windowed mode: user may have moved the
@@ -4706,13 +6826,23 @@ fn engine_main(
         let rect = overlay_geometry(s, &overlay);
         let cur = overlay.current_rect();
         if rect != cur {
-            overlay.reposition(rect.0, rect.1, rect.2, rect.3);
+            reposition_overlay_for_gui_mode(
+                &mut overlay, rect.0, rect.1, rect.2, rect.3, gui_priority_topmost,
+            );
             enforce_gui_priority(
                 gui_priority_hwnd,
                 gui_priority_topmost,
                 panel_hwnd,
                 overlay.hwnd().0 as isize,
             );
+        }
+        // A hard Stop physically removes the persistent WGL HWND from DWM to
+        // guarantee that no frozen frame survives. Reinsert it here at alpha=0
+        // as soon as the next session has restored the correct geometry. This
+        // gives DWM the same pre-existing transparent overlay tree that v235
+        // used, instead of introducing a fullscreen surface only at reveal.
+        if !overlay.is_visible() {
+            overlay.prepare_hidden_for_reveal();
         }
         let rect = overlay.current_rect();
         s.placed = true;
@@ -4744,7 +6874,10 @@ fn engine_main(
             (content_now.x, content_now.y, content_now.w, content_now.h);
         let mut panel_no_engage: Option<(i32, i32, i32, i32)> = None;
         if panel_hwnd != 0 && panel_visible {
-            let (pw, ph) = if panel_chipped { panel_chip } else { panel_bar };
+            let stale_chip_suppressed =
+                panel_chipped && panel_lurk_restore_geometry_guard_active();
+            let geometry_chipped = panel_chipped && !stale_chip_suppressed;
+            let (pw, ph) = if geometry_chipped { panel_chip } else { panel_bar };
             let (px, py) = panel_target_position(
                 s.mode,
                 rect,
@@ -4762,19 +6895,83 @@ fn engine_main(
             };
             if panel_moved || last_panel_raise_check.elapsed() >= Duration::from_millis(200) {
                 let overlay_hwnd = overlay.hwnd().0 as isize;
-                if !win32::window_is_above(panel_hwnd, overlay_hwnd) {
-                    win32::raise_topmost(panel_hwnd);
+                if gui_priority_topmost {
+                    // Modern GUI-topmost path: maintain one deterministic stack
+                    // to avoid GUI/panel flashing while either window moves.
+                    enforce_gui_priority(
+                        gui_priority_hwnd,
+                        true,
+                        panel_hwnd,
+                        overlay_hwnd,
+                    );
+                } else {
+                    // Exact v235 GUI-topmost-OFF panel contract: GUI priority is
+                    // completely inactive; only repair the panel if USER32 says
+                    // it actually fell below the overlay.
+                    if !win32::window_is_above(panel_hwnd, overlay_hwnd) {
+                        win32::raise_topmost(panel_hwnd);
+                        crate::input::keep_cursor_sprite_on_top();
+                    }
                 }
-                enforce_gui_priority(
-                    gui_priority_hwnd,
-                    gui_priority_topmost,
-                    panel_hwnd,
-                    overlay_hwnd,
-                );
                 last_panel_raise_check = Instant::now();
             }
             panel_no_engage = Some(panel_rect);
         }
+
+        if crate::logging::diagnostics_enabled()
+            && last_source_window_poll.elapsed() >= Duration::from_millis(250)
+        {
+            last_source_window_poll = Instant::now();
+            let overlay_hwnd = overlay.hwnd().0 as isize;
+            let cursor_hwnd = crate::input::cursor_sprite_hwnd();
+            let source_windows = win32::visible_top_level_windows_for_pid(
+                win32::window_pid(s.hwnd),
+                12,
+            );
+            if source_windows != last_source_visible_windows {
+                let had_source_popup = last_source_visible_windows.len() > 1;
+                let has_source_popup = source_windows.len() > 1;
+                win32::log_helper_compositor_snapshot(
+                    "source-window-set-change",
+                    gui_priority_hwnd,
+                    panel_hwnd,
+                    overlay_hwnd,
+                    cursor_hwnd,
+                    s.hwnd,
+                );
+                // Desktop-DC readback can block AMD/DWM for hundreds of ms.
+                // Sample pixels only when the source crosses the important
+                // no-popup <-> popup boundary (mpv #32768 appears/disappears),
+                // not for startup or every submenu mutation.
+                if had_source_popup != has_source_popup {
+                    win32::log_helper_physical_visibility(
+                        if has_source_popup {
+                            "source-popup-enter"
+                        } else {
+                            "source-popup-exit"
+                        },
+                        gui_priority_topmost,
+                        panel_hwnd,
+                        overlay_hwnd,
+                        cursor_hwnd,
+                    );
+                }
+                last_source_visible_windows = source_windows;
+                last_helper_compositor_diag = Instant::now();
+            } else if last_helper_compositor_diag.elapsed() >= Duration::from_secs(2) {
+                win32::log_helper_compositor_snapshot(
+                    "periodic-running",
+                    gui_priority_hwnd,
+                    panel_hwnd,
+                    overlay_hwnd,
+                    cursor_hwnd,
+                    s.hwnd,
+                );
+                last_helper_compositor_diag = Instant::now();
+            }
+        }
+        // Desktop-DC visibility sampling is deliberately popup-boundary only.
+        // On the RX 9060 XT it can block for ~0.5 s and itself perturb DWM.
         let phase_panel_finished = Instant::now();
 
         // Native windows that are actually above the magnified overlay are
@@ -4787,8 +6984,19 @@ fn engine_main(
 
         let mut phase_input_started = Instant::now();
         let mut phase_input_finished = phase_input_started;
-        // cursor engage geometry (letterboxed content inside the overlay)
-        if let Some(src) = win32::client_rect_on_screen(s.hwnd) {
+        // Cursor engage geometry must use the SAME coordinate space as the
+        // visible WGC frame. Previously this always used client_rect even when
+        // title-bar removal was OFF, so a full 1900x1072 frame was mapped into
+        // a 1896x1011 client rect: title-bar clicks landed in the client area,
+        // source-window dragging failed, and edge mapping was vertically skewed.
+        let frame_hint = if s.display_aspect.0 > 0 {
+            s.display_aspect
+        } else {
+            s.in_size
+        };
+        if let Some((src, window_frame_input, input_reference)) =
+            source_input_reference_rect(s.hwnd, s.capture_client_only, frame_hint)
+        {
             let (fw, fh) = if s.display_aspect.0 > 0 {
                 s.display_aspect
             } else {
@@ -4836,9 +7044,11 @@ fn engine_main(
                 );
             }
             phase_input_started = Instant::now();
-            let input_geometry_ready = s
-                .input_reenable_after
-                .is_none_or(|deadline| Instant::now() >= deadline);
+            let capture_geometry_ready = s.pending_resize_size.is_none()
+                && !(s.capture_resolution_applied && s.deferred_capture_resolution.is_some());
+            let input_geometry_ready = capture_geometry_ready
+                && s.input_reenable_after
+                    .is_none_or(|deadline| Instant::now() >= deadline);
             if input_geometry_ready {
                 s.input_reenable_after = None;
             }
@@ -4846,12 +7056,15 @@ fn engine_main(
             input.configure(
                 input_geometry_ready && overlay.is_visible(),
                 matches!(s.mode, ScaleMode::Auto),
+                window_frame_input,
+                input_reference,
                 crate::input::Rect {
                     x: rect.0,
                     y: rect.1,
                     w: rect.2,
                     h: rect.3,
                 },
+                overlay_hwnd,
                 content,
                 crate::input::Rect {
                     x: src.0,
@@ -4923,7 +7136,9 @@ fn engine_main(
                                     pending.pair_id,
                                     pending.generation,
                                     pending.timesteps.len(),
-                                    if cooperative_slots {
+                                    if pending.permit_next_after_post_submit {
+                                        "cooperative-after-post-submit"
+                                    } else if cooperative_slots {
                                         "cooperative-slots"
                                     } else {
                                         "streamed"
@@ -5009,13 +7224,7 @@ fn engine_main(
             && !gpu_path_was_active
             && s.gpu_interp_active_logged
         {
-            input.set_transition_suspended(false);
-            s.provider_transition_input_suspended = false;
-            s.provider_transition_input_suspended_since = None;
-            s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
-            log::info!(
-                "provider-transition-ready: first-interpolated-frame-presented input=resume-after-120ms"
-            );
+            resume_provider_transition_after_interpolated_present(&input, s, "gpu-resident");
         }
         // Absolute safety cap: never leave input intentionally suspended if a
         // provider fails to produce a frame. The mapping remains released, so
@@ -5037,21 +7246,26 @@ fn engine_main(
             continue;
         }
 
-        // Do not dequeue a newer source frame while a normal GPU interpolation
-        // pair is still inside its expected fast window. This preserves the
-        // required A -> midpoint -> B order instead of immediately marking the
-        // midpoint stale. A long cold TensorRT build is the sole exception: after
-        // 100 ms the existing live-passthrough branch keeps video and input alive.
-        if s.gpu_interp_pack_pending.is_some()
-            || s.gpu_interp_pending.as_ref().is_some_and(|pending| {
-                !pending.bypassed_newer
-                    && (pending.completed_outputs > 0
-                        || pending.next_output_index > 0
-                        || pending.submitted_at.elapsed() < GPU_INTERP_LIVE_BYPASS_AFTER)
-            })
-        {
+        // While a GPU interpolation pair is in flight, keep the last fully
+        // filtered image on screen. Never dequeue/present an unfiltered live
+        // replacement just because a TensorRT invocation is slow: preset
+        // editing must show exactly the selected filter state. The bounded
+        // result poll above keeps Win32/Stop responsive.
+        if s.gpu_interp_pack_pending.is_some() || s.gpu_interp_pending.is_some() {
+            if let Some(pending) = s.gpu_interp_pending.as_mut() {
+                let elapsed = pending.submitted_at.elapsed();
+                if !pending.slow_wait_logged && elapsed >= Duration::from_millis(250) {
+                    pending.slow_wait_logged = true;
+                    log::warn!(
+                        "interp-gpu-pending-slow: pair={} generation={} elapsed_ms={:.2} render_thread_alive=true policy=hold-last-filtered-frame",
+                        pending.pair_id,
+                        pending.generation,
+                        elapsed.as_secs_f64() * 1000.0
+                    );
+                }
+            }
             overlay.win.pump_messages();
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::yield_now();
             continue;
         }
 
@@ -5081,6 +7295,108 @@ fn engine_main(
         let queued_capture = interp_active || temporal_lookahead;
         s.source.set_queue_enabled(queued_capture);
         let phase_capture_started = Instant::now();
+
+        // A source may enter its own fullscreen presentation after capture has
+        // already started. Capture size is a windowed-source policy; forcing
+        // the old client canvas onto a monitor-covering WGC surface produces a
+        // zoom/crop-looking view. Let WGC's live fullscreen geometry own the
+        // session while keeping the user's requested size reserved for the
+        // return to windowed mode.
+        let live_monitor_fullscreen = win32::is_monitor_fullscreen(s.hwnd);
+        if !s.source_live_fullscreen && live_monitor_fullscreen {
+            let monitor_size = (s.monitor_rect.2, s.monitor_rect.3);
+            let live_presentation_signature = win32::fullscreen_presentation_signature(s.hwnd);
+            let recent_geometry_change = s
+                .last_geom_change
+                .is_some_and(|changed| changed.elapsed() < FULLSCREEN_ENTER_GEOMETRY_GRACE);
+            let capture_resize_intent = status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capture_resolution_resize_intent;
+            let source_owned_fullscreen = should_enter_live_fullscreen(
+                s.source_monitor_fullscreen,
+                live_monitor_fullscreen,
+                s.capture_canvas,
+                monitor_size,
+                s.source_presentation_signature,
+                live_presentation_signature,
+                capture_resize_intent,
+                recent_geometry_change,
+            );
+            // Do not equate monitor-sized pixels with fullscreen state. Neo can
+            // intentionally make a normal PIP/mpv client 1920x1080 on a 1080p
+            // display. Only source-owned presentation evidence may suspend the
+            // capture-resolution option.
+            if source_owned_fullscreen {
+                s.source_live_fullscreen = true;
+                s.fullscreen_exit_candidate_since = None;
+                let suspended_target = s.capture_canvas;
+                if suspended_target.is_some() {
+                    s.capture_canvas_suspended_for_fullscreen = true;
+                    s.capture_resolution_reapply_pending = false;
+                    s.deferred_capture_resolution = None;
+                    s.capture_resolution_applied = false;
+                    s.capture_resolution_wait_started = None;
+                    s.pending_resize_size = None;
+                    input.release();
+                }
+                {
+                    let mut st = status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    st.source_live_fullscreen = true;
+                    if suspended_target.is_some() {
+                        st.capture_resolution_fullscreen_notice_seq = st
+                            .capture_resolution_fullscreen_notice_seq
+                            .saturating_add(1);
+                    }
+                }
+                if let Some(target) = suspended_target {
+                    log::info!(
+                        "source-fullscreen-live-enter: hwnd={:#x} capture_canvas={}x{} monitor={}x{} action=suspend-capture-resolution follow=wgc-native",
+                        s.hwnd,
+                        target.0,
+                        target.1,
+                        monitor_size.0,
+                        monitor_size.1
+                    );
+                } else {
+                    log::info!(
+                        "source-fullscreen-live-enter: hwnd={:#x} capture_canvas=auto monitor={}x{} action=follow-wgc-native",
+                        s.hwnd,
+                        monitor_size.0,
+                        monitor_size.1
+                    );
+                }
+            }
+        } else if s.source_live_fullscreen {
+            if live_monitor_fullscreen {
+                s.fullscreen_exit_candidate_since = None;
+            } else {
+                let exit_since = s
+                    .fullscreen_exit_candidate_since
+                    .get_or_insert_with(Instant::now);
+                if exit_since.elapsed() >= Duration::from_millis(250) {
+                    s.source_live_fullscreen = false;
+                    s.fullscreen_exit_candidate_since = None;
+                    s.capture_resolution_reapply_pending = s.capture_canvas.is_some();
+                    {
+                        let mut st = status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        st.source_live_fullscreen = false;
+                        st.capture_resolution_reapply_seq =
+                            st.capture_resolution_reapply_seq.saturating_add(1);
+                    }
+                    log::info!(
+                        "source-fullscreen-live-exit: hwnd={:#x} action=windowed-stable capture_resolution_reapply_pending={}",
+                        s.hwnd,
+                        s.capture_resolution_reapply_pending
+                    );
+                }
+            }
+        }
+
         // In smooth, non-interpolated playback, wake before the next display
         // slot.  A fixed 20 ms wait limited the recovery path itself to 50 Hz
         // whenever WGC omitted one 16.7 ms notification.
@@ -5121,7 +7437,33 @@ fn engine_main(
         } else {
             s.source.take_latest(&mut s.frame)
         };
+        if took_frame && s.capture_canvas_suspended_for_fullscreen {
+            let monitor_size = (s.monitor_rect.2, s.monitor_rect.3);
+            let frame_is_fullscreen =
+                (s.frame.w - monitor_size.0).abs() <= 2 && (s.frame.h - monitor_size.1).abs() <= 2;
+            if !frame_is_fullscreen {
+                log::debug!(
+                    "fullscreen-transition frame ignored: observed={}x{} monitor={}x{} reason=await-native-wgc-fullscreen",
+                    s.frame.w,
+                    s.frame.h,
+                    monitor_size.0,
+                    monitor_size.1
+                );
+                overlay.win.pump_messages();
+                continue;
+            }
+        }
+        if took_frame && s.capture_resolution_reapply_pending {
+            // Keep the last complete fullscreen frame as a short transition
+            // shield. The GUI will immediately reissue the latest capture-size
+            // preference (or ClearCaptureGeometry for Auto), avoiding a brief
+            // window-native frame followed by a second resize/rebuild.
+            overlay.win.pump_messages();
+            continue;
+        }
         if took_frame
+            && !s.capture_canvas_suspended_for_fullscreen
+            && !s.capture_resolution_reapply_pending
             && let Some(target) = s.capture_canvas
             && should_apply_capture_canvas(
                 (s.frame.w, s.frame.h),
@@ -5261,11 +7603,16 @@ fn engine_main(
             }
         }
         // A settings/filter change may request reprocessing while WGC is
-        // static. The sequence guard below prevents the in-place highlight knee
-        // from being applied twice to the cached frame.
+        // static. This is a *semantic* refresh, not a duplicate source frame:
+        // the same source pixels must pass through the newly selected chain.
+        // Keep an explicit flag so cadence/duplicate suppression cannot reuse
+        // the old chain's last_tex and defer the visible effect until a later
+        // mouse/hover repaint from the source window.
+        let mut chain_reprocess_forced = false;
         if !took_frame && s.chain_reprocess_pending && !s.frame.data.is_empty() {
             got_new = true;
             took_frame = true;
+            chain_reprocess_forced = true;
             log::info!("chain-apply: reprocessing cached static source frame");
         }
         if took_frame && !cap_skip && s.capture_hdr {
@@ -5494,7 +7841,10 @@ fn engine_main(
                     // here produced the zoom/crop-looking output after a live
                     // 1280x720 -> 960x540 (or 16:9 -> 4:3) change.
                     s.display_aspect = new_in_size;
-                    if s.capture_canvas.is_some() {
+                    if s.capture_canvas.is_some()
+                        && !s.capture_canvas_suspended_for_fullscreen
+                        && !s.capture_resolution_reapply_pending
+                    {
                         s.capture_canvas = Some(new_in_size);
                     }
                     s.last_geom_change = None;
@@ -5662,6 +8012,7 @@ fn engine_main(
         if got_new
             && took_frame
             && !cap_skip
+            && !chain_reprocess_forced
             && (s.smooth_pacing || neodeint_active)
             && (s.duplicate_frame_reduction || s.browser_fullscreen_cadence)
             && !resize_committed
@@ -5889,6 +8240,7 @@ fn engine_main(
         if got_new
             && took_frame
             && !cap_skip
+            && !chain_reprocess_forced
             && !interp_active
             && !resize_committed
             && !smooth_content_duplicate
@@ -6250,79 +8602,6 @@ fn engine_main(
                     overlay.win.pump_messages();
                     continue;
                 }
-                if s.gpu_interp_pending.is_some() {
-                    // Only a genuinely long provider call reaches this branch.
-                    // Fast steady-state jobs are held above until their midpoint
-                    // is presented in temporal order. A cold TensorRT build may
-                    // take seconds, so live real-frame passthrough remains active
-                    // after the bounded grace period and only that warm-up result
-                    // is discarded when it eventually returns.
-                    if let Some(pending) = s.gpu_interp_pending.as_mut() {
-                        if !pending.bypassed_newer {
-                            log::warn!(
-                                "interp-gpu-live-bypass: pair={} generation={} elapsed_ms={:.2} reason=cold-provider-or-stalled-job",
-                                pending.pair_id,
-                                pending.generation,
-                                pending.submitted_at.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                        pending.bypassed_newer = true;
-                    }
-                    let interp_index = s.chain.interp_index().unwrap_or(0);
-                    let post_chain_start = (interp_index + 1).min(s.chain.stage_count());
-                    let input = upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms);
-                    let mut bypass_probe = |name: &str, kind: StageKind, ms: f64| {
-                        metrics.probe(
-                            name,
-                            if kind == StageKind::Glsl {
-                                "glsl"
-                            } else {
-                                "onnx"
-                            },
-                            ms,
-                        );
-                    };
-                    let cur_tex = if interp_index > 0 {
-                        match s.chain.process_range(
-                            &mut gc,
-                            input,
-                            out_size,
-                            0,
-                            interp_index,
-                            if stats { Some(&mut bypass_probe) } else { None },
-                        ) {
-                            Ok(texture) => texture,
-                            Err(error) => {
-                                log::error!("GPU interpolation bypass pre-chain failed: {error:#}");
-                                input
-                            }
-                        }
-                    } else {
-                        input
-                    };
-                    let now = Instant::now();
-                    let delivered = s.source.delivered();
-                    let captures = delivered.saturating_sub(s.metric_seq) as u32;
-                    s.metric_seq = delivered;
-                    process_and_present_from(
-                        &mut gc,
-                        &mut overlay,
-                        s,
-                        &metrics,
-                        &status,
-                        cur_tex,
-                        out_size,
-                        stats,
-                        now,
-                        captures,
-                        Some(FrameTiming::from_frame(&s.frame, now)),
-                        &[],
-                        downscaler,
-                        post_chain_start,
-                    );
-                    overlay.win.pump_messages();
-                    continue;
-                }
                 if s.frame.hdr {
                     // ONNX interp works on 8-bit RGB; HDR capture skips it
                     s.hist.clear();
@@ -6330,7 +8609,7 @@ fn engine_main(
                     s.interp_worker = None;
                     s.interp_pending = None;
                 }
-                let (need, delayed, rgba_direct) = {
+                let (need, delayed, rgba_direct, dml_rife) = {
                     let ist = ist.lock().unwrap();
                     (
                         ist.interp_frames(),
@@ -6340,6 +8619,11 @@ fn engine_main(
                             crate::render::onnx_stage::InterpKind::RifeV1 { .. }
                                 | crate::render::onnx_stage::InterpKind::Drba
                         ),
+                        ist.provider == crate::render::onnx_stage::OnnxProvider::DirectML
+                            && matches!(
+                                &ist.interp,
+                                crate::render::onnx_stage::InterpKind::RifeV1 { .. }
+                            ),
                     )
                 };
                 let interp_index = s.chain.interp_index().unwrap_or(0);
@@ -6387,6 +8671,68 @@ fn engine_main(
                         }
                     } else {
                         input
+                    };
+                    let cur_tex = if dml_rife {
+                        if let Some((limited_w, limited_h)) =
+                            directml_rife_limited_size(cur_tex.w(), cur_tex.h())
+                        {
+                            let source_size = (cur_tex.w(), cur_tex.h());
+                            match crate::render::scaler::resample(
+                                &mut gc,
+                                cur_tex,
+                                limited_w,
+                                limited_h,
+                                crate::render::scaler::Kernel::Spline36,
+                            ) {
+                                Ok(limited) => {
+                                    log_directml_rife_height_limit(
+                                        s,
+                                        source_size,
+                                        (limited_w, limited_h),
+                                        interp_index,
+                                        "gpu-resident",
+                                    );
+                                    limited
+                                }
+                                Err(error) => {
+                                    let message = format!(
+                                        "DirectML RIFE height-limit resample failed: {error:#}"
+                                    );
+                                    log::error!("{message}");
+                                    let mut state = status.lock().unwrap();
+                                    if !state.chain_errors.contains(&message) {
+                                        state.chain_errors.push(message);
+                                    }
+                                    drop(state);
+                                    // Never feed an over-limit frame to DirectML RIFE after
+                                    // the safety cap itself failed. Preserve the selected
+                                    // post-chain and present the real pre-RIFE frame instead.
+                                    let now = Instant::now();
+                                    process_and_present_from(
+                                        &mut gc,
+                                        &mut overlay,
+                                        s,
+                                        &metrics,
+                                        &status,
+                                        cur_tex,
+                                        out_size,
+                                        stats,
+                                        now,
+                                        0,
+                                        Some(FrameTiming::from_frame(&s.frame, now)),
+                                        &[],
+                                        downscaler,
+                                        post_chain_start,
+                                    );
+                                    overlay.win.pump_messages();
+                                    continue;
+                                }
+                            }
+                        } else {
+                            cur_tex
+                        }
+                    } else {
+                        cur_tex
                     };
                     let dimensions_changed = s.gpu_interp_hist.front().is_some_and(|frame| {
                         (frame.tex.w(), frame.tex.h()) != (cur_tex.w(), cur_tex.h())
@@ -6463,13 +8809,18 @@ fn engine_main(
                         .period_s()
                         .or_else(|| (s.arrival_interval > 0.0).then_some(s.arrival_interval))
                         .unwrap_or(1.0 / 30.0);
-                    let output_ratio = refresh_limited_output_ratio(
+                    let output_ratio = onnx_output_ratio(
                         factor,
                         Some(source_period),
                         s.monitor_refresh_hz,
                     );
                     let phases =
-                        onnx_interpolation_phases(factor, output_ratio, &mut s.flow_output_cadence);
+                        onnx_interpolation_phases(
+                            factor,
+                            output_ratio,
+                            onnx_x3_60hz_mode(s.monitor_refresh_hz),
+                            &mut s.flow_output_cadence,
+                        );
                     let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
                     let timesteps = phases
                         .into_iter()
@@ -6572,26 +8923,53 @@ fn engine_main(
                     };
                     let (prepared, output_slots) = {
                         let mut stage = ist.lock().unwrap();
+                        let post_glsl = s.chain.has_glsl_in_range(post_chain_start);
+                        // Keep real frames and generated frames on the same
+                        // texture contract before post-GLSL processing. The
+                        // former and TensorRT output already cross an RGBA8
+                        // boundary; preserving only DirectML's raw FP16 result
+                        // exposed sub-8-bit RIFE noise which Anime4K amplified
+                        // into a visible cell/dot pattern every other frame.
+                        // Conversion remains GPU-resident and adds no CPU copy.
+                        let preserve_float_after_dml = false;
                         let prepared = stage.prepare_interp_gpu_textures_with_factor(
                             &mut gc,
                             &history,
                             &timesteps,
                             s.interp_generation,
                             factor as usize,
+                            post_glsl,
                         )?;
                         let slots = if prepared.is_some() {
-                            stage.prepared_interp_gpu_outputs(timesteps.len())?
+                            stage.prepared_interp_gpu_outputs(
+                                timesteps.len(),
+                                preserve_float_after_dml,
+                            )?
                         } else {
                             Vec::new()
                         };
+                        if pair_id < 3
+                            && post_glsl
+                            && matches!(
+                                stage.provider,
+                                crate::render::onnx_stage::OnnxProvider::DirectML
+                            )
+                        {
+                            log::info!(
+                                "interp-post-handoff: backend=DirectML input=NCHW-FP output=RGBA8 post_glsl=true quantize_before_post=true parity=real-frame+TensorRT"
+                            );
+                        }
                         (prepared, slots)
                     };
                     let ready_outputs = vec![None; timesteps.len()];
-                    let cooperative_slots = factor >= 4 && timesteps.len() >= 3;
+                    let (cooperative_slots, permit_next_after_post_submit) =
+                        gpu_interp_slot_policy(factor, timesteps.len());
                     let pending = PendingGpuInterp {
                         generation: s.interp_generation,
                         pair_id,
+                        factor,
                         cooperative_slots,
+                        permit_next_after_post_submit,
                         stage: ist.clone(),
                         metric_name: interp_name.clone(),
                         real_tex: endpoint.tex,
@@ -6609,7 +8987,7 @@ fn engine_main(
                         output_period,
                         out_size,
                         submitted_at: Instant::now(),
-                        bypassed_newer: false,
+                        slow_wait_logged: false,
                     };
                     match prepared {
                         Some(fence) => {
@@ -6655,7 +9033,7 @@ fn engine_main(
                     );
                 }
                 let conv_t0 = Instant::now();
-                let (interp_w, interp_h, cur_data) = if s.frame.hdr {
+                let (mut interp_w, mut interp_h, mut cur_data) = if s.frame.hdr {
                     (s.frame.w, s.frame.h, Vec::new())
                 } else if interp_index > 0 {
                     let input = upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms);
@@ -6725,6 +9103,47 @@ fn engine_main(
                 } else {
                     (s.frame.w, s.frame.h, rgba_to_rgb(&s.frame.data))
                 };
+                if dml_rife && !s.frame.hdr {
+                    if let Some((limited_w, limited_h)) =
+                        directml_rife_limited_size(interp_w, interp_h)
+                    {
+                        // RifeV1/DRBA use the RGBA-direct engine path. For the
+                        // DirectML RIFE cap keep the real endpoints and generated
+                        // midpoints in the same limited geometry so cadence never
+                        // alternates between full-size and capped frames.
+                        if rgba_direct {
+                            if let Some(limited) = resize_rgba8_bilinear(
+                                &cur_data,
+                                interp_w,
+                                interp_h,
+                                limited_w,
+                                limited_h,
+                            ) {
+                                let source_size = (interp_w, interp_h);
+                                interp_w = limited_w;
+                                interp_h = limited_h;
+                                cur_data = limited;
+                                log_directml_rife_height_limit(
+                                    s,
+                                    source_size,
+                                    (limited_w, limited_h),
+                                    interp_index,
+                                    "cpu-visible",
+                                );
+                            } else {
+                                let message = format!(
+                                    "DirectML RIFE CPU height-limit resize failed: {}x{} -> {}x{}",
+                                    interp_w, interp_h, limited_w, limited_h
+                                );
+                                log::error!("{message}");
+                                let mut state = status.lock().unwrap();
+                                if !state.chain_errors.contains(&message) {
+                                    state.chain_errors.push(message);
+                                }
+                            }
+                        }
+                    }
+                }
                 let cur_frame: Arc<Vec<u8>> = Arc::new(cur_data);
                 if stats && !s.frame.hdr {
                     if rgba_direct {
@@ -6896,7 +9315,7 @@ fn engine_main(
                             s.cadence.period_s().or(pair_dt).or_else(|| {
                                 (s.arrival_interval > 0.0).then_some(s.arrival_interval)
                             });
-                        let output_ratio = refresh_limited_output_ratio(
+                        let output_ratio = onnx_output_ratio(
                             factor,
                             source_period_s,
                             s.monitor_refresh_hz,
@@ -6904,6 +9323,7 @@ fn engine_main(
                         let phases = onnx_interpolation_phases(
                             factor,
                             output_ratio,
+                            onnx_x3_60hz_mode(s.monitor_refresh_hz),
                             &mut s.flow_output_cadence,
                         );
                         let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
@@ -6964,6 +9384,7 @@ fn engine_main(
                     drain_pending_interp(
                         &mut gc,
                         &mut overlay,
+                        &input,
                         s,
                         &metrics,
                         &status,
@@ -7269,8 +9690,8 @@ fn engine_main(
             } else {
                 pace_processing_start(s, &mut overlay)
             };
-            if captures > 1 && s.phase_diag_samples < 12 {
-                log::info!(
+            if crate::logging::diagnostics_enabled() && captures > 1 && s.phase_diag_samples < 12 {
+                log::debug!(
                     "frame-phase diag: captures={} seq={} since_present_ms={:.2} setup_ms={:.2} cursor_ms={:.2} watchdog_ms={:.2} zorder_ms={:.2} geometry_ms={:.2} panel_ms={:.2} foreground_ms={:.2} input_ms={:.2} post_input_ms={:.2} capture_wait_take_ms={:.2} pre_process_ms={:.2}",
                     captures,
                     s.frame.seq,
@@ -7380,6 +9801,7 @@ fn engine_main(
             drain_pending_interp(
                 &mut gc,
                 &mut overlay,
+                &input,
                 s,
                 &metrics,
                 &status,
@@ -7410,11 +9832,23 @@ fn engine_main(
             // source slot; DWM retains the completed frame before then.
             if s.last_arrival.elapsed() >= period.mul_f64(1.5) && s.last_present.elapsed() >= period
             {
-                if let Some(t) = s.last_tex {
+                if let Some(t) = s.last_tex
+                    && overlay.present(&mut gc, t).is_ok()
+                {
                     let now = Instant::now();
-                    let _ = overlay.present(&mut gc, t);
                     s.last_present = now;
                     s.present_cadence.record(now);
+                    metrics.present_only();
+                    s.smooth_pacer
+                        .reanchor_after_gap_fill_present(now, Some(source_period_s));
+                    s.paced_present_deadline = None;
+                    if crate::logging::diagnostics_enabled() {
+                        log::debug!(
+                            "smooth-pacing gap-fill reanchor: cadence_ms={:.2} next_gap_ms={:.2}",
+                            source_period_s * 1000.0,
+                            source_period_s * 1000.0
+                        );
+                    }
                 }
             }
         } else if s.last_present.elapsed() > IDLE_KEEPALIVE_INTERVAL {
@@ -7452,12 +9886,50 @@ fn start_session(
     duplicate_frame_reduction: bool,
     factory: &mut StageFactory,
 ) -> Result<(Session, Vec<String>, Option<String>)> {
+    // Defensive invariant: WGC edge-pads odd dimensions before the frame
+    // reaches the engine. Keep the source client, transition target and input
+    // canvas on that same even geometry so an odd PIP aspect-fit can never
+    // leave the overlay waiting for an impossible frame size.
+    let deferred_capture_resolution = deferred_capture_resolution.map(|(requested, applied)| {
+        let normalized = normalize_capture_client_size(applied);
+        if normalized != applied {
+            log::info!(
+                "capture-start-even-normalize: requested={}x{} applied={}x{} normalized={}x{}",
+                requested.0,
+                requested.1,
+                applied.0,
+                applied.1,
+                normalized.0,
+                normalized.1
+            );
+        }
+        (requested, normalized)
+    });
+    let capture_canvas = deferred_capture_resolution
+        .map(|(_, applied)| applied)
+        .or_else(|| capture_canvas.map(normalize_capture_client_size));
     let monitor_rect = win32::monitor_rect_of(hwnd);
     let monitor_refresh_hz = win32::monitor_refresh_hz(hwnd);
+    // A monitor-covering source is already fullscreen presentation content.
+    // Cropping it again through Win32/DWM client coordinates can introduce a
+    // 1px x/y origin shift on geometry-sensitive fullscreen applications.
+    // Preserve the WGC frame exactly and let the capture layer only edge-pad
+    // an odd final row/column. Explicit capture canvases belong to the
+    // window/PIP path and keep the existing client-area semantics.
+    let source_monitor_fullscreen = source_restore_rect
+        .map(|rect| win32::is_rect_monitor_fullscreen(hwnd, rect))
+        .unwrap_or_else(|| win32::is_monitor_fullscreen(hwnd));
+    let effective_client_only =
+        client_only && !(source_monitor_fullscreen && capture_canvas.is_none());
+    if client_only != effective_client_only {
+        log::info!(
+            "fullscreen-pixel-exact: hwnd={hwnd:#x} client_crop=bypassed origin=(0,0) edge_pad=right/bottom-only reason=monitor-cover-source"
+        );
+    }
     let display_aspect = capture_canvas
         .map(|(w, h)| (w as i32, h as i32))
         .unwrap_or_else(|| {
-            if client_only {
+            if effective_client_only {
                 win32::client_rect_on_screen(hwnd)
             } else {
                 win32::window_rect(hwnd)
@@ -7480,7 +9952,7 @@ fn start_session(
         mode,
         ratio,
         hide_source,
-        client_only,
+        effective_client_only,
         fps_cap,
         smooth_pacing,
         duplicate_frame_reduction,
@@ -7495,7 +9967,27 @@ fn start_session(
     }
     // The user-facing HDR option now reuses the same fast RGBA8 WGC path as
     // HDR OFF. Only a small post-capture highlight knee is enabled below.
-    let source = WgcSource::start_fmt(hwnd, fps_cap, client_only, false)?;
+    let pixel_exact_raw_hint = if source_monitor_fullscreen && capture_canvas.is_none() {
+        source_restore_rect
+            .or_else(|| win32::window_rect(hwnd))
+            .and_then(|(_, _, w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)))
+    } else {
+        None
+    };
+    let source = WgcSource::start_fmt_with_pixel_lock(
+        hwnd,
+        fps_cap,
+        effective_client_only,
+        false,
+        pixel_exact_raw_hint,
+    )?;
+    if let Some((w, h)) = pixel_exact_raw_hint {
+        log::info!(
+            "fullscreen-pixel-exact-raw-lock: hwnd={hwnd:#x} raw_hint={}x{} tolerance=1px normalize=right/bottom-only material-resize=passthrough",
+            w,
+            h
+        );
+    }
     if let Some(cap) = fps_cap.filter(|cap| *cap > 0) {
         log::info!(
             "fps-cap pipeline: wgc_request=native target={} order={} applies_to=glsl/onnx/interpolation contiguous_post_reduction_seq=true",
@@ -7533,14 +10025,36 @@ fn start_session(
     }
     source.set_queue_enabled(chain.has_interp());
     let warning: Option<String> = None;
-    // Keep the source at the top of the z-order (just under our overlay) for
-    // the whole session: click-through clicks land on whatever window is
-    // under the cursor, so nothing may cover the source. Restored on stop.
+    log::info!(
+        "source-fullscreen-origin: hwnd={hwnd:#x} monitor_cover={source_monitor_fullscreen} client_only_requested={client_only} client_only_effective={effective_client_only}"
+    );
+    // Windowed/PIP sources are promoted just under Neo's overlay so a
+    // click-through lands on the selected source instead of an unrelated
+    // normal window. Do NOT promote a monitor-covering fullscreen source.
+    // Some applications/compositors can react to HWND_TOPMOST with a subtle
+    // outer-rect or presentation-layout change (for example a one-pixel size
+    // transition). That can look like a 1-2 px zoom even with an empty filter
+    // chain. The overlay is itself TOPMOST and the fullscreen source already
+    // covers the monitor, so source promotion is redundant.
     let src_was_topmost = win32::is_topmost(hwnd);
     log::info!(
         "source-geometry-saved: hwnd={hwnd:#x} rect={source_restore_rect:?} maximized={source_was_maximized}"
     );
-    win32::set_topmost(hwnd, true);
+    if source_monitor_fullscreen {
+        log::info!(
+            "source-zorder-pixel-lock: hwnd={hwnd:#x} fullscreen=true topmost_promotion=skipped original_topmost={src_was_topmost} rect={:?}",
+            win32::window_rect(hwnd)
+        );
+    } else {
+        win32::set_topmost(hwnd, true);
+        log::debug!(
+            "source-zorder: hwnd={hwnd:#x} fullscreen=false topmost_promotion=applied original_topmost={src_was_topmost}"
+        );
+    }
+    let source_presentation_signature = win32::fullscreen_presentation_signature(hwnd);
+    log::debug!(
+        "source-presentation-origin: hwnd={hwnd:#x} signature={source_presentation_signature:?} monitor_cover={source_monitor_fullscreen}"
+    );
     let (hid_source, hide_source_pending) = if hide_source {
         log::info!("source {hwnd:#x} visual hide deferred until first valid filtered frame");
         (None, true)
@@ -7550,6 +10064,12 @@ fn start_session(
     Ok((
         Session {
             hwnd,
+            source_monitor_fullscreen,
+            source_live_fullscreen: source_monitor_fullscreen,
+            source_presentation_signature,
+            capture_canvas_suspended_for_fullscreen: false,
+            capture_resolution_reapply_pending: false,
+            fullscreen_exit_candidate_since: None,
             browser_fullscreen_cadence: AUTO_CONTENT_CADENCE_ENABLED
                 && win32::is_browser_window(hwnd)
                 && win32::is_monitor_fullscreen(hwnd),
@@ -7558,7 +10078,7 @@ fn start_session(
             mode,
             ratio,
             fps_cap,
-            capture_client_only: client_only,
+            capture_client_only: effective_client_only,
             capture_hdr: hdr,
             hdr_sdr_mode,
             hdr_sdr_preprocess_logged: false,
@@ -7569,6 +10089,7 @@ fn start_session(
             source_restart_last: Instant::now() - Duration::from_secs(1),
             last_tex: None,
             last_present: Instant::now(),
+            last_present_started: Instant::now(),
             frame: FrameBuf::default(),
             chain_reprocess_pending: false,
             in_size: (0, 0),
@@ -7601,6 +10122,11 @@ fn start_session(
             monitor_refresh_hz,
             monitor_rect,
             last_src_pos: None,
+            source_drag_active: false,
+            source_client_drag_active: false,
+            source_client_unowned_rebase_pending: false,
+            source_client_drag_raw_origin: None,
+            source_client_drag_overlay_origin: None,
             arrival_interval: 0.0,
             last_arrival: Instant::now(),
             starve_released: false,
@@ -7643,6 +10169,7 @@ fn start_session(
             gpu_interp_pack_pending: None,
             gpu_interp_pending: None,
             gpu_interp_result_stash: std::collections::VecDeque::new(),
+            gpu_interp_permit_after_post_submit: None,
             gpu_interp_pair_id: 0,
             gpu_interp_active_logged: false,
             provider_transition_input_suspended: false,
@@ -7652,6 +10179,7 @@ fn start_session(
             interp_present_deadline: None,
             interp_post_warm: false,
             pre_chain_route_log_key: None,
+            dml_rife_limit_log_key: None,
             last_process_ms: 0.0,
             last_compute_ms: 0.0,
             last_upload_submit_ms: 0.0,
@@ -7661,10 +10189,22 @@ fn start_session(
             last_pacer_wait_ms: 0.0,
             last_present_call_ms: 0.0,
             last_present_block_ms: 0.0,
+            compositor_pressure_window_started: Instant::now(),
+            compositor_pressure_samples: 0,
+            compositor_pressure_max_ms: 0.0,
+            compositor_pressure_sum_ms: 0.0,
             last_filter_retry_log: None,
             metric_seq: 0,
             last_metrics_log: Instant::now(),
             phase_diag_samples: 0,
+            glsl_guard: GlslResponsivenessGuard::default(),
+            glsl_overload_history: std::collections::VecDeque::new(),
+            glsl_overload_hint: false,
+            glsl_chain_settle_until: None,
+            glsl_chain_immediate_until: None,
+            glsl_resolution_recheck_active: false,
+            glsl_resolution_recheck_started: None,
+            glsl_resolution_recheck_healthy_since: None,
         },
         errs,
         warning,
@@ -7726,45 +10266,139 @@ fn clamp_axis_to_bounds(pos: i32, size: i32, bounds_pos: i32, bounds_size: i32) 
     }
 }
 
-/// Keep the hidden source fully reachable by the hardware cursor.  Fullscreen
-/// mapping can move a PIP HWND partially beyond the monitor; a later windowed
-/// engage would then request SetCursorPos coordinates outside the virtual
-/// desktop and Windows would clamp them at the edge.
+fn client_rect_rebase_delta(
+    client: (i32, i32, i32, i32),
+    bounds: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (cx, cy, cw, ch) = client;
+    let (bx, by, bw, bh) = bounds;
+    let safe_x = clamp_axis_to_bounds(cx, cw, bx, bw);
+    let safe_y = clamp_axis_to_bounds(cy, ch, by, bh);
+    (safe_x.saturating_sub(cx), safe_y.saturating_sub(cy))
+}
+
+/// Keep the hidden source CLIENT fully reachable by the hardware cursor.
+///
+/// v426 still clamped the outer HWND rect. Chromium/PIP can report a client
+/// origin below that outer origin (31 px in the 2026-08-15 regression log).
+/// Consequently an outer rect ending at y=1080 could leave the actual input
+/// client ending at y=1111. ClipCursor/SetCursorPos then hit the physical
+/// desktop edge before the virtual cursor reached the magnified-window edge,
+/// which felt like a sticky boundary that needed an extra push to escape.
+///
+/// Translate the OUTER window by the amount required to put the CLIENT rect
+/// inside the monitor, then re-read the client geometry. Windows may adjust
+/// non-client geometry while moving Chromium custom-frame windows, so verify
+/// convergence for a few synchronous passes instead of assuming one SetWindowPos
+/// produces the requested client origin. The visible Neo overlay is untouched.
 fn keep_source_window_reachable(hwnd: isize) -> Option<(i32, i32)> {
     if win32::is_monitor_fullscreen(hwnd) {
         return win32::client_rect_on_screen(hwnd).map(|(x, y, _, _)| (x, y));
     }
-    let (x, y, w, h) = win32::window_rect(hwnd)?;
-    let (mx, my, mw, mh) = win32::monitor_rect_of(hwnd);
-    let nx = clamp_axis_to_bounds(x, w, mx, mw);
-    let ny = clamp_axis_to_bounds(y, h, my, mh);
-    if (nx, ny) != (x, y) {
-        win32::set_window_rect(hwnd, nx, ny, w, h);
+
+    let monitor = win32::monitor_rect_of(hwnd);
+    let mut moved = false;
+    let mut attempts = 0usize;
+
+    for attempt in 0..3 {
+        attempts = attempt + 1;
+        let client_before = win32::client_rect_on_screen(hwnd)?;
+        let (dx, dy) = client_rect_rebase_delta(client_before, monitor);
+        if dx == 0 && dy == 0 {
+            if moved {
+                log::info!(
+                    "source-window-client-rebase-verified: hwnd={:#x} client=({}, {}, {}x{}) monitor=({}, {}, {}x{}) attempts={}",
+                    hwnd,
+                    client_before.0,
+                    client_before.1,
+                    client_before.2,
+                    client_before.3,
+                    monitor.0,
+                    monitor.1,
+                    monitor.2,
+                    monitor.3,
+                    attempts
+                );
+            }
+            return Some((client_before.0, client_before.1));
+        }
+
+        let (wx, wy, ww, wh) = win32::window_rect(hwnd)?;
+        let nx = wx.saturating_add(dx);
+        let ny = wy.saturating_add(dy);
+        win32::set_window_rect(hwnd, nx, ny, ww, wh);
+        moved = true;
         log::info!(
-            "source-window-rebased: hwnd={:#x} from=({}, {}) to=({}, {}) size={}x{} monitor=({}, {}, {}x{})",
+            "source-window-rebased: hwnd={:#x} outer_from=({}, {}) outer_to=({}, {}) size={}x{} client_before=({}, {}, {}x{}) client_shift=({},{}) monitor=({}, {}, {}x{}) basis=client",
             hwnd,
-            x,
-            y,
+            wx,
+            wy,
             nx,
             ny,
-            w,
-            h,
-            mx,
-            my,
-            mw,
-            mh
+            ww,
+            wh,
+            client_before.0,
+            client_before.1,
+            client_before.2,
+            client_before.3,
+            dx,
+            dy,
+            monitor.0,
+            monitor.1,
+            monitor.2,
+            monitor.3
         );
     }
-    win32::client_rect_on_screen(hwnd).map(|(cx, cy, _, _)| (cx, cy))
+
+    let client_after = win32::client_rect_on_screen(hwnd)?;
+    let residual = client_rect_rebase_delta(client_after, monitor);
+    if residual != (0, 0) {
+        log::warn!(
+            "source-window-client-rebase-incomplete: hwnd={:#x} client=({}, {}, {}x{}) residual=({},{}) monitor=({}, {}, {}x{}) attempts={}",
+            hwnd,
+            client_after.0,
+            client_after.1,
+            client_after.2,
+            client_after.3,
+            residual.0,
+            residual.1,
+            monitor.0,
+            monitor.1,
+            monitor.2,
+            monitor.3,
+            attempts
+        );
+    }
+    Some((client_after.0, client_after.1))
 }
 
-fn move_windowed_overlay_by_source_delta(overlay: &mut OverlayWindow, dx: i32, dy: i32) {
+fn client_drag_overlay_position_from_raw(
+    overlay_origin: (i32, i32),
+    raw_origin: (i32, i32),
+    raw_current: (i32, i32),
+) -> (i32, i32) {
+    (
+        overlay_origin
+            .0
+            .saturating_add(raw_current.0.saturating_sub(raw_origin.0)),
+        overlay_origin
+            .1
+            .saturating_add(raw_current.1.saturating_sub(raw_origin.1)),
+    )
+}
+
+fn move_windowed_overlay_by_source_delta(
+    overlay: &mut OverlayWindow,
+    dx: i32,
+    dy: i32,
+    gui_topmost: bool,
+) {
     let (x, y, w, h) = overlay.current_rect();
     let (mx, my, mw, mh) = win32::monitor_rect_of(overlay.hwnd().0 as isize);
     let nx = clamp_axis_to_bounds(x.saturating_add(dx), w, mx, mw);
     let ny = clamp_axis_to_bounds(y.saturating_add(dy), h, my, mh);
     if (nx, ny) != (x, y) {
-        overlay.reposition(nx, ny, w, h);
+        reposition_overlay_for_gui_mode(overlay, nx, ny, w, h, gui_topmost);
     }
 }
 
@@ -7832,7 +10466,7 @@ fn stop_session(
         if let Some(was_layered) = s.hid_source {
             win32::show_window_visual(s.hwnd, was_layered);
         }
-        if !s.src_was_topmost {
+        if !s.src_was_topmost && !s.source_monitor_fullscreen {
             win32::set_topmost(s.hwnd, false);
         }
         if let Some(rect) = s.source_restore_rect {
@@ -7850,7 +10484,8 @@ fn stop_session(
             );
         }
     }
-    overlay.hide();
+    detach_overlay_owned_helpers(overlay.hwnd().0 as isize);
+    overlay.hide_for_stop();
     if gpu_resources_safe_to_clear {
         gc.clear_pool();
     } else {
@@ -7912,9 +10547,14 @@ fn stop_session(
     g.starting = false;
     g.running = false;
     g.stopping = false;
+    g.glsl_interactive_pause = false;
+    g.glsl_overload_notice_latched = false;
+    g.glsl_overload_auto_stop_deadline = None;
     g.hidden_src = None;
     g.source_recovery = None;
     g.warning = None;
+    g.source_live_fullscreen = false;
+    g.capture_resolution_resize_intent = None;
     g.onnx_tensorrt_stages = 0;
     g.onnx_cuda_stages = 0;
     g.onnx_directml_fallbacks = 0;
@@ -7941,6 +10581,96 @@ fn save_screenshot_async(path: std::path::PathBuf, w: u32, h: u32, rgba: Vec<u8>
                 Err(error) => log::error!("screenshot failed: {}: {error:#}", path.display()),
             }
         });
+}
+
+/// Return the aspect-preserving DirectML RIFE safety size. The limit is
+/// deliberately based on logical RIFE input height (matching the mpv script),
+/// not ONNX's later 128-pixel padding. Width is rounded to the nearest even
+/// pixel so downstream video/image stages never receive a needless odd width.
+fn directml_rife_limited_size(w: i32, h: i32) -> Option<(i32, i32)> {
+    if w <= 0 || h <= DIRECTML_RIFE_MAX_HEIGHT {
+        return None;
+    }
+    let scaled = (w as f64 * DIRECTML_RIFE_MAX_HEIGHT as f64 / h as f64).round() as i32;
+    let limited_w = ((scaled.max(2) + 1) / 2) * 2;
+    Some((limited_w, DIRECTML_RIFE_MAX_HEIGHT))
+}
+
+fn log_directml_rife_height_limit(
+    s: &mut Session,
+    source: (i32, i32),
+    limited: (i32, i32),
+    interp_index: usize,
+    route: &str,
+) {
+    let key = (source.0, source.1, limited.0, limited.1, interp_index);
+    if s.dml_rife_limit_log_key != Some(key) {
+        log::info!(
+            "directml-rife-height-limit: source={}x{} limited={}x{} max_height={} interp_index={} position={} route={} scaler=spline36 policy=always-for-directml-rife",
+            source.0,
+            source.1,
+            limited.0,
+            limited.1,
+            DIRECTML_RIFE_MAX_HEIGHT,
+            interp_index,
+            if interp_index == 0 { "first" } else { "after-prechain" },
+            route
+        );
+        s.dml_rife_limit_log_key = Some(key);
+    }
+}
+
+/// Bilinear CPU fallback for the diagnostic/non-resident interpolation route.
+/// The production DirectML RIFE path uses the GPU Spline36 limiter above; this
+/// keeps the same 1440p contract even when GPU interpolation is explicitly
+/// disabled or unavailable.
+fn resize_rgba8_bilinear(
+    src: &[u8],
+    sw: i32,
+    sh: i32,
+    dw: i32,
+    dh: i32,
+) -> Option<Vec<u8>> {
+    if sw <= 0
+        || sh <= 0
+        || dw <= 0
+        || dh <= 0
+        || src.len() != sw as usize * sh as usize * 4
+    {
+        return None;
+    }
+    if (sw, sh) == (dw, dh) {
+        return Some(src.to_vec());
+    }
+
+    let dst_stride = dw as usize * 4;
+    let mut dst = vec![0u8; dst_stride * dh as usize];
+    dst.par_chunks_mut(dst_stride)
+        .enumerate()
+        .for_each(|(dy, row)| {
+            let sy = (((dy as f64 + 0.5) * sh as f64 / dh as f64) - 0.5)
+                .clamp(0.0, sh as f64 - 1.0);
+            let y0 = sy.floor() as usize;
+            let y1 = (y0 + 1).min(sh as usize - 1);
+            let fy = sy - y0 as f64;
+            for dx in 0..dw as usize {
+                let sx = (((dx as f64 + 0.5) * sw as f64 / dw as f64) - 0.5)
+                    .clamp(0.0, sw as f64 - 1.0);
+                let x0 = sx.floor() as usize;
+                let x1 = (x0 + 1).min(sw as usize - 1);
+                let fx = sx - x0 as f64;
+                for channel in 0..4 {
+                    let at = |x: usize, y: usize| {
+                        src[(y * sw as usize + x) * 4 + channel] as f64
+                    };
+                    let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
+                    let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
+                    row[dx * 4 + channel] =
+                        (top * (1.0 - fy) + bottom * fy).round() as u8;
+                }
+            }
+        });
+    Some(dst)
 }
 
 /// Diagnostic wrapper for the capture-buffer -> GL texture submission.
@@ -8069,6 +10799,20 @@ fn fit_frame_canvas_dot_by_dot(frame: &mut FrameBuf, target: (i32, i32)) -> bool
     true
 }
 
+fn normalize_capture_client_size(size: (u32, u32)) -> (u32, u32) {
+    let even = |value: u32, min_value: u32, max_value: u32| {
+        let bounded = value.clamp(min_value, max_value);
+        if bounded & 1 == 0 {
+            bounded
+        } else if bounded < max_value {
+            bounded + 1
+        } else {
+            bounded.saturating_sub(1).max(min_value)
+        }
+    };
+    (even(size.0, 160, 7680), even(size.1, 120, 4320))
+}
+
 /// Do not let a crop/pad fallback disguise the old source size while an
 /// explicit client resize is pending. The reveal state machine must first see
 /// a real WGC frame produced at the requested client dimensions.
@@ -8189,6 +10933,7 @@ fn frame_present_latency_ms(timing: FrameTiming, present_time: PresentTime) -> f
 fn drain_pending_interp(
     gc: &mut GlContext,
     overlay: &mut OverlayWindow,
+    input: &crate::input::InputSystem,
     s: &mut Session,
     metrics: &Metrics,
     status: &Arc<Mutex<Status>>,
@@ -8300,6 +11045,11 @@ fn drain_pending_interp(
         }
         let t0 = Instant::now();
         let tex = gc.upload_rgb8(mw, mh, &mid);
+        let transition_presented_before = if s.provider_transition_input_suspended {
+            Some(status.lock().unwrap().presented)
+        } else {
+            None
+        };
         process_and_present_from(
             gc,
             overlay,
@@ -8329,6 +11079,12 @@ fn drain_pending_interp(
             downscaler,
             pending.chain_start_index,
         );
+        if let Some(presented_before) = transition_presented_before {
+            let presented_after = status.lock().unwrap().presented;
+            if presented_after > presented_before {
+                resume_provider_transition_after_interpolated_present(input, s, "cpu-worker");
+            }
+        }
         if s.smooth_pacing {
             let scheduled_next = output_deadline + output_step;
             let now = Instant::now();
@@ -8464,6 +11220,22 @@ fn process_and_present(
     );
 }
 
+fn release_gpu_interp_permit_after_post_submit(s: &mut Session) {
+    let Some((generation, pair_id)) = s.gpu_interp_permit_after_post_submit.take() else {
+        return;
+    };
+    if let Some(worker) = s.gpu_interp_worker.as_ref() {
+        worker.permit_next_slot(generation, pair_id);
+        if pair_id < 3 || pair_id % 120 == 0 {
+            log::debug!(
+                "interp-gpu-slot-release: pair={} generation={} point=after-post-submit",
+                pair_id,
+                generation
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_and_present_from(
     gc: &mut GlContext,
@@ -8481,6 +11253,93 @@ fn process_and_present_from(
     downscaler: crate::render::scaler::Kernel,
     chain_start_index: usize,
 ) {
+    // `process_from()` clears chain_reprocess_pending after a successful chain
+    // run. Remember whether this present came from an explicit filter edit so
+    // we can synchronously commit that one frame to DWM below.
+    let chain_reprocess_commit = s.chain_reprocess_pending;
+
+    // Selected filters are part of the requested image semantics. Never omit
+    // any post-interpolation stage. The low-spec admission guard is therefore
+    // limited to NON-interpolation chains, where it may hold the previous
+    // already-filtered frame but never substitute an unfiltered one.
+    let guard_eligible = glsl_guard_eligible(s);
+    let guard_can_hold = guard_eligible
+        && !s.chain.has_interp()
+        && overlay.is_visible()
+        && s.last_tex.is_some()
+        && !s.chain_reprocess_pending
+        && !s.capture_resolution_applied
+        && s.deferred_capture_resolution.is_none()
+        && s.pending_resize_size.is_none();
+
+    let interactive_pause = guard_can_hold
+        && s.glsl_guard.mode != GlslGuardMode::Off
+        && !s.glsl_resolution_recheck_active
+        && crate::input::main_gui_has_native_cursor_ownership();
+    let auto_stop_hold = guard_can_hold
+        && !s.glsl_resolution_recheck_active
+        && status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .glsl_overload_auto_stop_deadline
+            .is_some();
+
+    {
+        let mut state = status.lock().unwrap();
+        if state.glsl_interactive_pause != interactive_pause {
+            state.glsl_interactive_pause = interactive_pause;
+            log::info!(
+                "glsl-responsiveness-gui-priority: active={} mode={:?} action={}",
+                interactive_pause,
+                s.glsl_guard.mode,
+                if interactive_pause {
+                    "hold-last-complete-frame-for-main-gui"
+                } else {
+                    "resume-guarded-rendering"
+                }
+            );
+        }
+    }
+    if auto_stop_hold {
+        // The overload decision is already final for this workload.
+        // Preserve the last complete filtered frame during the short warning
+        // grace instead of continuing to consume the very GPU time needed by
+        // cursor/DWM/GUI recovery. The actual shutdown is still dispatched by
+        // the GUI through the ordinary Cmd::Stop path.
+        release_gpu_interp_permit_after_post_submit(s);
+        let mut keep = Vec::with_capacity(1 + keep_extra.len());
+        if let Some(last_good) = s.last_tex {
+            keep.push(last_good);
+        }
+        keep.extend_from_slice(keep_extra);
+        gc.release_frame(&keep);
+        return;
+    }
+
+    if interactive_pause {
+        release_gpu_interp_permit_after_post_submit(s);
+        let mut keep = Vec::with_capacity(1 + keep_extra.len());
+        if let Some(last_good) = s.last_tex {
+            keep.push(last_good);
+        }
+        keep.extend_from_slice(keep_extra);
+        gc.release_frame(&keep);
+        return;
+    }
+
+    if guard_can_hold && s.glsl_guard.should_skip_frame() {
+        release_gpu_interp_permit_after_post_submit(s);
+        let gpu = latest_gui_gpu_percent();
+        s.glsl_guard.note_skipped(gpu);
+        let mut keep = Vec::with_capacity(1 + keep_extra.len());
+        if let Some(last_good) = s.last_tex {
+            keep.push(last_good);
+        }
+        keep.extend_from_slice(keep_extra);
+        gc.release_frame(&keep);
+        return;
+    }
+
     let m = metrics.clone();
     let mut probe_fn = |name: &str, kind: StageKind, ms: f64| {
         m.probe(
@@ -8493,6 +11352,7 @@ fn process_and_present_from(
             ms,
         );
     };
+    let chain_input_size = (input.w(), input.h());
     let chain_started = Instant::now();
     let result = s.chain.process_from(
         gc,
@@ -8505,6 +11365,25 @@ fn process_and_present_from(
     match result {
         Ok(chain_tex) => {
             s.chain_reprocess_pending = false;
+            if stats && s.chain.has_interp() && chain_start_index > 0 {
+                let post_stages = s
+                    .chain
+                    .stages
+                    .iter()
+                    .skip(chain_start_index)
+                    .map(|stage| stage.name().to_string())
+                    .collect::<Vec<_>>();
+                log::debug!(
+                    "interp-post-chain-verified: start={} total={} input={}x{} output={}x{} stages={:?}",
+                    chain_start_index,
+                    s.chain.stage_count(),
+                    chain_input_size.0,
+                    chain_input_size.1,
+                    chain_tex.w(),
+                    chain_tex.h(),
+                    post_stages
+                );
+            }
             // fit into the window with the selected kernel (Spline36 default),
             // then run OUTPUT/SCALED-hook shaders (sharpeners) at display size
             // Compute against the committed frame geometry. During an aspect
@@ -8523,8 +11402,20 @@ fn process_and_present_from(
                 .unwrap_or(chain_tex);
             s.last_resample_submit_ms = resample_started.elapsed().as_secs_f64() * 1000.0;
             let post_started = Instant::now();
-            for shader in s.chain.post_shaders() {
-                match crate::render::glsl_engine::GlslEngine::run_post(gc, &shader, final_tex) {
+            for (metric_label, shader) in s.chain.post_shaders_with_metric_labels() {
+                // OUTPUT/SCALED-hook shaders execute outside FilterChain::process_range,
+                // after the final display-size resample. They therefore need their own
+                // asynchronous GL_TIME_ELAPSED query; otherwise the effect is applied
+                // correctly but the per-stage statistics row never receives a sample.
+                let timer = stats
+                    .then(|| gc.begin_gpu_timer(&metric_label))
+                    .flatten();
+                let post_result =
+                    crate::render::glsl_engine::GlslEngine::run_post(gc, &shader, final_tex);
+                if let Some(query) = timer {
+                    gc.end_gpu_timer(query, metric_label.clone());
+                }
+                match post_result {
                     Ok(t) => final_tex = t,
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -8542,13 +11433,25 @@ fn process_and_present_from(
                 }
             }
             s.last_post_submit_ms = post_started.elapsed().as_secs_f64() * 1000.0;
+            // x4/x5: the current output's conversion + GLSL post-chain is now
+            // ordered on the GL queue. Release the next unique provider slot
+            // here, not after import (which lets RIFE preempt the GLSL chain)
+            // and not after SwapBuffers (which needlessly serializes DML with
+            // compositor wait). All interpolation/output buffers are per-slot.
+            release_gpu_interp_permit_after_post_submit(s);
             if overlay.size() != (desired_overlay.2, desired_overlay.3) {
                 let old_size = overlay.size();
-                overlay.reposition(
+                let gui_hwnd = win32::main_gui_hwnd();
+                let gui_topmost = gui_hwnd != 0
+                    && win32::is_window_valid(gui_hwnd)
+                    && win32::is_topmost(gui_hwnd);
+                reposition_overlay_for_gui_mode(
+                    overlay,
                     desired_overlay.0,
                     desired_overlay.1,
                     desired_overlay.2,
                     desired_overlay.3,
+                    gui_topmost,
                 );
                 status.lock().unwrap().overlay_rect = desired_overlay;
                 log::info!(
@@ -8563,6 +11466,7 @@ fn process_and_present_from(
             }
             let compute_elapsed = t0.elapsed();
             s.last_compute_ms = compute_elapsed.as_secs_f64() * 1000.0;
+
             let pacer_wait_started = Instant::now();
             if let Some(deadline) = s.paced_present_deadline.take() {
                 wait_until_with_pump(overlay, deadline);
@@ -8574,6 +11478,7 @@ fn process_and_present_from(
             }
             s.last_pacer_wait_ms = pacer_wait_started.elapsed().as_secs_f64() * 1000.0;
             let present_call_started = Instant::now();
+            s.last_present_started = present_call_started;
             let present_result = overlay.present_with_swap_timing(gc, final_tex);
             s.last_present_call_ms = present_call_started.elapsed().as_secs_f64() * 1000.0;
             let present_time = PresentTime::now();
@@ -8581,12 +11486,60 @@ fn process_and_present_from(
                 .as_ref()
                 .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
+            if crate::logging::diagnostics_enabled() {
+                // A panel blink cannot be observed from this render thread, but
+                // long SwapBuffers waits are the compositor-pressure side of the
+                // same timeline. Aggregate instead of logging every frame so a
+                // heavy preset does not create a multi-megabyte log flood.
+                if s.last_present_block_ms >= 12.0 {
+                    s.compositor_pressure_samples = s.compositor_pressure_samples.saturating_add(1);
+                    s.compositor_pressure_max_ms =
+                        s.compositor_pressure_max_ms.max(s.last_present_block_ms);
+                    s.compositor_pressure_sum_ms += s.last_present_block_ms;
+                }
+                if s.compositor_pressure_window_started.elapsed() >= Duration::from_millis(500) {
+                    if s.compositor_pressure_samples > 0 {
+                        let avg_ms = s.compositor_pressure_sum_ms
+                            / s.compositor_pressure_samples.max(1) as f64;
+                        log::debug!(
+                            "overlay-compositor-pressure: window_ms={:.0} samples={} avg_swap_ms={:.2} max_swap_ms={:.2} last_swap_ms={:.2} present_call_ms={:.2} pacer_wait_ms={:.2} compute_ms={:.2} smooth={} glsl={} interp={}",
+                            s.compositor_pressure_window_started.elapsed().as_secs_f64() * 1000.0,
+                            s.compositor_pressure_samples,
+                            avg_ms,
+                            s.compositor_pressure_max_ms,
+                            s.last_present_block_ms,
+                            s.last_present_call_ms,
+                            s.last_pacer_wait_ms,
+                            s.last_compute_ms,
+                            s.smooth_pacing,
+                            s.chain.has_glsl(),
+                            s.chain.has_interp()
+                        );
+                    }
+                    s.compositor_pressure_window_started = Instant::now();
+                    s.compositor_pressure_samples = 0;
+                    s.compositor_pressure_max_ms = 0.0;
+                    s.compositor_pressure_sum_ms = 0.0;
+                }
+            }
             let effective_present_interval_s = s
                 .present_cadence
                 .last
                 .map(|last| present_time.instant.duration_since(last).as_secs_f64());
+            // OpenGL stages are submitted asynchronously. Their GPU time can
+            // therefore appear in SwapBuffers instead of `compute_elapsed`.
+            // Feed that deferred tail into the next-frame preparation budget
+            // as well as the interpolation path, so an ordinary shader chain
+            // starts early enough without changing its presentation cadence.
+            let deferred_gpu_tail_s = s
+                .cadence
+                .period_s()
+                .map(|period_s| {
+                    ((s.last_present_block_ms - 1.25).max(0.0) / 1000.0).min(period_s * 0.75)
+                })
+                .unwrap_or(0.0);
             s.smooth_pacer
-                .observe_process(compute_elapsed.as_secs_f64());
+                .observe_process(compute_elapsed.as_secs_f64() + deferred_gpu_tail_s);
             // A normal Chromium/DWM path can block SwapBuffers for 8-12ms
             // without losing output cadence. Never disable manual pacing from
             // that signal alone.
@@ -8597,7 +11550,7 @@ fn process_and_present_from(
                     .smooth_pacer
                     .observe_effective_present_interval(interval_s, s.cadence.period_s())
             {
-                log::info!(
+                log::debug!(
                     "smooth-pacing effective cadence handoff: compositor_paced={} interval_ms={:.2} cadence_ms={:.2} monitor_hz={:.2}",
                     compositor_paced,
                     interval_s * 1000.0,
@@ -8609,6 +11562,16 @@ fn process_and_present_from(
             if let Err(e) = present_result {
                 status.lock().unwrap().last_error = Some(format!("{e:#}"));
             } else {
+                if chain_reprocess_commit && overlay.is_visible() {
+                    // WGC is change-driven, so a paused source may not deliver
+                    // another frame after a filter toggle. Force DWM to consume
+                    // this newly filtered SwapBuffers result now rather than
+                    // relying on a later mouse/hover repaint to make it visible.
+                    overlay.flush_compositor();
+                    log::info!(
+                        "chain-reprocess-present-commit: action=dwm-flush filtered_frame_visible=true"
+                    );
+                }
                 s.present_cadence.record(present_time.instant);
                 if overlay.is_visible()
                     && s.capture_resolution_applied
@@ -8700,7 +11663,7 @@ fn process_and_present_from(
                             }
                         }
                     }
-                    if reveal_ready && s.hide_source_pending {
+                    if reveal_ready && s.hide_source_pending && !s.source_monitor_fullscreen {
                         if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
                             s.hide_source_pending = false;
                             s.hid_source = Some(was_layered);
@@ -8760,6 +11723,23 @@ fn process_and_present_from(
                     if reveal_ready {
                         reveal_ready = crate::input::InputSystem::prepare_overlay_reveal();
                     }
+                    if reveal_ready && s.provider_transition_input_suspended {
+                        // v421: provider-transition suspension is only a guard while
+                        // the new provider/session has not produced a usable frame.
+                        // Reaching this point proves the complete filter chain already
+                        // produced the first target-sized filtered frame and cursor
+                        // handoff preparation succeeded. Waiting specifically for a
+                        // later synthetic/interpolated midpoint left DirectML RIFE
+                        // sessions suspended indefinitely on routes that present the
+                        // first real filtered frame before any midpoint diagnostic.
+                        crate::input::InputSystem::resume_transition_suspended();
+                        s.provider_transition_input_suspended = false;
+                        s.provider_transition_input_suspended_since = None;
+                        s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+                        log::info!(
+                            "provider-transition-ready: first-filtered-frame-ready-before-overlay-reveal input=resume-after-120ms"
+                        );
+                    }
                     if reveal_ready {
                         // The persistent WGL HWND is double-buffered. On AMD,
                         // a very fast GLSL chain can finish and reveal before
@@ -8779,10 +11759,103 @@ fn process_and_present_from(
                         }
                     }
                     if reveal_ready {
+                        if crate::logging::diagnostics_enabled() {
+                            win32::log_helper_compositor_snapshot(
+                                "reveal-before-show",
+                                win32::main_gui_hwnd(),
+                                win32::panel_gdi_host_hwnd(),
+                                overlay.hwnd().0 as isize,
+                                crate::input::cursor_sprite_hwnd(),
+                                s.hwnd,
+                            );
+                        }
                         overlay.show();
+                        let overlay_hwnd = overlay.hwnd().0 as isize;
+                        let gui_priority_hwnd = win32::main_gui_hwnd();
+                        let gui_priority_topmost = gui_priority_hwnd != 0
+                            && win32::is_window_valid(gui_priority_hwnd)
+                            && win32::is_topmost(gui_priority_hwnd);
+                        let panel_hwnd = win32::panel_gdi_host_hwnd();
+                        let panel_visible = panel_hwnd != 0
+                            && win32::is_window_valid(panel_hwnd)
+                            && win32::is_window_visible(panel_hwnd);
+
+                        if gui_priority_topmost {
+                            // Modern GUI-topmost fix, intentionally isolated to
+                            // ON only. Reassert GUI > panel > overlay and commit
+                            // that hierarchy before continuing.
+                            enforce_gui_priority(
+                                gui_priority_hwnd,
+                                true,
+                                if panel_visible { panel_hwnd } else { 0 },
+                                overlay_hwnd,
+                            );
+                            overlay.flush_compositor();
+                        } else {
+                            // v235 path: when GUI topmost is OFF, show() is the
+                            // complete reveal operation. Do not run the newer
+                            // stack normalizer or an extra DwmFlush afterwards.
+                            log::info!(
+                                "overlay-reveal-path: gui_topmost=false mode=v235-show-only"
+                            );
+                        }
+
+                        if crate::logging::diagnostics_enabled() {
+                            win32::log_helper_compositor_snapshot(
+                                if gui_priority_topmost {
+                                    "reveal-after-topmost-restack"
+                                } else {
+                                    "reveal-after-v235-off-path"
+                                },
+                                gui_priority_hwnd,
+                                panel_hwnd,
+                                overlay_hwnd,
+                                crate::input::cursor_sprite_hwnd(),
+                                s.hwnd,
+                            );
+                            let panel_above = panel_hwnd == 0
+                                || !panel_visible
+                                || win32::window_is_above(panel_hwnd, overlay_hwnd);
+                            log::info!(
+                                "overlay-reveal-zorder-postcondition: gui_topmost={} panel_visible={} panel={:#x} overlay={:#x} panel_owner={:#x} cursor_owner={:#x} panel_above_overlay={}",
+                                gui_priority_topmost,
+                                panel_visible,
+                                panel_hwnd,
+                                overlay_hwnd,
+                                win32::window_owner(panel_hwnd),
+                                crate::input::cursor_sprite_owner(),
+                                panel_above
+                            );
+                        }
                         log::info!(
                             "overlay shown after atomic cursor handoff and first target-sized filtered frame"
                         );
+                        // v348t fullscreen handoff: OverlayWindow::show() does
+                        // DwmFlush after alpha=255, so the complete filtered
+                        // frame is already composited before the fullscreen
+                        // source becomes transparent. This removes the desktop
+                        // flash caused by the old source-hide -> overlay-show
+                        // ordering. Windowed/deferred-resize behavior is left
+                        // unchanged.
+                        if s.source_monitor_fullscreen && s.hide_source_pending {
+                            if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
+                                s.hide_source_pending = false;
+                                s.hid_source = Some(was_layered);
+                                status.lock().unwrap().hidden_src = Some((s.hwnd, was_layered));
+                                log::info!(
+                                    "source {:#x} visually hidden after opaque fullscreen overlay commit (was_layered={was_layered})",
+                                    s.hwnd
+                                );
+                            } else {
+                                // The opaque overlay already covers the source,
+                                // so hiding failure is not allowed to expose the
+                                // desktop or abort a valid fullscreen capture.
+                                log::warn!(
+                                    "source {:#x} fullscreen visual hide failed after overlay commit; overlay remains visible",
+                                    s.hwnd
+                                );
+                            }
+                        }
                         // The revealed frame can still be the transition
                         // shield while TensorRT compiles asynchronously.
                     }
@@ -8800,6 +11873,7 @@ fn process_and_present_from(
             status.lock().unwrap().presented += 1;
             let elapsed_ms = present_time.instant.duration_since(t0).as_secs_f64() * 1000.0;
             s.last_process_ms = elapsed_ms;
+            update_glsl_guard_after_processed(s, status);
             let present_latency_ms =
                 timing.map(|frame_timing| frame_present_latency_ms(frame_timing, present_time));
             metrics.set_internal_size((chain_tex.w(), chain_tex.h()));
@@ -8822,6 +11896,7 @@ fn process_and_present_from(
             }
         }
         Err(e) => {
+            release_gpu_interp_permit_after_post_submit(s);
             s.paced_present_deadline = None;
             let msg = format!("{e:#}");
             if crate::render::onnx_stage::onnx_cancel_requested() {
@@ -8866,6 +11941,7 @@ fn process_and_present_from(
                 }
             }
             s.last_process_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            update_glsl_guard_after_processed(s, status);
         }
     }
 }
@@ -8880,8 +11956,12 @@ fn log_metrics_if_due(
     if s.last_metrics_log.elapsed() < Duration::from_secs(1) {
         return;
     }
+    if !crate::logging::diagnostics_enabled() {
+        s.last_metrics_log = Instant::now();
+        return;
+    }
     let snap = metrics.snapshot();
-    log::info!(
+    log::debug!(
         "stats-resolution: input={}x{} virtual_output={}x{} internal={}x{} displayed={}x{}",
         s.in_size.0,
         s.in_size.1,
@@ -8894,7 +11974,7 @@ fn log_metrics_if_due(
     );
     let (present_ms, present_jitter_ms, present_min_ms, present_max_ms) =
         s.present_cadence.summary();
-    log::info!(
+    log::debug!(
         "stats-snapshot: source_locked_fps={:.3} capture_dequeue_fps={:.1} present_fps={:.1} total_ms={:.2} delay_frames={} in={}x{} out={}x{} last_process_ms={:.2} compute_ms={:.2} path_ms(upload={:.2},chain={:.2},resample={:.2},post={:.2},pacer_wait={:.2},present_call={:.2},swap={:.2}) smooth={} cadence_ms={:.3} present_interval_ms={:.2} jitter_ms={:.2} present_min_ms={:.2} present_max_ms={:.2} queue_depth={} queue_dropped={}",
         snap.source_fps,
         snap.capture_fps,
@@ -8924,7 +12004,7 @@ fn log_metrics_if_due(
         s.source.queued_dropped()
     );
     for (name, st) in snap.display_stages_in_order(&s.chain.metric_stage_order()) {
-        log::info!(
+        log::debug!(
             "stats-stage: ms={:.2} kind={} name={}",
             st.ms,
             st.kind,
@@ -8936,22 +12016,152 @@ fn log_metrics_if_due(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CadenceEstimator, CapRateGate, FlowOutputCadence, FrameTiming, GpuInterpContinuity,
-        IDLE_KEEPALIVE_INTERVAL, NEOFLOW_QUEUE_MAX, PendingNoEngage, SmoothPacer, cap_accept,
-        clamp_axis_to_bounds, classify_gpu_interp_continuity, fit_aspect_inside,
-        fit_fixed_overlay_size, fit_frame_canvas_dot_by_dot, fixed_overlay_aspect_basis,
-        frame_comb_fraction, frame_signature, gpu_interp_present_lead_s, initial_display_aspect,
-        interp_pair_is_contiguous, neoflow_source_period_s, normalized_frame_span_s,
-        onnx_interpolation_phases, panel_target_position, refresh_limited_output_ratio,
-        resize_static_rgba8_frame, save_screenshot_async, should_apply_capture_canvas,
-        signature_has_coherent_motion, signature_has_temporal_continuity, signatures_match,
-        snap_video_period, snap_video_period_with_history, update_neodeint_scene_latch,
-        virtual_shader_output_size,
-    };
+    use super::*;
     use crate::capture::wgc::FrameBuf;
-    use crate::core::config::ScaleMode;
+    use half::f16;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn directml_rife_height_limit_matches_mpv_1440_policy() {
+        assert_eq!(directml_rife_limited_size(3416, 1920), Some((2562, 1440)));
+        assert_eq!(directml_rife_limited_size(2560, 1920), Some((1920, 1440)));
+        assert_eq!(directml_rife_limited_size(3840, 2160), Some((2560, 1440)));
+        assert_eq!(directml_rife_limited_size(2560, 1440), None);
+        assert_eq!(directml_rife_limited_size(1920, 1080), None);
+    }
+
+    #[test]
+    fn geometry_watchdog_ignores_position_only_window_moves() {
+        let original = (100, 200, 1896, 1011);
+        let moved = (800, 600, 1896, 1011);
+        let resized = (800, 600, 1900, 1014);
+        assert!(!rect_size_changed(original, moved));
+        assert!(rect_size_changed(original, resized));
+    }
+
+    #[test]
+    fn monitor_sized_capture_canvas_is_not_source_fullscreen_by_pixels_alone() {
+        let windowed_sig = Some((1, 2, false));
+        assert!(!should_enter_live_fullscreen(
+            false,
+            true,
+            Some((1920, 1080)),
+            (1920, 1080),
+            windowed_sig,
+            windowed_sig,
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn real_fullscreen_presentation_change_still_wins_at_monitor_sized_canvas() {
+        assert!(should_enter_live_fullscreen(
+            false,
+            true,
+            Some((1920, 1080)),
+            (1920, 1080),
+            Some((1, 2, false)),
+            Some((0, 0, false)),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn capture_resize_handoff_cannot_false_trigger_fullscreen() {
+        assert!(!should_enter_live_fullscreen(
+            false,
+            true,
+            None,
+            (1920, 1080),
+            Some((1, 2, false)),
+            Some((1, 2, false)),
+            Some((1920, 1080)),
+            false,
+        ));
+        // Without a matching Neo capture canvas or live resize intent, the same stable monitor cover
+        // is source-owned once the short resize hand-off has elapsed.
+        assert!(should_enter_live_fullscreen(
+            false,
+            true,
+            None,
+            (1920, 1080),
+            Some((1, 2, false)),
+            Some((1, 2, false)),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn drag_overlay_target_is_absolute_and_clamp_history_independent() {
+        let source_start = (100, 100);
+        let overlay_start = (300, 200, 800, 450);
+        let monitor = (0, 0, 1920, 1080);
+
+        // Far beyond the right edge clamps the visible overlay.
+        assert_eq!(
+            drag_overlay_target(source_start, (2000, 100), overlay_start, monitor),
+            (1120, 200)
+        );
+        // A small reversal while the hidden source is still far beyond the
+        // clamp must remain clamped; an incremental-delta follower would creep.
+        assert_eq!(
+            drag_overlay_target(source_start, (1900, 100), overlay_start, monitor),
+            (1120, 200)
+        );
+        // Returning to an in-range absolute displacement lands at the exact
+        // deterministic position, independent of the path taken before it.
+        assert_eq!(
+            drag_overlay_target(source_start, (500, 250), overlay_start, monitor),
+            (700, 350)
+        );
+    }
+
+    #[test]
+    fn client_drag_raw_anchor_keeps_moving_after_hidden_source_hits_os_wall() {
+        // The v425 failure log shows Chromium holding a 640px PIP at x=-284
+        // while the user's drag continued. Visual placement must therefore
+        // depend only on the raw LEFT-down span, never on source HWND deltas.
+        let overlay_origin = (808, 156);
+        let raw_down = (1110, 420);
+        assert_eq!(
+            client_drag_overlay_position_from_raw(overlay_origin, raw_down, (600, 420)),
+            (298, 156)
+        );
+        // Continue another 500px left even if the native source x is still
+        // frozen at -284. There is deliberately no monitor clamp here.
+        assert_eq!(
+            client_drag_overlay_position_from_raw(overlay_origin, raw_down, (100, 420)),
+            (-202, 156)
+        );
+    }
+
+    #[test]
+    fn client_drag_raw_anchor_coalesces_stalled_samples_without_incremental_debt() {
+        let overlay_origin = (500, 300);
+        let raw_down = (900, 500);
+        // A render/interpolation stall may skip every intermediate mouse sample.
+        // Absolute-from-origin placement must land directly at the latest hand
+        // position rather than replaying/banking delayed source deltas.
+        assert_eq!(
+            client_drag_overlay_position_from_raw(overlay_origin, raw_down, (1250, 760)),
+            (850, 560)
+        );
+        // Reversing is deterministic and history-independent.
+        assert_eq!(
+            client_drag_overlay_position_from_raw(overlay_origin, raw_down, (820, 460)),
+            (420, 260)
+        );
+    }
+
+    #[test]
+    fn full_window_wgc_reference_allows_even_pad_without_false_restart() {
+        let dwm = (1696, 447, 1900, 1071);
+        assert!(!frame_size_mismatches_reference((1900, 1072), dwm));
+        assert!(frame_size_mismatches_reference((2100, 1200), dwm));
+    }
 
     #[test]
     fn no_engage_geometry_keeps_only_latest_language_mode_or_drag_sample() {
@@ -9028,11 +12238,11 @@ mod tests {
         let mut cadence = FlowOutputCadence::default();
         assert_eq!(cadence.phases(2.5).len(), 3);
         assert_eq!(
-            onnx_interpolation_phases(2, 2.0, &mut cadence),
+            onnx_interpolation_phases(2, 2.0, false, &mut cadence),
             vec![0.5, 1.0]
         );
         assert_eq!(
-            onnx_interpolation_phases(2, 2.0, &mut cadence),
+            onnx_interpolation_phases(2, 2.0, false, &mut cadence),
             vec![0.5, 1.0]
         );
     }
@@ -9041,18 +12251,18 @@ mod tests {
     fn x4_and_x5_generate_all_intermediate_phases_on_120hz() {
         let mut cadence = FlowOutputCadence::default();
         assert_eq!(
-            onnx_interpolation_phases(4, 4.0, &mut cadence),
+            onnx_interpolation_phases(4, 4.0, false, &mut cadence),
             vec![0.25, 0.5, 0.75, 1.0]
         );
         cadence.reset();
         assert_eq!(
-            onnx_interpolation_phases(5, 5.0, &mut cadence),
+            onnx_interpolation_phases(5, 5.0, false, &mut cadence),
             vec![0.2, 0.4, 0.6, 0.8, 1.0]
         );
         // 24000/1001 sources on a nominal 120 Hz display may report a ratio
         // a few thousandths below five. They still require the exact x5 grid.
         assert_eq!(
-            onnx_interpolation_phases(5, 4.995, &mut cadence),
+            onnx_interpolation_phases(5, 4.995, false, &mut cadence),
             vec![0.2, 0.4, 0.6, 0.8, 1.0]
         );
     }
@@ -9062,7 +12272,7 @@ mod tests {
         let mut cadence = FlowOutputCadence::default();
         // Covers a transient cadence overshoot during interpolation startup.
         // The old accumulator emitted five synthetic timesteps and no endpoint.
-        let phases = onnx_interpolation_phases(5, 4.14, &mut cadence);
+        let phases = onnx_interpolation_phases(5, 4.14, false, &mut cadence);
         assert!(
             phases.len() <= 4,
             "x5 may generate at most four synthetic mids"
@@ -9080,7 +12290,7 @@ mod tests {
         // genuinely different model timesteps, never duplicated presents.
         for _kind in ["RIFE", "DRBA"] {
             let mut cadence = FlowOutputCadence::default();
-            let phases = onnx_interpolation_phases(5, 5.0, &mut cadence);
+            let phases = onnx_interpolation_phases(5, 5.0, false, &mut cadence);
             let mids = phases
                 .iter()
                 .copied()
@@ -9092,34 +12302,170 @@ mod tests {
     }
 
     #[test]
-    fn gpu_interp_lead_excludes_swap_wait_from_x5_budget() {
+    fn gpu_interp_lead_accounts_for_deferred_shader_gpu_tail() {
         let period = 1.0 / 120.0;
-        // Field regression: ~2 ms of post work plus an ~8 ms compositor wait
-        // must not be interpreted as 10 ms of work that needs to start before
-        // every 8.33 ms slot.
+        // GLSL submission itself can take ~2 ms while its deferred GPU work
+        // is paid by the following SwapBuffers. The preparation lead must
+        // include that tail, but remain below one complete output slot.
         let lead = gpu_interp_present_lead_s(2.0, 8.0, period);
-        assert!(lead > 0.0030 && lead < 0.0035, "lead={lead}");
-        assert!(lead < period * 0.5);
+        assert!(lead > period * 0.85, "lead={lead}");
+        assert!(lead <= period * 0.90 + f64::EPSILON);
     }
 
     #[test]
-    fn blocking_present_reanchors_only_interp_clock_to_actual_vblank() {
-        let period_s = 1.0 / 120.0;
+    fn pacing_guard_swap_block_does_not_extend_next_interp_slot() {
+        for fps in [48.0, 72.0, 96.0, 120.0] {
+            for block_ms in [1u64, 3, 8] {
+                let period_s = 1.0 / fps;
+                let period = Duration::from_secs_f64(period_s);
+                let base = Instant::now();
+                let mut cadence = FlowOutputCadence::default();
+                cadence.next_present = Some(base + period);
+
+                // Submit exactly on the scheduled slot, then model healthy
+                // NVIDIA/AMD/DWM block durations. Completion is late,
+                // submission is not, so the next slot must not move.
+                let started = base;
+                let completed = started + Duration::from_millis(block_ms);
+                assert!(!cadence.observe_blocking_present(
+                    started,
+                    completed,
+                    period_s,
+                    block_ms as f64 / 1000.0,
+                ));
+                assert_eq!(cadence.next_present, Some(base + period));
+            }
+        }
+    }
+
+    #[test]
+    fn pacing_guard_irrecoverable_lateness_preserves_original_phase_grid() {
+        let period_s = 1.0 / 72.0;
         let period = Duration::from_secs_f64(period_s);
         let base = Instant::now();
         let mut cadence = FlowOutputCadence::default();
         cadence.next_present = Some(base + period);
-        let actual = base + Duration::from_millis(2);
-        assert!(cadence.observe_blocking_present(actual, period_s, 0.006));
-        assert_eq!(cadence.next_present, Some(actual + period));
+        cadence.present_period_s = period_s;
 
-        let before = cadence.next_present;
-        assert!(!cadence.observe_blocking_present(
-            actual + Duration::from_millis(1),
-            period_s,
-            0.000_1,
-        ));
-        assert_eq!(cadence.next_present, before);
+        // Model a genuinely irrecoverable delay of more than two slots. The
+        // old path re-anchored to `started + period`, making a random driver
+        // return time the new permanent cadence phase. The recovered deadline
+        // must instead stay on the original base + N*period grid.
+        let started = base + period.mul_f64(2.5);
+        let completed = started + Duration::from_millis(4);
+        assert!(cadence.observe_blocking_present(started, completed, period_s, 0.004,));
+        let recovered = cadence.next_present.unwrap();
+        let recovered_slots = recovered.duration_since(base).as_secs_f64() / period_s;
+        assert!(
+            (recovered_slots - 3.0).abs() < 0.000_1,
+            "slots={recovered_slots}"
+        );
+
+        // The next on-grid submission must remain stable even if SwapBuffers
+        // blocks again; block duration must never accumulate into the clock.
+        let next_started = base + period.mul_f64(3.0);
+        cadence.next_present = Some(base + period.mul_f64(4.0));
+        let next_completed = next_started + Duration::from_millis(4);
+        assert!(!cadence.observe_blocking_present(next_started, next_completed, period_s, 0.004,));
+        let stable = cadence.next_present.unwrap();
+        let stable_slots = stable.duration_since(base).as_secs_f64() / period_s;
+        assert!((stable_slots - 4.0).abs() < 0.000_1, "slots={stable_slots}");
+    }
+
+    #[test]
+    fn interp_cadence_period_lock_rebases_from_last_submit_not_loop_time() {
+        let base = Instant::now();
+        let mut cadence = FlowOutputCadence::default();
+        let transient_period_s = 1.0 / 44.0;
+        let locked_period_s = 1.0 / 48.0;
+        cadence.present_period_s = transient_period_s;
+        cadence.last_present_started = Some(base);
+        cadence.next_present = Some(base + Duration::from_secs_f64(transient_period_s));
+
+        // The cadence estimator locks after startup while the render loop is at
+        // an unrelated timestamp. The new 48fps phase must be derived from the
+        // actual previous back-buffer submission.
+        let loop_now = base + Duration::from_millis(7);
+        let deadline = cadence.reserve_present_deadline(loop_now, locked_period_s);
+        let deadline_slots = deadline.duration_since(base).as_secs_f64() / locked_period_s;
+        let next_slots = cadence
+            .next_present
+            .unwrap()
+            .duration_since(base)
+            .as_secs_f64()
+            / locked_period_s;
+        assert!(
+            (deadline_slots - 1.0).abs() < 0.000_1,
+            "slots={deadline_slots}"
+        );
+        assert!((next_slots - 2.0).abs() < 0.000_1, "slots={next_slots}");
+    }
+
+    #[test]
+    fn interp_cadence_missed_slots_advance_without_random_reanchor_or_burst() {
+        for fps in [48.0, 72.0, 96.0, 120.0] {
+            let period_s = 1.0 / fps;
+            let period = Duration::from_secs_f64(period_s);
+            let base = Instant::now();
+            let mut cadence = FlowOutputCadence::default();
+            cadence.present_period_s = period_s;
+            cadence.next_present = Some(base);
+
+            // Arrive 2.4 slots late. Reserve the latest slot on the original
+            // phase grid, leaving the following deadline in the future instead
+            // of anchoring the whole clock to this delayed loop iteration.
+            let now = base + period.mul_f64(2.4);
+            let deadline = cadence.reserve_present_deadline(now, period_s);
+            let deadline_slots = deadline.duration_since(base).as_secs_f64() / period_s;
+            let next = cadence.next_present.unwrap();
+            let next_slots = next.duration_since(base).as_secs_f64() / period_s;
+            assert!(
+                (deadline_slots - 2.0).abs() < 0.000_1,
+                "fps={fps} slots={deadline_slots}"
+            );
+            assert!(
+                (next_slots - 3.0).abs() < 0.000_1,
+                "fps={fps} slots={next_slots}"
+            );
+            assert!(next > now);
+        }
+    }
+
+    #[test]
+    fn pacing_guard_integer_multi_output_slot_policy_is_uniform() {
+        assert_eq!(gpu_interp_slot_policy(2, 1), (false, false));
+        assert_eq!(gpu_interp_slot_policy(3, 1), (false, false));
+        assert_eq!(gpu_interp_slot_policy(3, 2), (true, true));
+        assert_eq!(gpu_interp_slot_policy(4, 3), (true, true));
+        assert_eq!(gpu_interp_slot_policy(5, 4), (true, true));
+    }
+
+    #[test]
+    fn gpu_x3_mid_detach_covers_directml_and_tensorrt_only() {
+        use crate::render::onnx_stage::OnnxProvider;
+        assert!(provider_uses_gpu_x3_mid_detach(OnnxProvider::DirectML));
+        assert!(provider_uses_gpu_x3_mid_detach(OnnxProvider::TensorRT));
+        assert!(!provider_uses_gpu_x3_mid_detach(OnnxProvider::Cuda));
+    }
+
+    #[test]
+    fn pacing_guard_x2_to_x5_keep_unique_model_phases_and_expected_periods() {
+        for (factor, expected) in [
+            (2u32, vec![0.5f32, 1.0f32]),
+            (3u32, vec![1.0f32 / 3.0, 2.0f32 / 3.0, 1.0f32]),
+            (4u32, vec![0.25f32, 0.5f32, 0.75f32, 1.0f32]),
+            (5u32, vec![0.2f32, 0.4f32, 0.6f32, 0.8f32, 1.0f32]),
+        ] {
+            let mut cadence = FlowOutputCadence::default();
+            let phases = onnx_interpolation_phases(factor, factor as f64, false, &mut cadence);
+            assert_eq!(phases, expected);
+            for pair in phases.windows(2) {
+                assert!(pair[0] < pair[1], "model phases must be unique");
+            }
+            let output_period = (1.0 / 24.0) / factor as f64;
+            let expected_fps = 1.0 / output_period;
+            assert!((expected_fps - 24.0 * factor as f64).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -9193,6 +12539,23 @@ mod tests {
         assert_eq!(clamp_axis_to_bounds(1613, 640, 0, 1920), 1280);
         assert_eq!(clamp_axis_to_bounds(-120, 640, 0, 1920), 0);
         assert_eq!(clamp_axis_to_bounds(896, 1024, 0, 1920), 896);
+        // Regression for the v422 log: the final input clip was
+        // (1532, 667, 640, 480), outside a 1920x1080 monitor. Both axes must
+        // be rebased before the next ClipCursor ownership cycle.
+        assert_eq!(clamp_axis_to_bounds(1532, 640, 0, 1920), 1280);
+        assert_eq!(clamp_axis_to_bounds(667, 480, 0, 1080), 600);
+
+        // v426 regression: the outer PIP had already been moved to y=360,
+        // but its actual input client was still y=391..1110. Rebase decisions
+        // must therefore use the client rect and request another -31 px move.
+        assert_eq!(
+            client_rect_rebase_delta((618, 391, 1280, 720), (0, 0, 1920, 1080)),
+            (0, -31)
+        );
+        assert_eq!(
+            client_rect_rebase_delta((618, 360, 1280, 720), (0, 0, 1920, 1080)),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -9376,6 +12739,60 @@ mod tests {
     }
 
     #[test]
+    fn onnx_x3_60hz_mode_is_narrow_and_does_not_match_other_refresh_rates() {
+        assert!(onnx_x3_60hz_mode(Some(59.94)));
+        assert!(onnx_x3_60hz_mode(Some(60.0)));
+        assert!(!onnx_x3_60hz_mode(Some(59.0)));
+        assert!(!onnx_x3_60hz_mode(Some(61.0)));
+        assert!(!onnx_x3_60hz_mode(Some(75.0)));
+        assert!(!onnx_x3_60hz_mode(Some(120.0)));
+        assert!(!onnx_x3_60hz_mode(Some(144.0)));
+        assert!(!onnx_x3_60hz_mode(Some(165.0)));
+        assert!(!onnx_x3_60hz_mode(None));
+    }
+
+    #[test]
+    fn onnx_x3_60hz_keeps_refresh_limited_60fps_cadence() {
+        let period_24p = Some(1.0 / 24.0);
+        let ratio = onnx_output_ratio(3, period_24p, Some(60.0));
+        assert!((ratio - 2.5).abs() < 1e-9);
+        assert!((onnx_output_ratio(3, Some(1.0 / 25.0), Some(60.0)) - 2.4).abs() < 1e-9);
+        assert!((onnx_output_ratio(3, Some(1.0 / 30.0), Some(60.0)) - 2.0).abs() < 1e-9);
+        let mut cadence = FlowOutputCadence::default();
+        assert_eq!(
+            onnx_interpolation_phases(3, ratio, true, &mut cadence),
+            vec![0.2, 0.6, 1.0]
+        );
+        assert_eq!(
+            onnx_interpolation_phases(3, ratio, true, &mut cadence),
+            vec![0.4, 0.8]
+        );
+    }
+
+    #[test]
+    fn onnx_x3_non_60hz_is_strict_integer_and_clears_60hz_fractional_state() {
+        let period = Some(1.0 / 24.0);
+        assert_eq!(onnx_output_ratio(3, period, Some(120.0)), 3.0);
+        assert_eq!(onnx_output_ratio(3, period, Some(75.0)), 3.0);
+        let mut cadence = FlowOutputCadence::default();
+        cadence.next_phase = Some(0.4);
+        cadence.phase_step = 0.4;
+        assert_eq!(
+            onnx_interpolation_phases(3, 3.0, false, &mut cadence),
+            vec![1.0 / 3.0, 2.0 / 3.0, 1.0]
+        );
+        assert!(cadence.next_phase.is_none());
+        assert_eq!(cadence.phase_step, 0.0);
+    }
+
+    #[test]
+    fn x3_uses_same_cooperative_slot_release_class_as_x4_x5() {
+        assert_eq!(gpu_interp_slot_policy(3, 2), (true, true));
+        assert_eq!(gpu_interp_slot_policy(4, 3), (true, true));
+        assert_eq!(gpu_interp_slot_policy(5, 4), (true, true));
+    }
+
+    #[test]
     fn capped_15fps_x3_targets_45fps_on_a_120hz_monitor() {
         let capped_period = Some(1.0 / 15.0);
         assert_eq!(
@@ -9383,7 +12800,7 @@ mod tests {
             3.0
         );
         let mut cadence = FlowOutputCadence::default();
-        let phases = onnx_interpolation_phases(3, 3.0, &mut cadence);
+        let phases = onnx_interpolation_phases(3, 3.0, false, &mut cadence);
         assert_eq!(phases, vec![1.0 / 3.0, 2.0 / 3.0, 1.0]);
         assert_eq!(phases.len() * 15, 45);
     }
@@ -9845,6 +13262,43 @@ mod tests {
     }
 
     #[test]
+    fn smooth_pacer_gap_fill_present_forces_a_full_next_period() {
+        let period = 1.0 / 24.0;
+        let base = Instant::now();
+
+        // Without the gap-fill re-anchor the saved target is already in the
+        // past, so the next real frame is allowed to present immediately.
+        let mut stale = SmoothPacer::default();
+        let (_, first_present) = stale
+            .processing_deadline(base, Some(period), 0.0, Some(120.0))
+            .unwrap();
+        let gap_fill_complete = first_present + Duration::from_secs_f64(period * 1.55);
+        let (_, stale_next_present) = stale
+            .processing_deadline(gap_fill_complete, Some(period), 0.0, Some(120.0))
+            .unwrap();
+        assert_eq!(stale_next_present, gap_fill_complete);
+
+        // The real gap-fill path now resets that obsolete phase. The next
+        // frame therefore remains one complete source period away.
+        let mut fixed = SmoothPacer::default();
+        let _ = fixed
+            .processing_deadline(base, Some(period), 0.0, Some(120.0))
+            .unwrap();
+        fixed.reanchor_after_gap_fill_present(gap_fill_complete, Some(period));
+        let (_, fixed_next_present) = fixed
+            .processing_deadline(gap_fill_complete, Some(period), 0.0, Some(120.0))
+            .unwrap();
+        assert!(
+            (fixed_next_present
+                .duration_since(gap_fill_complete)
+                .as_secs_f64()
+                - period)
+                .abs()
+                < 0.000_001
+        );
+    }
+
+    #[test]
     fn smooth_pacer_preserves_exact_24p_clock_for_dwm_at_any_refresh() {
         let mut pacer = SmoothPacer::default();
         let mut now = Instant::now();
@@ -10202,6 +13656,13 @@ mod tests {
             initial_display_aspect(Some((640, 480)), (640, 480)),
             (640, 480)
         );
+    }
+
+    #[test]
+    fn capture_client_size_matches_wgc_even_frame_contract() {
+        assert_eq!(normalize_capture_client_size((640, 359)), (640, 360));
+        assert_eq!(normalize_capture_client_size((959, 719)), (960, 720));
+        assert_eq!(normalize_capture_client_size((640, 360)), (640, 360));
     }
 
     #[test]

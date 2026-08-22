@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "DirectML 回退：{count} 个滤镜",
   "tensorrt.pack_required": "需要另行提供的 TensorRT Backend Pack。",
   "tensorrt.unavailable_help": "TensorRT 后端当前不可用。详细原因请查看 cHiDeScaler-Neo.log。",
+  "glsl_overload.auto_stop": "性能不足，将停止放大。",
   "glsl_overload.pause": "滤镜负载过高。操作 GUI 时会暂停处理，以保持界面响应。",
   "glsl_overload.lighter_filter_help": "切换到负载较低的滤镜后会解除此警告。",
   "capture.fullscreen_notice_title": "捕获分辨率",

@@ -11,7 +11,7 @@
 //! - intermediates: F16 textures, NEAREST, clamp-to-edge.
 
 use super::gl::{Dtype, GlContext, GpuTex};
-use super::mpv::{ComputeSpec, ParamTy, Params, Pass, Sizes, UserShader, eval_rpn_p};
+use super::mpv::{ComputeSpec, ParamTy, Params, Pass, PassOffset, Sizes, UserShader, eval_rpn_p};
 use anyhow::{Result, anyhow};
 use glow::HasContext;
 use std::collections::HashMap;
@@ -27,10 +27,13 @@ pub struct GlslEngine;
 static GLSL_DIAG_SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
 fn glsl_diag_once(key: String, message: impl FnOnce() -> String) {
+    if !crate::logging::diagnostics_enabled() {
+        return;
+    }
     let seen = GLSL_DIAG_SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let mut seen = seen.lock().unwrap();
     if seen.insert(key) {
-        log::info!("{}", message());
+        log::debug!("{}", message());
     }
 }
 
@@ -46,7 +49,7 @@ impl GlslEngine {
         if shader.is_post {
             return Self::run_post(gc, shader, main);
         }
-        if shader.uses_yuv {
+        if shader.uses_chroma {
             return Self::run_yuv_emulated(gc, shader, main, out_size);
         }
         if shader.is_rgb {
@@ -192,6 +195,7 @@ impl GlslEngine {
         ow: i32,
         oh: i32,
         out_comps: u8,
+        tex_offset_px: (f32, f32),
     ) -> GpuTex {
         let ow = ow.max(1);
         let oh = oh.max(1);
@@ -237,7 +241,7 @@ impl GlslEngine {
                 gl.uniform_2_f32(Some(&loc), ow as f32, oh as f32);
             }
             if let Some(loc) = gl.get_uniform_location(prog, "tex_offset") {
-                gl.uniform_2_f32(Some(&loc), 0.0, 0.0);
+                gl.uniform_2_f32(Some(&loc), tex_offset_px.0, tex_offset_px.1);
             }
             if let Some(loc) = gl.get_uniform_location(prog, "random") {
                 gl.uniform_1_f32(Some(&loc), current_random());
@@ -285,6 +289,7 @@ impl GlslEngine {
         ow: i32,
         oh: i32,
         out_comps: u8,
+        tex_offset_px: (f32, f32),
     ) -> GpuTex {
         let ow = ow.max(1);
         let oh = oh.max(1);
@@ -328,7 +333,7 @@ impl GlslEngine {
                 gl.uniform_2_f32(Some(&loc), ow as f32, oh as f32);
             }
             if let Some(loc) = gl.get_uniform_location(prog, "tex_offset") {
-                gl.uniform_2_f32(Some(&loc), 0.0, 0.0);
+                gl.uniform_2_f32(Some(&loc), tex_offset_px.0, tex_offset_px.1);
             }
             if let Some(loc) = gl.get_uniform_location(prog, "random") {
                 gl.uniform_1_f32(Some(&loc), current_random());
@@ -436,7 +441,7 @@ impl GlslEngine {
                 .map(str::to_string)
                 .unwrap_or_else(|| hooked_texture_key(p, textures));
             // skip passes hooking planes we don't carry (e.g. CHROMA-only)
-            let Some(&hooked_tex) = textures.get(&hooked) else {
+            let Some(&initial_hooked_tex) = textures.get(&hooked) else {
                 glsl_diag_once(
                     format!("{}:{idx}:missing-hook:{hooked}", shader.path),
                     || {
@@ -452,6 +457,27 @@ impl GlslEngine {
                 );
                 continue;
             };
+            let save = p.save.clone().unwrap_or_else(|| hooked.clone());
+            let overwrites_hooked = save == hooked;
+            let mut hooked_tex = initial_hooked_tex;
+
+            // mpv `//!OFFSET ALIGN` consumes any previously accumulated phase
+            // before this pass. The directive is meaningful only when the pass
+            // overwrites the hooked texture, matching mpv's OFFSET semantics.
+            if p.offset == PassOffset::Align && overwrites_hooked && hooked_tex.has_offset() {
+                hooked_tex = crate::render::scaler::align_offset(gc, hooked_tex)?;
+                textures.insert(hooked.clone(), hooked_tex);
+                glsl_diag_once(format!("{}:{idx}:offset-align", shader.path), || {
+                    format!(
+                        "glsl-offset: shader={} pass={} action=align hook={} prior=({:.3},{:.3})",
+                        shader.name(),
+                        idx,
+                        hooked,
+                        initial_hooked_tex.offset_x,
+                        initial_hooked_tex.offset_y
+                    )
+                });
+            }
             textures.insert("HOOKED".into(), hooked_tex);
             comps.insert("HOOKED".into(), comps[&hooked]);
             sizes.insert("HOOKED".into(), sizes[&hooked]);
@@ -514,7 +540,6 @@ impl GlslEngine {
                 binds_comps.push((n.clone(), comps[n], t.d() > 1));
             }
 
-            let save = p.save.clone().unwrap_or_else(|| hooked.clone());
             let out_comps = match canonical_tex_name(&save) {
                 "MAIN" | "RGB" | "NATIVE" | "MAINPRESUB" | "OUTPUT" | "SCALED" => 4,
                 "LUMA" => 1,
@@ -534,7 +559,7 @@ impl GlslEngine {
             );
             glsl_diag_once(format!("{}:{idx}:run", shader.path), || {
                 format!(
-                    "glsl-pass run: shader={} pass={} desc='{}' hook={} raw_hook={} save={} size={}x{} comps={} binds={:?} compute={}",
+                    "glsl-pass run: shader={} pass={} desc='{}' hook={} raw_hook={} save={} size={}x{} comps={} binds={:?} compute={} offset={:?}",
                     shader.name(),
                     idx,
                     p.desc,
@@ -545,7 +570,8 @@ impl GlslEngine {
                     oh,
                     out_comps,
                     p.binds,
-                    p.compute.is_some()
+                    p.compute.is_some(),
+                    p.offset
                 )
             });
             let tgt = if let Some(spec) = p.compute {
@@ -560,7 +586,18 @@ impl GlslEngine {
                     &pvals,
                     out_comps,
                 )?;
-                Self::compute(gc, prog, spec, &binds, &storage, &pvals, ow, oh, out_comps)
+                Self::compute(
+                    gc,
+                    prog,
+                    spec,
+                    &binds,
+                    &storage,
+                    &pvals,
+                    ow,
+                    oh,
+                    out_comps,
+                    hooked_tex.offset(),
+                )
             } else {
                 let prog = Self::program_for(
                     gc,
@@ -571,8 +608,47 @@ impl GlslEngine {
                     &storage,
                     &pvals,
                 )?;
-                Self::render(gc, prog, &binds, &storage, &pvals, ow, oh, out_comps)
+                Self::render(
+                    gc,
+                    prog,
+                    &binds,
+                    &storage,
+                    &pvals,
+                    ow,
+                    oh,
+                    out_comps,
+                    hooked_tex.offset(),
+                )
             };
+            // Carry mpv's pending pixel phase as texture metadata. Existing
+            // phase scales with the output grid; a numeric OFFSET is added only
+            // when this pass overwrites the hooked texture. The next scaling
+            // pass consumes it.
+            let sx = ow as f32 / hooked_tex.w().max(1) as f32;
+            let sy = oh as f32 / hooked_tex.h().max(1) as f32;
+            let mut out_offset = (hooked_tex.offset_x * sx, hooked_tex.offset_y * sy);
+            if overwrites_hooked {
+                match p.offset {
+                    PassOffset::Pixels(x, y) => {
+                        out_offset.0 += x;
+                        out_offset.1 += y;
+                    }
+                    PassOffset::Align => out_offset = (0.0, 0.0),
+                    PassOffset::None => {}
+                }
+            } else if matches!(p.offset, PassOffset::Pixels(_, _) | PassOffset::Align) {
+                glsl_diag_once(format!("{}:{idx}:offset-ignored-save", shader.path), || {
+                    format!(
+                        "glsl-offset: shader={} pass={} offset={:?} ignored because save={} does not overwrite hook={}",
+                        shader.name(),
+                        idx,
+                        p.offset,
+                        save,
+                        hooked
+                    )
+                });
+            }
+            let tgt = tgt.with_offset(out_offset.0, out_offset.1);
             textures.insert(save.clone(), tgt);
             comps.insert(save.clone(), out_comps);
             sizes.insert(save, (ow as f64, oh as f64));
@@ -627,6 +703,16 @@ impl GlslEngine {
         main: GpuTex,
         out_size: (i32, i32),
     ) -> Result<GpuTex> {
+        glsl_diag_once(format!("{}:luma-preserve", shader.path), || {
+            format!(
+                "glsl-luma-preserve: shader={} input={}x{} output_ref={}x{} chroma=original-RGB-preserved",
+                shader.name(),
+                main.w(),
+                main.h(),
+                out_size.0,
+                out_size.1
+            )
+        });
         let luma = Self::extract_luma(gc, main)?;
         let mut textures = HashMap::from([
             ("LUMA".to_string(), luma),
@@ -650,9 +736,9 @@ impl GlslEngine {
     }
 
     /// RGB capture -> mpv-style pseudo YUV planes. This path is used only for
-    /// shaders that explicitly hook/bind LUMA or CHROMA; RGB/MAIN shaders never
-    /// pay this cost. It lets YUV-plane mpv shaders such as nnedi3 run on
-    /// uncompressed/RGB sources instead of silently behaving as no-ops.
+    /// shaders that actually hook/bind CHROMA. LUMA-only shaders preserve the
+    /// original RGB chroma and use `run_luma`, avoiding an unnecessary
+    /// RGB -> pseudo-4:2:0 -> RGB round-trip.
     fn run_yuv_emulated(
         gc: &mut GlContext,
         shader: &UserShader,
@@ -763,7 +849,9 @@ impl GlslEngine {
             main.w(),
             main.h(),
             1,
-        ))
+            main.offset(),
+        )
+        .with_offset(main.offset_x, main.offset_y))
     }
 
     fn extract_chroma(gc: &mut GlContext, main: GpuTex) -> Result<GpuTex> {
@@ -771,15 +859,22 @@ impl GlslEngine {
             "#version 330\nin vec2 v_uv; out vec4 frag;\nuniform sampler2D MAIN_tx;\nvoid main(){{\nvec3 rgb = texture(MAIN_tx, v_uv).rgb;\nfloat y = dot(rgb, vec3({KR},{KG},{KB}));\nfloat cb = (rgb.b - y) / (2.0*(1.0-{KB})) + 0.5;\nfloat cr = (rgb.r - y) / (2.0*(1.0-{KR})) + 0.5;\nfrag = vec4(cb,cr,0.0,1.0);\n}}\n"
         );
         let prog = gc.program(&frag).map_err(|e| anyhow!(e))?;
+        let cw = (main.w() + 1) / 2;
+        let ch = (main.h() + 1) / 2;
         Ok(Self::render(
             gc,
             prog,
             &[("MAIN".into(), main)],
             &[],
             &[],
-            (main.w() + 1) / 2,
-            (main.h() + 1) / 2,
+            cw,
+            ch,
             2,
+            main.offset(),
+        )
+        .with_offset(
+            main.offset_x * cw as f32 / main.w().max(1) as f32,
+            main.offset_y * ch as f32 / main.h().max(1) as f32,
         ))
     }
 
@@ -798,9 +893,10 @@ impl GlslEngine {
             yprime.w(),
             yprime.h(),
             4,
+            yprime.offset(),
         );
         gc.set_filter_linear(main, false);
-        Ok(out)
+        Ok(out.with_offset(yprime.offset_x, yprime.offset_y))
     }
 
     fn yuv_to_rgb(gc: &mut GlContext, y: GpuTex, c: GpuTex) -> Result<GpuTex> {
@@ -818,9 +914,10 @@ impl GlslEngine {
             y.w(),
             y.h(),
             4,
+            y.offset(),
         );
         gc.set_filter_linear(c, false);
-        Ok(out)
+        Ok(out.with_offset(y.offset_x, y.offset_y))
     }
 }
 
@@ -1001,8 +1098,9 @@ fn fragment_src(
         // #version 440 like mpv composes: slang/libretro ports rely on the
         // 4.2+ relaxation of `const` locals with non-constant initializers
         // (NVIDIA rejects them under 330 with C1059  Ecrt-royale case)
-        "#version 440\n{extensions}in vec2 v_uv;\nout vec4 frag;\nuniform vec2 input_size;\nuniform vec2 target_size;\nuniform vec2 out_size;\nuniform vec2 tex_offset;\nvec4 linearize(vec4 c){{ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(2.2)), c.a); }}\nvec4 delinearize(vec4 c){{ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(1.0/2.2)), c.a); }}\n",
+        "#version 440\n{extensions}in vec2 v_uv;\nout vec4 frag;\nuniform vec2 input_size;\nuniform vec2 target_size;\nuniform vec2 out_size;\nuniform vec2 tex_offset;\n",
     );
+    append_mpv_transfer_helpers(&mut prelude, &body);
     append_common_uniforms(
         &mut prelude,
         raw_hook,
@@ -1028,9 +1126,10 @@ fn compute_src(
     let (extensions, body) = split_glsl_extensions(code);
     let (layout, _) = image_format(out_comps);
     let mut prelude = format!(
-        "#version 440\n{extensions}layout(local_size_x = {}, local_size_y = {}, local_size_z = 1) in;\nlayout({layout}, binding = 0) writeonly uniform image2D out_image;\nuniform vec2 input_size;\nuniform vec2 target_size;\nuniform vec2 out_size;\nuniform vec2 tex_offset;\nvec4 linearize(vec4 c){{ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(2.2)), c.a); }}\nvec4 delinearize(vec4 c){{ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(1.0/2.2)), c.a); }}\n",
+        "#version 440\n{extensions}layout(local_size_x = {}, local_size_y = {}, local_size_z = 1) in;\nlayout({layout}, binding = 0) writeonly uniform image2D out_image;\nuniform vec2 input_size;\nuniform vec2 target_size;\nuniform vec2 out_size;\nuniform vec2 tex_offset;\n",
         spec.threads_w, spec.threads_h
     );
+    append_mpv_transfer_helpers(&mut prelude, &body);
     append_common_uniforms(
         &mut prelude,
         raw_hook,
@@ -1041,6 +1140,123 @@ fn compute_src(
         &body,
     );
     format!("{prelude}\n{body}\nvoid main(){{ hook(); }}\n")
+}
+
+/// mpv user shaders sometimes provide fallback implementations guarded by
+/// `#ifndef linearize` / `#ifndef delinearize` (for example crt-lottes).
+/// Injecting Neo's helper as a GLSL function does not make those preprocessor
+/// guards false, so an unconditional helper causes a duplicate-function error.
+///
+/// Preserve mpv-style drop-in compatibility by supplying a helper only when
+/// the shader does not already contain a real function body with that name.
+/// A shader-provided implementation therefore wins unchanged; shaders that
+/// merely call the helper keep the existing Neo fallback behavior.
+fn append_mpv_transfer_helpers(prelude: &mut String, body: &str) {
+    if !body_defines_function(body, "linearize") {
+        prelude.push_str(
+            "vec4 linearize(vec4 c){ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(2.2)), c.a); }\n",
+        );
+    }
+    if !body_defines_function(body, "delinearize") {
+        prelude.push_str(
+            "vec4 delinearize(vec4 c){ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(1.0/2.2)), c.a); }\n",
+        );
+    }
+}
+
+fn body_defines_function(body: &str, name: &str) -> bool {
+    let scan = glsl_without_comments_for_scan(body);
+    let bytes = scan.as_bytes();
+    let name_bytes = name.as_bytes();
+    let mut search_from = 0usize;
+
+    while search_from + name_bytes.len() <= bytes.len() {
+        let Some(rel) = scan[search_from..].find(name) else {
+            return false;
+        };
+        let start = search_from + rel;
+        let end = start + name_bytes.len();
+
+        let left_ok = start == 0
+            || !((bytes[start - 1] as char).is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let right_ok = end == bytes.len()
+            || !((bytes[end] as char).is_ascii_alphanumeric() || bytes[end] == b'_');
+        if !left_ok || !right_ok {
+            search_from = end;
+            continue;
+        }
+
+        let mut open = end;
+        while open < bytes.len() && (bytes[open] as char).is_ascii_whitespace() {
+            open += 1;
+        }
+        if open >= bytes.len() || bytes[open] != b'(' {
+            search_from = end;
+            continue;
+        }
+        let Some(close) = matching_paren(&scan, open) else {
+            search_from = end;
+            continue;
+        };
+
+        let mut next = close + 1;
+        while next < bytes.len() && (bytes[next] as char).is_ascii_whitespace() {
+            next += 1;
+        }
+        if next < bytes.len() && bytes[next] == b'{' {
+            return true;
+        }
+        search_from = end;
+    }
+    false
+}
+
+fn glsl_without_comments_for_scan(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while i < bytes.len() {
+        if line_comment {
+            if bytes[i] == b'\n' {
+                line_comment = false;
+                out.push(b'\n');
+            } else {
+                out.push(b' ');
+            }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                out.extend_from_slice(b"  ");
+                i += 2;
+                block_comment = false;
+            } else {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            out.extend_from_slice(b"  ");
+            i += 2;
+            line_comment = true;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            out.extend_from_slice(b"  ");
+            i += 2;
+            block_comment = true;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
 /// True when the shader body itself `#define`s `name` (mpv-libretro ports
@@ -1403,8 +1619,8 @@ fn matching_paren(s: &str, open_idx: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapt_f16_extensions, fragment_src, hook_raw_define, persistent_texture_key,
-        rewrite_spirv_dp4_compat,
+        adapt_f16_extensions, body_defines_function, fragment_src, hook_raw_define,
+        persistent_texture_key, rewrite_spirv_dp4_compat,
     };
 
     #[test]
@@ -1449,6 +1665,64 @@ mod tests {
         assert!(src.contains("uniform vec2 input_size;"));
         assert!(src.contains("#define HOOKED_mul 1.0"));
         assert!(!src.contains("#define HOOKED_mul vec4"));
+    }
+
+    #[test]
+    fn mpv_transfer_helper_is_not_injected_over_shader_fallback() {
+        let code = r#"
+#ifndef linearize
+vec4 linearize(vec4 color) {
+    return vec4(pow(max(color.rgb, vec3(0.0)), vec3(2.4)), color.a);
+}
+#endif
+#ifndef delinearize
+vec4 delinearize(vec4 color) {
+    return vec4(pow(max(color.rgb, vec3(0.0)), vec3(1.0 / 2.4)), color.a);
+}
+#endif
+vec4 hook(){ return delinearize(linearize(HOOKED_tex(HOOKED_pos))); }
+"#;
+        let src = fragment_src(
+            code,
+            "MAIN",
+            &[("HOOKED".into(), 4, false)],
+            &[],
+            &[],
+        );
+        assert_eq!(src.matches("vec4 linearize(vec4").count(), 1);
+        assert_eq!(src.matches("vec4 delinearize(vec4").count(), 1);
+        assert!(src.contains("vec3(2.4)"));
+        assert!(src.contains("vec3(1.0 / 2.4)"));
+    }
+
+    #[test]
+    fn mpv_transfer_helper_is_still_supplied_when_shader_only_calls_it() {
+        let src = fragment_src(
+            "vec4 hook(){ return delinearize(linearize(HOOKED_tex(HOOKED_pos))); }",
+            "MAIN",
+            &[("HOOKED".into(), 4, false)],
+            &[],
+            &[],
+        );
+        assert_eq!(src.matches("vec4 linearize(vec4").count(), 1);
+        assert_eq!(src.matches("vec4 delinearize(vec4").count(), 1);
+        assert!(src.contains("vec3(2.2)"));
+    }
+
+    #[test]
+    fn transfer_function_detector_ignores_calls_and_finds_real_bodies() {
+        assert!(!body_defines_function(
+            "vec4 hook(){ return linearize(vec4(1.0)); }",
+            "linearize"
+        ));
+        assert!(body_defines_function(
+            "vec4 linearize(vec4 c)\n/* keep comment */\n{ return c; }",
+            "linearize"
+        ));
+        assert!(!body_defines_function(
+            "// vec4 linearize(vec4 c) { return c; }\nvec4 hook(){ return vec4(1.0); }",
+            "linearize"
+        ));
     }
 
     #[test]

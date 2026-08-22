@@ -1,4 +1,3 @@
-pub mod browser;
 pub mod engine;
 pub mod i18n;
 pub mod input;

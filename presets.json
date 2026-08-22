@@ -182,21 +182,21 @@
       ]
     },
     {
-      "name": "AnimeJaNai HD V3",
+      "name": "AnimeJaNai HD V3.1",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3_SuperUltraCompact_5k-fp16.onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_fp16.onnx",
           "enabled": true
         }
       ]
     },
     {
-      "name": "AnimeJaNai HD V3 Sharp",
+      "name": "AnimeJaNai HD V3.1 Sharp",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3Sharp1_SuperUltraCompact_25k-fp16.onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_fp16.onnx",
           "enabled": true
         }
       ]
@@ -262,11 +262,11 @@
       ]
     },
     {
-      "name": "SD Anime ***∞***",
+      "name": "SD-HD Anime ***∞***",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3Sharp1_SuperUltraCompact_25k-fp16.onnx",
+          "path": "models/AnimeJaNai/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_fp16.onnx",
           "enabled": true
         },
         {
@@ -322,7 +322,27 @@
       ]
     },
     {
-      "name": "LosOdy360  [X360/PS3]",
+      "name": "SD Anime **Ω** + temporalfix  [Cel]",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/ToHeart_35mm/ToHeart_35mm_Compact_V1_1_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "onnx",
+          "path": "models/TemporalFix/temporalfix_s2_v1_op18_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "LosOdy360  [720p]  @X360/PS3",
       "chain": [
         {
           "kind": "onnx",
@@ -332,6 +352,26 @@
         {
           "kind": "glsl",
           "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "Live Action [1080p]  @FHD",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/aWarpSharp3_RT.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Sharpen/GEGL_unsharp_mask_RT.glsl",
           "enabled": true
         }
       ]
@@ -402,7 +442,7 @@
       ]
     },
     {
-      "name": "RIFE Lite   FG",
+      "name": "RIFE Lite  FG",
       "chain": [
         {
           "kind": "onnx",
@@ -422,7 +462,7 @@
       ]
     },
     {
-      "name": "RIFE Lite S + QCOM  FG",
+      "name": "RIFE Lite S + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
@@ -431,13 +471,13 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/QCOM/QCOM_quicksrnet_small_x2.glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
           "enabled": true
         }
       ]
     },
     {
-      "name": "RIFE Lite + QCOM  FG",
+      "name": "RIFE Lite + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
@@ -446,7 +486,7 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/QCOM/QCOM_quicksrnet_small_x2.glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
           "enabled": true
         }
       ]
@@ -464,7 +504,7 @@
           "path": "shaders/Resize/Spline16_Neo.glsl",
           "enabled": true,
           "params": {
-            "RESIZE_SCALE": 0.9
+            "RESIZE_SCALE": 0.75
           }
         },
         {
@@ -494,7 +534,7 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         }
       ]
@@ -509,12 +549,12 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         }
       ]
@@ -529,12 +569,12 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         },
         {
           "kind": "glsl",
-          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         }
       ]
@@ -549,12 +589,12 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         },
         {
           "kind": "glsl",
-          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         }
       ]
@@ -569,12 +609,12 @@
         },
         {
           "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_L.glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         },
         {
           "kind": "glsl",
-          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         }
       ]

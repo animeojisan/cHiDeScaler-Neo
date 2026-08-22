@@ -56,6 +56,7 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `filter.none` | (No filters found) |
 | `filter.reorder_help` | (Hold and drag to reorder) |
 | `filter.toggle` | Enable/Disable |
+| `glsl_overload.auto_stop` | Insufficient performance. Scaling will stop. |
 | `glsl_overload.lighter_filter_help` | Switch to a lighter filter to clear this warning. |
 | `glsl_overload.pause` | The filter is overloaded. Processing is paused while you use the GUI to protect responsiveness. |
 | `hdr.help` | Reduces blown highlights in HDR video. Applies next start. |

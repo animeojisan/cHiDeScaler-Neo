@@ -26,6 +26,11 @@ pub struct OverlayWindow {
     width: i32,
     height: i32,
     visible: bool,
+    // True when the native WGL HWND has already been reinserted into DWM's
+    // visible tree at alpha=0 and is waiting for the first safe reveal.
+    // This preserves the v235 composition behaviour while still allowing the
+    // hard SW_HIDE used by the modern Stop path to retire stale AMD surfaces.
+    staged_hidden: bool,
 }
 
 impl OverlayWindow {
@@ -49,6 +54,7 @@ impl OverlayWindow {
             width: w,
             height: h,
             visible: false,
+            staged_hidden: false,
         })
     }
 
@@ -58,6 +64,38 @@ impl OverlayWindow {
 
     pub fn size(&self) -> (i32, i32) {
         (self.width, self.height)
+    }
+
+    /// Reinsert a physically hidden Stop-era WGL HWND into DWM while it is
+    /// still fully transparent. v235 never removed the overlay from DWM's
+    /// composition tree; the later hard Stop fix did, and showing the full-
+    /// screen HWND only at the reveal boundary can let AMD promote it before
+    /// the small panel/cursor helper surfaces are composed. Stage it early at
+    /// alpha=0 after geometry is restored, then reveal by alpha only.
+    pub fn prepare_hidden_for_reveal(&mut self) {
+        if self.visible || self.staged_hidden {
+            return;
+        }
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.win.hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                0,
+                LWA_ALPHA,
+            );
+            if !IsWindowVisible(self.win.hwnd).as_bool() {
+                let _ = ShowWindow(self.win.hwnd, SW_SHOWNOACTIVATE);
+            }
+            let _ = DwmFlush();
+        }
+        self.staged_hidden = true;
+        log::info!(
+            "overlay-hidden-stage-ready: hwnd={:#x} native_visible={} alpha=0 size={}x{}",
+            self.win.hwnd.0 as isize,
+            unsafe { IsWindowVisible(self.win.hwnd).as_bool() },
+            self.width,
+            self.height
+        );
     }
 
     pub fn show(&mut self) {
@@ -87,14 +125,13 @@ impl OverlayWindow {
             let _ = DwmFlush();
         }
         self.visible = true;
+        self.staged_hidden = false;
     }
 
     pub fn hide(&mut self) {
         unsafe {
-            // Logical hide only: retain the transparent, click-through window
-            // in DWM's composition tree. Physically hiding and later showing
-            // this persistent WGL HWND resurrected the previous session's
-            // front surface for one composition on AMD.
+            // Logical hide for ordinary in-session transitions: retain the
+            // transparent, click-through window in DWM's composition tree.
             let _ = SetLayeredWindowAttributes(
                 self.win.hwnd,
                 windows::Win32::Foundation::COLORREF(0),
@@ -104,13 +141,88 @@ impl OverlayWindow {
             let _ = DwmFlush();
         }
         self.visible = false;
+        // Native HWND remains visible in DWM at alpha=0.
+        self.staged_hidden = true;
+    }
+
+    /// Final capture-stop hide. Stop is a hard visual boundary: after it
+    /// returns, no WGL/DWM surface from the magnified view may remain on the
+    /// desktop. Alpha=0 plus off-screen parking was insufficient on the AMD
+    /// reproduction (the old full-screen frame could remain scanned out), so
+    /// physically remove the overlay HWND from the visible window tree here.
+    /// The persistent WGL context is retained; show() restores the HWND while
+    /// alpha is still 0 and only exposes it after the next frame is double-primed.
+    pub fn hide_for_stop(&mut self) {
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.win.hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                0,
+                LWA_ALPHA,
+            );
+            let _ = DwmFlush();
+            let _ = ShowWindow(self.win.hwnd, SW_HIDE);
+            let _ = SetWindowPos(
+                self.win.hwnd,
+                None,
+                -32000,
+                -32000,
+                1,
+                1,
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER,
+            );
+            let _ = DwmFlush();
+            let native_visible = IsWindowVisible(self.win.hwnd).as_bool();
+            if native_visible {
+                log::error!("overlay-stop-hide-postcondition-failed: hwnd={:#x} native_visible=true", self.win.hwnd.0 as isize);
+            } else {
+                log::info!("overlay-stop-hide-complete: hwnd={:#x} native_visible=false rect=(-32000,-32000 1x1)", self.win.hwnd.0 as isize);
+            }
+        }
+        self.width = 1;
+        self.height = 1;
+        self.visible = false;
+        self.staged_hidden = false;
     }
 
     pub fn is_visible(&self) -> bool {
         self.visible
     }
 
+    /// Commit already-swapped overlay content to the Desktop Window Manager.
+    /// Used only for one-shot semantic updates such as a filter-chain edit on
+    /// a paused/change-driven WGC source; ordinary playback stays asynchronous.
+    pub fn flush_compositor(&self) {
+        unsafe {
+            let _ = DwmFlush();
+        }
+    }
+
+    /// Geometry-only reposition used while the main GUI itself is TOPMOST.
+    /// This is the modern stable path: do not disturb the established
+    /// GUI > panel > overlay sibling ordering.
     pub fn reposition(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.win.hwnd,
+                None,
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER,
+            );
+        }
+        self.width = w;
+        self.height = h;
+    }
+
+    /// v235-compatible reposition for GUI-topmost OFF. v235 always supplied
+    /// HWND_TOPMOST when placing the overlay. Later GUI-topmost fixes changed
+    /// this globally to SWP_NOZORDER so the TOPMOST GUI would not flicker.
+    /// Keep that newer behaviour only for GUI-topmost ON; when OFF, restore the
+    /// original overlay placement contract exactly.
+    pub fn reposition_v235_topmost(&mut self, x: i32, y: i32, w: i32, h: i32) {
         unsafe {
             let _ = SetWindowPos(
                 self.win.hwnd,
@@ -158,9 +270,17 @@ impl OverlayWindow {
         let gl = gc.gl.clone();
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(0, 0, ww, wh);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
+            // The present shader is opaque (alpha=1.0) and blending/depth are
+            // disabled. If the content viewport covers the complete overlay,
+            // the following fullscreen draw overwrites every color pixel, so
+            // clearing the same surface first is redundant. Preserve the old
+            // black clear whenever letterbox/pillarbox pixels are present.
+            let full_cover = vx == 0 && vy == 0 && vw == ww && vh == wh;
+            if !full_cover {
+                gl.viewport(0, 0, ww, wh);
+                gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
             gl.viewport(vx, vy, vw.max(1), vh.max(1));
             gl.use_program(Some(prog));
             gl.active_texture(glow::TEXTURE0);

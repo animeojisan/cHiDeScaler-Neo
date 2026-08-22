@@ -50,6 +50,7 @@ impl ResourceMonitor {
             && let Ok(value) = value.parse::<f32>()
         {
             let value = value.clamp(0.0, 100.0);
+            chidescaler_neo::engine::set_gui_gpu_percent(Some(value));
             return (value, Some(value));
         }
         if self.last_update.elapsed() >= Duration::from_millis(750) {
@@ -57,6 +58,7 @@ impl ResourceMonitor {
             self.update_cpu();
             self.update_gpu();
         }
+        chidescaler_neo::engine::set_gui_gpu_percent(self.gpu);
         (self.cpu, self.gpu)
     }
 
@@ -137,6 +139,7 @@ impl ResourceMonitor {
             // Diagnostic-only grouping keeps the LUID/physical adapter in the
             // key so a multi-GPU machine cannot hide which real GPU engine is
             // busy. This does NOT feed the GUI value.
+            let diagnostics = crate::logging::diagnostics_enabled();
             let mut physical_engines: HashMap<String, f64> = HashMap::new();
             let mut per_pid_engine: HashMap<(u32, String), f64> = HashMap::new();
             let mut diag_items = Vec::<GpuDiagItem>::new();
@@ -156,19 +159,21 @@ impl ResourceMonitor {
                     .unwrap_or_else(|| name.clone());
                 *engines.entry(legacy_key).or_default() += value;
 
-                let physical_key = physical_engine_key(&name);
-                *physical_engines.entry(physical_key.clone()).or_default() += value;
-                let pid = parse_pid(&name).unwrap_or(0);
-                if pid != 0 {
-                    *per_pid_engine
-                        .entry((pid, physical_key.clone()))
-                        .or_default() += value;
+                if diagnostics {
+                    let physical_key = physical_engine_key(&name);
+                    *physical_engines.entry(physical_key.clone()).or_default() += value;
+                    let pid = parse_pid(&name).unwrap_or(0);
+                    if pid != 0 {
+                        *per_pid_engine
+                            .entry((pid, physical_key.clone()))
+                            .or_default() += value;
+                    }
+                    diag_items.push(GpuDiagItem {
+                        pid,
+                        physical_key,
+                        value,
+                    });
                 }
-                diag_items.push(GpuDiagItem {
-                    pid,
-                    physical_key,
-                    value,
-                });
             }
 
             let (legacy_key, legacy_value) = top_entry(&engines)
@@ -176,12 +181,10 @@ impl ResourceMonitor {
                 .unwrap_or_else(|| ("none".to_string(), 0.0));
             self.gpu = Some(legacy_value.clamp(0.0, 100.0) as f32);
 
-            // Diagnostic logging only. Keep enough raw Windows GPU-engine
-            // evidence in the normal log to correlate the displayed percentage
-            // with individual engines and processes without external tools.
-            if log::log_enabled!(log::Level::Info)
-                && self.last_gpu_diag_log.elapsed() >= Duration::from_millis(1500)
-            {
+            // Detailed diagnostic logging only. The legacy GUI GPU value above
+            // is always calculated; physical-engine/process attribution below
+            // is skipped unless the user enabled "Save log".
+            if diagnostics && self.last_gpu_diag_log.elapsed() >= Duration::from_millis(1500) {
                 self.last_gpu_diag_log = Instant::now();
                 let (physical_key, physical_value) = top_entry(&physical_engines)
                     .map(|(key, value)| (key.clone(), *value))
@@ -234,7 +237,7 @@ impl ResourceMonitor {
                     .collect::<Vec<_>>()
                     .join(",");
 
-                log::info!(
+                log::debug!(
                     "gpu-diag: gui_legacy={:.1}% legacy_engine='{}' physical_top={:.1}% physical_engine='{}' top_engines=[{}] contributors=[{}] process_max=[{}]",
                     legacy_value.clamp(0.0, 100.0),
                     compact_engine_key(&legacy_key),

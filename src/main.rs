@@ -6,10 +6,9 @@
 //! beginners can always stop magnification even in fullscreen mode.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chidescaler_neo::browser;
 use chidescaler_neo::core::config::{
-    BrowserKind, CaptureResolution, OnnxBackendPreference, ScaleMode, Settings, StageKind,
-    StageSpec, UiLanguage, UiLanguageMode, UiMode, app_dir,
+    CaptureResolution, OnnxBackendPreference, ScaleMode, Settings, StageKind, StageSpec,
+    UiLanguage, UiLanguageMode, UiMode, app_dir,
 };
 use chidescaler_neo::core::metrics::StageStat;
 use chidescaler_neo::core::presets::{
@@ -17,6 +16,7 @@ use chidescaler_neo::core::presets::{
 };
 use chidescaler_neo::engine::{Cmd, EngineHandle, Status, panel_target_position};
 use chidescaler_neo::i18n;
+use chidescaler_neo::input;
 use chidescaler_neo::logging;
 use chidescaler_neo::platform::hotkeys::{
     HotkeyEvent, HotkeyThread, HotkeyValidationError, hotkey_is_available, validate_user_hotkey,
@@ -26,7 +26,12 @@ use chidescaler_neo::render::onnx_backend::{
     TensorRtAvailability, detect_tensorrt_backend, tensorrt_cache_root,
 };
 use eframe::egui;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use winit::application::ApplicationHandler;
+use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
+use winit::event_loop::ActiveEventLoop;
+use winit::window::WindowId;
 
 mod resource_monitor;
 use resource_monitor::ResourceMonitor;
@@ -35,9 +40,6 @@ const HK_TOGGLE: i32 = 1;
 const HK_QUIT: i32 = 2;
 const HK_PANEL: i32 = 3;
 const HK_GUI_TOPMOST: i32 = 4;
-// Frozen for now: keep the implementation available for a later review, but
-// expose no launcher and create no browser profile/cache from the GUI.
-const BROWSER_HW_LAUNCHER_ENABLED: bool = false;
 // HDR highlight protection is frozen pending a later review. Keep the setting,
 // translations, capture path and processing code intact so the feature can be
 // restored by changing this single gate, but hide the checkbox and never pass
@@ -47,14 +49,18 @@ const HDR_CAPTURE_OPTION_ENABLED: bool = false;
 fn tensorrt_option_visible(availability: &TensorRtAvailability) -> bool {
     availability.available
 }
-const BUILD_ID: &str = "20260809-v343g-portable-pointer-backup";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
 const BASIC_MIN_SIZE: [f32; 2] = [720.0, 350.0];
 const BASIC_MAX_RESTORED_WIDTH: f32 = 870.0;
-const MINI_DEFAULT_SIZE: [f32; 2] = [760.0, 100.0];
-const MINI_MIN_SIZE: [f32; 2] = [760.0, 96.0];
+// v348z: the latched capture button gained more physical depth.  Mini needs
+// a few logical points of real viewport breathing room below that control so
+// the raised face/socket never reads as glued to the window edge.  These are
+// egui logical points, so the extra clearance remains DPI-aware.
+const MINI_DEFAULT_SIZE: [f32; 2] = [760.0, 105.0];
+const MINI_MIN_SIZE: [f32; 2] = [760.0, 101.0];
 const MINI_PRESET_WIDTH: f32 = 270.0;
 const MAX_FPS_CAP: u32 = 240;
 // Full mode follows the same model as Basic mode: measure the localized text
@@ -71,6 +77,152 @@ const CAPTURE_RESOLUTION_FIELD_MAX_WIDTH: f32 = 156.0;
 
 fn hdr_capture_requested(settings: &Settings) -> bool {
     HDR_CAPTURE_OPTION_ENABLED && settings.hdr_capture
+}
+
+// v415 diagnostic: v414 eliminated the visual split, but a live native-caption
+// drag still steals enough GPU/desktop-compositor scheduling to reduce video
+// throughput. Keep every Win32 move/input event native and real-time, but do
+// not submit new WGPU GUI frames while the caption is physically held. DWM can
+// move the already-composed front buffer as a static image. On button release,
+// forward one deferred RedrawRequested so the final GUI state is refreshed.
+// This gate never touches the independent WGL/OpenGL video overlay or filter
+// engine and does not rate-limit mouse coordinates or native window movement.
+struct GuiCaptionDragRedrawGate<'a> {
+    inner: eframe::EframeWinitApplication<'a>,
+    deferred_redraws: HashSet<WindowId>,
+    // The root/main viewport exists from app startup, while the floating panel
+    // is only created later when capture starts. Remember the first native
+    // WindowId once and gate redraws for that window only.
+    root_window_id: Option<WindowId>,
+    root_window_identified: bool,
+    // control_panel() is generated from the root App::ui() pass, so freezing
+    // every root redraw also freezes the native GDI panel's FPS text. During a
+    // caption drag allow a sparse root update only for fresh stats/state, while
+    // keeping the bulk of the v416 drag-time WGPU load suppression.
+    last_root_drag_redraw: Option<Instant>,
+}
+
+impl<'a> GuiCaptionDragRedrawGate<'a> {
+    fn new(inner: eframe::EframeWinitApplication<'a>) -> Self {
+        Self {
+            inner,
+            deferred_redraws: HashSet::new(),
+            root_window_id: None,
+            root_window_identified: false,
+            last_root_drag_redraw: None,
+        }
+    }
+
+    fn root_drag_redraw_due(&self, now: Instant) -> bool {
+        self.last_root_drag_redraw.map_or(true, |last| {
+            now.duration_since(last) >= Duration::from_millis(200)
+        })
+    }
+
+    fn flush_deferred_redraws(&mut self, event_loop: &ActiveEventLoop) {
+        if self.deferred_redraws.is_empty() {
+            return;
+        }
+
+        if input::native_gui_caption_drag_active() {
+            // A child/panel RedrawRequested cannot regenerate panel contents by
+            // itself: the panel is built inside the root App::ui() pass. Let one
+            // deferred root redraw through every 200 ms (~5 Hz) so the FPS text
+            // remains live, without returning to continuous WGPU submissions.
+            let Some(root) = self.root_window_id else {
+                return;
+            };
+            let now = Instant::now();
+            if self.deferred_redraws.contains(&root) && self.root_drag_redraw_due(now) {
+                self.deferred_redraws.remove(&root);
+                self.last_root_drag_redraw = Some(now);
+                self.inner
+                    .window_event(event_loop, root, WindowEvent::RedrawRequested);
+            }
+            return;
+        }
+
+        self.last_root_drag_redraw = None;
+        let pending = self.deferred_redraws.drain().collect::<Vec<_>>();
+        for window_id in pending {
+            self.inner
+                .window_event(event_loop, window_id, WindowEvent::RedrawRequested);
+        }
+    }
+}
+
+impl ApplicationHandler<eframe::UserEvent> for GuiCaptionDragRedrawGate<'_> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.inner.resumed(event_loop);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if !self.root_window_identified {
+            self.root_window_id = Some(window_id);
+            self.root_window_identified = true;
+        }
+
+        let is_root_window = self.root_window_id == Some(window_id);
+        if is_root_window
+            && matches!(&event, WindowEvent::RedrawRequested)
+            && input::native_gui_caption_drag_active()
+        {
+            let now = Instant::now();
+            if self.root_drag_redraw_due(now) {
+                self.deferred_redraws.remove(&window_id);
+                self.last_root_drag_redraw = Some(now);
+            } else {
+                self.deferred_redraws.insert(window_id);
+                return;
+            }
+        }
+
+        let destroyed = matches!(&event, WindowEvent::Destroyed);
+        self.inner.window_event(event_loop, window_id, event);
+        if destroyed {
+            self.deferred_redraws.remove(&window_id);
+        }
+        self.flush_deferred_redraws(event_loop);
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        self.inner.new_events(event_loop, cause);
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: eframe::UserEvent) {
+        self.inner.user_event(event_loop, event);
+    }
+
+    fn device_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        self.inner.device_event(event_loop, device_id, event);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_deferred_redraws(event_loop);
+        self.inner.about_to_wait(event_loop);
+    }
+
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        self.inner.suspended(event_loop);
+    }
+
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        self.inner.exiting(event_loop);
+    }
+
+    fn memory_warning(&mut self, event_loop: &ActiveEventLoop) {
+        self.inner.memory_warning(event_loop);
+    }
 }
 
 fn stage_file_name(path: &str) -> String {
@@ -145,6 +297,25 @@ fn stats_rows_in_filter_chain_order(
             if let Some(row) = remaining[index].take() {
                 ordered.push(row);
             }
+        } else {
+            // A chain transition / capture-resolution reset clears measured
+            // stage timings. ONNX/interpolation timing often returns before an
+            // asynchronous GLSL timer query, so `rows` can be non-empty while
+            // one or more live GLSL stages have no fresh timing yet. Keep every
+            // enabled filter visible in its authoritative chain position rather
+            // than making the row disappear until the next GPU timing sample.
+            let kind = match stage.kind {
+                StageKind::Glsl => "glsl",
+                StageKind::Onnx => "onnx",
+                StageKind::Flow => "gpu",
+            };
+            ordered.push((
+                expected,
+                StageStat {
+                    kind: kind.to_string(),
+                    ms: -1.0,
+                },
+            ));
         }
     }
 
@@ -160,17 +331,15 @@ fn stats_rows_in_filter_chain_order(
 pub static NvOptimusEnablement: u32 = 1;
 #[unsafe(no_mangle)]
 pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
-const PANEL_STOP_W_PTS: f32 = 82.0;
-const PANEL_COLLAPSE_W_PTS: f32 = 34.0;
-const PANEL_ICON_W_PTS: f32 = 34.0;
-const PANEL_FPS_W_PTS: f32 = 68.0;
 const PANEL_BAR_W_PTS: f32 = 270.0;
 const PANEL_BAR_H_PTS: f32 = 30.0;
-const PANEL_CHIP_W_PTS: f32 = 34.0;
+// The lurk chip is fully transparent and exists only as a rediscovery / hover
+// hit area.  Keep its height unchanged, but make it twice as wide so users do
+// not have to hunt for a 34pt-wide invisible target when restoring the panel.
+const PANEL_CHIP_W_PTS: f32 = 68.0;
 const PANEL_CHIP_H_PTS: f32 = 24.0;
-const PANEL_LURK_ALPHA: u8 = 18;
+const PANEL_LURK_ALPHA: u8 = 0;
 const STATS_FONT_SIZE: f32 = 11.5;
-const SHOW_PANEL_GRIP: bool = false;
 const MINI_LANGUAGE_POPUP_HEIGHT: f32 = 58.0;
 const FULL_LANGUAGE_POPUP_HEIGHT: f32 = 286.0;
 const MINI_PRESET_POPUP_HEIGHT: f32 = 80.0;
@@ -227,20 +396,23 @@ fn basic_restored_width(width: f32) -> f32 {
     width.clamp(BASIC_MIN_SIZE[0], BASIC_MAX_RESTORED_WIDTH)
 }
 
-fn gui_fallback_repaint_ms(running: bool, gui_dt_seconds: f32) -> u64 {
+fn gui_fallback_repaint_ms(running: bool, _gui_dt_seconds: f32) -> u64 {
     if !running {
         return 250;
     }
-    // Input events repaint immediately. This periodic fallback is only a safety
-    // net; on a genuinely slow GUI machine reduce idle egui/DWM work rather
-    // than inserting waits or synchronization into the filter/render thread.
-    if gui_dt_seconds.is_finite() && gui_dt_seconds >= 0.080 {
-        66
-    } else if gui_dt_seconds.is_finite() && gui_dt_seconds >= 0.045 {
-        50
-    } else {
-        33
-    }
+    // v409: while capture is steadily running, treat the main GUI like a
+    // mostly static surface. Native pointer/keyboard/window events wake egui
+    // immediately, and explicit short repaint requests still drive Start/Stop
+    // press animation, preparing/stopping state, panel feedback, etc. This
+    // fallback is only a safety heartbeat for asynchronous state changes.
+    // Keep it entirely on the GUI thread: never sleep/yield/synchronize the
+    // capture/filter/present thread, and do not touch cursor/input ownership.
+    // v410: 521 ms is deliberately non-harmonic with the common 60 Hz /
+    // 30 fps / 24 fps cadences. A 500 ms heartbeat repeatedly lands on the
+    // same presentation phase (30 refreshes at 60 Hz, 12 frames at 24 fps),
+    // so even a very low repaint rate can keep colliding with the same DWM
+    // composition phase. Let the GUI heartbeat drift through the video phase.
+    521
 }
 
 fn full_chain_height(filter_count: usize, stats_on: bool) -> f32 {
@@ -482,123 +654,6 @@ fn chain_stage_name_job(
     job.append(name, 0.0, normal);
     job
 }
-const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(0x2b, 0x2b, 0x2b);
-const PANEL_BUTTON: egui::Color32 = egui::Color32::from_rgb(0x3c, 0x3c, 0x3c);
-const PANEL_HOVER: egui::Color32 = egui::Color32::from_rgb(0x50, 0x50, 0x50);
-const PANEL_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0x2f, 0x7d, 0x4a);
-const PANEL_FG: egui::Color32 = egui::Color32::from_rgb(0xf2, 0xf2, 0xf2);
-
-#[derive(Clone, Copy)]
-enum PanelControl {
-    Stop,
-    Camera,
-    GuiTopmost,
-    Collapse,
-}
-
-fn panel_camera_geometry(center: egui::Pos2) -> (egui::Rect, egui::Rect, egui::Pos2) {
-    let body = egui::Rect::from_center_size(center + egui::vec2(0.0, 1.5), egui::vec2(16.0, 10.0));
-    let bump = egui::Rect::from_center_size(center + egui::vec2(-3.0, -5.0), egui::vec2(6.0, 3.0));
-    (body, bump, center + egui::vec2(0.0, 1.5))
-}
-
-/// Paint panel text by the actual visible glyph bounds rather than by the
-/// font baseline. CJK and Latin locale fonts have different ascent/descent
-/// metrics; baseline centering made non-Japanese Stop labels sit visibly low.
-fn paint_panel_text_ink_centered(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    target_x: f32,
-    text: &str,
-    lang: UiLanguage,
-) {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        egui::FontId::new(12.0, mixed_text_font_family(text, lang)),
-        PANEL_FG,
-    );
-    let ink = galley.mesh_bounds;
-    let target = egui::pos2(target_x, rect.center().y);
-    let pos = target - ink.center().to_vec2();
-    ui.painter().galley(pos, galley, PANEL_FG);
-}
-
-fn panel_control_button(
-    ui: &mut egui::Ui,
-    width: f32,
-    stable_hover: bool,
-    active: bool,
-    control: PanelControl,
-    lang: UiLanguage,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
-    let fill = if active || response.is_pointer_button_down_on() {
-        PANEL_ACTIVE
-    } else if stable_hover || response.hovered() {
-        PANEL_HOVER
-    } else {
-        PANEL_BUTTON
-    };
-    ui.painter().rect_filled(rect, 3.0, fill);
-    let center = rect.center();
-    match control {
-        PanelControl::Stop => {
-            let square =
-                egui::Rect::from_center_size(center + egui::vec2(-22.0, 0.0), egui::vec2(6.0, 6.0));
-            ui.painter().rect_filled(square, 0.5, PANEL_FG);
-            paint_panel_text_ink_centered(
-                ui,
-                rect,
-                center.x + 5.0,
-                i18n::text(lang, "capture.stop"),
-                lang,
-            );
-        }
-        PanelControl::Camera => {
-            let (body, bump, lens_center) = panel_camera_geometry(center);
-            ui.painter().rect_stroke(
-                body,
-                2.0,
-                egui::Stroke::new(1.4, PANEL_FG),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().rect_filled(bump, 1.0, PANEL_FG);
-            ui.painter()
-                .circle_stroke(lens_center, 2.7, egui::Stroke::new(1.3, PANEL_FG));
-        }
-        PanelControl::GuiTopmost => {
-            let window = egui::Rect::from_center_size(center, egui::vec2(16.0, 12.0));
-            ui.painter().rect_stroke(
-                window,
-                2.0,
-                egui::Stroke::new(1.4, PANEL_FG),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().line_segment(
-                [
-                    window.left_top() + egui::vec2(1.5, 3.5),
-                    window.right_top() + egui::vec2(-1.5, 3.5),
-                ],
-                egui::Stroke::new(1.2, PANEL_FG),
-            );
-            for x in [3.0, 5.3, 7.6] {
-                ui.painter()
-                    .circle_filled(window.left_top() + egui::vec2(x, 2.0), 0.65, PANEL_FG);
-            }
-        }
-        PanelControl::Collapse => {
-            ui.painter().line_segment(
-                [
-                    center + egui::vec2(-6.0, 0.0),
-                    center + egui::vec2(6.0, 0.0),
-                ],
-                egui::Stroke::new(1.6, PANEL_FG),
-            );
-        }
-    }
-    response
-}
-
 fn install_emergency_cleanup() {
     chidescaler_neo::input::startup_recover_input_state();
     let previous = std::panic::take_hook();
@@ -627,10 +682,47 @@ fn apply_panel_action_state(
     }
 }
 
+fn cleanup_removed_browser_launcher_artifacts(app_dir: &std::path::Path) {
+    // v348n: the former "HW decode OFF" browser launcher has been permanently
+    // removed. Old releases could leave a complete Chromium/Firefox profile
+    // tree below cache/BrowserProfiles, including DiskCache/GPUCache/Code Cache.
+    // It is entirely launcher-owned and no longer has any runtime consumer, so
+    // remove it instead of carrying an unbounded dead cache forever.
+    let legacy = app_dir.join("cache").join("BrowserProfiles");
+    if !legacy.exists() {
+        return;
+    }
+    match std::fs::remove_dir_all(&legacy) {
+        Ok(()) => {
+            log::info!(
+                "legacy-browser-profile-cleanup: removed obsolete launcher data path={}",
+                legacy.display()
+            );
+            let cache_root = app_dir.join("cache");
+            let is_empty = std::fs::read_dir(&cache_root)
+                .ok()
+                .and_then(|mut entries| entries.next().transpose().ok())
+                .flatten()
+                .is_none();
+            if is_empty {
+                let _ = std::fs::remove_dir(&cache_root);
+            }
+        }
+        Err(error) => {
+            // A browser left running from an older build may still hold files
+            // open. Keep startup safe and retry automatically next launch.
+            log::warn!(
+                "legacy-browser-profile-cleanup: retained path={} error={error}",
+                legacy.display()
+            );
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     logging::init();
     install_emergency_cleanup();
-    log::info!("cHiDeScaler-Neo build {BUILD_ID}");
+    log::info!("cHiDeScaler-Neo version {APP_VERSION}");
     // Keep the native egui event loop responsive when the render worker is
     // saturating the same low-end GPU. This is thread-local only: capture,
     // provider and process priorities are unchanged.
@@ -638,6 +730,7 @@ fn main() -> eframe::Result {
     // user opted into elevated mode: relaunch with UAC once
     let saved = {
         let dir = app_dir();
+        cleanup_removed_browser_launcher_artifacts(&dir);
         let mut st = load_settings(&dir);
         if let Ok(mode) = std::env::var("NEO_GUI_SCREENSHOT_MODE") {
             st.ui_mode = match mode.to_ascii_lowercase().as_str() {
@@ -682,9 +775,6 @@ fn main() -> eframe::Result {
     // Do not persist a Windows GPU preference; when a driver ignores these
     // hints, adapter selection is left to Windows and the system default.
     log::info!("gpu-preference: portable vendor hints enabled; no registry changes");
-    // Show the build tag in the title so a still-running older instance is
-    // immediately distinguishable from the executable currently on disk.
-    let build_tag = BUILD_ID.split('-').nth(1).unwrap_or("dev");
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -693,9 +783,13 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(default_size)
         .with_min_inner_size(min_size)
+        // Keep ordinary Windows Minimize and Close behavior. Maximize stays
+        // disabled because Neo's mode-specific layout owns the window size.
+        .with_close_button(true)
+        .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title(format!("cHiDeScaler-Neo [{build_tag}]"));
+        .with_title("cHiDeScaler-Neo");
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
         if (min_size[0]..=4000.0).contains(&w) && (min_size[1]..=4000.0).contains(&h) {
@@ -710,15 +804,34 @@ fn main() -> eframe::Result {
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    // Keep the established non-vsync eframe/WGPU GUI compositor path.
+    // ONNX x3 now uses a strict integer interpolation timeline independently
+    // of GUI/DWM presentation policy.
+    options.renderer = eframe::Renderer::Wgpu;
+    options.wgpu_options =
+        eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
+            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            desired_maximum_frame_latency: Some(1),
+        });
+    // Own eframe's already-supported winit event loop only to gate WGPU
+    // RedrawRequested while a native caption drag is active. The OS window
+    // continues moving at full native rate; only fresh GUI GPU submissions are
+    // deferred until release.
+    let event_loop =
+        winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build()?;
+    let eframe_app = eframe::create_native(
         "cHiDeScaler-Neo",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+        &event_loop,
+    );
+    let mut app = GuiCaptionDragRedrawGate::new(eframe_app);
+    event_loop.run_app(&mut app)?;
+    Ok(())
 }
 
 fn load_icon() -> Option<egui::IconData> {
@@ -1878,6 +1991,57 @@ fn is_picture_in_picture_title(title: &str) -> bool {
         || lower.contains("picture-in-picture")
 }
 
+fn even_capture_neighbors(value: u32, min_value: u32, max_value: u32) -> (u32, u32) {
+    let min_even = if min_value & 1 == 0 {
+        min_value
+    } else {
+        min_value.saturating_add(1)
+    };
+    let max_even = max_value & !1;
+    let bounded = value.clamp(min_even, max_even.max(min_even));
+    let down = (bounded & !1).max(min_even).min(max_even.max(min_even));
+    let up = bounded
+        .saturating_add(bounded & 1)
+        .max(min_even)
+        .min(max_even.max(min_even));
+    (down, up)
+}
+
+fn evenize_capture_fit(
+    limit: CaptureResolution,
+    proposed: CaptureResolution,
+    current_aspect: f64,
+) -> CaptureResolution {
+    // WGC normalizes an odd right/bottom edge by replicating one pixel so the
+    // GPU path always receives an even-sized frame. If the source HWND itself
+    // remains odd-sized (for example 640x359), the capture-resolution state
+    // machine waits forever for a frame shape WGC can never publish. Choose the
+    // closest even client size up front so source geometry, WGC, ONNX and input
+    // mapping all share one coordinate space.
+    let (w0, w1) = even_capture_neighbors(proposed.w, 160, limit.w.max(160));
+    let (h0, h1) = even_capture_neighbors(proposed.h, 120, limit.h.max(120));
+    let mut best = CaptureResolution { w: w0, h: h0 };
+    let mut best_error = f64::INFINITY;
+    let mut best_area = 0u64;
+    for w in [w0, w1] {
+        for h in [h0, h1] {
+            if w == 0 || h == 0 || w > limit.w || h > limit.h {
+                continue;
+            }
+            let aspect = w as f64 / h as f64;
+            let error = ((aspect / current_aspect) - 1.0).abs();
+            let area = u64::from(w) * u64::from(h);
+            if error < best_error - 1e-9 || ((error - best_error).abs() <= 1e-9 && area > best_area)
+            {
+                best = CaptureResolution { w, h };
+                best_error = error;
+                best_area = area;
+            }
+        }
+    }
+    best
+}
+
 fn fit_resolution_preserving_aspect(
     limit: CaptureResolution,
     current_size: (i32, i32),
@@ -1887,20 +2051,22 @@ fn fit_resolution_preserving_aspect(
     }
     // PiP client sizes often differ from their nominal aspect by one physical
     // pixel (for example 758x426). Treat that as the same aspect and honor the
-    // requested capture size exactly; producing 1280x719 breaks ONNX models
-    // which require paired dimensions. No image resampling is performed here.
+    // requested capture size exactly when possible. The final applied size is
+    // nevertheless kept even because WGC's GPU path edge-pads odd dimensions.
     let current_aspect = current_size.0 as f64 / current_size.1 as f64;
     let requested_aspect = limit.w as f64 / limit.h as f64;
-    if ((current_aspect / requested_aspect) - 1.0).abs() <= 0.0025 {
-        return limit;
-    }
-    let scale =
-        (limit.w as f64 / current_size.0 as f64).min(limit.h as f64 / current_size.1 as f64);
-    let mut w = (current_size.0 as f64 * scale).round().max(160.0) as u32;
-    let mut h = (current_size.1 as f64 * scale).round().max(120.0) as u32;
-    w = w.min(limit.w);
-    h = h.min(limit.h);
-    CaptureResolution { w, h }
+    let proposed = if ((current_aspect / requested_aspect) - 1.0).abs() <= 0.0025 {
+        limit
+    } else {
+        let scale =
+            (limit.w as f64 / current_size.0 as f64).min(limit.h as f64 / current_size.1 as f64);
+        let mut w = (current_size.0 as f64 * scale).round().max(160.0) as u32;
+        let mut h = (current_size.1 as f64 * scale).round().max(120.0) as u32;
+        w = w.min(limit.w);
+        h = h.min(limit.h);
+        CaptureResolution { w, h }
+    };
+    evenize_capture_fit(limit, proposed, current_aspect)
 }
 
 fn parse_capture_resolution(text: &str) -> Option<Option<CaptureResolution>> {
@@ -2073,6 +2239,39 @@ fn is_resize_shader_path(path: &str) -> bool {
         .starts_with("shaders/resize/")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PanelDiagSnapshot {
+    rect: Option<(i32, i32, i32, i32)>,
+    expected_size: (i32, i32),
+    effective_show: bool,
+    lurk: bool,
+    native_visible: bool,
+    layered: bool,
+    passthrough: bool,
+    topmost: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingUiModeTransition {
+    mode: UiMode,
+    target: egui::Vec2,
+    armed_at: Instant,
+    /// False while only the native/root surface is being resized. Once true,
+    /// the target mode is already drawing behind the snapshot/cloak transition guard.
+    mode_committed: bool,
+    /// Keep at least two complete target-mode frames covered before revealing the
+    /// root GUI. Fast AutoNoVsync paths can render those frames in only a few ms,
+    /// so committed_at also enforces a minimum DWM-visible hold interval.
+    hidden_warmup_frames: u8,
+    committed_at: Option<Instant>,
+    /// True when a native GDI snapshot shield is covering the old/root GUI
+    /// representation while the WGPU surface is resized behind it.
+    shield_applied: bool,
+    /// DWM cloak is retained only as a fail-safe if snapshot capture/creation
+    /// fails. The normal transition path never removes the GUI from DWM.
+    cloak_applied: bool,
+}
+
 struct App {
     engine: EngineHandle,
     hotkeys: HotkeyThread,
@@ -2088,13 +2287,15 @@ struct App {
     hotkey_editor_error: Option<String>,
     hotkey_capture_pending: Option<(String, egui::Key)>,
     resize_scale_editor: Option<(usize, f32)>,
-    browser_launch_feedback: Option<(bool, String)>,
     gui_test_screenshot_path: Option<std::path::PathBuf>,
     gui_test_screenshot_requested: bool,
     gui_test_frame_count: u32,
     target_hwnd: isize,
     target_title: String,
     elevated_target_notice: Option<(isize, String)>,
+    capture_resolution_fullscreen_notice_open: bool,
+    capture_resolution_fullscreen_notice_seen_seq: u64,
+    capture_resolution_reapply_seen_seq: u64,
     last_poll: Instant,
     save_as_open: bool,
     save_as_name: String,
@@ -2102,6 +2303,15 @@ struct App {
     confirm_delete: bool,
     gui_hwnd: isize,
     gui_topmost_applied: Option<bool>,
+    /// When turning GUI topmost OFF during capture, keep the native GUI topmost
+    /// until the v459-compatible WGPU composition anchor is physically ready.
+    /// This prevents a one-composition flash while DWM switches presentation paths.
+    gui_topmost_off_pending: bool,
+    /// v525: while the staged OFF transition prepares the first WGPU keep-alive
+    /// surface, remove the still-TOPMOST root GUI from DWM composition. Otherwise
+    /// the expensive first anchor Present can expose the old GUI for one frame
+    /// immediately before it is demoted behind the fullscreen overlay.
+    gui_topmost_off_cloak_applied: bool,
     gui_mouse_passthrough_applied: Option<bool>,
     gui_priority_sent: Option<(isize, bool)>,
     panel_visible: bool,
@@ -2110,6 +2320,18 @@ struct App {
     ratio_text: String,
     capture_resolution_text: String,
     panel_hwnd: isize,
+    /// Tiny eframe/WGPU viewport used only as an AMD/DWM composition keep-alive
+    /// while capture is running with the main GUI not-topmost.  The visible
+    /// control panel remains the native GDI host; this viewport sits underneath
+    /// it and never owns input.  v448-v454 intentionally kept the old WGPU panel
+    /// alive for this exact compositor contract, which v465 removed.
+    compositor_anchor_hwnd: isize,
+    compositor_anchor_state_sent: Option<(bool, isize, isize, isize)>,
+    compositor_anchor_last_warn_at: Instant,
+    /// Single auxiliary dialog viewport used by Mini mode. Keeping one stable
+    /// HWND avoids multiplying cursor ownership boundaries while still letting
+    /// every warning/editor escape Mini's 105-point main viewport.
+    mini_dialog_hwnd: isize,
     panel_metrics_sent: Option<bool>,
     panel_screenshot_feedback_until: Option<Instant>,
     panel_chip_lurking: bool,
@@ -2124,9 +2346,25 @@ struct App {
     panel_state_sent: Option<(bool, bool)>,
     panel_layout_sent: Option<(isize, (i32, i32), (i32, i32))>,
     panel_placed_for_run: bool,
+    /// While restoring the full bar from the transparent lurk chip, keep the parent
+    /// fully transparent until its final bar geometry is committed. The GDI mirror is
+    /// then painted/shown first and the parent is revealed last, preventing a one-frame
+    /// glimpse of the resizing WGPU surface.
+    panel_gdi_reveal_pending: bool,
+    /// Diagnostic-only control-panel compositor trace. These fields never
+    /// influence layout, z-order, visibility, pacing, or input routing.
+    panel_diag_seq: u64,
+    panel_diag_last_frame_at: Option<Instant>,
+    panel_diag_last_snapshot: Option<PanelDiagSnapshot>,
+    panel_diag_last_trace_at: Instant,
     last_panel_hotkey: Option<Instant>,
     was_running: bool,
     was_capture_busy: bool,
+    /// Direct Win32 Start/Stop presses are committed on pointer-down. This
+    /// short bridge covers the few milliseconds before engine status reflects
+    /// the new latch state; after that starting/running/stopping keeps the
+    /// physical button depressed until the state transition really completes.
+    main_control_press_until: Option<Instant>,
     capture_idle_since: Instant,
     qa_auto_start: bool,
     qa_panel_preview: bool,
@@ -2136,6 +2374,10 @@ struct App {
     mini_language_width_applied: Option<i32>,
     basic_language_width_applied: Option<i32>,
     full_language_width_applied: Option<i32>,
+    /// A GUI mode change is resized first and committed only after the root
+    /// viewport reports the requested final inner size. This prevents a fast
+    /// WGPU/DWM path from presenting a half-transition layout.
+    pending_ui_mode: Option<PendingUiModeTransition>,
     /// QA-only language override; never written to settings.json.
     locale_test_override: Option<UiLanguage>,
     custom_locales: Vec<i18n::CustomLocale>,
@@ -2239,7 +2481,7 @@ impl App {
         install_ui_fonts(&cc.egui_ctx);
         select_ui_font_for_locale(&cc.egui_ctx, initial_language);
         logging::set_file_logging(&dir, settings.log_on);
-        log::info!("cHiDeScaler-Neo build {BUILD_ID} app_dir={}", dir.display());
+        log::info!("cHiDeScaler-Neo version {APP_VERSION}");
         let ratio_text = format!("{:.1}", settings.ratio);
         let capture_resolution_text =
             capture_resolution_label(settings.capture_resolution, initial_language);
@@ -2272,8 +2514,13 @@ impl App {
             tensorrt_availability.device_id,
             trt_cache_root,
         );
-        engine.metrics.set_enabled(settings.stats_on);
-        let hotkeys = HotkeyThread::start(Self::hotkey_bindings(&settings.hotkey_toggle));
+        engine
+            .metrics
+            .set_enabled(settings.stats_on || logging::diagnostics_enabled());
+        let hotkeys = HotkeyThread::start(
+            Self::hotkey_bindings(&settings.hotkey_toggle),
+            engine.stop_handle(),
+        );
         let hotkey_editor_candidate = settings.hotkey_toggle.clone();
         let gui_test_screenshot_path = std::env::var_os("NEO_GUI_SCREENSHOT").map(Into::into);
         let gui_test_save_as = gui_test_mode.eq_ignore_ascii_case("save_as");
@@ -2304,13 +2551,15 @@ impl App {
             hotkey_editor_error: None,
             hotkey_capture_pending: None,
             resize_scale_editor: None,
-            browser_launch_feedback: None,
             gui_test_screenshot_path,
             gui_test_screenshot_requested: false,
             gui_test_frame_count: 0,
             target_hwnd: qa_target_hwnd,
             target_title: win32::window_title(qa_target_hwnd),
             elevated_target_notice: None,
+            capture_resolution_fullscreen_notice_open: false,
+            capture_resolution_fullscreen_notice_seen_seq: 0,
+            capture_resolution_reapply_seen_seq: 0,
             last_poll: Instant::now() - Duration::from_secs(1),
             save_as_open: gui_test_save_as,
             save_as_name: gui_test_save_as_name,
@@ -2318,6 +2567,8 @@ impl App {
             confirm_delete: false,
             gui_hwnd: 0,
             gui_topmost_applied: None,
+            gui_topmost_off_pending: false,
+            gui_topmost_off_cloak_applied: false,
             gui_mouse_passthrough_applied: None,
             gui_priority_sent: None,
             panel_visible: true,
@@ -2325,6 +2576,10 @@ impl App {
             ratio_text,
             capture_resolution_text,
             panel_hwnd: 0,
+            compositor_anchor_hwnd: 0,
+            compositor_anchor_state_sent: None,
+            compositor_anchor_last_warn_at: Instant::now() - Duration::from_secs(2),
+            mini_dialog_hwnd: 0,
             panel_metrics_sent: None,
             panel_screenshot_feedback_until: None,
             panel_chip_lurking: false,
@@ -2335,9 +2590,15 @@ impl App {
             panel_state_sent: None,
             panel_layout_sent: None,
             panel_placed_for_run: false,
+            panel_gdi_reveal_pending: false,
+            panel_diag_seq: 0,
+            panel_diag_last_frame_at: None,
+            panel_diag_last_snapshot: None,
+            panel_diag_last_trace_at: Instant::now() - Duration::from_secs(1),
             last_panel_hotkey: None,
             was_running: false,
             was_capture_busy: false,
+            main_control_press_until: None,
             capture_idle_since: Instant::now(),
             qa_auto_start,
             qa_panel_preview,
@@ -2347,6 +2608,7 @@ impl App {
             mini_language_width_applied: None,
             basic_language_width_applied: None,
             full_language_width_applied: None,
+            pending_ui_mode: None,
             locale_test_override,
             custom_locales,
             tensorrt_availability,
@@ -2384,69 +2646,187 @@ impl App {
         });
     }
 
-    fn switch_ui_mode(&mut self, ctx: &egui::Context, mode: UiMode) {
-        if mode == self.settings.ui_mode {
+    fn prepare_ui_mode_switch(&mut self, ui: &egui::Ui, lang: UiLanguage, mode: UiMode) {
+        if mode == self.settings.ui_mode || self.pending_ui_mode.is_some() {
             return;
         }
-        // A popup opened in Mini has a deliberately short viewport. Close it
-        // before switching modes so no live popup can survive into Basic/Full.
-        egui::Popup::close_all(ctx);
-        self.settings.ui_mode = mode;
-        self.basic_stats_layout_applied = None;
-        self.basic_stats_rows_applied = None;
-        self.mini_language_width_applied = None;
-        self.basic_language_width_applied = None;
-        self.full_language_width_applied = None;
-        let stats_height = self.basic_stats_height();
-        let (logical_size, logical_min) = match mode {
-            UiMode::Mini => (
-                (
-                    self.settings
-                        .mini_win_size
-                        .map(|size| size.0)
-                        .unwrap_or(MINI_DEFAULT_SIZE[0]),
-                    MINI_DEFAULT_SIZE[1],
-                ),
-                MINI_MIN_SIZE,
-            ),
-            UiMode::Basic => (
-                {
-                    let remembered = self
-                        .settings
-                        .basic_win_size
-                        .unwrap_or((BASIC_DEFAULT_SIZE[0], BASIC_DEFAULT_SIZE[1]));
-                    (
-                        basic_restored_width(remembered.0),
-                        if self.settings.stats_on {
-                            stats_height
-                        } else {
-                            BASIC_DEFAULT_SIZE[1]
-                        },
-                    )
-                },
-                BASIC_MIN_SIZE,
-            ),
-            UiMode::Full => (
-                self.settings
-                    .win_size
-                    .unwrap_or((FULL_DEFAULT_SIZE[0], FULL_DEFAULT_SIZE[1])),
-                FULL_MIN_SIZE,
-            ),
+        // A root WGPU surface resize can become visible to DWM before the first
+        // target-layout frame is ready. Keep the old screen representation
+        // visible with a native GDI snapshot shield while the real root HWND
+        // resizes underneath it. Unlike v467's normal-path DWM cloak, this does
+        // not expose the fullscreen video overlay where the GUI used to be.
+        egui::Popup::close_all(ui.ctx());
+
+        // Invalidate only the target mode's sizing latch. The current mode keeps
+        // drawing while the native surface reaches the target geometry.
+        let target = match mode {
+            UiMode::Mini => {
+                self.mini_language_width_applied = None;
+                self.resize_mini_for_language(ui, lang)
+            }
+            UiMode::Basic => {
+                self.basic_language_width_applied = None;
+                let target = self.resize_basic_for_language(ui, lang);
+                self.basic_stats_layout_applied = Some(self.settings.stats_on);
+                self.basic_stats_rows_applied = Some(self.basic_stats_rows());
+                target
+            }
+            UiMode::Full => {
+                self.full_language_width_applied = None;
+                self.resize_full_for_language(ui, lang)
+            }
         };
-        // Viewport commands use egui points; remembered sizes use OS-logical
-        // points so they remain stable when the GUI zoom factor changes.
-        let zoom = ctx.zoom_factor().max(0.1);
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-            logical_min[0] / zoom,
-            logical_min[1] / zoom,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            logical_size.0.max(logical_min[0]) / zoom,
-            logical_size.1.max(logical_min[1]) / zoom,
-        )));
+        // Viewport commands above are queued by egui and are not applied until
+        // after this update returns, so the root HWND still contains the fully
+        // rendered old mode here. Capture the union of the current and target
+        // footprints before DWM can resize it. The shield therefore preserves
+        // exactly what the user was seeing: old GUI pixels plus the surrounding
+        // video/desktop pixels that a growing GUI is about to cover.
+        let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
+        let shield_applied = self.gui_hwnd != 0
+            && win32::show_gui_transition_snapshot(
+                self.gui_hwnd,
+                target.x,
+                target.y,
+                pixels_per_point,
+            );
+        // Fail-safe only. If desktop capture/window creation is unavailable,
+        // preserve v467's proven no-transition behavior rather than exposing a
+        // half-resized WGPU frame.
+        let cloak_applied =
+            !shield_applied && self.gui_hwnd != 0 && win32::set_window_cloaked(self.gui_hwnd, true);
+
+        self.pending_ui_mode = Some(PendingUiModeTransition {
+            mode,
+            target,
+            armed_at: Instant::now(),
+            mode_committed: false,
+            hidden_warmup_frames: 0,
+            committed_at: None,
+            shield_applied,
+            cloak_applied,
+        });
+        log::info!(
+            "ui-mode-transition: prepared from={:?} to={mode:?} target={:.1}x{:.1} shield={} cloaked_fallback={}",
+            self.settings.ui_mode,
+            target.x,
+            target.y,
+            shield_applied,
+            cloak_applied
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn commit_pending_ui_mode_if_ready(&mut self, ctx: &egui::Context) {
+        let Some(mut transition) = self.pending_ui_mode else {
+            return;
+        };
+
+        // After the mode has been committed, keep rendering it behind the
+        // snapshot shield (or the cloak fail-safe) for two complete eframe
+        // updates. The next update cannot run until the previous frame has gone
+        // through the renderer/Present path, so the final layout has a stable
+        // front buffer before the old visual representation is released.
+        if transition.mode_committed {
+            if transition.shield_applied {
+                win32::keep_gui_transition_snapshot_topmost();
+            }
+            if transition.hidden_warmup_frames > 0 {
+                transition.hidden_warmup_frames -= 1;
+                self.pending_ui_mode = Some(transition);
+                ctx.request_repaint_after(Duration::from_millis(8));
+                return;
+            }
+            // Two eframe updates can complete in under 10 ms on a fast GPU.
+            // Hold the old snapshot through at least two 60-Hz compositor
+            // intervals so DWM cannot expose a resize frame after the helper is
+            // removed but before the final root surface has actually composed.
+            const SNAPSHOT_MIN_HOLD_AFTER_COMMIT: Duration = Duration::from_millis(40);
+            if let Some(committed_at) = transition.committed_at {
+                let elapsed = committed_at.elapsed();
+                if elapsed < SNAPSHOT_MIN_HOLD_AFTER_COMMIT {
+                    self.pending_ui_mode = Some(transition);
+                    ctx.request_repaint_after(SNAPSHOT_MIN_HOLD_AFTER_COMMIT - elapsed);
+                    return;
+                }
+            }
+
+            if transition.cloak_applied && self.gui_hwnd != 0 {
+                let reveal_requested = win32::set_window_cloaked(self.gui_hwnd, false);
+                let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+                if !reveal_requested || still_cloaked {
+                    // Fail-visible contract: never clear the transition latch
+                    // while our own root GUI still reports cloaked. Retry on a
+                    // later frame rather than leaving the application invisible.
+                    self.pending_ui_mode = Some(transition);
+                    log::warn!(
+                        "ui-mode-transition: uncloak-retry mode={:?} request_ok={} still_cloaked={}",
+                        transition.mode,
+                        reveal_requested,
+                        still_cloaked
+                    );
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                    return;
+                }
+            }
+            if transition.shield_applied {
+                // One compositor sync while the owned snapshot is still above
+                // the root GUI guarantees DWM has consumed the final surface
+                // before the shield disappears. This runs only on explicit UI
+                // mode switches, never in the video Present loop.
+                win32::sync_gui_transition_with_dwm();
+                win32::keep_gui_transition_snapshot_topmost();
+                win32::hide_gui_transition_snapshot();
+            }
+            log::info!(
+                "ui-mode-transition: revealed mode={:?} snapshot_released={} uncloaked_fallback={}",
+                transition.mode,
+                transition.shield_applied,
+                transition.cloak_applied
+            );
+            self.pending_ui_mode = None;
+            ctx.request_repaint();
+            return;
+        }
+
+        if transition.shield_applied {
+            win32::keep_gui_transition_snapshot_topmost();
+        }
+        let current = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+        let geometry_ready = current.as_ref().is_some_and(|size| {
+            (size.x - transition.target.x).abs() <= 1.5
+                && (size.y - transition.target.y).abs() <= 1.5
+        });
+        let timed_out = transition.armed_at.elapsed() >= Duration::from_millis(250);
+        if !geometry_ready && !timed_out {
+            ctx.request_repaint_after(Duration::from_millis(8));
+            return;
+        }
+
+        self.settings.ui_mode = transition.mode;
         save_settings(&self.app_dir, &self.settings);
-        log::info!("ui-mode: switched to {mode:?}");
-        ctx.request_repaint();
+        transition.mode_committed = true;
+        transition.hidden_warmup_frames = 2;
+        transition.committed_at = Some(Instant::now());
+        self.pending_ui_mode = Some(transition);
+        if geometry_ready {
+            log::info!(
+                "ui-mode-transition: committed-covered mode={:?} target={:.1}x{:.1} warmup_frames=2",
+                transition.mode,
+                transition.target.x,
+                transition.target.y
+            );
+        } else {
+            log::warn!(
+                "ui-mode-transition: commit-timeout-covered mode={:?} target={:.1}x{:.1} current={:?} warmup_frames=2",
+                transition.mode,
+                transition.target.x,
+                transition.target.y,
+                current.as_ref().map(|size| (size.x, size.y))
+            );
+        }
+        log::info!("ui-mode: switched to {:?}", transition.mode);
+        ctx.request_repaint_after(Duration::from_millis(8));
     }
 
     fn basic_stats_rows(&self) -> usize {
@@ -2461,7 +2841,7 @@ impl App {
         438.0 + self.basic_stats_rows() as f32 * 22.0
     }
 
-    fn resize_mini_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) {
+    fn resize_mini_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) -> egui::Vec2 {
         let measure = |text: &str, size: f32| {
             ui.painter()
                 .layout_no_wrap(
@@ -2473,10 +2853,10 @@ impl App {
                 .x
         };
         let start = i18n::text(lang, "capture.start");
-        let stop = i18n::text(lang, "capture.stop_icon");
+        let running = i18n::text(lang, "capture.running");
         let capture = i18n::text(lang, "capture.short");
         let localized_width =
-            measure(start, 15.0).max(measure(stop, 15.0)) + measure(capture, 12.0);
+            measure(start, 15.0).max(measure(running, 15.0)) + measure(capture, 12.0);
         let zoom = ui.ctx().zoom_factor().max(0.1);
         let monitor_width = ui
             .ctx()
@@ -2488,8 +2868,9 @@ impl App {
             .max(MINI_DEFAULT_SIZE[0])
             .min((monitor_width - 32.0).max(MINI_DEFAULT_SIZE[0]));
         let width_key = desired.round() as i32;
+        let target = egui::vec2(desired / zoom, MINI_DEFAULT_SIZE[1] / zoom);
         if self.mini_language_width_applied == Some(width_key) {
-            return;
+            return target;
         }
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
@@ -2506,6 +2887,7 @@ impl App {
             "mini-layout: language={} width={desired:.0}",
             i18n::tag(lang)
         );
+        target
     }
 
     fn resize_basic_for_stats(&self, ctx: &egui::Context) {
@@ -2524,7 +2906,7 @@ impl App {
         )));
     }
 
-    fn resize_basic_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) {
+    fn resize_basic_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) -> egui::Vec2 {
         let label_width: f32 = [
             tr(lang, "", "Display:"),
             tr(lang, "", "Fullscreen"),
@@ -2554,14 +2936,15 @@ impl App {
             .max(BASIC_DEFAULT_SIZE[0])
             .min((monitor_width - 32.0).max(BASIC_DEFAULT_SIZE[0]));
         let width_key = desired.round() as i32;
-        if self.basic_language_width_applied == Some(width_key) {
-            return;
-        }
         let height = if self.settings.stats_on {
             self.basic_stats_height()
         } else {
             BASIC_DEFAULT_SIZE[1]
         };
+        let target = egui::vec2(desired / zoom, height / zoom);
+        if self.basic_language_width_applied == Some(width_key) {
+            return target;
+        }
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                 desired / zoom,
@@ -2577,9 +2960,10 @@ impl App {
             "basic-layout: language={} width={desired:.0}",
             i18n::tag(lang)
         );
+        target
     }
 
-    fn resize_full_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) {
+    fn resize_full_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) -> egui::Vec2 {
         // Full follows the same measured sizing model as Basic mode:
         // measure only the current language's visible text, add the fixed
         // widths of the widgets that are actually present, and reserve a
@@ -2681,10 +3065,10 @@ impl App {
         };
         let start_label = i18n::text(lang, "capture.start")
             .trim_start_matches(|c: char| c == '▶' || c.is_whitespace());
-        let stop_label = i18n::text(lang, "capture.stop_icon")
-            .trim_start_matches(|c: char| c == '■' || c.is_whitespace());
+        let running_label = i18n::text(lang, "capture.running")
+            .trim_start_matches(|c: char| c == '●' || c.is_whitespace());
         let start_button_width = (measure_locale(start_label, 15.0)
-            .max(measure_locale(stop_label, 15.0))
+            .max(measure_locale(running_label, 15.0))
             + 10.0
             + 7.0
             + 36.0)
@@ -2747,8 +3131,9 @@ impl App {
             .max(FULL_MIN_SIZE[1])
             .min((monitor_height - 32.0).max(FULL_MIN_SIZE[1]));
         let layout_key = full_layout_key(desired, monitor_height, desired_height);
+        let target = egui::vec2(desired / zoom, desired_height / zoom);
         if self.full_language_width_applied == Some(layout_key) {
-            return;
+            return target;
         }
 
         ui.ctx()
@@ -2775,6 +3160,7 @@ impl App {
             row_toolbar * zoom,
             toolbar_wrap_extra > 0.0
         );
+        target
     }
 
     fn resource_meter(&mut self, ui: &mut egui::Ui) {
@@ -2977,14 +3363,20 @@ impl App {
 
         let old = self.settings.hotkey_toggle.clone();
         self.hotkeys.stop();
-        let replacement = HotkeyThread::start(Self::hotkey_bindings(&canonical));
+        let replacement = HotkeyThread::start(
+            Self::hotkey_bindings(&canonical),
+            self.engine.stop_handle(),
+        );
         if replacement
             .registration_failures
             .iter()
             .any(|(id, _)| *id == HK_TOGGLE)
         {
             drop(replacement);
-            self.hotkeys = HotkeyThread::start(Self::hotkey_bindings(&old));
+            self.hotkeys = HotkeyThread::start(
+                Self::hotkey_bindings(&old),
+                self.engine.stop_handle(),
+            );
             return Err(tr(
                 lang,
                 "登録中に競合が発生しました。以前のショートカットへ戻しました。",
@@ -3039,41 +3431,50 @@ impl App {
             return false;
         }
 
-        // Fullscreen safety is a property of the source geometry at the start
-        // of this capture session, not of its current live rectangle. An
-        // explicit 1920x1080 capture-resolution request can itself make a PIP
-        // cover a 1080p monitor. Treating that app-created rectangle as native
-        // fullscreen caused the next 854x480/960x540/etc. request to be ignored.
-        // Status::source_recovery contains the immutable pre-resize snapshot.
-        let session_origin_fullscreen = self
+        // A source that was genuinely fullscreen at capture start always owns
+        // its native WGC geometry. For a running windowed-origin session, the
+        // engine publishes a separate live fullscreen state when the source
+        // application later switches itself to monitor-covering presentation.
+        // This avoids misclassifying a Neo-initiated 1920x1080 resize on a
+        // 1080p monitor as fullscreen.
+        let status = self
             .engine
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .source_recovery
-            .as_ref()
-            .and_then(|(hwnd, rect, _, _)| {
-                if *hwnd != self.target_hwnd {
-                    return None;
-                }
-                rect.as_ref()
-                    .copied()
-                    .map(|r| win32::is_rect_monitor_fullscreen(*hwnd, r))
-            });
-
+            .clone();
+        let session_origin_fullscreen =
+            status
+                .source_recovery
+                .as_ref()
+                .and_then(|(hwnd, rect, _, _)| {
+                    if *hwnd != self.target_hwnd {
+                        return None;
+                    }
+                    rect.as_ref()
+                        .copied()
+                        .map(|r| win32::is_rect_monitor_fullscreen(*hwnd, r))
+                });
+        if status.running || status.starting {
+            return status.source_live_fullscreen;
+        }
         capture_resolution_fullscreen_guard(
             session_origin_fullscreen,
             win32::is_monitor_fullscreen(self.target_hwnd),
         )
     }
 
-    fn apply_capture_resolution_to_target(&self) -> bool {
+    fn apply_capture_resolution_to_target(&mut self) -> bool {
         if self.settings.capture_resolution.is_none() {
+            if self.running() {
+                self.engine.send(Cmd::ClearCaptureGeometry);
+            }
             return true;
         }
         if self.capture_resolution_disabled_for_target() {
+            self.capture_resolution_fullscreen_notice_open = true;
             log::warn!(
-                "capture-resolution ignored for source that was monitor-fullscreen at capture start: hwnd={:#x}; preserving native source geometry for correct cursor mapping",
+                "capture-resolution ignored while source is fullscreen: hwnd={:#x}; preference retained for windowed mode and WGC native geometry preserved",
                 self.target_hwnd
             );
             return true;
@@ -3081,6 +3482,14 @@ impl App {
         let Some((res, applied)) = self.capture_resolution_plan() else {
             return false;
         };
+        let publish_live_resize_intent = self.running();
+        if publish_live_resize_intent {
+            self.engine
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capture_resolution_resize_intent = Some((applied.w, applied.h));
+        }
         if win32::resize_client_area(self.target_hwnd, applied.w, applied.h) {
             // Coordinate the live source resize with the render thread. Merely
             // resizing the PIP from the GUI let queued old-size WGC frames and
@@ -3099,6 +3508,13 @@ impl App {
             );
             true
         } else {
+            if publish_live_resize_intent {
+                self.engine
+                    .status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .capture_resolution_resize_intent = None;
+            }
             let actual = win32::client_rect_on_screen(self.target_hwnd)
                 .map(|(_, _, w, h)| format!("{w}x{h}"))
                 .unwrap_or_else(|| "unavailable".to_string());
@@ -3111,25 +3527,6 @@ impl App {
                 applied.h
             );
             false
-        }
-    }
-
-    fn gui_can_take_priority(&self) -> bool {
-        self.settings.gui_topmost
-            && self.gui_hwnd != 0
-            && win32::is_window_valid(self.gui_hwnd)
-            && !win32::is_minimized(self.gui_hwnd)
-    }
-
-    fn keep_gui_above_panel_if_needed(&self) {
-        if self.gui_can_take_priority()
-            && self.panel_hwnd != 0
-            && win32::is_window_valid(self.panel_hwnd)
-            && win32::is_own_window(self.panel_hwnd)
-            && !win32::window_is_above(self.gui_hwnd, self.panel_hwnd)
-        {
-            win32::raise_topmost(self.gui_hwnd);
-            chidescaler_neo::input::keep_cursor_sprite_on_top();
         }
     }
 
@@ -3164,6 +3561,25 @@ impl App {
             self.start();
         }
         let status = self.engine.status.lock().unwrap().clone();
+        if status.capture_resolution_fullscreen_notice_seq
+            > self.capture_resolution_fullscreen_notice_seen_seq
+        {
+            self.capture_resolution_fullscreen_notice_seen_seq =
+                status.capture_resolution_fullscreen_notice_seq;
+            if self.settings.capture_resolution.is_some() {
+                self.capture_resolution_fullscreen_notice_open = true;
+            }
+        }
+        if status.capture_resolution_reapply_seq > self.capture_resolution_reapply_seen_seq {
+            self.capture_resolution_reapply_seen_seq = status.capture_resolution_reapply_seq;
+            if running {
+                if self.settings.capture_resolution.is_some() {
+                    let _ = self.apply_capture_resolution_to_target();
+                } else {
+                    self.engine.send(Cmd::ClearCaptureGeometry);
+                }
+            }
+        }
         let gui_priority = (self.gui_hwnd, self.settings.gui_topmost);
         if self.gui_priority_sent != Some(gui_priority) {
             self.engine.send(Cmd::SetGuiPriority {
@@ -3171,6 +3587,38 @@ impl App {
                 topmost: gui_priority.1,
             });
             self.gui_priority_sent = Some(gui_priority);
+        }
+        // Fail-visible retry for explicit TOPMOST-ON and capture-stop
+        // transitions. Normally DWMWA_CLOAK=0 succeeds immediately, but never
+        // leave the root GUI hidden if DWM transiently keeps the cloak bit set.
+        // While capture is running with GUI TOPMOST still OFF, the retained
+        // cloak is intentional and must not be released here.
+        if self.gui_topmost_off_cloak_applied
+            // A staged TOPMOST-OFF request intentionally cloaks the GUI while
+            // settings.gui_topmost is still true until the anchor commit.
+            // Never let the fail-visible ON/idle retry undo that transition
+            // cloak in this narrow pending window.
+            && !self.gui_topmost_off_pending
+            && (self.settings.gui_topmost || !running)
+            && self.gui_hwnd != 0
+            && win32::is_window_valid(self.gui_hwnd)
+        {
+            if self.settings.gui_topmost {
+                win32::set_own_topmost(self.gui_hwnd, true);
+                win32::raise_topmost(self.gui_hwnd);
+            }
+            let reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+            let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+            if !still_cloaked {
+                self.gui_topmost_off_cloak_applied = false;
+                log::debug!(
+                    "GUI topmost cloak release retry: gui={:#x} request_ok={} running={} topmost={} result=revealed",
+                    self.gui_hwnd,
+                    reveal_ok,
+                    running,
+                    self.settings.gui_topmost
+                );
+            }
         }
         let mut ne = Vec::new();
         // Stable reference policy:
@@ -3191,13 +3639,17 @@ impl App {
                 if !win32::is_topmost(self.gui_hwnd) {
                     win32::set_own_topmost(self.gui_hwnd, true);
                 }
-                if status.overlay_hwnd != 0
-                    && !win32::window_is_above(self.gui_hwnd, status.overlay_hwnd)
-                {
-                    win32::raise_topmost(self.gui_hwnd);
-                    chidescaler_neo::input::keep_cursor_sprite_on_top();
-                }
-                self.keep_gui_above_panel_if_needed();
+                // Converge all Neo-owned topmost siblings on one stable order.
+                // Never independently raise GUI/panel/overlay: those competing
+                // lifts caused DWM to alternate which surface was in front
+                // while the magnified window was dragged across the GUI.
+                win32::normalize_neo_topmost_stack(
+                    self.gui_hwnd,
+                    true,
+                    self.panel_hwnd,
+                    status.overlay_hwnd,
+                );
+                chidescaler_neo::input::keep_cursor_sprite_on_top();
                 if let Some(r) = win32::window_rect(self.gui_hwnd) {
                     ne.push((r.0, r.1, r.2, r.3, self.gui_hwnd));
                 }
@@ -3269,11 +3721,21 @@ impl App {
                 "capture-resolution disabled for this fullscreen session: hwnd={:#x}; source resolution and cursor coordinates preserved",
                 self.target_hwnd
             );
+            if self.settings.capture_resolution.is_some() {
+                self.capture_resolution_fullscreen_notice_open = true;
+            }
         }
-        let deferred_capture_resolution = if self.settings.hide_source
-            && !capture_resolution_disabled
-        {
+        // Resolve the PIP aspect-safe geometry once from the original source.
+        // The applied size, not the nominal menu limit, is the authoritative
+        // capture/input canvas for this session. Recomputing from a source that
+        // Neo already resized can otherwise rebase the coordinate system.
+        let capture_resolution_plan = if capture_resolution_disabled {
+            None
+        } else {
             self.capture_resolution_plan()
+        };
+        let deferred_capture_resolution = if self.settings.hide_source {
+            capture_resolution_plan
                 .map(|(requested, applied)| ((requested.w, requested.h), (applied.w, applied.h)))
         } else {
             None
@@ -3281,10 +3743,11 @@ impl App {
         let capture_resolution_ready = if self.settings.hide_source {
             self.settings.capture_resolution.is_none()
                 || capture_resolution_disabled
-                || deferred_capture_resolution.is_some()
+                || capture_resolution_plan.is_some()
         } else {
             self.apply_capture_resolution_to_target()
         };
+        let capture_canvas = capture_resolution_plan.map(|(_, applied)| (applied.w, applied.h));
         if !capture_resolution_ready {
             if let Some(rect) = source_restore_rect {
                 let restored =
@@ -3332,6 +3795,12 @@ impl App {
             self.target_title,
             self.chain.iter().filter(|stage| stage.enabled).count()
         );
+        log::info!(
+            "privilege-diag: neo_elevated={} source_pid={} source_elevated={:?}",
+            win32::own_process_elevated(),
+            win32::window_pid(self.target_hwnd),
+            win32::process_elevated(win32::window_pid(self.target_hwnd))
+        );
         // An explicit capture resolution describes the source client area.
         // Always crop decorations in this mode so the captured dimensions and
         // statistics remain exactly equal to the requested size.
@@ -3357,10 +3826,7 @@ impl App {
             source_restore_rect,
             source_was_maximized,
             deferred_capture_resolution,
-            capture_canvas: self
-                .settings
-                .capture_resolution
-                .map(|resolution| (resolution.w, resolution.h)),
+            capture_canvas,
         });
     }
 
@@ -3384,8 +3850,14 @@ impl App {
         )
     }
 
-    fn request_capture_stop(&mut self, source: &str) -> bool {
-        let (starting, running, stopping, provider_preparing) = self.capture_busy_now();
+    fn dispatch_capture_stop_known(
+        &mut self,
+        source: &str,
+        starting: bool,
+        running: bool,
+        stopping: bool,
+        provider_preparing: bool,
+    ) -> bool {
         if stopping {
             log::info!(
                 "capture-stop-request: source={source} result=ignored-already-stopping starting={starting} running={running} preparing={provider_preparing}"
@@ -3404,6 +3876,11 @@ impl App {
             );
             false
         }
+    }
+
+    fn request_capture_stop(&mut self, source: &str) -> bool {
+        let (starting, running, stopping, provider_preparing) = self.capture_busy_now();
+        self.dispatch_capture_stop_known(source, starting, running, stopping, provider_preparing)
     }
 
     fn request_capture_start(&mut self, source: &str) -> bool {
@@ -3537,39 +4014,36 @@ impl App {
         self.panel_leave_at = None;
         self.panel_state_sent = None;
         self.panel_layout_sent = None;
-        // Commit hit-testing immediately in the hotkey frame. Waiting for the
-        // child viewport's next repaint can leave its old input-active state
-        // above the desktop when AMD delays that repaint.
+        // Commit native panel hit-testing/visibility immediately in the hotkey
+        // frame. The v465 panel has no WGPU child surface to keep alive.
         if self.panel_hwnd != 0
             && win32::is_window_valid(self.panel_hwnd)
             && win32::is_own_window(self.panel_hwnd)
         {
             if self.panel_visible && running && self.settings.panel_show {
                 win32::set_window_input_passthrough(self.panel_hwnd, false);
-                win32::set_window_alpha(self.panel_hwnd, 255);
+                win32::set_window_opaque_unlayered(self.panel_hwnd);
+                // Reveal after control_panel has refreshed the GDI pixels.
             } else {
                 win32::set_window_alpha(self.panel_hwnd, 0);
                 win32::set_window_input_passthrough(self.panel_hwnd, true);
+                win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
             }
         }
         if self.panel_visible {
             if self.panel_hwnd != 0
-                && win32::is_window_valid(self.panel_hwnd)
-                && win32::is_own_window(self.panel_hwnd)
+                && (!win32::is_window_valid(self.panel_hwnd)
+                    || !win32::is_own_window(self.panel_hwnd))
             {
-                win32::raise_topmost(self.panel_hwnd);
-                self.keep_gui_above_panel_if_needed();
-            } else {
                 self.panel_hwnd = 0;
                 self.panel_layout_sent = None;
             }
+            // Z-order is normalized by the single shared hierarchy manager on
+            // the next GUI/engine tick. Do not lift the panel independently.
             ctx.request_repaint_after(Duration::from_millis(16));
         }
-        // Do not send ViewportCommand::Visible while capture is running.
-        // AMD keeps this viewport's WGL context in the same driver scheduling
-        // domain as the magnified overlay; swapping a hidden child surface
-        // stalls the entire overlay until the panel is shown again. The panel
-        // stays composed and is suspended with alpha=0 + input pass-through.
+        // Keep the engine's panel visibility metadata in sync with the native
+        // GDI host. No eframe child viewport or secondary GPU surface exists.
         self.engine.send(Cmd::SetPanelState {
             visible: running && self.panel_visible && self.settings.panel_show,
             chip: false,
@@ -3582,52 +4056,277 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn toggle_gui_topmost(&mut self) {
-        self.settings.gui_topmost = !self.settings.gui_topmost;
+    fn commit_gui_topmost_off(&mut self, reason: &str) {
+        self.gui_topmost_off_pending = false;
+        self.settings.gui_topmost = false;
         if self.gui_hwnd != 0 && win32::is_window_valid(self.gui_hwnd) {
-            win32::set_own_topmost(self.gui_hwnd, self.settings.gui_topmost);
-            if self.settings.gui_topmost {
-                win32::activate_window(self.gui_hwnd);
-                win32::raise_topmost(self.gui_hwnd);
+            win32::set_own_topmost(self.gui_hwnd, false);
+
+            // v538: keep the GUI cloaked until the entire TOPMOST helper stack
+            // has been recommitted *after* the GUI demotion. The first panel
+            // GUI-button click may have to create the v459 keep-alive anchor,
+            // and that first Present can take tens of milliseconds. Releasing
+            // the cloak after only the GUI demotion allowed DWM to expose the
+            // newly-uncloaked root for one composition frame before the
+            // overlay/anchor/panel order settled: disappear -> flash -> hide.
+            //
+            // Reuse the existing GUI-TOPMOST-OFF recommit path and preserve the
+            // established sibling order: overlay < anchor < panel < cursor.
+            // This runs only for the already-cloaked OFF transition; normal
+            // capture, panel, cursor and render paths are untouched.
+            if self.gui_topmost_off_cloak_applied {
+                let status = self
+                    .engine
+                    .status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let overlay = status.overlay_hwnd;
+                if overlay != 0
+                    && win32::is_window_valid(overlay)
+                    && win32::is_own_window(overlay)
+                {
+                    // First recommit the fullscreen overlay into TOPMOST without
+                    // lifting the panel yet. Then rebuild the helper stack in
+                    // deterministic bottom-to-top order.
+                    win32::recommit_overlay_below_helpers(0, overlay);
+
+                    let anchor = self.compositor_anchor_hwnd;
+                    if anchor != 0
+                        && win32::is_window_valid(anchor)
+                        && win32::is_own_window(anchor)
+                    {
+                        win32::raise_topmost(anchor);
+                    }
+                    if self.panel_hwnd != 0
+                        && win32::is_window_valid(self.panel_hwnd)
+                        && win32::is_own_window(self.panel_hwnd)
+                        && win32::is_window_visible(self.panel_hwnd)
+                    {
+                        win32::raise_topmost(self.panel_hwnd);
+                    }
+                    chidescaler_neo::input::keep_cursor_sprite_on_top();
+
+                    log::debug!(
+                        "GUI topmost off pre-uncloak restack: gui={:#x} overlay={:#x} anchor={:#x} panel={:#x} anchor_above_overlay={} panel_above_anchor={}",
+                        self.gui_hwnd,
+                        overlay,
+                        self.compositor_anchor_hwnd,
+                        self.panel_hwnd,
+                        self.compositor_anchor_hwnd == 0
+                            || win32::window_is_above(self.compositor_anchor_hwnd, overlay),
+                        self.compositor_anchor_hwnd == 0
+                            || self.panel_hwnd == 0
+                            || win32::window_is_above(self.panel_hwnd, self.compositor_anchor_hwnd),
+                    );
+                }
+
+                // v539: while capture is still running, do NOT uncloak the
+                // ordinary GUI after demotion. A DWM-uncloaked normal window can
+                // still be sampled for one composition frame even when the
+                // overlay/helper sibling order is already correct. That is the
+                // remaining disappear -> reappear -> disappear symptom seen in
+                // v538. Keeping the GUI cloaked for the whole TOPMOST-OFF state
+                // makes the visual contract deterministic: the first click
+                // cloaks it once, and it cannot re-enter composition until the
+                // user explicitly turns GUI TOPMOST back on or capture stops.
+                let keep_cloaked = status.running
+                    && !status.stopping
+                    && overlay != 0
+                    && win32::is_window_valid(overlay)
+                    && win32::is_own_window(overlay);
+                win32::sync_panel_composition_with_dwm();
+                if keep_cloaked {
+                    log::debug!(
+                        "GUI topmost off cloak retained: gui={:#x} reason={} until=topmost-on-or-capture-stop",
+                        self.gui_hwnd,
+                        reason
+                    );
+                } else {
+                    let reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+                    let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+                    self.gui_topmost_off_cloak_applied = still_cloaked;
+                    log::debug!(
+                        "GUI topmost off cloak release: gui={:#x} ok={} still_cloaked={} reason={} capture_active=false",
+                        self.gui_hwnd,
+                        reveal_ok,
+                        still_cloaked,
+                        reason
+                    );
+                }
             }
         }
-        self.gui_topmost_applied = Some(self.settings.gui_topmost);
+        self.gui_topmost_applied = Some(false);
         self.gui_priority_sent = None;
         save_settings(&self.app_dir, &self.settings);
-        log::info!("GUI topmost toggled: {}", self.settings.gui_topmost);
+        log::info!("GUI topmost toggled: false transition={reason}");
+    }
+
+    fn toggle_gui_topmost(&mut self) {
+        // Persistent always-on-top is independent from GUI minimize/restore.
+        // Only the dedicated GUI setting/hotkey may change this preference.
+        //
+        // While capture is running, turning TOPMOST off is staged until the
+        // v459-compatible WGPU composition anchor is already alive underneath
+        // the panel. Demoting the root GUI first and creating the anchor
+        // afterwards caused the occasional one-frame "blink, then disappear"
+        // transition on AMD. TOPMOST on remains immediate.
+        if self.gui_topmost_off_pending {
+            // A second toggle before the staged OFF commits means the user
+            // wants to stay ON. Nothing native has been demoted yet. Restore
+            // only the cloak owned by this transition; do not disturb any
+            // unrelated GUI transition guard.
+            self.gui_topmost_off_pending = false;
+            if self.gui_topmost_off_cloak_applied
+                && self.gui_hwnd != 0
+                && win32::is_window_valid(self.gui_hwnd)
+            {
+                let reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+                win32::raise_topmost(self.gui_hwnd);
+                log::debug!(
+                    "GUI topmost off cloak cancelled: gui={:#x} ok={}",
+                    self.gui_hwnd,
+                    reveal_ok
+                );
+            }
+            self.gui_topmost_off_cloak_applied = false;
+            log::info!("GUI topmost off staging cancelled: requested_state=true");
+            return;
+        }
+
+        if self.settings.gui_topmost {
+            let status = self
+                .engine
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let anchor_needed = status.running
+                && !status.stopping
+                && status.overlay_hwnd != 0
+                && win32::is_window_valid(status.overlay_hwnd)
+                && self.panel_visible
+                && self.settings.panel_show
+                && self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_own_window(self.panel_hwnd)
+                && win32::is_window_visible(self.panel_hwnd);
+
+            if anchor_needed {
+                // v525: make the old TOPMOST GUI disappear from DWM *before*
+                // constructing the first keep-alive WGPU surface. On affected
+                // systems that first Present can take tens of milliseconds;
+                // leaving the GUI visible until afterwards creates the visible
+                // one-frame flash reported when the panel GUI button is turned
+                // OFF. Cloaking changes composition visibility only; the HWND,
+                // input state and TOPMOST bit remain untouched until commit.
+                self.gui_topmost_off_cloak_applied = self.gui_hwnd != 0
+                    && win32::is_window_valid(self.gui_hwnd)
+                    && win32::set_window_cloaked(self.gui_hwnd, true);
+                if self.gui_topmost_off_cloak_applied {
+                    win32::sync_panel_composition_with_dwm();
+                }
+                self.gui_topmost_off_pending = true;
+                log::debug!(
+                    "GUI topmost off staged: gui={:#x} panel={:#x} overlay={:#x} action=cloak-before-anchor cloak_applied={}",
+                    self.gui_hwnd,
+                    self.panel_hwnd,
+                    status.overlay_hwnd,
+                    self.gui_topmost_off_cloak_applied
+                );
+                return;
+            }
+
+            self.commit_gui_topmost_off("immediate-anchor-unneeded");
+            return;
+        }
+
+        self.settings.gui_topmost = true;
+        if self.gui_hwnd != 0 && win32::is_window_valid(self.gui_hwnd) {
+            // If TOPMOST-OFF owns a persistent DWM cloak, rebuild the visible
+            // TOPMOST relationship *before* releasing it. The GUI therefore
+            // returns exactly once in the requested ON state instead of being
+            // briefly composed as an ordinary window underneath the overlay.
+            win32::set_own_topmost(self.gui_hwnd, true);
+            win32::raise_topmost(self.gui_hwnd);
+            if self.gui_topmost_off_cloak_applied {
+                let status = self
+                    .engine
+                    .status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if status.overlay_hwnd != 0
+                    && win32::is_window_valid(status.overlay_hwnd)
+                    && win32::is_own_window(status.overlay_hwnd)
+                {
+                    win32::normalize_neo_topmost_stack(
+                        self.gui_hwnd,
+                        true,
+                        self.panel_hwnd,
+                        status.overlay_hwnd,
+                    );
+                    chidescaler_neo::input::keep_cursor_sprite_on_top();
+                }
+                win32::sync_panel_composition_with_dwm();
+                let reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+                let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+                self.gui_topmost_off_cloak_applied = still_cloaked;
+                if still_cloaked {
+                    log::warn!(
+                        "GUI topmost on cloak release pending: gui={:#x} request_ok={} still_cloaked=true",
+                        self.gui_hwnd,
+                        reveal_ok
+                    );
+                } else {
+                    log::debug!(
+                        "GUI topmost on cloak release: gui={:#x} request_ok={} order=topmost-before-uncloak",
+                        self.gui_hwnd,
+                        reveal_ok
+                    );
+                }
+            }
+            win32::activate_window(self.gui_hwnd);
+            win32::raise_topmost(self.gui_hwnd);
+        }
+        self.gui_topmost_applied = Some(true);
+        self.gui_priority_sent = None;
+        save_settings(&self.app_dir, &self.settings);
+        log::info!("GUI topmost toggled: true");
     }
 
     // ------------- control panel (old cHiDeScaler port) -------------
-    // The GUI only DRAWS the panel; the engine owns its position and moves
-    // it every tick in lockstep with the overlay (the previous GUI-side
-    // follow at repaint rate visibly detached from the window).
+    // The panel is a native GDI window; the engine owns its position and moves
+    // it every tick in lockstep with the overlay. The main WGPU GUI never has
+    // to repaint a second panel swapchain.
     fn control_panel(&mut self, ctx: &egui::Context, status: &Status) {
         let lang = self.effective_language();
-        let show = status.running && self.panel_visible && self.settings.panel_show;
+        let show = status.running && !status.stopping && self.panel_visible && self.settings.panel_show;
         let effective_show = show && self.panel_placed_for_run;
-        let physical_show = status.running
-            && (self.panel_placed_for_run
-                || (self.panel_hwnd != 0
-                    && win32::is_window_valid(self.panel_hwnd)
-                    && win32::is_own_window(self.panel_hwnd)));
+        // v465 has no hidden WGPU keep-alive panel. Physical visibility follows
+        // the logical/native GDI panel visibility exactly.
+        let physical_show = effective_show;
         let lurk = self.panel_chip_lurking && !self.panel_bar_shown;
         if self.panel_state_sent != Some((effective_show, lurk)) {
             if self.panel_hwnd != 0
                 && win32::is_window_valid(self.panel_hwnd)
                 && win32::is_own_window(self.panel_hwnd)
             {
-                // Preserve the child OpenGL surface on AMD. A logically hidden
-                // panel remains a transparent, input-pass-through top-level
-                // window instead of entering SW_HIDE while capture is active.
+                // Apply the native host's alpha/input state immediately. There
+                // is no child GPU surface or vendor-specific keep-alive path.
                 if effective_show {
                     win32::set_window_input_passthrough(self.panel_hwnd, false);
-                    win32::set_window_alpha(
-                        self.panel_hwnd,
-                        if lurk { PANEL_LURK_ALPHA } else { 255 },
-                    );
+                    if lurk {
+                        win32::set_window_alpha(self.panel_hwnd, PANEL_LURK_ALPHA);
+                    } else {
+                        win32::set_window_opaque_unlayered(self.panel_hwnd);
+                    }
                 } else {
                     win32::set_window_alpha(self.panel_hwnd, 0);
                     win32::set_window_input_passthrough(self.panel_hwnd, true);
+                    if win32::is_panel_gdi_host(self.panel_hwnd) {
+                        win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
+                    }
                 }
             }
             self.engine.send(Cmd::SetPanelState {
@@ -3641,8 +4340,26 @@ impl App {
             self.panel_metrics_sent = Some(show);
         }
         if !status.running {
+            win32::hide_panel_gdi_mirror();
+            if self.panel_hwnd != 0 && win32::is_panel_gdi_host(self.panel_hwnd) {
+                // Ownership is a running-session ordering aid only. Clear it
+                // after Stop so the panel remains logically independent from
+                // both GUI and persistent overlay while idle.
+                win32::set_panel_overlay_owner(self.panel_hwnd, status.overlay_hwnd, false);
+                win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
+            }
+            self.panel_diag_last_frame_at = None;
+            self.panel_diag_last_snapshot = None;
             return;
         }
+        let panel_diag_started = Instant::now();
+        let panel_diag_gap_ms = self
+            .panel_diag_last_frame_at
+            .replace(panel_diag_started)
+            .map(|previous| panel_diag_started.duration_since(previous).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        self.panel_diag_seq = self.panel_diag_seq.wrapping_add(1);
+        let panel_diag_seq = self.panel_diag_seq;
         let present_fps = self.engine.metrics.snapshot().present_fps;
         let z = ctx.zoom_factor();
         let nppp = ctx
@@ -3652,11 +4369,6 @@ impl App {
         // Floating bar: [stop][present fps][screenshot][GUI visibility][collapse].
         let (bar_w, bar_h) = (PANEL_BAR_W_PTS, PANEL_BAR_H_PTS); // egui pts
         let (chip_w, chip_h) = (PANEL_CHIP_W_PTS, PANEL_CHIP_H_PTS);
-        let (w_pts, h_pts) = if lurk {
-            (chip_w * z, chip_h * z)
-        } else {
-            (bar_w * z, bar_h * z)
-        };
         let bar_px = (
             (bar_w * z * nppp).ceil() as i32,
             (bar_h * z * nppp).ceil() as i32,
@@ -3680,11 +4392,6 @@ impl App {
             content_rect,
             panel_px,
         );
-        let logical_per_px = z / nppp;
-        let initial_pos = [
-            initial_px.0 as f32 * logical_per_px,
-            initial_px.1 as f32 * logical_per_px,
-        ];
         let mut panel_stop_requested = false;
         let mut collapse = false;
         let mut expand = false;
@@ -3726,164 +4433,59 @@ impl App {
             let inside = |(x, y): (i32, i32)| {
                 (x >= rx && x < rx + rw && y >= ry && y < ry + rh).then_some((x, y))
             };
-            let pointer = inside(win32::cursor_pos())
-                .or_else(|| chidescaler_neo::input::virtual_cursor_pos().and_then(inside))?;
-            chidescaler_neo::input::panel_action_for_relative_x(rw, pointer.0 - rx)
+            // The visible cursor over the floating panel is normally Neo's
+            // sprite, not the real cursor.  virtual_cursor_pos() uses try_lock
+            // and can therefore return None for a single repaint while the LL
+            // hook owns State; that one-frame miss was enough to alternate the
+            // custom button fill between hover/idle and produce a subtle blink.
+            // Read the already-published sprite target lock-free first, then
+            // fall back to the native cursor only when the sprite is not the
+            // visible owner.
+            let pointer = chidescaler_neo::input::panel_virtual_cursor_pos_lockfree()
+                .and_then(inside)
+                .or_else(|| inside(win32::cursor_pos()))?;
+            chidescaler_neo::input::panel_action_for_relative_x(rw, rh, pointer.0 - rx)
         });
-        // Are we in lurk MODE right now (chip that temporarily expands on hover)?
-        // The — button toggles: pinned bar -> lurk; a hover-expanded chip -> pin.
-        let in_lurk_mode = self.panel_chip_lurking;
-
-        let mut panel_viewport = egui::ViewportBuilder::default()
-            .with_title("panel")
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_taskbar(false)
-            .with_visible(physical_show)
-            .with_inner_size([w_pts, h_pts]);
-        // Position is an initial creation hint only. The render engine owns
-        // panel placement after creation; continuously supplying this stale
-        // GUI-thread position made the panel flash between two locations while
-        // a fixed/windowed overlay was moving.
+        // v465: the floating control panel no longer needs an eframe/WGPU
+        // child viewport. v448+ already renders the visible pixels with the
+        // cached GDI mirror and input.rs already commits every panel action via
+        // the lock-free Win32 hook. Keeping show_viewport_immediate here made
+        // every unrelated root-GUI hover/mode-switch repaint submit another
+        // WGPU surface. On the low-spec reproduction that lurk/full-bar child
+        // Present repeatedly stalled for 15-27 ms even while the panel was in
+        // transparent lurk mode. Use a native GDI host instead: same HWND,
+        // geometry, topmost and direct-input contract, zero panel GPU Present.
+        let panel_host_update_started = Instant::now();
         if self.panel_hwnd == 0 {
-            panel_viewport = panel_viewport.with_position(initial_pos);
+            if let Some(h) = win32::ensure_panel_gdi_host(panel_px.0, panel_px.1) {
+                self.panel_hwnd = h;
+                self.panel_gdi_reveal_pending = false;
+                self.panel_state_sent = None;
+                self.panel_layout_sent = None;
+                win32::set_window_rect(h, initial_px.0, initial_px.1, panel_px.0, panel_px.1);
+                log::info!(
+                    "panel-backend: native-gdi isolated hwnd={:#x} no_wgpu_surface=true",
+                    h
+                );
+            }
         }
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("neo_ctrl_panel"),
-            panel_viewport,
-            |ctx2, _| {
-                const GRIP: egui::Color32 = egui::Color32::from_rgb(0x1f, 0x1f, 0x1f);
-                let frame = egui::Frame::new()
-                    .fill(PANEL_BG)
-                    .inner_margin(egui::Margin::same(2));
-                egui::CentralPanel::default().frame(frame).show(ctx2, |ui| {
-                    hovered_any = ui.ui_contains_pointer();
-                    if lurk {
-                        // Bare semi-transparent chip only. The old icon glyphs were
-                        // visually noisy at this tiny size; keep the full
-                        // hover/click target and native alpha behavior unchanged.
-                        let r = ui.allocate_response(ui.available_size(), egui::Sense::click());
-                        ui.painter().rect_filled(r.rect.shrink(1.0), 2.0, GRIP);
-                        if r.clicked() {
-                            expand = true; // pin the bar back open
-                        }
-                    } else {
-                        ui.horizontal_centered(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
-                            if SHOW_PANEL_GRIP {
-                                // grip/brand only; move the view by dragging the source itself.
-                                let grip = ui.add_sized(
-                                    [30.0, 24.0],
-                                    egui::Button::new(
-                                        egui::RichText::new("✥").size(12.0).color(PANEL_FG),
-                                    )
-                                    .fill(GRIP)
-                                    .corner_radius(egui::CornerRadius::same(3)),
-                                );
-                                if grip.hovered() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-                                }
-                            }
-                            let stop = panel_control_button(
-                                ui,
-                                PANEL_STOP_W_PTS,
-                                stable_hover_action
-                                    == Some(chidescaler_neo::input::PANEL_ACTION_STOP),
-                                false,
-                                PanelControl::Stop,
-                                lang,
-                            );
-                            if stop.clicked() {
-                                panel_stop_requested = true;
-                            }
-                            let (fps_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(PANEL_FPS_W_PTS, 24.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().text(
-                                fps_rect.center() + egui::vec2(0.0, -1.0),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{present_fps:.1} fps"),
-                                egui::FontId::new(11.5, egui::FontFamily::Name("ui_latin".into())),
-                                PANEL_FG,
-                            );
-                            let screenshot = panel_control_button(
-                                ui,
-                                PANEL_ICON_W_PTS,
-                                stable_hover_action
-                                    == Some(chidescaler_neo::input::PANEL_ACTION_SCREENSHOT),
-                                screenshot_feedback,
-                                PanelControl::Camera,
-                                lang,
-                            )
-                            .on_hover_text(i18n::text(lang, "panel.screenshot"));
-                            if screenshot.clicked() {
-                                take_screenshot = true;
-                            }
-                            let gui_visibility = panel_control_button(
-                                ui,
-                                PANEL_ICON_W_PTS,
-                                stable_hover_action
-                                    == Some(chidescaler_neo::input::PANEL_ACTION_GUI_TOPMOST),
-                                self.settings.gui_topmost,
-                                PanelControl::GuiTopmost,
-                                lang,
-                            )
-                            .on_hover_text(i18n::text(
-                                lang,
-                                if self.settings.gui_topmost {
-                                    "panel.gui_topmost_disable_help"
-                                } else {
-                                    "panel.gui_topmost_enable_help"
-                                },
-                            ));
-                            if gui_visibility.clicked() {
-                                toggle_gui_topmost = true;
-                            }
-                            if panel_control_button(
-                                ui,
-                                PANEL_COLLAPSE_W_PTS,
-                                stable_hover_action
-                                    == Some(chidescaler_neo::input::PANEL_ACTION_COLLAPSE),
-                                false,
-                                PanelControl::Collapse,
-                                lang,
-                            )
-                            .on_hover_text(i18n::text(
-                                lang,
-                                if in_lurk_mode {
-                                    "panel.keep_visible"
-                                } else {
-                                    "panel.minimize_help"
-                                },
-                            ))
-                            .clicked()
-                            {
-                                // toggle: a hover-expanded chip pins back to an
-                                // always-on bar; a pinned bar lurks.
-                                if in_lurk_mode {
-                                    expand = true;
-                                } else {
-                                    collapse = true;
-                                }
-                            }
-                        });
-                    }
-                });
-            },
-        );
+        // Keep the historical diagnostic field name so old/new logs remain
+        // directly comparable. It now measures only native-host bookkeeping;
+        // there is deliberately no child WGPU Present in this path.
+        let panel_viewport_draw_ms = panel_host_update_started.elapsed().as_secs_f64() * 1000.0;
 
         if self.panel_hwnd != 0
             && (!win32::is_window_valid(self.panel_hwnd) || !win32::is_own_window(self.panel_hwnd))
         {
             self.panel_hwnd = 0;
+            self.panel_gdi_reveal_pending = false;
             self.panel_state_sent = None;
             self.panel_layout_sent = None;
         }
         if self.panel_hwnd == 0 {
-            if let Some(h) = win32::find_own_window("panel") {
+            if let Some(h) = win32::ensure_panel_gdi_host(panel_px.0, panel_px.1) {
                 self.panel_hwnd = h;
+                self.panel_gdi_reveal_pending = false;
                 self.panel_state_sent = None;
                 self.panel_layout_sent = None;
             }
@@ -3909,12 +4511,13 @@ impl App {
                 );
             }
             if show && self.panel_placed_for_run {
-                if status.overlay_hwnd == 0
-                    || !win32::window_is_above(self.panel_hwnd, status.overlay_hwnd)
-                {
-                    win32::raise_topmost(self.panel_hwnd);
-                }
-                self.keep_gui_above_panel_if_needed();
+                win32::normalize_neo_topmost_stack(
+                    self.gui_hwnd,
+                    self.settings.gui_topmost,
+                    self.panel_hwnd,
+                    status.overlay_hwnd,
+                );
+                chidescaler_neo::input::keep_cursor_sprite_on_top();
             }
             if show && let Some((rx, ry, rw, rh)) = win32::window_rect(self.panel_hwnd) {
                 // No invisible hover moat around the panel. Expanding the chip
@@ -3932,7 +4535,8 @@ impl App {
                 // what visually hovers it, so hit-test that too (the cursor-routing design's
                 // _check_panel_hover). This is what auto-expands the chip in
                 // fullscreen without any teleport.
-                if let Some((vx, vy)) = chidescaler_neo::input::virtual_cursor_pos() {
+                if let Some((vx, vy)) = chidescaler_neo::input::panel_virtual_cursor_pos_lockfree()
+                {
                     if over(vx, vy) {
                         hovered_any = true;
                     }
@@ -3969,7 +4573,7 @@ impl App {
         }
         if self.panel_chip_lurking {
             if lurk {
-                // Hovering the translucent chip restores the persistent panel.
+                // Hovering the fully transparent chip area restores the persistent panel.
                 // The restore remains one-way until collapse is requested again,
                 // and is disarmed until the pointer leaves once after a collapse.
                 if hovered_any && self.panel_hover_restore_armed {
@@ -3995,24 +4599,102 @@ impl App {
         }
         let final_lurk = self.panel_chip_lurking && !self.panel_bar_shown;
         let final_show = show && self.panel_placed_for_run;
+        let restoring_from_lurk = final_show
+            && !final_lurk
+            && self
+                .panel_state_sent
+                .is_some_and(|(was_show, was_lurk)| was_show && was_lurk);
+        let becoming_visible = final_show
+            && !final_lurk
+            && self
+                .panel_state_sent
+                .is_none_or(|(was_show, was_lurk)| !was_show || was_lurk);
+        if restoring_from_lurk {
+            // v528: v527 can resize/draw the complete 297x33 bar here while
+            // the render thread still owns the previous queued chip=true state.
+            // Until that thread consumes the final chip=false state below, tell
+            // its geometry follower to keep using bar geometry rather than
+            // replaying stale lurk-chip geometry over the freshly restored host.
+            chidescaler_neo::engine::begin_panel_lurk_restore_geometry_guard();
+        }
+        if becoming_visible {
+            // Atomic panel reveal: prepare the cached GDI pixels first and,
+            // when GUI-topmost is OFF, also wait for the proven v459 WGPU
+            // composition anchor.  The host itself stays alpha=0 until the
+            // complete visual stack is ready, preventing the old two-stage
+            // start/restore appearance.
+            self.panel_gdi_reveal_pending = true;
+
+            // Lurk restore used to wait for the render-engine SetPanel command
+            // to resize the host from the transparent lurk hit area back to
+            // the 297x33 bar. That left one GUI frame where the logical state
+            // was already "bar" but USER32 still clipped the GDI child to the
+            // old chip rectangle. On some DWM/AMD timings the child then became
+            // visible while Windows was still validating only pieces of the
+            // enlarged region, making the panel appear to fill in gradually as
+            // the pointer moved. Resize the still-transparent host
+            // synchronously at this exact transition; the engine receives the
+            // same layout below and simply observes that it is already correct.
+            if restoring_from_lurk
+                && self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_own_window(self.panel_hwnd)
+            {
+                let (px, py) = panel_target_position(
+                    self.settings.scale_mode,
+                    status.overlay_rect,
+                    content_rect,
+                    bar_px,
+                );
+                win32::set_window_rect(self.panel_hwnd, px, py, bar_px.0, bar_px.1);
+                log::debug!(
+                    "panel-lurk-restore-prelayout: hwnd={:#x} rect=({}, {}, {}, {}) action=resize-hidden-before-gdi-reveal",
+                    self.panel_hwnd,
+                    px,
+                    py,
+                    bar_px.0,
+                    bar_px.1
+                );
+            }
+        }
         if self.panel_state_sent != Some((final_show, final_lurk)) {
             // Apply alpha/input state on the GUI thread in the same frame as the
             // — button action. SetPanelState is metadata-only; without this,
             // panel_state_sent could advance before alpha changed and the panel
-            // would remain opaque instead of returning to its translucent chip.
+            // would remain opaque instead of returning to its transparent lurk area.
             if self.panel_hwnd != 0
                 && win32::is_window_valid(self.panel_hwnd)
                 && win32::is_own_window(self.panel_hwnd)
             {
                 if final_show {
                     win32::set_window_input_passthrough(self.panel_hwnd, false);
-                    win32::set_window_alpha(
-                        self.panel_hwnd,
-                        if final_lurk { PANEL_LURK_ALPHA } else { 255 },
-                    );
+                    if final_lurk {
+                        self.panel_gdi_reveal_pending = false;
+                        win32::set_window_alpha(self.panel_hwnd, PANEL_LURK_ALPHA);
+                    } else if self.panel_gdi_reveal_pending {
+                        // The GDI mirror is a child of the native host. Alpha=0 lets
+                        // us prepare the full mirror without showing either layer.
+                        win32::set_window_alpha(self.panel_hwnd, 0);
+                    } else {
+                        win32::set_window_opaque_unlayered(self.panel_hwnd);
+                    }
                 } else {
+                    self.panel_gdi_reveal_pending = false;
+                    // Withdraw the visual WGPU anchor first.  It remains a
+                    // separate HWND for the AMD composition contract, so hiding
+                    // it before the parent panel prevents a one-composition
+                    // trailing layer during Stop/panel-hide.  The anchor method
+                    // below will retire the viewport normally in the same frame.
+                    if self.compositor_anchor_hwnd != 0
+                        && win32::is_window_valid(self.compositor_anchor_hwnd)
+                        && win32::is_own_window(self.compositor_anchor_hwnd)
+                    {
+                        win32::set_window_alpha(self.compositor_anchor_hwnd, 0);
+                        win32::set_visible_no_activate(self.compositor_anchor_hwnd, false);
+                    }
                     win32::set_window_alpha(self.panel_hwnd, 0);
                     win32::set_window_input_passthrough(self.panel_hwnd, true);
+                    win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
                 }
             }
             self.engine.send(Cmd::SetPanelState {
@@ -4023,6 +4705,228 @@ impl App {
             self.panel_layout_sent = None;
             ctx.request_repaint();
         }
+
+        // v465: the cached GDI child is now the only panel drawing surface.
+        // It covers both the ordinary bar and the tiny lurk chip; the native
+        // host remains the hit-test/z-order/alpha owner and has no GPU surface.
+        let mirror_hover_slot = match stable_hover_action {
+            Some(chidescaler_neo::input::PANEL_ACTION_STOP) => 1,
+            Some(chidescaler_neo::input::PANEL_ACTION_SCREENSHOT) => 2,
+            Some(chidescaler_neo::input::PANEL_ACTION_GUI_TOPMOST) => 3,
+            Some(chidescaler_neo::input::PANEL_ACTION_COLLAPSE) => 4,
+            _ => 0,
+        };
+        let mirror_size = if final_lurk { chip_px } else { bar_px };
+        let panel_geometry_ready = self.panel_hwnd != 0
+            && win32::window_rect(self.panel_hwnd).is_some_and(|(_, _, w, h)| {
+                (w - mirror_size.0).abs() <= 3 && (h - mirror_size.1).abs() <= 3
+            });
+        // Pre-v465 behavior: lurk is a completely invisible hit area.  Never
+        // leave the cached GDI child visible as a dark lurk chip.
+        let mirror_visible = final_show
+            && !final_lurk
+            && (!self.panel_gdi_reveal_pending || panel_geometry_ready);
+        win32::update_panel_gdi_mirror(
+            self.panel_hwnd,
+            mirror_size.0,
+            mirror_size.1,
+            mirror_visible,
+            final_lurk,
+            i18n::text(lang, "capture.stop"),
+            present_fps,
+            mirror_hover_slot,
+            screenshot_feedback,
+        );
+        let anchor_required_for_reveal = final_show
+            && !final_lurk
+            && !self.settings.gui_topmost
+            && status.overlay_hwnd != 0
+            && win32::is_window_valid(status.overlay_hwnd);
+        let anchor_ready_for_reveal = !anchor_required_for_reveal
+            || (self.compositor_anchor_hwnd != 0
+                && win32::is_window_valid(self.compositor_anchor_hwnd)
+                && win32::is_own_window(self.compositor_anchor_hwnd)
+                && win32::is_window_visible(self.compositor_anchor_hwnd)
+                && win32::window_is_above(self.compositor_anchor_hwnd, status.overlay_hwnd));
+        if self.panel_gdi_reveal_pending && panel_geometry_ready && anchor_ready_for_reveal {
+            // Reveal only after every visible layer is ready.  This is one
+            // Show/alpha commit, not host-then-child or panel-then-anchor.
+            win32::set_window_opaque_unlayered(self.panel_hwnd);
+            win32::set_panel_gdi_host_visible(self.panel_hwnd, true);
+
+            // The mirror is fully primed while the host is still hidden, but on
+            // rare USER32/DWM timings the first visible composition can expose
+            // only part of those cached pixels. Re-publish the same complete
+            // 297x33 frame once *after* the host becomes visible. Keep ordinary
+            // FPS/hover updates on their existing small dirty-region path.
+            let reveal_republish =
+                win32::republish_panel_gdi_mirror_full(self.panel_hwnd);
+            self.panel_gdi_reveal_pending = false;
+            log::debug!(
+                "panel-atomic-reveal-commit: hwnd={:#x} size={}x{} anchor_required={} order=mirror-anchor-host-last reveal_republish={}",
+                self.panel_hwnd,
+                mirror_size.0,
+                mirror_size.1,
+                anchor_required_for_reveal,
+                reveal_republish
+            );
+        }
+        if final_show && !self.panel_gdi_reveal_pending {
+            win32::set_panel_gdi_host_visible(self.panel_hwnd, true);
+        } else if !final_show {
+            win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
+        }
+
+        if logging::diagnostics_enabled() {
+            let expected_size = if final_lurk { chip_px } else { bar_px };
+            let rect = if self.panel_hwnd != 0 && win32::is_window_valid(self.panel_hwnd) {
+                win32::window_rect(self.panel_hwnd)
+            } else {
+                None
+            };
+            let native_visible = self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_window_visible(self.panel_hwnd);
+            let layered = self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_window_layered(self.panel_hwnd);
+            let passthrough = self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::window_input_passthrough(self.panel_hwnd);
+            let topmost = self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_topmost(self.panel_hwnd);
+            let (gdi_mirror_valid, gdi_mirror_visible) =
+                win32::panel_gdi_mirror_status(self.panel_hwnd);
+            let snapshot = PanelDiagSnapshot {
+                rect,
+                expected_size,
+                effective_show: final_show,
+                lurk: final_lurk,
+                native_visible,
+                layered,
+                passthrough,
+                topmost,
+            };
+            let state_changed = self.panel_diag_last_snapshot != Some(snapshot);
+            if state_changed {
+                log::info!(
+                    "panel-compositor-state: seq={} hwnd={:#x} rect={:?} expected={}x{} show={} lurk={} native_visible={} layered={} passthrough={} topmost={}",
+                    panel_diag_seq,
+                    self.panel_hwnd,
+                    rect,
+                    expected_size.0,
+                    expected_size.1,
+                    final_show,
+                    final_lurk,
+                    native_visible,
+                    layered,
+                    passthrough,
+                    topmost
+                );
+                self.panel_diag_last_snapshot = Some(snapshot);
+            }
+
+            let size_mismatch = final_show
+                && rect.is_some_and(|(_, _, w, h)| {
+                    (w - expected_size.0).abs() > 3 || (h - expected_size.1).abs() > 3
+                });
+            let visibility_mismatch = physical_show && self.panel_placed_for_run && !native_visible;
+            let layered_mismatch =
+                final_show && ((!final_lurk && layered) || (final_lurk && !layered));
+            let passthrough_mismatch = final_show && passthrough;
+            let topmost_mismatch = final_show && !topmost;
+            // In lurk mode the cached GDI child is deliberately hidden: the
+            // parent HWND alone remains as the transparent hover target.  The
+            // old diagnostic treated that expected hidden state as an anomaly,
+            // producing a WARN every trace interval while the panel was
+            // lurking.  Validate the mirror against the state we actually
+            // require instead: visible for the bar, hidden for the lurk chip.
+            let mirror_should_be_visible = final_show && !final_lurk;
+            let mirror_mismatch = final_show
+                && (!gdi_mirror_valid || gdi_mirror_visible != mirror_should_be_visible);
+            let draw_stall = panel_viewport_draw_ms >= 12.0;
+            let heartbeat_stall = panel_diag_gap_ms >= 900.0;
+            let anomaly = size_mismatch
+                || visibility_mismatch
+                || layered_mismatch
+                || passthrough_mismatch
+                || topmost_mismatch
+                || mirror_mismatch
+                || draw_stall
+                || heartbeat_stall;
+            // Pointer movement can wake egui at high frequency. Keep the
+            // diagnostic timeline dense enough to correlate a blink without
+            // turning ordinary mouse movement into a log flood.
+            let should_trace = state_changed
+                || anomaly
+                || self.panel_diag_last_trace_at.elapsed() >= Duration::from_millis(250);
+            if should_trace {
+                self.panel_diag_last_trace_at = Instant::now();
+                log::debug!(
+                    "panel-frame-diag: seq={} gap_ms={:.2} draw_ms={:.2} hwnd={:#x} show={} effective_show={} physical_show={} lurk_before={} lurk_final={} hovered={} fps={:.1} expected={}x{} rect={:?} native_visible={} layered={} passthrough={} topmost={} gdi_mirror_valid={} gdi_mirror_visible={} state_changed={} anomalies=size:{} visible:{} layered:{} passthrough:{} topmost:{} mirror:{} draw_stall:{} heartbeat_stall:{}",
+                    panel_diag_seq,
+                    panel_diag_gap_ms,
+                    panel_viewport_draw_ms,
+                    self.panel_hwnd,
+                    show,
+                    final_show,
+                    physical_show,
+                    lurk,
+                    final_lurk,
+                    hovered_any,
+                    present_fps,
+                    expected_size.0,
+                    expected_size.1,
+                    rect,
+                    native_visible,
+                    layered,
+                    passthrough,
+                    topmost,
+                    gdi_mirror_valid,
+                    gdi_mirror_visible,
+                    state_changed,
+                    size_mismatch,
+                    visibility_mismatch,
+                    layered_mismatch,
+                    passthrough_mismatch,
+                    topmost_mismatch,
+                    mirror_mismatch,
+                    draw_stall,
+                    heartbeat_stall
+                );
+
+                if anomaly {
+                    log::warn!(
+                        "panel-compositor-anomaly: seq={} hwnd={:#x} gap_ms={:.2} draw_ms={:.2} rect={:?} expected={}x{} show={} lurk={} visible={} layered={} passthrough={} topmost={} gdi_mirror_valid={} gdi_mirror_visible={} flags=[size={},visible={},layered={},passthrough={},topmost={},mirror={},draw_stall={},heartbeat_stall={}]",
+                        panel_diag_seq,
+                        self.panel_hwnd,
+                        panel_diag_gap_ms,
+                        panel_viewport_draw_ms,
+                        rect,
+                        expected_size.0,
+                        expected_size.1,
+                        final_show,
+                        final_lurk,
+                        native_visible,
+                        layered,
+                        passthrough,
+                        topmost,
+                        gdi_mirror_valid,
+                        gdi_mirror_visible,
+                        size_mismatch,
+                        visibility_mismatch,
+                        layered_mismatch,
+                        passthrough_mismatch,
+                        topmost_mismatch,
+                        mirror_mismatch,
+                        draw_stall,
+                        heartbeat_stall
+                    );
+                }
+            }
+        }
+
         if panel_stop_requested {
             if self.qa_panel_preview {
                 self.qa_panel_preview = false;
@@ -4056,7 +4960,272 @@ impl App {
             self.request_filtered_screenshot();
         }
         if toggle_gui_topmost {
+            // Deliberately share the exact same implementation as Ctrl+Alt+G.
             self.toggle_gui_topmost();
+        }
+    }
+
+
+    /// Restore only the compositor keep-alive part of the pre-v465 floating
+    /// panel architecture.  The actual panel is still native GDI and all cursor
+    /// / input ownership remains on the existing Win32 path.
+    ///
+    /// v448-v454 deliberately kept an eframe/WGPU panel HWND physically alive
+    /// because it was part of the AMD composition contract.  v465 removed that
+    /// WGPU surface to eliminate child-swapchain Present stalls.  On affected
+    /// AMD systems the remaining fullscreen WGL overlay can then be scanned out
+    /// independently while ordinary GDI/layered helper HWNDs are logically above
+    /// it but absent from the final screen.  A source popup or topmost main GUI
+    /// forces normal composition again, which exactly matches the field symptom.
+    ///
+    /// This anchor is intentionally NOT a replacement panel.  It is first
+    /// created hidden, placed underneath the GDI panel, made input-transparent,
+    /// then shown without activation.  GUI-topmost ON never uses the anchor.
+    fn compositor_keepalive_anchor(&mut self, ctx: &egui::Context, status: &Status) {
+        const TITLE: &str = "NeoCompositorKeepalivePanel";
+
+        let overlay_valid = status.overlay_hwnd != 0 && win32::is_window_valid(status.overlay_hwnd);
+        let panel_valid = self.panel_hwnd != 0
+            && win32::is_window_valid(self.panel_hwnd)
+            && win32::is_own_window(self.panel_hwnd);
+        // v459-proven contract: the extra WGPU top-level surface exists only
+        // while the ordinary floating panel is physically present and the main
+        // GUI is not itself topmost.  Do not create a tiny always-on fallback
+        // when the panel is disabled: that was a v505 experiment, not part of
+        // the known-good pre-v465 behavior.
+        let active = status.running
+            && (!self.settings.gui_topmost || self.gui_topmost_off_pending)
+            && overlay_valid
+            && panel_valid
+            && self.panel_visible
+            && self.settings.panel_show
+            && (win32::is_window_visible(self.panel_hwnd) || self.panel_gdi_reveal_pending);
+
+        if !active {
+            // If capture/panel state changed before an OFF transition could
+            // need an anchor, the overlay no longer requires the composition
+            // bridge. Commit the requested ordinary GUI state directly.
+            if self.gui_topmost_off_pending
+                && (!status.running
+                    || status.stopping
+                    || !overlay_valid
+                    || !panel_valid
+                    || !self.panel_visible
+                    || !self.settings.panel_show)
+            {
+                self.commit_gui_topmost_off("anchor-became-unneeded");
+            }
+
+            let old_anchor = self.compositor_anchor_hwnd;
+            if old_anchor != 0
+                && win32::is_window_valid(old_anchor)
+                && win32::is_own_window(old_anchor)
+            {
+                win32::set_visible_no_activate(old_anchor, false);
+                win32::set_own_topmost(old_anchor, false);
+            }
+            if self.compositor_anchor_state_sent
+                != Some((false, old_anchor, self.panel_hwnd, status.overlay_hwnd))
+            {
+                self.compositor_anchor_state_sent =
+                    Some((false, old_anchor, self.panel_hwnd, status.overlay_hwnd));
+                if old_anchor != 0 {
+                    log::info!(
+                        "compositor-keepalive-anchor: active=false hwnd={:#x} action=withdraw-v459-panel-contract",
+                        old_anchor
+                    );
+                }
+            }
+            // Not submitting an immediate viewport destroys the retained child.
+            self.compositor_anchor_hwnd = 0;
+            return;
+        }
+
+        let Some((panel_x, panel_y, panel_w, panel_h)) = win32::window_rect(self.panel_hwnd) else {
+            return;
+        };
+        // Keep the proven v459-compatible WGPU surface underneath the native
+        // GDI panel. Only its inset follows the 5 px rounded host so no WGPU
+        // pixels can peek through the clipped corners; classification/lifetime
+        // and z-order rules remain identical to v508.
+        let inset = if panel_w > 12 && panel_h > 12 { 5 } else { 1 };
+        let px = panel_x + inset;
+        let py = panel_y + inset;
+        let pw = (panel_w - inset * 2).max(2);
+        let ph = (panel_h - inset * 2).max(2);
+
+        let z = ctx.zoom_factor().max(0.5);
+        let nppp = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.5);
+        let logical_per_px = z / nppp;
+        let size_pts = [
+            (pw as f32 * logical_per_px).max(2.0),
+            (ph as f32 * logical_per_px).max(2.0),
+        ];
+        let pos_pts = [px as f32 * logical_per_px, py as f32 * logical_per_px];
+
+        // Match the known-good v454/v459 panel viewport classification as
+        // closely as possible.  In particular, do NOT use with_active(false)
+        // or with_mouse_passthrough(true): those change the native extended
+        // style/classification and were not present before v465.
+        let creating_anchor = self.compositor_anchor_hwnd == 0;
+        let viewport = egui::ViewportBuilder::default()
+            .with_title(TITLE)
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_taskbar(false)
+            // Never expose the WGPU backing layer before it has been placed
+            // underneath the completed GDI panel.  This changes only initial
+            // visibility, not the v459 HWND/surface classification.
+            .with_visible(!creating_anchor)
+            .with_inner_size(size_pts)
+            .with_position(pos_pts);
+
+        let present_started = Instant::now();
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("neo_compositor_keepalive_panel_v459"),
+            viewport,
+            |ctx2, _| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::from_rgb(43, 43, 43)))
+                    .show(ctx2, |_ui| {});
+            },
+        );
+        let anchor_present_ms = present_started.elapsed().as_secs_f64() * 1000.0;
+
+        if self.compositor_anchor_hwnd != 0
+            && (!win32::is_window_valid(self.compositor_anchor_hwnd)
+                || !win32::is_own_window(self.compositor_anchor_hwnd))
+        {
+            self.compositor_anchor_hwnd = 0;
+            self.compositor_anchor_state_sent = None;
+        }
+        if self.compositor_anchor_hwnd == 0 {
+            if let Some(hwnd) = win32::find_own_window(TITLE) {
+                self.compositor_anchor_hwnd = hwnd;
+                self.compositor_anchor_state_sent = None;
+                log::info!(
+                    "compositor-keepalive-anchor-created: hwnd={:#x} backend=eframe-wgpu contract=v459-normal-top-level",
+                    hwnd
+                );
+            }
+        }
+
+        let anchor = self.compositor_anchor_hwnd;
+        if anchor == 0 || !win32::is_window_valid(anchor) || !win32::is_own_window(anchor) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        // Keep the composition surface alive in lurk mode, and also keep it
+        // transparent while a full panel reveal is being prepared.  The old
+        // v512 ordering made this backing layer opaque before the GDI host, so
+        // a dark/offset second layer could be seen for one composition frame.
+        let anchor_lurk = self.panel_chip_lurking && !self.panel_bar_shown;
+        let anchor_must_stay_transparent = anchor_lurk || self.panel_gdi_reveal_pending;
+        if anchor_must_stay_transparent {
+            if !win32::is_window_layered(anchor) {
+                win32::set_window_alpha(anchor, 0);
+            }
+        }
+
+        // Geometry follows the native panel, but avoid continuous TOPMOST
+        // churn.  Prepare the hidden/transparent backing surface completely
+        // before it can become visible.
+        if win32::window_rect(anchor) != Some((px, py, pw, ph)) {
+            win32::set_window_rect(anchor, px, py, pw, ph);
+        }
+        if !win32::is_topmost(anchor) {
+            win32::set_own_topmost(anchor, true);
+        }
+        if !win32::window_is_above(anchor, status.overlay_hwnd) {
+            win32::place_below(status.overlay_hwnd, anchor);
+        }
+        if !win32::window_is_above(self.panel_hwnd, anchor) {
+            win32::place_below(anchor, self.panel_hwnd);
+        }
+        if !win32::is_window_visible(anchor) {
+            // At first creation the viewport itself is hidden.  Show it only
+            // after alpha/geometry/z-order have been committed.
+            win32::set_visible_no_activate(anchor, true);
+        }
+
+        // control_panel() is the sole owner of revealing the GDI host.  Once it
+        // has completed that commit, make the already-covered WGPU anchor
+        // opaque underneath it and wait for one DWM boundary.  Front layer
+        // first, backing layer second: there is never an exposed WGPU rectangle.
+        if !anchor_lurk
+            && !self.panel_gdi_reveal_pending
+            && win32::is_window_visible(self.panel_hwnd)
+            && win32::window_is_above(self.panel_hwnd, anchor)
+            && win32::is_window_layered(anchor)
+        {
+            win32::set_window_opaque_unlayered(anchor);
+            win32::sync_panel_composition_with_dwm();
+            log::debug!(
+                "panel-layer-sync-commit: panel={:#x} anchor={:#x} order=panel-first-anchor-second",
+                self.panel_hwnd,
+                anchor
+            );
+        } else if !anchor_lurk
+            && !self.panel_gdi_reveal_pending
+            && !win32::is_window_layered(anchor)
+        {
+            // Normal steady state: preserve the proven opaque v459 surface.
+        }
+
+        // The anchor is now fully placed, visible, topmost and covered by the
+        // GDI panel. Only at this boundary may a staged GUI-TOPMOST OFF request
+        // demote the root GUI. DWM therefore sees one stable composition change
+        // instead of "GUI down -> create anchor -> restack".
+        if self.gui_topmost_off_pending
+            && !anchor_lurk
+            && !self.panel_gdi_reveal_pending
+            && win32::is_window_visible(anchor)
+            && win32::window_is_above(anchor, status.overlay_hwnd)
+            && win32::window_is_above(self.panel_hwnd, anchor)
+            && !win32::is_window_layered(anchor)
+        {
+            self.commit_gui_topmost_off("anchor-prepared-before-demote");
+            win32::sync_panel_composition_with_dwm();
+            log::debug!(
+                "GUI topmost off atomic-commit: gui={:#x} panel={:#x} anchor={:#x} overlay={:#x}",
+                self.gui_hwnd,
+                self.panel_hwnd,
+                anchor,
+                status.overlay_hwnd
+            );
+        }
+
+        chidescaler_neo::input::keep_cursor_sprite_on_top();
+
+        let state = (active, anchor, self.panel_hwnd, status.overlay_hwnd);
+        if self.compositor_anchor_state_sent != Some(state) {
+            self.compositor_anchor_state_sent = Some(state);
+            log::info!(
+                "compositor-keepalive-anchor: active=true contract=v459 hwnd={:#x} panel={:#x} overlay={:#x} anchor_above_overlay={} panel_above_anchor={} rect={:?} present_ms={:.2}",
+                anchor,
+                self.panel_hwnd,
+                status.overlay_hwnd,
+                win32::window_is_above(anchor, status.overlay_hwnd),
+                win32::window_is_above(self.panel_hwnd, anchor),
+                win32::window_rect(anchor),
+                anchor_present_ms,
+            );
+        }
+
+        if anchor_present_ms >= 8.0
+            && self.compositor_anchor_last_warn_at.elapsed() >= Duration::from_secs(1)
+        {
+            self.compositor_anchor_last_warn_at = Instant::now();
+            log::warn!(
+                "compositor-keepalive-anchor-present-stall: ms={:.2} hwnd={:#x} contract=v459 diagnostic_only=true",
+                anchor_present_ms,
+                anchor
+            );
         }
     }
 
@@ -4074,10 +5243,735 @@ impl App {
     }
 }
 
+impl App {
+    /// Mini overload warning must stay on the already-existing root GUI surface.
+    ///
+    /// v465 removed the floating panel's WGPU viewport after low-spec machines
+    /// exposed horizontal/sandstorm-like corruption when an auxiliary WGPU
+    /// swapchain was created/repainted under heavy 3D pressure. The generic
+    /// Mini dialog host reintroduced that same class of risk for the GLSL
+    /// overload notice because the notice appears precisely when GPU headroom is
+    /// exhausted. Draw this informational warning as a foreground Area inside
+    /// the root GUI instead: no new HWND, swapchain, surface configure, resize,
+    /// DWM restack, capture change, or video-path synchronization is involved.
+    fn render_mini_glsl_overload_notice(
+        &self,
+        ctx: &egui::Context,
+        lang: UiLanguage,
+        status: &Status,
+        running: bool,
+    ) {
+        if self.settings.ui_mode != UiMode::Mini
+            || !running
+            || !status.glsl_overload_notice_latched
+        {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("mini-glsl-overload-inline"))
+            // Keep the warning wholly inside Mini's first row.  It must never
+            // grow downward into the capture button row, even while the locale
+            // font is being swapped in the same egui frame.
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 6.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                // Keep the warning icon out of the text run.  Locale-specific
+                // fonts give U+26A0 (WARNING SIGN) different ascent/baseline
+                // metrics, so a single text galley can look vertically centered
+                // in Japanese while the triangle shifts in Latin/CJK/Korean
+                // locales.  The triangle is now pure geometry centered on the
+                // physical warning rect; only the message uses locale fonts.
+                let warning = i18n::text(lang, "glsl_overload.auto_stop");
+                let font = egui::FontId::new(11.5, locale_font_family(lang));
+                // Do not use Label/Frame auto-layout here.  During a language
+                // switch egui can briefly inherit a narrow available width;
+                // Label then wraps to two rows and the floating warning reaches
+                // the capture button below.  A pre-laid-out galley has no wrap
+                // path at all, so the warning remains exactly one line.
+                let galley = ui.painter().layout_no_wrap(
+                    warning.to_owned(),
+                    font,
+                    egui::Color32::WHITE,
+                );
+                let ink = galley.mesh_bounds;
+                const WARNING_H: f32 = 25.0;
+                const WARNING_MIN_W: f32 = 104.0;
+                const WARNING_PAD_X: f32 = 12.0;
+                const ICON_W: f32 = 12.0;
+                const ICON_H: f32 = 11.0;
+                const ICON_TEXT_GAP: f32 = 5.0;
+                let group_w = ICON_W + ICON_TEXT_GAP + ink.width();
+                let warning_w = (group_w + WARNING_PAD_X * 2.0).max(WARNING_MIN_W);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(warning_w, WARNING_H),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    5.0,
+                    egui::Color32::from_rgb(50, 39, 18),
+                );
+                ui.painter().rect_stroke(
+                    rect,
+                    5.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(214, 164, 66)),
+                    egui::StrokeKind::Inside,
+                );
+
+                let group_left = rect.center().x - group_w * 0.5;
+                let icon_center = egui::pos2(group_left + ICON_W * 0.5, rect.center().y);
+                let half_w = ICON_W * 0.5;
+                let half_h = ICON_H * 0.5;
+                let icon_stroke = egui::Stroke::new(1.15, egui::Color32::WHITE);
+                let top = egui::pos2(icon_center.x, icon_center.y - half_h);
+                let left = egui::pos2(icon_center.x - half_w, icon_center.y + half_h);
+                let right = egui::pos2(icon_center.x + half_w, icon_center.y + half_h);
+                ui.painter().line_segment([top, left], icon_stroke);
+                ui.painter().line_segment([left, right], icon_stroke);
+                ui.painter().line_segment([right, top], icon_stroke);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(icon_center.x, icon_center.y - 2.6),
+                        egui::pos2(icon_center.x, icon_center.y + 1.5),
+                    ],
+                    egui::Stroke::new(1.25, egui::Color32::WHITE),
+                );
+                ui.painter().circle_filled(
+                    egui::pos2(icon_center.x, icon_center.y + 3.6),
+                    0.85,
+                    egui::Color32::WHITE,
+                );
+
+                // Center the visible message ink independently of the icon.
+                // The icon's geometric center and the message ink center both
+                // sit exactly on the yellow border's vertical center in every
+                // locale, while the whole icon+text group remains horizontally
+                // centered as one unit.
+                let desired_ink_left = group_left + ICON_W + ICON_TEXT_GAP;
+                let galley_pos = egui::pos2(
+                    desired_ink_left - ink.min.x,
+                    rect.center().y - ink.center().y,
+                );
+                ui.painter().galley(galley_pos, galley, egui::Color32::WHITE);
+            });
+    }
+
+    fn render_mini_dialog_host(
+        &mut self,
+        ctx: &egui::Context,
+        lang: UiLanguage,
+        status: &Status,
+        running: bool,
+    ) {
+        if self.mini_dialog_hwnd != 0 && !win32::is_window_valid(self.mini_dialog_hwnd) {
+            self.mini_dialog_hwnd = 0;
+        }
+        if self.settings.ui_mode != UiMode::Mini {
+            return;
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Kind {
+            TensorRt,
+            Elevated,
+            FullscreenCaptureNotice,
+            ResizeScale,
+            Hotkey,
+            FilterPicker,
+            SaveAs,
+            DeletePreset,
+        }
+
+        let trt_progress = chidescaler_neo::render::onnx_stage::tensorrt_build_progress();
+        let kind = if trt_progress.is_some() {
+            Some(Kind::TensorRt)
+        } else if self.elevated_target_notice.is_some() {
+            Some(Kind::Elevated)
+        } else if self.capture_resolution_fullscreen_notice_open {
+            Some(Kind::FullscreenCaptureNotice)
+        } else if self.resize_scale_editor.is_some() {
+            Some(Kind::ResizeScale)
+        } else if self.hotkey_editor_open {
+            Some(Kind::Hotkey)
+        } else if self.filter_picker_open {
+            Some(Kind::FilterPicker)
+        } else if self.save_as_open {
+            Some(Kind::SaveAs)
+        } else if self.confirm_delete {
+            Some(Kind::DeletePreset)
+        } else {
+            None
+        };
+
+        let Some(kind) = kind else {
+            // show_viewport_immediate destroys the retained child after it is no
+            // longer submitted. Do not keep a stale HWND in cursor/z-order code.
+            if self.mini_dialog_hwnd != 0 && !win32::is_window_valid(self.mini_dialog_hwnd) {
+                self.mini_dialog_hwnd = 0;
+            }
+            return;
+        };
+
+        let (display_title, requested_size): (&str, [f32; 2]) = match kind {
+            Kind::TensorRt => (
+                tr(
+                    lang,
+                    "TensorRT用エンジンを作成中",
+                    "Preparing TensorRT engine",
+                ),
+                [430.0, 285.0],
+            ),
+            Kind::Elevated => (
+                tr(
+                    lang,
+                    "管理者権限が必要です",
+                    "Administrator permission required",
+                ),
+                [440.0, 330.0],
+            ),
+            Kind::FullscreenCaptureNotice => (
+                i18n::text(lang, "capture.fullscreen_notice_title"),
+                [400.0, 280.0],
+            ),
+            Kind::ResizeScale => (tr(lang, "リサイズ倍率", "Resize scale"), [340.0, 225.0]),
+            Kind::Hotkey => (
+                tr(lang, "ショートカット編集", "Edit Shortcut"),
+                [430.0, 340.0],
+            ),
+            Kind::FilterPicker => (tr(lang, "フィルター追加", "Add Filter"), [470.0, 520.0]),
+            Kind::SaveAs => (tr(lang, "別名で保存", "Save As"), [430.0, 250.0]),
+            Kind::DeletePreset => (
+                tr(lang, "プリセットの削除", "Delete Preset"),
+                [390.0, 230.0],
+            ),
+        };
+
+        // Never let a dialog exceed the current monitor. This is especially
+        // important for Mini on low-resolution / high-DPI desktops: the body
+        // becomes scrollable while the action row remains fixed and reachable.
+        let monitor_size = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or(egui::vec2(1280.0, 720.0));
+        let size = [
+            requested_size[0].min((monitor_size.x - 32.0).max(300.0)),
+            requested_size[1].min((monitor_size.y - 48.0).max(190.0)),
+        ];
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_title("cHiDeScaler-Neo Mini Dialog")
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_inner_size(size);
+        if self.mini_dialog_hwnd == 0 {
+            let z = ctx.zoom_factor();
+            if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+                let center = outer.center();
+                viewport = viewport.with_position([
+                    (center.x * z - size[0] * 0.5).max(8.0),
+                    (center.y * z - size[1] * 0.5).max(8.0),
+                ]);
+            }
+        }
+
+        let mut close_notice = false;
+        let mut trt_stop = false;
+        let mut elevated_restart = false;
+        let mut elevated_cancel = false;
+        let mut resize_apply = false;
+        let mut resize_cancel = false;
+        let mut resize_value = self
+            .resize_scale_editor
+            .map(|(_, value)| value)
+            .unwrap_or(0.75);
+        let mut hotkey_save = false;
+        let mut hotkey_cancel = false;
+        let mut filter_add: Option<(StageKind, String)> = None;
+        let mut filter_cancel = false;
+        let mut save_as_overwrite = false;
+        let mut save_as_new = false;
+        let mut save_as_cancel = false;
+        let mut delete_confirm = false;
+        let mut delete_cancel = false;
+
+        let elevated_snapshot = self.elevated_target_notice.clone();
+        let trt_snapshot = trt_progress.clone();
+        let filter_tree = (kind == Kind::FilterPicker).then(|| build_filter_tree(&self.available));
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("neo_mini_dialog_host"),
+            viewport,
+            |ctx2, _| {
+                let dialog_ctx = ctx2.ctx().clone();
+                let frame = egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(16, 18, 22))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 84, 100)))
+                    .corner_radius(egui::CornerRadius::same(7))
+                    .inner_margin(egui::Margin::same(12));
+                egui::CentralPanel::default().frame(frame).show(ctx2, |ui| {
+                    ui.set_min_size(egui::vec2(size[0] - 24.0, size[1] - 24.0));
+                    ui.label(
+                        egui::RichText::new(display_title)
+                            .family(locale_font_family(lang))
+                            .strong()
+                            .size(13.0),
+                    );
+                    ui.separator();
+
+                    let has_footer = true;
+                    let footer_reserve = 50.0;
+                    let body_height = (ui.available_height() - footer_reserve).max(56.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("mini_dialog_body")
+                        .max_height(body_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| match kind {
+                            Kind::TensorRt => {
+                                if let Some((model, elapsed, completed, total, model_active)) =
+                                    trt_snapshot.as_ref()
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(if *model_active {
+                                            tr(
+                                                lang,
+                                                "現在のONNX用エンジンを作成しています。",
+                                                "Building the engine for the current ONNX model.",
+                                            )
+                                        } else {
+                                            tr(
+                                                lang,
+                                                "次のONNXの処理開始を待っています。",
+                                                "Waiting for the next ONNX model to begin processing.",
+                                            )
+                                        });
+                                    });
+                                    ui.add_space(8.0);
+                                    let model_label = if model.to_ascii_lowercase().ends_with(".onnx") {
+                                        model.clone()
+                                    } else {
+                                        format!("{model}.onnx")
+                                    };
+                                    ui.label(egui::RichText::new(model_label).monospace().size(11.0));
+                                    ui.label(format!(
+                                        "{}: {}/{}",
+                                        tr(lang, "エンジン", "Engine"),
+                                        (*completed + 1).min(*total),
+                                        total
+                                    ));
+                                    if *model_active {
+                                        ui.label(format!(
+                                            "{}: {:.1}s",
+                                            tr(lang, "このエンジンの経過時間", "Current engine elapsed"),
+                                            elapsed.as_secs_f64()
+                                        ));
+                                    }
+                                    if chidescaler_neo::render::onnx_stage::tensorrt_cancel_requested() {
+                                        ui.add_space(6.0);
+                                        ui.label(tr(
+                                            lang,
+                                            "停止要求を受け付けました。現在のTensorRT処理が完了し次第停止します。",
+                                            "Stop requested. Capture will close after the current TensorRT operation finishes.",
+                                        ));
+                                    }
+                                }
+                            }
+                            Kind::Elevated => {
+                                if let Some((_, title)) = elevated_snapshot.as_ref() {
+                                    ui.label(tr(
+                                        lang,
+                                        "選択したウィンドウは管理者権限で動作しています。",
+                                        "The selected window is running with administrator permission.",
+                                    ));
+                                    ui.label(egui::RichText::new(title).strong());
+                                    ui.add_space(4.0);
+                                    ui.label(tr(
+                                        lang,
+                                        "このウィンドウを拡大・操作するには、cHiDeScaler-Neoも管理者として再起動してください。再起動後、対象ウィンドウをもう一度選択してください。",
+                                        "To capture and control this window, restart cHiDeScaler-Neo as administrator, then select the window again.",
+                                    ));
+                                }
+                            }
+                            Kind::FullscreenCaptureNotice => {
+                                ui.label(i18n::text(lang, "capture.fullscreen_notice_body"));
+                            }
+                            Kind::ResizeScale => {
+                                ui.horizontal(|ui| {
+                                    ui.label(tr(lang, "倍率", "Scale"));
+                                    ui.add(
+                                        egui::DragValue::new(&mut resize_value)
+                                            .range(0.25..=4.0)
+                                            .speed(0.01)
+                                            .fixed_decimals(2),
+                                    );
+                                });
+                                ui.label(tr(
+                                    lang,
+                                    "0.25～4.00（初期値 0.75）",
+                                    "0.25–4.00 (default 0.75)",
+                                ));
+                            }
+                            Kind::Hotkey => {
+                                let captured = capture_hotkey_candidate(&dialog_ctx);
+                                let captured_this_frame = captured.is_some();
+                                if let Some(pending) = captured {
+                                    self.hotkey_capture_pending = Some(pending);
+                                    self.hotkey_editor_error = None;
+                                }
+                                let released = self
+                                    .hotkey_capture_pending
+                                    .as_ref()
+                                    .is_some_and(|(_, key)| {
+                                        dialog_ctx.input(|input| {
+                                            !input.key_down(*key) && input.modifiers.is_none()
+                                        })
+                                    });
+                                if released
+                                    && let Some((candidate, _)) = self.hotkey_capture_pending.take()
+                                {
+                                    match validate_user_hotkey(&candidate) {
+                                        Ok(candidate) => {
+                                            self.hotkey_editor_candidate = candidate;
+                                            self.hotkey_editor_error = None;
+                                        }
+                                        Err(error) => {
+                                            self.hotkey_editor_error =
+                                                Some(hotkey_error_text(lang, &error));
+                                        }
+                                    }
+                                }
+                                if dialog_ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                    hotkey_cancel = true;
+                                }
+                                let held = held_hotkey_modifiers(&dialog_ctx);
+                                ui.label(tr(
+                                    lang,
+                                    "Ctrl / Alt / Shiftを押しながら、文字・数字・Fキーなどを押してください。",
+                                    "Hold Ctrl, Alt, or Shift and press a letter, number, function key, or navigation key.",
+                                ));
+                                ui.add_space(10.0);
+                                let pending_display = self
+                                    .hotkey_capture_pending
+                                    .as_ref()
+                                    .map(|(candidate, _)| candidate.as_str());
+                                let display = if let Some(candidate) = pending_display {
+                                    candidate
+                                } else if !captured_this_frame && !held.is_empty() {
+                                    held.as_str()
+                                } else {
+                                    self.hotkey_editor_candidate.as_str()
+                                };
+                                hotkey_chips(ui, display);
+                                ui.add_space(8.0);
+                                if let Some(error) = &self.hotkey_editor_error {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(tr(
+                                            lang,
+                                            "合計2～3キー。修飾キーのみ、Winキー、予約済みキーは使用できません。",
+                                            "Two or three keys total. Modifier-only, Win-key, and reserved shortcuts are blocked.",
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
+                                    );
+                                }
+                            }
+                            Kind::FilterPicker => {
+                                if let Some(tree) = filter_tree.as_ref() {
+                                    render_filter_tree_picker(
+                                        ui,
+                                        tree,
+                                        "mini-filter-picker",
+                                        lang,
+                                        &mut filter_add,
+                                    );
+                                }
+                            }
+                            Kind::SaveAs => {
+                                let edit = ui.text_edit_singleline(&mut self.save_as_name);
+                                if edit.changed() {
+                                    self.save_as_error = None;
+                                }
+                                if let Some(error) = self.save_as_error {
+                                    let message = match error {
+                                        PresetEditError::EmptyName => tr(
+                                            lang,
+                                            "名前を入力してください。",
+                                            "Enter a preset name.",
+                                        ),
+                                        PresetEditError::NameInUse => tr(
+                                            lang,
+                                            "同じ名前のプリセットが既にあります。",
+                                            "A preset with this name already exists.",
+                                        ),
+                                        PresetEditError::ActivePresetMissing => tr(
+                                            lang,
+                                            "選択中のプリセットが見つかりません。",
+                                            "The selected preset could not be found.",
+                                        ),
+                                    };
+                                    ui.colored_label(egui::Color32::LIGHT_RED, message);
+                                }
+                            }
+                            Kind::DeletePreset => {
+                                ui.label(
+                                    i18n::text(lang, "preset.delete_confirm")
+                                        .replace("{name}", &self.store.data.active),
+                                );
+                            }
+                        });
+
+                    if has_footer {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal_centered(|ui| match kind {
+                            Kind::TensorRt => {
+                                if chidescaler_neo::render::onnx_stage::tensorrt_cancel_requested() {
+                                    ui.add_enabled_ui(false, |ui| {
+                                        let _ = control_row_button(ui, tr(lang, "停止", "Stop"));
+                                    });
+                                } else if control_row_button(ui, tr(lang, "停止", "Stop")).clicked() {
+                                    trt_stop = true;
+                                }
+                            }
+                            Kind::Elevated => {
+                                if control_row_button(
+                                    ui,
+                                    tr(lang, "管理者として再起動", "Restart as administrator"),
+                                )
+                                .clicked()
+                                {
+                                    elevated_restart = true;
+                                }
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    elevated_cancel = true;
+                                }
+                            }
+                            Kind::FullscreenCaptureNotice => {
+                                if control_row_button(ui, "OK").clicked() {
+                                    close_notice = true;
+                                }
+                            }
+                            Kind::ResizeScale => {
+                                if control_row_button(ui, tr(lang, "適用", "Apply")).clicked() {
+                                    resize_apply = true;
+                                }
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    resize_cancel = true;
+                                }
+                            }
+                            Kind::Hotkey => {
+                                if control_row_button(ui, tr(lang, "保存", "Save")).clicked() {
+                                    hotkey_save = true;
+                                }
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    hotkey_cancel = true;
+                                }
+                            }
+                            Kind::FilterPicker => {
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    filter_cancel = true;
+                                }
+                            }
+                            Kind::SaveAs => {
+                                if control_row_button(ui, tr(lang, "上書き保存", "Overwrite")).clicked() {
+                                    save_as_overwrite = true;
+                                }
+                                if control_row_button(ui, tr(lang, "別名で保存", "Save As")).clicked() {
+                                    save_as_new = true;
+                                }
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    save_as_cancel = true;
+                                }
+                            }
+                            Kind::DeletePreset => {
+                                if control_row_button(ui, tr(lang, "削除", "Delete")).clicked() {
+                                    delete_confirm = true;
+                                }
+                                if control_row_button(ui, tr(lang, "キャンセル", "Cancel")).clicked() {
+                                    delete_cancel = true;
+                                }
+                            }
+                        });
+                    }
+                });
+            },
+        );
+
+        // Discover the single retained viewport after creation and make it a
+        // normal interactive Neo-owned topmost window. Cursor ownership can then
+        // use the existing process-owned HWND fallback without adding another
+        // special cursor state machine or altering the v350g/v361/v362 contract.
+        if self.mini_dialog_hwnd == 0
+            && let Some(hwnd) = win32::find_own_window("cHiDeScaler-Neo Mini Dialog")
+        {
+            self.mini_dialog_hwnd = hwnd;
+            win32::set_window_input_passthrough(hwnd, false);
+            log::info!("mini-dialog-host: hwnd={hwnd:#x} registered cursor_route=own-window");
+        }
+        if self.mini_dialog_hwnd != 0 {
+            if !win32::is_window_valid(self.mini_dialog_hwnd) {
+                self.mini_dialog_hwnd = 0;
+            } else {
+                if !win32::is_topmost(self.mini_dialog_hwnd) {
+                    win32::set_own_topmost(self.mini_dialog_hwnd, true);
+                }
+                win32::set_window_input_passthrough(self.mini_dialog_hwnd, false);
+                if running
+                    && status.overlay_hwnd != 0
+                    && !win32::window_is_above(self.mini_dialog_hwnd, status.overlay_hwnd)
+                {
+                    win32::raise_topmost(self.mini_dialog_hwnd);
+                    chidescaler_neo::input::keep_cursor_sprite_on_top();
+                }
+            }
+        }
+
+        match kind {
+            Kind::TensorRt => {
+                if trt_stop {
+                    let _ = self.request_capture_stop("tensorrt-progress-dialog");
+                }
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Kind::Elevated => {
+                if elevated_restart {
+                    if let Some((hwnd, _)) = elevated_snapshot {
+                        self.settings.run_as_admin = true;
+                        save_settings(&self.app_dir, &self.settings);
+                        log::info!(
+                            "elevated-target-guidance accepted: hwnd={hwnd:#x}; relaunching as administrator"
+                        );
+                        if win32::relaunch_as_admin() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        } else {
+                            self.engine.status.lock().unwrap().last_error = Some(
+                                tr(
+                                    lang,
+                                    "管理者として再起動できませんでした。Windowsの確認画面で許可してから、もう一度お試しください。",
+                                    "Could not restart as administrator. Allow the Windows confirmation prompt and try again.",
+                                )
+                                .to_string(),
+                            );
+                        }
+                    }
+                    self.elevated_target_notice = None;
+                } else if elevated_cancel {
+                    self.elevated_target_notice = None;
+                }
+            }
+            Kind::FullscreenCaptureNotice => {
+                if close_notice {
+                    self.capture_resolution_fullscreen_notice_open = false;
+                }
+            }
+            Kind::ResizeScale => {
+                if let Some((index, _)) = self.resize_scale_editor {
+                    let value = resize_value.clamp(0.25, 4.0);
+                    if resize_apply && index < self.chain.len() {
+                        self.chain[index]
+                            .params
+                            .insert("RESIZE_SCALE".to_string(), value);
+                        log::info!(
+                            "resize-scale-edit: index={index} value={value:.2} path={}",
+                            self.chain[index].path
+                        );
+                        self.resize_scale_editor = None;
+                        self.apply_live();
+                    } else if resize_cancel {
+                        self.resize_scale_editor = None;
+                    } else {
+                        self.resize_scale_editor = Some((index, value));
+                    }
+                }
+            }
+            Kind::Hotkey => {
+                if hotkey_save {
+                    let candidate = self.hotkey_editor_candidate.clone();
+                    match self.commit_toggle_hotkey(&candidate, lang) {
+                        Ok(()) => {
+                            self.hotkey_editor_open = false;
+                            self.hotkey_editor_error = None;
+                            self.hotkey_capture_pending = None;
+                        }
+                        Err(error) => self.hotkey_editor_error = Some(error),
+                    }
+                } else if hotkey_cancel {
+                    self.hotkey_editor_open = false;
+                    self.hotkey_editor_candidate = self.settings.hotkey_toggle.clone();
+                    self.hotkey_editor_error = None;
+                    self.hotkey_capture_pending = None;
+                }
+            }
+            Kind::FilterPicker => {
+                if let Some((stage_kind, path)) = filter_add {
+                    self.filter_picker_open = false;
+                    self.add_filter_to_chain(stage_kind, path);
+                } else if filter_cancel {
+                    self.filter_picker_open = false;
+                    log::info!("filter-picker-close: cancelled=true source=mini-dialog-host");
+                }
+            }
+            Kind::SaveAs => {
+                if save_as_overwrite {
+                    match self
+                        .store
+                        .overwrite_active_as(&self.save_as_name, &self.chain)
+                    {
+                        Ok(name) => {
+                            self.saved_chain = self.chain.clone();
+                            self.store.save();
+                            self.save_as_open = false;
+                            self.save_as_error = None;
+                            log::info!("preset-overwrite: name={name}");
+                        }
+                        Err(error) => self.save_as_error = Some(error),
+                    }
+                } else if save_as_new {
+                    match self.store.save_as_new(&self.save_as_name, &self.chain) {
+                        Ok(name) => {
+                            self.saved_chain = self.chain.clone();
+                            self.store.save();
+                            self.save_as_open = false;
+                            self.save_as_error = None;
+                            log::info!("preset-save-as: name={name}");
+                        }
+                        Err(error) => self.save_as_error = Some(error),
+                    }
+                } else if save_as_cancel {
+                    self.save_as_open = false;
+                    self.save_as_error = None;
+                }
+            }
+            Kind::DeletePreset => {
+                if delete_confirm {
+                    let active = self.store.data.active.clone();
+                    self.store
+                        .data
+                        .presets
+                        .retain(|preset| preset.name != active);
+                    if let Some(first) = self.store.data.presets.first() {
+                        let name = first.name.clone();
+                        self.select_preset(&name);
+                    }
+                    self.store.save();
+                    self.confirm_delete = false;
+                } else if delete_cancel {
+                    self.confirm_delete = false;
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
+        self.commit_pending_ui_mode_if_ready(ctx);
         // Diagnostic sampling stays active regardless of UI mode/stats layout.
         // It does not change the GPU bar calculation; ResourceMonitor logs the
         // same legacy value plus raw per-engine/per-process evidence so GPU
@@ -4105,7 +5999,8 @@ impl eframe::App for App {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
                     self.gui_hwnd = w.hwnd.get();
                     win32::set_dark_title_bar(self.gui_hwnd);
-                    win32::disable_maximize(self.gui_hwnd);
+                    win32::disable_native_maximize_button(self.gui_hwnd);
+                    win32::install_main_gui_native_minimize(self.gui_hwnd);
                 }
             }
         }
@@ -4154,8 +6049,51 @@ impl eframe::App for App {
         }
         self.was_capture_busy = capture_busy_now;
 
+        // v348u: Start and Stop now share the same physical pointer-DOWN path.
+        // This removes the v348t asymmetry where Stop fired on DOWN but Start
+        // depended on a later egui release that could be swallowed or lost.
+        let main_actions = chidescaler_neo::input::take_main_actions();
+        if main_actions != 0 {
+            let now = Instant::now();
+            self.main_control_press_until = Some(now + Duration::from_millis(115));
+        }
+        if main_actions & chidescaler_neo::input::MAIN_ACTION_STOP != 0 {
+            let current = self.engine.status.lock().unwrap().clone();
+            let provider_preparing = chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
+            if current.starting || current.running || provider_preparing {
+                log::info!("main-capture-control: action=stop trigger=win32-lockfree-down");
+                let _ = self.request_capture_stop("main-gui-direct");
+            } else {
+                log::debug!("main-capture-control: action=stop result=stale-direct-click-ignored");
+            }
+        }
+        if main_actions & chidescaler_neo::input::MAIN_ACTION_START != 0 {
+            let current = self.engine.status.lock().unwrap().clone();
+            let provider_preparing = chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
+            if !current.starting && !current.running && !current.stopping && !provider_preparing {
+                log::info!("main-capture-control: action=start trigger=win32-lockfree-down");
+                let _ = self.request_capture_start("main-gui-direct");
+            } else {
+                log::debug!(
+                    "main-capture-control: action=start result=stale-direct-click-ignored starting={} running={} stopping={} preparing={}",
+                    current.starting,
+                    current.running,
+                    current.stopping,
+                    provider_preparing
+                );
+            }
+        }
+
         let mut toggle_hotkey_handled = false;
         while let Ok(event) = self.hotkeys.rx.try_recv() {
+            if event.handled_while_minimized {
+                log::info!(
+                    "hotkey-dispatch-ignored: id={} binding='{}' reason=already-handled-while-minimized",
+                    event.id,
+                    event.binding
+                );
+                continue;
+            }
             if self.hotkey_editor_open {
                 log::info!(
                     "hotkey-dispatch-ignored: id={} binding='{}' reason=editor-open",
@@ -4222,7 +6160,31 @@ impl eframe::App for App {
                 }
             }
         }
-        let status = self.engine.status.lock().unwrap().clone();
+        let mut status = self.engine.status.lock().unwrap().clone();
+
+        // The established GLSL overload detector remains the sole authority.
+        // Once it has armed a deadline, keep the warning readable for the full
+        // grace period and then enter the exact same Stop path as the user's
+        // normal Stop button. Engine::send(Cmd::Stop) therefore retains all of
+        // the proven immediate cursor/source/overlay recovery and provider
+        // cancellation behavior.
+        if status.running && !status.stopping {
+            if let Some(deadline) = status.glsl_overload_auto_stop_deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    log::info!(
+                        "glsl-overload-auto-stop: deadline-reached action=dispatch-normal-stop"
+                    );
+                    let _ = self.request_capture_stop("glsl-overload-auto-stop");
+                    status = self.engine.status.lock().unwrap().clone();
+                } else {
+                    // Event-driven GUI modes must still wake at the deadline even
+                    // when the pointer is elsewhere or the GUI is behind the overlay.
+                    ctx.request_repaint_after((deadline - now).min(Duration::from_millis(100)));
+                }
+            }
+        }
+
         if status.onnx_backend_revision != self.onnx_backend_revision_seen {
             self.onnx_backend_revision_seen = status.onnx_backend_revision;
             if let Some(requested) = self.onnx_backend_pending.take() {
@@ -4239,10 +6201,11 @@ impl eframe::App for App {
         }
         let running = status.running;
         if !self.was_running && running {
-            // A retained egui child viewport still has the previous session's
+            // The retained native panel host still has the previous session's
             // desktop position. Keep it hidden until control_panel commits
             // the new overlay-relative rectangle with its final pixel size.
             self.panel_placed_for_run = false;
+            self.panel_gdi_reveal_pending = false;
             self.panel_state_sent = None;
             self.panel_layout_sent = None;
             if self.panel_hwnd != 0
@@ -4251,9 +6214,29 @@ impl eframe::App for App {
             {
                 win32::set_window_alpha(self.panel_hwnd, 0);
                 win32::set_window_input_passthrough(self.panel_hwnd, true);
+                if win32::is_panel_gdi_host(self.panel_hwnd) {
+                    win32::set_panel_gdi_host_visible(self.panel_hwnd, false);
+                }
             }
         }
         if self.was_running && !running {
+            // v539 TOPMOST-OFF keeps the root GUI DWM-cloaked for the whole
+            // running interval. Once the overlay session ends, release only
+            // that owned cloak and restore the ordinary non-topmost GUI.
+            if self.gui_topmost_off_cloak_applied
+                && self.gui_hwnd != 0
+                && win32::is_window_valid(self.gui_hwnd)
+            {
+                let reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+                let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+                self.gui_topmost_off_cloak_applied = still_cloaked;
+                log::debug!(
+                    "GUI topmost off cloak release on capture stop: gui={:#x} request_ok={} still_cloaked={}",
+                    self.gui_hwnd,
+                    reveal_ok,
+                    still_cloaked
+                );
+            }
             // A fullscreen source may re-assert its own ClipCursor while it is
             // foreground. Put our topmost GUI back in the foreground first,
             // then perform a final process-wide cursor release.
@@ -4287,8 +6270,71 @@ impl eframe::App for App {
         if self.locale_test_override.is_none() {
             self.settings.language = lang;
         }
-        if let Some((model, elapsed, completed, total, model_active)) =
-            chidescaler_neo::render::onnx_stage::tensorrt_build_progress()
+
+        // When the root GUI is not physically visible above the video
+        // overlay (GUI topmost OFF/cloaked, minimized, or simply behind the
+        // windowed overlay), mirror the same overload-stop notice directly on
+        // the magnified content using a cached native GDI helper. This does not
+        // create another WGPU surface, avoiding low-spec GUI corruption.
+        // content_rect is physical desktop geometry for both
+        // fullscreen and windowed magnification, so moves/resizes naturally
+        // reposition the notice without touching WGC/GLSL/Present.
+        let root_gui_notice_visible = self.gui_hwnd != 0
+            && win32::is_window_valid(self.gui_hwnd)
+            && win32::is_window_visible(self.gui_hwnd)
+            && !win32::is_minimized(self.gui_hwnd)
+            && !win32::is_cloaked(self.gui_hwnd)
+            && status.overlay_hwnd != 0
+            && win32::window_is_above(self.gui_hwnd, status.overlay_hwnd);
+        if running
+            && !status.stopping
+            && status.glsl_overload_auto_stop_deadline.is_some()
+            && !root_gui_notice_visible
+        {
+            win32::show_overload_notice_gdi(
+                status.overlay_hwnd,
+                status.content_rect,
+                i18n::text(lang, "glsl_overload.auto_stop"),
+            );
+        } else {
+            win32::hide_overload_notice_gdi();
+        }
+
+        // Low-spec GLSL protection is intentionally visible. The
+        // established overload thresholds unchanged, but a proven overload now
+        // enters a six-second readable warning grace and then the ordinary Stop route. During
+        // the grace the engine holds the last complete filtered frame whenever
+        // that is semantics-safe, so cursor/GUI/DWM recovery gets GPU headroom.
+        if self.settings.ui_mode != UiMode::Mini && running && status.glsl_overload_notice_latched {
+            egui::Window::new("glsl-overload-pause-notice")
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 58.0))
+                .collapsible(false)
+                .resizable(false)
+                .movable(false)
+                .title_bar(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(34, 29, 18))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(214, 164, 66),
+                        ))
+                        .corner_radius(6.0)
+                        .inner_margin(12.0),
+                )
+                .show(ctx, |ui| {
+                    ui.set_max_width(580.0);
+                    ui.label(
+                        egui::RichText::new(i18n::text(lang, "glsl_overload.auto_stop"))
+                            .family(locale_font_family(lang))
+                            .strong(),
+                    );
+                });
+        }
+
+        if self.settings.ui_mode != UiMode::Mini
+            && let Some((model, elapsed, completed, total, model_active)) =
+                chidescaler_neo::render::onnx_stage::tensorrt_build_progress()
         {
             let cancel_requested = chidescaler_neo::render::onnx_stage::tensorrt_cancel_requested();
             egui::Window::new(tr(
@@ -4362,8 +6408,8 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         let mini_ui = self.settings.ui_mode == UiMode::Mini;
-        let mut basic_ui = self.settings.ui_mode == UiMode::Basic;
-        let mut full_ui = self.settings.ui_mode == UiMode::Full;
+        let basic_ui = self.settings.ui_mode == UiMode::Basic;
+        let full_ui = self.settings.ui_mode == UiMode::Full;
         // QA-only transition path: start with statistics off, then enable it
         // without resetting layout state. This catches stale resize keys that
         // a screenshot launched directly in stats-on mode cannot detect.
@@ -4387,7 +6433,6 @@ impl eframe::App for App {
         }
 
         // ---------- top bar ----------
-        let mut requested_ui_mode = None;
         let mut language_changed = false;
         egui::Panel::top("top").show(root, |ui| {
             if mini_ui {
@@ -4592,7 +6637,9 @@ impl eframe::App for App {
                         ctx.request_repaint();
                     }
                     ui.add_space(5.0);
-                    requested_ui_mode = ui_mode_pill(ui, self.settings.ui_mode);
+                    if let Some(mode) = ui_mode_pill(ui, self.settings.ui_mode) {
+                        self.prepare_ui_mode_switch(ui, lang, mode);
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -4600,19 +6647,28 @@ impl eframe::App for App {
                 // Size from the actual localized galley so left/right padding
                 // remains equal for long French, Portuguese and German text.
                 {
-                    let capture_busy = status.starting
-                        || running
-                        || status.stopping
-                        || chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
-                    let label = if status.stopping {
-                        tr(lang, "停止処理中", "Stopping")
-                    } else if capture_busy {
-                        tr(lang, "■ 停止", "■ Stop")
+                    let provider_preparing =
+                        chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
+                    let preparing = status.starting || provider_preparing;
+                    if preparing || status.stopping {
+                        // Keep the transient button state visibly live while
+                        // filters/providers are being prepared or Stop cleanup
+                        // is unwinding; idle GUI fallback can otherwise be too
+                        // slow to show the state before it has already changed.
+                        ctx.request_repaint_after(Duration::from_millis(33));
+                    }
+                    // Keep the compact two-label control: idle/preparing shows
+                    // Start, while a confirmed running/teardown state shows Stop.
+                    // v408 changes only the visual latch: active capture is now
+                    // indicated by a raised red Stop face rather than a face held down.
+                    let label = if running || status.stopping {
+                        i18n::text(lang, "capture.running")
                     } else {
-                        tr(lang, "▶ 拡大開始", "▶ Start")
+                        i18n::text(lang, "capture.start")
                     };
-                    let label_text = label
-                        .trim_start_matches(|c: char| c == '▶' || c == '■' || c.is_whitespace());
+                    let label_text = label.trim_start_matches(|c: char| {
+                        c == '▶' || c == '■' || c == '●' || c.is_whitespace()
+                    });
                     let font = egui::FontId::new(15.0, locale_font_family(lang));
                     let galley = ui.painter().layout_no_wrap(
                         label_text.to_owned(),
@@ -4624,65 +6680,131 @@ impl eframe::App for App {
                     // different side bearings and ascenders, so centering
                     // the logical galley makes the visible padding drift.
                     let ink_bounds = galley.mesh_bounds;
-                    const ICON_SIZE: f32 = 10.0;
-                    const ICON_GAP: f32 = 7.0;
-                    let group_width = ICON_SIZE + ICON_GAP + ink_bounds.width();
-                    let button_width = (group_width + 36.0).max(150.0);
+                    let group_width = ink_bounds.width();
+                    let button_width = (group_width + 44.0).max(150.0);
                     let (rect, resp) = ui
                         .allocate_exact_size(egui::vec2(button_width, 36.0), egui::Sense::click());
-                    let base = if status.stopping {
-                        egui::Color32::from_rgb(88, 88, 88)
-                    } else if capture_busy {
-                        egui::Color32::from_rgb(140, 60, 60)
+
+                    let now = Instant::now();
+                    if self
+                        .main_control_press_until
+                        .is_some_and(|until| now >= until)
+                    {
+                        self.main_control_press_until = None;
+                    }
+                    // v408: keep the tactile push animation, but do not keep
+                    // the button mechanically latched while capture is running.
+                    // A real pointer/keyboard DOWN still depresses the face for
+                    // the existing short 115 ms feedback window; once capture
+                    // starts, the face rises again and the red Stop state alone
+                    // communicates that capture is active.
+                    let pressed = resp.is_pointer_button_down_on()
+                        || chidescaler_neo::input::main_control_direct_pressed()
+                        || self
+                            .main_control_press_until
+                            .is_some_and(|until| now < until);
+                    if pressed {
+                        ctx.request_repaint_after(Duration::from_millis(16));
+                    }
+
+                    // Idle/starting remains neutral. Running and Stop cleanup use
+                    // a raised red face so the active state is obvious without a
+                    // permanently recessed control.
+                    let base = if running || status.stopping {
+                        egui::Color32::from_rgb(176, 58, 58)
                     } else {
-                        egui::Color32::from_rgb(50, 110, 60)
+                        egui::Color32::from_rgb(76, 82, 92)
                     };
-                    let fill = if resp.hovered() {
-                        base.gamma_multiply(1.25)
+                    let press_y = if pressed { 3.0 } else { 0.0 };
+                    let depth_y = if pressed { 3.8 } else { 5.2 };
+
+                    let depth_rect = rect.translate(egui::vec2(0.0, depth_y));
+                    ui.painter().rect_filled(
+                        depth_rect,
+                        9.0,
+                        base.gamma_multiply(0.42),
+                    );
+                    let face_rect = rect.translate(egui::vec2(0.0, press_y));
+                    let fill = if pressed {
+                        base.gamma_multiply(0.92)
+                    } else if resp.hovered() {
+                        base.gamma_multiply(1.15)
                     } else {
                         base
                     };
-                    ui.painter().rect_filled(rect, 9.0, fill);
-                    // Font glyphs for ▶/■ vary in baseline and side bearing,
-                    // especially between CJK fonts. Draw the status symbol as
-                    // geometry and center the icon+label group as one unit.
-                    let group_left = rect.center().x - group_width * 0.5;
-                    let icon_center = egui::pos2(group_left + ICON_SIZE * 0.5, rect.center().y);
-                    if capture_busy {
-                        ui.painter().rect_filled(
-                            egui::Rect::from_center_size(
-                                icon_center,
-                                egui::vec2(ICON_SIZE - 1.0, ICON_SIZE - 1.0),
-                            ),
+
+                    ui.painter().rect_filled(face_rect, 7.4, fill);
+                    ui.painter().rect_stroke(
+                        face_rect.shrink(0.6),
+                        6.8,
+                        egui::Stroke::new(
                             0.8,
-                            egui::Color32::WHITE,
-                        );
-                    } else {
-                        let half = ICON_SIZE * 0.5;
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(icon_center.x - half, icon_center.y - half),
-                                egui::pos2(icon_center.x - half, icon_center.y + half),
-                                egui::pos2(icon_center.x + half, icon_center.y),
-                            ],
-                            egui::Color32::WHITE,
-                            egui::Stroke::NONE,
-                        ));
-                    }
-                    let text_center = egui::pos2(
-                        group_left + ICON_SIZE + ICON_GAP + ink_bounds.width() * 0.5,
-                        rect.center().y,
+                            if !pressed {
+                                egui::Color32::WHITE.gamma_multiply(0.14)
+                            } else {
+                                egui::Color32::WHITE.gamma_multiply(0.06)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
                     );
+
+                    // The text follows the transient physical face so the short
+                    // click depression still feels identical to the old button.
+                    let text_center = face_rect.center();
                     let galley_pos = text_center - ink_bounds.center().to_vec2();
                     ui.painter()
                         .galley(galley_pos, galley, egui::Color32::WHITE);
-                    if resp.clicked() {
+
+                    // Publish the *painted* control rectangle in Win32 client
+                    // pixels. Start and Stop both commit on the same physical DOWN edge;
+                    // only the published mode changes with the latch state.
+                    let control_screen_rect = if self.gui_hwnd != 0 {
+                        let ppp = ui.ctx().pixels_per_point().max(0.5);
+                        let left = (rect.min.x * ppp).floor() as i32;
+                        let top = (rect.min.y * ppp).floor() as i32;
+                        let right = (rect.max.x * ppp).ceil() as i32;
+                        let bottom = (rect.max.y * ppp).ceil() as i32;
+                        Some((left, top, (right - left).max(1), (bottom - top).max(1)))
+                    } else {
+                        None
+                    };
+                    let control_mode = if status.stopping {
+                        chidescaler_neo::input::MAIN_CONTROL_DISABLED
+                    } else if preparing || running {
+                        chidescaler_neo::input::MAIN_CONTROL_STOP
+                    } else {
+                        chidescaler_neo::input::MAIN_CONTROL_START
+                    };
+                    chidescaler_neo::input::set_main_control_surface(
+                        self.gui_hwnd,
+                        control_screen_rect,
+                        control_mode,
+                    );
+
+                    // Native mouse actions are already committed on physical
+                    // pointer-DOWN by WH_MOUSE_LL. Never toggle again from the
+                    // matching egui release: that exact duplicate was able to
+                    // turn a completed Stop into an unintended Start in v348t.
+                    if resp.clicked_by(egui::PointerButton::Primary) {
+                        log::debug!(
+                            "main-capture-control: action=release result=presentation-only"
+                        );
+                    }
+                    // Keep keyboard activation available without reintroducing
+                    // release-based mouse semantics.
+                    let keyboard_activate = resp.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    if keyboard_activate {
+                        self.main_control_press_until =
+                            Some(now + Duration::from_millis(115));
                         if status.stopping {
-                            log::info!("main-capture-control: action=stop result=ignored-already-stopping");
-                        } else if capture_busy {
-                            let _ = self.request_capture_stop("main-gui");
+                            log::info!(
+                                "main-capture-control: action=keyboard result=ignored-already-stopping"
+                            );
+                        } else if preparing || running {
+                            let _ = self.request_capture_stop("main-gui-keyboard");
                         } else {
-                            let _ = self.request_capture_start("main-gui");
+                            let _ = self.request_capture_start("main-gui-keyboard");
                         }
                     }
                 }
@@ -4988,13 +7110,11 @@ impl eframe::App for App {
                     self.confirm_delete = true;
                 }
             });
-            ui.add_space(8.0);
+            // v348z: Mini's deeper raised/latched capture button visually
+            // occupies more of the lower edge than the old flat control. Keep
+            // an explicit DPI-aware footer gutter without changing Basic/Full.
+            ui.add_space(if mini_ui { 13.0 } else { 8.0 });
         });
-        if let Some(mode) = requested_ui_mode {
-            self.switch_ui_mode(ctx, mode);
-            basic_ui = self.settings.ui_mode == UiMode::Basic;
-            full_ui = self.settings.ui_mode == UiMode::Full;
-        }
 
         // ---------- target frame ----------
         if !mini_ui {
@@ -5123,7 +7243,9 @@ impl eframe::App for App {
                         )
                         .changed()
                         {
-                            self.engine.metrics.set_enabled(self.settings.stats_on);
+                            self.engine.metrics.set_enabled(
+                                self.settings.stats_on || logging::diagnostics_enabled(),
+                            );
                             self.resize_basic_for_stats(ui.ctx());
                             self.basic_stats_layout_applied = Some(self.settings.stats_on);
                             self.basic_stats_rows_applied = Some(self.basic_stats_rows());
@@ -5215,13 +7337,15 @@ impl eframe::App for App {
                             }
                         } else {
                             for (name, stage) in rows {
+                                let line = if stage.ms >= 0.0 {
+                                    format!("  {:>5.2}ms  [{}] {}", stage.ms, stage.kind, name)
+                                } else {
+                                    format!("  --.--ms  [{}] {}", stage.kind, name)
+                                };
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "  {:>5.2}ms  [{}] {}",
-                                        stage.ms, stage.kind, name
-                                    ))
-                                    .family(locale_font_family(UiLanguage::EnUs))
-                                    .size(STATS_FONT_SIZE),
+                                    egui::RichText::new(line)
+                                        .family(locale_font_family(UiLanguage::EnUs))
+                                        .size(STATS_FONT_SIZE),
                                 );
                             }
                         }
@@ -5417,7 +7541,7 @@ impl eframe::App for App {
                 )
                     .changed()
                 {
-                    self.engine.metrics.set_enabled(self.settings.stats_on);
+                    self.engine.metrics.set_enabled(self.settings.stats_on || logging::diagnostics_enabled());
                     settings_changed = true;
                 }
                 if ink_centered_checkbox(
@@ -5439,14 +7563,41 @@ impl eframe::App for App {
                 {
                     settings_changed = true;
                 }
-                if ink_centered_checkbox(
+                // A fixed capture resolution is defined in client-area pixels, so
+                // client-only capture is mandatory while a resolution is selected.
+                // Keep the user's manual setting untouched underneath the forced
+                // visual state so switching Capture Resolution back to Auto restores
+                // exactly the previous ON/OFF preference.
+                let capture_resolution_forces_client_only =
+                    self.settings.capture_resolution.is_some();
+                let mut client_only_display = if capture_resolution_forces_client_only {
+                    true
+                } else {
+                    self.settings.client_only
+                };
+                let mut client_only_response = ink_centered_checkbox_enabled(
                     ui,
-                    &mut self.settings.client_only,
+                    !capture_resolution_forces_client_only,
+                    &mut client_only_display,
                     tr(lang, "タイトルバー除外", "Client area only"),
-                )
-                    .on_hover_text(i18n::text(lang, "capture.client_help"))
-                    .changed()
-                {
+                );
+                if capture_resolution_forces_client_only {
+                    // `add_enabled(false, ...)` intentionally suppresses interaction,
+                    // including hover sensing. Add a hover-only response over the
+                    // exact disabled checkbox rect so the reason for the forced ON
+                    // state remains discoverable without making the control clickable.
+                    ui.interact(
+                        client_only_response.rect,
+                        client_only_response.id.with("forced-client-only-help"),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(i18n::text(lang, "capture.client_forced_help"));
+                } else {
+                    client_only_response =
+                        client_only_response.on_hover_text(i18n::text(lang, "capture.client_help"));
+                }
+                if !capture_resolution_forces_client_only && client_only_response.changed() {
+                    self.settings.client_only = client_only_display;
                     settings_changed = true;
                 }
                 if HDR_CAPTURE_OPTION_ENABLED
@@ -5469,6 +7620,12 @@ impl eframe::App for App {
                     .changed()
                 {
                     logging::set_file_logging(&self.app_dir, self.settings.log_on);
+                    // Detailed per-stage timers serve either the visible Stats
+                    // panel or the diagnostic log. Keep them off only when
+                    // neither feature needs them.
+                    self.engine.metrics.set_enabled(
+                        self.settings.stats_on || logging::diagnostics_enabled(),
+                    );
                     settings_changed = true;
                 }
                 ui.separator();
@@ -5629,103 +7786,7 @@ impl eframe::App for App {
                         );
                     });
 
-                if BROWSER_HW_LAUNCHER_ENABLED {
-                    egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(27, 28, 30))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(65, 68, 73),
-                    ))
-                    .corner_radius(egui::CornerRadius::same(5))
-                    .inner_margin(egui::Margin::same(8))
-                    .show(&mut columns[1], |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.set_min_height(64.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                egui::RichText::new(tr(
-                                    lang,
-                                    "HWアクセラレーション",
-                                    "HW Acceleration",
-                                ))
-                                .size(12.0)
-                                .strong(),
-                            );
-                            let browser_before = self.settings.browser_kind;
-                            egui::ComboBox::from_id_salt("software_decode_browser")
-                                .width(118.0)
-                                .selected_text(self.settings.browser_kind.display_name())
-                                .show_ui(ui, |ui| {
-                                    for kind in [
-                                        BrowserKind::Edge,
-                                        BrowserKind::Chrome,
-                                        BrowserKind::Firefox,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut self.settings.browser_kind,
-                                            kind,
-                                            kind.display_name(),
-                                        );
-                                    }
-                                });
-                            if self.settings.browser_kind != browser_before {
-                                settings_changed = true;
-                                self.browser_launch_feedback = None;
-                            }
-                        });
-                        ui.add_space(3.0);
-                        ui.horizontal_wrapped(|ui| {
-                            let launch = ui
-                                .button(tr(
-                                    lang,
-                                    "HWデコードOFFで起動",
-                                    "Launch with HW decode OFF",
-                                ))
-                                .on_hover_text(i18n::text(lang, "browser.launch_help"));
-                            if launch.clicked() {
-                                let selected = self.settings.browser_kind;
-                                self.browser_launch_feedback = match browser::launch_hw_decode_off(
-                                    &self.app_dir,
-                                    selected,
-                                ) {
-                                    Ok(_) => Some((
-                                        true,
-                                        format!(
-                                            "{}{}",
-                                            selected.display_name(),
-                                            tr(lang, "を起動しました", " launched")
-                                        ),
-                                    )),
-                                    Err(error) => {
-                                        log::warn!("browser-launch-ui-error: {error}");
-                                        Some((
-                                            false,
-                                            format!(
-                                                "{}{}",
-                                                selected.display_name(),
-                                                tr(
-                                                    lang,
-                                                    "が見つからないか、起動できませんでした",
-                                                    " was not found or could not be launched",
-                                                )
-                                            ),
-                                        ))
-                                    }
-                                };
-                            }
-                            if let Some((ok, message)) = &self.browser_launch_feedback {
-                                let color = if *ok {
-                                    egui::Color32::LIGHT_GREEN
-                                } else {
-                                    egui::Color32::LIGHT_RED
-                                };
-                                ui.colored_label(color, message);
-                            }
-                        });
-                    });
-                } else {
-                    self.resource_meter(&mut columns[1]);
-                }
+                self.resource_meter(&mut columns[1]);
             });
             if settings_changed {
                 save_settings(&self.app_dir, &self.settings);
@@ -5801,13 +7862,15 @@ impl eframe::App for App {
                     }
                 } else {
                     for (name, st) in rows {
+                        let line = if st.ms >= 0.0 {
+                            format!("  {:>5.2}ms  [{}] {}", st.ms, st.kind, name)
+                        } else {
+                            format!("  --.--ms  [{}] {}", st.kind, name)
+                        };
                         ui.label(
-                            egui::RichText::new(format!(
-                                "  {:>5.2}ms  [{}] {}",
-                                st.ms, st.kind, name
-                            ))
-                            .family(locale_font_family(UiLanguage::EnUs))
-                            .size(STATS_FONT_SIZE),
+                            egui::RichText::new(line)
+                                .family(locale_font_family(UiLanguage::EnUs))
+                                .size(STATS_FONT_SIZE),
                         );
                     }
                 }
@@ -6158,9 +8221,58 @@ impl eframe::App for App {
         let mut panel_status = status.clone();
         panel_status.running |= self.qa_panel_preview;
         self.control_panel(ctx, &panel_status);
+        // v505: restore only the pre-v465 AMD/WGPU composition keep-alive.
+        // The native GDI panel and the existing independent cursor sprite remain
+        // authoritative for visuals/input; this viewport is only a DWM anchor.
+        self.compositor_keepalive_anchor(ctx, &panel_status);
 
         // ---------- modals ----------
-        if let Some((hwnd, title)) = self.elevated_target_notice.clone() {
+        if self.settings.ui_mode != UiMode::Mini && self.capture_resolution_fullscreen_notice_open {
+            let mut close_notice = false;
+            let notice_title = i18n::text(lang, "capture.fullscreen_notice_title");
+            let notice_body = i18n::text(lang, "capture.fullscreen_notice_body");
+            egui::Window::new(notice_title)
+                .id(egui::Id::new("capture_resolution_fullscreen_notice"))
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 68.0))
+                .collapsible(false)
+                .resizable(false)
+                .movable(false)
+                .show(ctx, |ui| {
+                    // Size this one-shot notice from the actual localized glyph width
+                    // instead of forcing the old 430-point minimum. Short CJK text stays
+                    // compact, while longer Latin translations get only the width they
+                    // need. The clamp prevents either a cramped column or a very wide
+                    // release-notice window on high-DPI / localized systems.
+                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                    let text_color = ui.visuals().text_color();
+                    let unwrapped_body_width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(notice_body.to_owned(), font_id, text_color)
+                            .size()
+                            .x
+                    });
+                    let notice_width = (unwrapped_body_width / 4.8).clamp(300.0, 390.0);
+                    ui.set_min_width(notice_width);
+                    ui.set_max_width(notice_width);
+                    ui.label(notice_body);
+                    ui.add_space(8.0);
+                    ui.horizontal_centered(|ui| {
+                        // Use the same glyph-bounds centering path as the other corrected
+                        // Neo popup buttons. The stock button baseline can look vertically
+                        // high/low depending on the active Windows font and DPI.
+                        if control_row_button(ui, "OK").clicked() {
+                            close_notice = true;
+                        }
+                    });
+                });
+            if close_notice {
+                self.capture_resolution_fullscreen_notice_open = false;
+            }
+        }
+
+        if self.settings.ui_mode != UiMode::Mini
+            && let Some((hwnd, title)) = self.elevated_target_notice.clone()
+        {
             let mut keep_open = true;
             let mut restart = false;
             egui::Window::new(tr(
@@ -6231,7 +8343,9 @@ impl eframe::App for App {
                 self.elevated_target_notice = None;
             }
         }
-        if let Some((index, mut value)) = self.resize_scale_editor.take() {
+        if self.settings.ui_mode != UiMode::Mini
+            && let Some((index, mut value)) = self.resize_scale_editor.take()
+        {
             let mut keep_open = true;
             let mut apply = false;
             egui::Window::new(tr(lang, "リサイズ倍率", "Resize scale"))
@@ -6276,7 +8390,7 @@ impl eframe::App for App {
                 self.resize_scale_editor = Some((index, value.clamp(0.25, 4.0)));
             }
         }
-        if self.hotkey_editor_open {
+        if self.settings.ui_mode != UiMode::Mini && self.hotkey_editor_open {
             let mut open = true;
             let mut save = false;
             let mut cancel = false;
@@ -6376,7 +8490,7 @@ impl eframe::App for App {
                 self.hotkey_capture_pending = None;
             }
         }
-        if self.filter_picker_open {
+        if self.settings.ui_mode != UiMode::Mini && self.filter_picker_open {
             let tree = build_filter_tree(&self.available);
             let mut open = true;
             let mut add: Option<(StageKind, String)> = None;
@@ -6399,7 +8513,7 @@ impl eframe::App for App {
                 log::info!("filter-picker-close: cancelled=true");
             }
         }
-        if self.save_as_open {
+        if self.settings.ui_mode != UiMode::Mini && self.save_as_open {
             let mut open = true;
             egui::Window::new(tr(lang, "別名で保存", "Save As"))
                 .collapsible(false)
@@ -6468,7 +8582,7 @@ impl eframe::App for App {
                 self.save_as_error = None;
             }
         }
-        if self.confirm_delete {
+        if self.settings.ui_mode != UiMode::Mini && self.confirm_delete {
             egui::Window::new(tr(lang, "プリセットの削除", "Delete Preset"))
                 .collapsible(false)
                 .resizable(false)
@@ -6496,6 +8610,9 @@ impl eframe::App for App {
                 });
         }
 
+        self.render_mini_glsl_overload_notice(ctx, lang, &status, running);
+        self.render_mini_dialog_host(ctx, lang, &status, running);
+
         if self.gui_test_screenshot_path.is_some() && !self.gui_test_screenshot_requested {
             self.gui_test_frame_count += 1;
             let required_frames = std::env::var("NEO_GUI_SCREENSHOT_FRAMES")
@@ -6520,6 +8637,11 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Never leave a temporary transition helper alive during shutdown.
+        win32::hide_gui_transition_snapshot();
+        if self.gui_hwnd != 0 && win32::is_cloaked(self.gui_hwnd) {
+            let _ = win32::set_window_cloaked(self.gui_hwnd, false);
+        }
         if std::env::var_os("NEO_GUI_SCREENSHOT").is_none() {
             save_settings(&self.app_dir, &self.settings);
             self.store.save();
@@ -6546,11 +8668,20 @@ mod app_tests {
     use super::*;
 
     #[test]
+    fn gui_surfaces_use_autonovsync_and_sparse_caption_drag_redraws() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("present_mode: eframe::wgpu::PresentMode::AutoNoVsync"));
+        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(runtime.contains("fn root_drag_redraw_due"));
+        assert!(runtime.contains("Duration::from_millis(200)"));
+    }
+
+    #[test]
     fn gui_fallback_throttles_only_the_gui_side() {
         assert_eq!(gui_fallback_repaint_ms(false, 0.200), 250);
-        assert_eq!(gui_fallback_repaint_ms(true, 0.016), 33);
-        assert_eq!(gui_fallback_repaint_ms(true, 0.050), 50);
-        assert_eq!(gui_fallback_repaint_ms(true, 0.100), 66);
+        assert_eq!(gui_fallback_repaint_ms(true, 0.016), 521);
+        assert_eq!(gui_fallback_repaint_ms(true, 0.050), 521);
+        assert_eq!(gui_fallback_repaint_ms(true, 0.100), 521);
     }
 
     #[test]
@@ -6665,7 +8796,7 @@ mod app_tests {
             .split("fn request_onnx_backend_switch")
             .nth(1)
             .expect("backend request function")
-            .split("fn switch_ui_mode")
+            .split("fn prepare_ui_mode_switch")
             .next()
             .expect("backend request function end");
         let selected = request
@@ -6839,6 +8970,91 @@ mod app_tests {
         ] {
             assert!(modal_source.contains(label), "missing modal label: {label}");
         }
+    }
+
+    #[test]
+    fn mini_mode_routes_all_window_modals_through_one_dialog_host() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("neo_mini_dialog_host"));
+        assert!(source.contains("cHiDeScaler-Neo Mini Dialog"));
+        assert!(source.contains("with_always_on_top()"));
+        assert!(source.contains("mini-dialog-host: hwnd="));
+        assert!(source.contains("cursor_route=own-window"));
+        for variant in [
+            "TensorRt",
+            "Elevated",
+            "FullscreenCaptureNotice",
+            "ResizeScale",
+            "Hotkey",
+            "FilterPicker",
+            "SaveAs",
+            "DeletePreset",
+        ] {
+            assert!(source.contains(&format!("Kind::{variant}")));
+        }
+        // Body content may scroll, but the action row is painted after the
+        // ScrollArea so OK/Cancel/Stop remains reachable even in Mini.
+        let host = source
+            .split("fn render_mini_dialog_host")
+            .nth(1)
+            .expect("mini dialog host")
+            .split("impl eframe::App for App")
+            .next()
+            .expect("mini dialog host end");
+        let scroll = host.find("ScrollArea::vertical()").expect("scroll body");
+        let footer = host
+            .find("ui.horizontal_centered(|ui| match kind")
+            .expect("fixed footer");
+        assert!(scroll < footer);
+        // The overload warning is intentionally NOT another Mini child viewport:
+        // it appears exactly when low-spec GPUs have no WGPU headroom.
+        assert!(source.contains("mini-glsl-overload-inline"));
+        assert!(!host.contains("GlslOverload"));
+        assert!(!host.contains("glsl_overload.pause"));
+
+        // The inline warning must never re-enter egui's wrapping layout.  It
+        // is intentionally a fixed-height, pre-laid-out one-line galley. The
+        // warning triangle is geometry (not a locale-font glyph), so its center
+        // cannot drift when switching fonts/languages.
+        let warning = source
+            .split("fn render_mini_glsl_overload_notice")
+            .nth(1)
+            .expect("mini overload warning")
+            .split("fn render_mini_dialog_host")
+            .next()
+            .expect("mini overload warning end");
+        assert!(warning.contains("layout_no_wrap"));
+        assert!(warning.contains("const WARNING_H: f32 = 25.0"));
+        assert!(warning.contains("let icon_center = egui::pos2"));
+        assert!(warning.contains("rect.center().y - ink.center().y"));
+        assert!(warning.contains("line_segment([top, left]"));
+        assert!(!warning.contains("⚠ 性能不足"));
+        assert!(!warning.contains("ui.label("));
+        assert!(!warning.contains("egui::Frame::new()"));
+        assert!(warning.contains("glsl_overload.auto_stop"));
+    }
+
+    #[test]
+    fn proven_glsl_overload_uses_bounded_grace_then_normal_stop() {
+        let main = include_str!("main.rs");
+        let engine = include_str!("engine.rs");
+        let win32 = include_str!("platform/win32.rs");
+        assert!(engine.contains("GLSL_OVERLOAD_AUTO_STOP_GRACE: Duration = Duration::from_secs(6)"));
+        assert!(engine.contains("glsl_overload_auto_stop_deadline"));
+        assert!(engine.contains("action=warn-then-normal-stop"));
+        assert!(engine.contains("if auto_stop_hold"));
+        assert!(main.contains("request_capture_stop(\"glsl-overload-auto-stop\")"));
+        assert!(main.contains("deadline-reached action=dispatch-normal-stop"));
+        // GUI-hidden warning uses the live magnified content rect and a cached
+        // native GDI helper; never reintroduce an overload-time WGPU viewport.
+        assert!(main.contains("show_overload_notice_gdi"));
+        assert!(main.contains("status.content_rect"));
+        assert!(win32.contains("NeoOverloadNoticeGdi"));
+        assert!(win32.contains("WS_EX_LAYERED | WS_EX_TRANSPARENT"));
+        assert!(win32.contains("backend=native-gdi-no-wgpu"));
+        // No separate force-close path: the existing Cmd::Stop route remains
+        // the sole shutdown mechanism.
+        assert!(!main.contains("Cmd::Shutdown // glsl-overload"));
     }
 
     #[test]
@@ -7103,6 +9319,13 @@ mod app_tests {
             fit_resolution_preserving_aspect(CaptureResolution { w: 640, h: 480 }, (854, 480)),
             CaptureResolution { w: 640, h: 360 }
         );
+        // Regression: 762x428 used to round to 640x359. WGC then edge-padded
+        // that frame to 640x360 while the engine waited forever for 640x359,
+        // causing a transition blackout and releasing cursor mapping.
+        assert_eq!(
+            fit_resolution_preserving_aspect(CaptureResolution { w: 640, h: 480 }, (762, 428)),
+            CaptureResolution { w: 640, h: 360 }
+        );
         assert!(is_picture_in_picture_title("ピクチャー イン ピクチャー"));
         assert!(is_picture_in_picture_title("Picture-in-Picture"));
     }
@@ -7156,19 +9379,19 @@ mod app_tests {
 
     #[test]
     fn panel_stop_is_idempotent_and_never_becomes_start() {
-        assert!(NeoApp::should_dispatch_panel_stop(
+        assert!(App::should_dispatch_panel_stop(
             false, true, false, false
         ));
-        assert!(NeoApp::should_dispatch_panel_stop(
+        assert!(App::should_dispatch_panel_stop(
             true, false, false, false
         ));
-        assert!(NeoApp::should_dispatch_panel_stop(
+        assert!(App::should_dispatch_panel_stop(
             false, false, false, true
         ));
-        assert!(!NeoApp::should_dispatch_panel_stop(
+        assert!(!App::should_dispatch_panel_stop(
             false, false, true, false
         ));
-        assert!(!NeoApp::should_dispatch_panel_stop(
+        assert!(!App::should_dispatch_panel_stop(
             false, false, false, false
         ));
 
@@ -7196,7 +9419,8 @@ mod app_tests {
         assert!(!source.contains(
             "if resp.clicked() && !status.stopping {\n                        self.toggle();"
         ));
-        assert!(source.contains("request_capture_stop(\"main-gui\")"));
+        assert!(source.contains("request_capture_stop(\"main-gui-direct\")"));
+        assert!(source.contains("request_capture_stop(\"main-gui-keyboard\")"));
         assert!(source.contains("request_capture_stop(\"floating-panel\")"));
         assert!(source.contains("dispatch_toggle_hotkey(&event)"));
     }
@@ -7208,21 +9432,6 @@ mod app_tests {
         assert!(source.contains("event.received_at <= self.capture_idle_since"));
         assert!(source.contains("hotkey-toggle-stale-ignored"));
         assert!(source.contains("hotkey-toggle-coalesced"));
-    }
-
-    #[test]
-    fn panel_stop_uses_visible_ink_centering_for_every_locale() {
-        let source = include_str!("main.rs");
-        let start = source.find("PanelControl::Stop =>").expect("stop control");
-        let end = source[start..]
-            .find("PanelControl::Camera =>")
-            .map(|offset| start + offset)
-            .expect("camera control");
-        let body = &source[start..end];
-        assert!(body.contains("paint_panel_text_ink_centered"));
-        assert!(body.contains(r#"i18n::text(lang, "capture.stop")"#));
-        assert!(!body.contains("UiLanguage::JaJp"));
-        assert!(!body.contains("+ egui::vec2(5.0, 1.5)"));
     }
 
     #[test]
@@ -7249,38 +9458,6 @@ mod app_tests {
         ] {
             assert!(!source.contains(&obsolete));
         }
-    }
-
-    #[test]
-    fn panel_bar_fits_stop_fps_camera_and_collapse() {
-        assert!(!SHOW_PANEL_GRIP);
-        let controls = PANEL_STOP_W_PTS
-            + PANEL_FPS_W_PTS
-            + PANEL_ICON_W_PTS
-            + PANEL_ICON_W_PTS
-            + PANEL_COLLAPSE_W_PTS;
-        assert!(PANEL_BAR_W_PTS >= controls + 9.0);
-        assert!(PANEL_BAR_W_PTS <= controls + 20.0);
-    }
-
-    #[test]
-    fn camera_and_collapse_art_are_geometrically_centered() {
-        let center = egui::pos2(17.0, 12.0);
-        let (body, bump, lens) = panel_camera_geometry(center);
-        let visual_top = body.top().min(bump.top());
-        let visual_bottom = body.bottom().max(bump.bottom());
-        assert!(((visual_top + visual_bottom) * 0.5 - center.y).abs() < f32::EPSILON);
-        assert!((body.center().x - center.x).abs() < f32::EPSILON);
-        assert!((lens.x - center.x).abs() < f32::EPSILON);
-        let collapse_left = center + egui::vec2(-6.0, 0.0);
-        let collapse_right = center + egui::vec2(6.0, 0.0);
-        assert_eq!(
-            egui::pos2(
-                (collapse_left.x + collapse_right.x) * 0.5,
-                (collapse_left.y + collapse_right.y) * 0.5,
-            ),
-            center
-        );
     }
 
     #[test]
@@ -7320,6 +9497,41 @@ mod app_tests {
         let ordered = stats_rows_in_filter_chain_order(&chain, rows);
         assert_eq!(ordered[0].0, "rife_v4.22_lite_fp16.onnx [DirectML]");
         assert_eq!(ordered[1].0, "2x_AnimeJaNai.onnx [DirectML]");
+    }
+
+    #[test]
+    fn gui_statistics_keep_unmeasured_live_shader_visible() {
+        let chain = vec![
+            StageSpec {
+                kind: StageKind::Onnx,
+                path: "models/rife_v4.22_lite_fp16.onnx".into(),
+                enabled: true,
+                params: Default::default(),
+            },
+            StageSpec {
+                kind: StageKind::Glsl,
+                path: "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl".into(),
+                enabled: true,
+                params: Default::default(),
+            },
+        ];
+        // This is the transient state seen after metrics.reset(): the ONNX
+        // worker reports immediately while the asynchronous GLSL timer has not
+        // produced a new sample yet. The GLSL row must remain visible.
+        let rows = vec![(
+            "rife_v4.22_lite_fp16.onnx [DirectML]".to_string(),
+            StageStat {
+                kind: "onnx".into(),
+                ms: 13.8,
+            },
+        )];
+
+        let ordered = stats_rows_in_filter_chain_order(&chain, rows);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].0, "rife_v4.22_lite_fp16.onnx [DirectML]");
+        assert_eq!(ordered[1].0, "FSRCNNX_x2_16_0_4_1.glsl");
+        assert!(ordered[1].1.ms < 0.0);
+        assert_eq!(ordered[1].1.kind, "glsl");
     }
 
     #[test]
@@ -7506,4 +9718,84 @@ mod app_tests {
         });
         assert_eq!(captured, Some(("Ctrl+Alt+Z".into(), egui::Key::Z)));
     }
+    #[test]
+    fn control_panel_uses_native_gdi_host_without_wgpu_child_viewport() {
+        let source = include_str!("main.rs");
+        let control = source
+            .split("fn control_panel")
+            .nth(1)
+            .expect("control_panel source")
+            .split("fn compositor_keepalive_anchor")
+            .next()
+            .expect("control_panel boundary");
+        assert!(control.contains("ensure_panel_gdi_host"));
+        assert!(control.contains("update_panel_gdi_mirror"));
+        assert!(!control.contains("show_viewport_immediate("));
+        assert!(!control.contains("show_viewport_deferred("));
+    }
+
+    #[test]
+    fn compositor_keepalive_is_separate_from_native_panel_and_off_only() {
+        let source = include_str!("main.rs");
+        let anchor = source
+            .split("fn compositor_keepalive_anchor")
+            .nth(1)
+            .expect("compositor anchor source")
+            .split("fn request_filtered_screenshot")
+            .next()
+            .expect("compositor anchor boundary");
+        assert!(anchor.contains("(!self.settings.gui_topmost || self.gui_topmost_off_pending)"));
+        assert!(anchor.contains("show_viewport_immediate("));
+        assert!(!anchor.contains("with_mouse_passthrough(true)"));
+        assert!(anchor.contains("place_below(status.overlay_hwnd, anchor)"));
+        assert!(anchor.contains("keep_cursor_sprite_on_top()"));
+    }
+    #[test]
+    fn gui_topmost_off_cloaks_before_anchor_creation_and_retains_cloak_while_running() {
+        let source = include_str!("main.rs");
+        let toggle = source
+            .split("fn toggle_gui_topmost")
+            .nth(1)
+            .expect("toggle_gui_topmost source")
+            .split("fn control_panel")
+            .next()
+            .expect("toggle boundary");
+        let cloak = toggle.find("set_window_cloaked(self.gui_hwnd, true)").expect("OFF cloak");
+        let pending = toggle.find("self.gui_topmost_off_pending = true").expect("OFF pending");
+        assert!(cloak < pending, "GUI must be cloaked before anchor creation is armed");
+        assert!(
+            toggle.contains("GUI topmost on cloak release"),
+            "TOPMOST ON must explicitly release the retained OFF cloak"
+        );
+
+        let update = source
+            .split("fn update(&mut self")
+            .nth(1)
+            .expect("update source")
+            .split("fn commit_gui_topmost_off")
+            .next()
+            .expect("update boundary");
+        assert!(
+            update.contains("&& !self.gui_topmost_off_pending"),
+            "fail-visible retry must not uncloak a staged TOPMOST-OFF transition"
+        );
+
+        let commit = source
+            .split("fn commit_gui_topmost_off")
+            .nth(1)
+            .expect("commit source")
+            .split("fn toggle_gui_topmost")
+            .next()
+            .expect("commit boundary");
+        let demote = commit.find("set_own_topmost(self.gui_hwnd, false)").expect("GUI demote");
+        let restack = commit
+            .find("recommit_overlay_below_helpers(0, overlay)")
+            .expect("TOPMOST helper restack");
+        let retain = commit
+            .find("GUI topmost off cloak retained")
+            .expect("running OFF cloak retention");
+        assert!(demote < restack, "GUI must be demoted while still cloaked");
+        assert!(restack < retain, "helper order must settle before the OFF cloak is retained");
+    }
+
 }

@@ -27,3 +27,23 @@ _diagnostics/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local/private development artifacts
+*.user
+*.suo
+*.tmp
+*.bak
+*.old
+*.dmp
+*.etl
+*.trace
+*.zip
+*.7z
+*.rar
+*.engine
+*.profile
+*.cache
+/.cargo/
+/_audit/
+/_scratch/
+

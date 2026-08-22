@@ -161,9 +161,15 @@ impl Metrics {
         }
         g.configured_stage_order = configured.clone();
 
+        g.snap.stages.retain(|name, stat| {
+            configured.iter().any(|current| current == name)
+                || is_frame_interpolation_detail(name)
+                || is_frame_interpolation_summary(name, stat)
+        });
         let mut stage_order = configured;
         for name in g.snap.stage_order.clone() {
             if g.snap.stages.contains_key(&name)
+                && is_frame_interpolation_detail(&name)
                 && !stage_order.iter().any(|existing| existing == &name)
             {
                 stage_order.push(name);
@@ -203,6 +209,18 @@ impl Metrics {
     pub fn probe(&self, name: &str, kind: &str, ms: f64) {
         let mut g = self.inner.lock().unwrap();
         if !g.gui_enabled {
+            return;
+        }
+        // Asynchronous GL timer results may arrive after a preset switch.
+        // Never let a completed query from the previous chain create a stale
+        // filter row in the current preset's statistics.
+        if !g.configured_stage_order.is_empty()
+            && !g
+                .configured_stage_order
+                .iter()
+                .any(|configured| configured == name)
+            && !is_frame_interpolation_detail(name)
+        {
             return;
         }
         if !g.snap.stages.contains_key(name)
@@ -258,6 +276,32 @@ impl Metrics {
             g.snap.lag_frames = latency_ms_to_frames(total_ms, DELAY_FRAME_MS_60FPS);
         }
         g.frame_stage_max_ms = 0.0;
+        match g.window_start {
+            None => g.window_start = Some(now),
+            Some(t0) => {
+                let dt = now.duration_since(t0).as_secs_f64();
+                if dt >= 1.0 {
+                    g.snap.present_fps = g.presents as f64 / dt;
+                    g.snap.capture_fps = g.captures as f64 / dt;
+                    g.presents = 0;
+                    g.captures = 0;
+                    g.window_start = Some(now);
+                }
+            }
+        }
+    }
+
+    /// Record a successful overlay presentation that reused an already
+    /// processed texture. This keeps the user-facing final-output FPS honest
+    /// without pretending that WGC delivered another captured frame or
+    /// disturbing per-stage timing from the next real processed frame.
+    pub fn present_only(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if !g.gui_enabled && !g.panel_enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        g.presents += 1;
         match g.window_start {
             None => g.window_start = Some(now),
             Some(t0) => {
@@ -511,6 +555,19 @@ mod tests {
         let rows = metrics.snapshot().display_stages();
         assert_eq!(rows[0].0, "rife_v4.22_lite_fp16.onnx [TensorRT]");
         assert_eq!(rows[1].0, "2x_AnimeJaNai.onnx [TensorRT]");
+    }
+
+    #[test]
+    fn stale_async_gpu_result_cannot_add_previous_preset_row() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        metrics.set_stage_order(vec!["Current.glsl".to_string()]);
+        metrics.probe("Current.glsl", "glsl", 1.5);
+        metrics.probe("PreviousPreset.glsl", "glsl", 8.0);
+
+        let rows = metrics.snapshot().display_stages();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "Current.glsl");
     }
 
     #[test]

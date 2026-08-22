@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "DirectMLフォールバック: {count}フィルター",
   "tensorrt.pack_required": "別配布のTensorRT Backend Packが必要です。",
   "tensorrt.unavailable_help": "TensorRTバックエンドを現在利用できません。詳しい原因はcHiDeScaler-Neo.logを確認してください。",
+  "glsl_overload.auto_stop": "性能不足のため拡大を停止します",
   "glsl_overload.pause": "フィルターが過負荷です。GUI操作中は処理を一時停止して応答性を保護します。",
   "glsl_overload.lighter_filter_help": "軽いフィルターに変更するとこの警告は解除されます。",
   "capture.fullscreen_notice_title": "キャプチャ解像度",

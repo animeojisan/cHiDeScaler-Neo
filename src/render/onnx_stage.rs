@@ -19,6 +19,7 @@ use ort::{
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, c_void};
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
@@ -30,10 +31,15 @@ use windows::{
         Foundation::{CloseHandle, HANDLE, LUID},
         Graphics::{
             Direct3D12::{
-                D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_QUEUE_DESC, D3D12_FENCE_FLAG_NONE,
+                D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_FENCE_FLAG_NONE,
                 D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
+                D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
                 D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12CommandAllocator, ID3D12CommandList,
                 ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList,
                 ID3D12Resource,
@@ -161,56 +167,73 @@ fn tensorrt_progress_model_name(model: &Path) -> String {
 
 fn begin_tensorrt_build(model: &Path) {
     let name = tensorrt_progress_model_name(model);
-    let mut progress = TENSORRT_BUILD_PROGRESS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap();
-    if progress.started.is_none() {
-        progress.started = Some(Instant::now());
+    let first_build_epoch;
+    {
+        let mut progress = TENSORRT_BUILD_PROGRESS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        first_build_epoch = progress.started.is_none();
+        if first_build_epoch {
+            progress.started = Some(Instant::now());
+        }
+        if !progress.models.contains(&name) {
+            progress.models.push(name.clone());
+        }
+        log::info!(
+            "tensorrt-engine-build: registered model={} total={}",
+            name,
+            progress.models.len()
+        );
     }
-    if !progress.models.contains(&name) {
-        progress.models.push(name.clone());
+    if first_build_epoch {
+        crate::input::InputSystem::set_tensorrt_build_cursor_guard(true);
     }
-    log::info!(
-        "tensorrt-engine-build: registered model={} total={}",
-        name,
-        progress.models.len()
-    );
 }
 
 fn mark_tensorrt_model_failed(model: &Path, reason: &str) {
     let name = tensorrt_progress_model_name(model);
-    let mut progress = TENSORRT_BUILD_PROGRESS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap();
-    let before = progress.models.len();
-    progress.models.retain(|candidate| candidate != &name);
-    progress.completed.remove(&name);
-    progress.model_started.remove(&name);
-    if progress.current.as_deref() == Some(name.as_str()) {
-        progress.current = progress
-            .models
-            .iter()
-            .find(|model| !progress.completed.contains(*model))
-            .cloned();
-    }
-    if progress.models.is_empty() || progress.completed.len() == progress.models.len() {
-        if before > 0 {
-            log::warn!(
-                "tensorrt-engine-build: failed model={} remaining=0 reason={}",
-                name,
-                reason
-            );
+    let release_guard;
+    {
+        let mut progress = TENSORRT_BUILD_PROGRESS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        let before = progress.models.len();
+        progress.models.retain(|candidate| candidate != &name);
+        progress.completed.remove(&name);
+        progress.model_started.remove(&name);
+        if progress.current.as_deref() == Some(name.as_str()) {
+            progress.current = progress
+                .models
+                .iter()
+                .find(|model| !progress.completed.contains(*model))
+                .cloned();
         }
-        *progress = TensorRtBuildProgress::default();
-    } else if progress.models.len() != before {
-        log::warn!(
-            "tensorrt-engine-build: failed model={} remaining={} reason={}",
-            name,
-            progress.models.len(),
-            reason
-        );
+        if progress.models.is_empty() || progress.completed.len() == progress.models.len() {
+            if before > 0 {
+                log::warn!(
+                    "tensorrt-engine-build: failed model={} remaining=0 reason={}",
+                    name,
+                    reason
+                );
+            }
+            *progress = TensorRtBuildProgress::default();
+            release_guard = true;
+        } else {
+            if progress.models.len() != before {
+                log::warn!(
+                    "tensorrt-engine-build: failed model={} remaining={} reason={}",
+                    name,
+                    progress.models.len(),
+                    reason
+                );
+            }
+            release_guard = false;
+        }
+    }
+    if release_guard {
+        crate::input::InputSystem::set_tensorrt_build_cursor_guard(false);
     }
 }
 
@@ -374,47 +397,52 @@ pub fn mark_tensorrt_model_started(name: &str) {
 }
 
 pub fn mark_tensorrt_model_completed(name: &str) {
-    let mut progress = TENSORRT_BUILD_PROGRESS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !progress.models.iter().any(|model| model == name) {
-        return;
-    }
-    if progress.completed.insert(name.to_string()) {
-        let model_elapsed = progress
-            .model_started
-            .get(name)
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
-        log::info!(
-            "tensorrt-engine-build: model-ready model={} completed={}/{} model_elapsed_ms={:.2}",
-            name,
-            progress.completed.len(),
-            progress.models.len(),
-            model_elapsed.as_secs_f64() * 1000.0
-        );
-    }
-    if !progress.models.is_empty() && progress.completed.len() == progress.models.len() {
-        if let Some(started) = progress.started {
+    let release_guard;
+    {
+        let mut progress = TENSORRT_BUILD_PROGRESS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !progress.models.iter().any(|model| model == name) {
+            return;
+        }
+        if progress.completed.insert(name.to_string()) {
+            let model_elapsed = progress
+                .model_started
+                .get(name)
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
             log::info!(
-                "tensorrt-engine-build: inference-ready completed={}/{} elapsed_ms={:.2}",
+                "tensorrt-engine-build: model-ready model={} completed={}/{} model_elapsed_ms={:.2}",
+                name,
                 progress.completed.len(),
                 progress.models.len(),
-                started.elapsed().as_secs_f64() * 1000.0
+                model_elapsed.as_secs_f64() * 1000.0
             );
         }
-        *progress = TensorRtBuildProgress::default();
-        return;
+        if !progress.models.is_empty() && progress.completed.len() == progress.models.len() {
+            if let Some(started) = progress.started {
+                log::info!(
+                    "tensorrt-engine-build: inference-ready completed={}/{} elapsed_ms={:.2}",
+                    progress.completed.len(),
+                    progress.models.len(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            *progress = TensorRtBuildProgress::default();
+            release_guard = true;
+        } else {
+            progress.current = progress
+                .models
+                .iter()
+                .find(|model| !progress.completed.contains(*model))
+                .cloned();
+            release_guard = false;
+        }
     }
-    // Move immediately to the next unfinished model. It may still be waiting
-    // for enough frames/history; the snapshot tells the GUI whether its actual
-    // TensorRT run has begun.
-    progress.current = progress
-        .models
-        .iter()
-        .find(|model| !progress.completed.contains(*model))
-        .cloned();
+    if release_guard {
+        crate::input::InputSystem::set_tensorrt_build_cursor_guard(false);
+    }
 }
 
 /// Current TensorRT build item. The final bool is true only after that model's
@@ -449,19 +477,22 @@ pub fn tensorrt_build_progress() -> Option<(String, Duration, usize, usize, bool
 /// Successful completion goes through `mark_tensorrt_model_completed`;
 /// displaying a frame is not proof that a lazy TensorRT build has finished.
 pub fn finish_tensorrt_build_progress() {
-    let mut progress = TENSORRT_BUILD_PROGRESS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap();
-    if let Some(started) = progress.started {
-        log::info!(
-            "tensorrt-engine-build: progress-cleared completed={}/{} elapsed_ms={:.2}",
-            progress.completed.len(),
-            progress.models.len(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
+    {
+        let mut progress = TENSORRT_BUILD_PROGRESS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        if let Some(started) = progress.started {
+            log::info!(
+                "tensorrt-engine-build: progress-cleared completed={}/{} elapsed_ms={:.2}",
+                progress.completed.len(),
+                progress.models.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        *progress = TensorRtBuildProgress::default();
     }
-    *progress = TensorRtBuildProgress::default();
+    crate::input::InputSystem::set_tensorrt_build_cursor_guard(false);
 }
 /// rife_v4.25_lite REQUIRES 128-multiple padding: 64 (1920x1088) fails inside
 /// DML with an invalid-parameter on a Mul node (tested) — the lite arch has a
@@ -664,6 +695,11 @@ pub(crate) struct PreparedInterpGpuOutput {
     pub(crate) size: (i32, i32),
     pub(crate) padded: (i32, i32),
     pub(crate) fp16: bool,
+    /// Keep DirectML interpolation in floating point when a shader/image
+    /// stage follows it. Quantizing RIFE/DRBA to RGBA8 before a CNN
+    /// upscaler can turn tiny provider-specific errors into visible
+    /// checkerboard/nearest-neighbour-like blocks.
+    pub(crate) preserve_float: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -672,6 +708,38 @@ pub struct UpscaleProfile {
     pub run_ms: f64,
     pub out_ms: f64,
     pub output_size: (usize, usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmlGlInteropMode {
+    ProviderOwnedCopy,
+    Direct,
+}
+
+impl DmlGlInteropMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ProviderOwnedCopy => "ProviderOwnedCopyBridge",
+            Self::Direct => "AppOwnedDirect",
+        }
+    }
+}
+
+fn resolve_dml_gl_interop_mode(
+    configured: &str,
+    after_interpolation: bool,
+    conservative_driver: bool,
+) -> Option<DmlGlInteropMode> {
+    let configured = configured.trim().to_ascii_lowercase();
+    match configured.as_str() {
+        "direct" => Some(DmlGlInteropMode::Direct),
+        "1" | "input" | "copy" | "auto" => Some(DmlGlInteropMode::ProviderOwnedCopy),
+        "0" | "off" | "false" | "disable" | "disabled" => None,
+        "" if after_interpolation && !conservative_driver => {
+            Some(DmlGlInteropMode::ProviderOwnedCopy)
+        }
+        _ => None,
+    }
 }
 
 impl OnnxStage {
@@ -715,6 +783,13 @@ impl OnnxStage {
 
     fn load_directml(path: &Path, adapter_id: Option<i32>) -> Result<Self> {
         init_onnx().map_err(|e| anyhow!(e))?;
+        let graph_optimization = match std::env::var("CHIDESCALER_DML_GRAPH_OPT").ok().as_deref() {
+            Some("disable") => GraphOptimizationLevel::Disable,
+            Some("basic") => GraphOptimizationLevel::Level1,
+            Some("extended") => GraphOptimizationLevel::Level2,
+            _ => GraphOptimizationLevel::All,
+        };
+        log::info!("directml-graph-optimization: level={graph_optimization:?}");
         let directml = match adapter_id {
             Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
             None => ort::ep::DirectML::default().with_performance_preference(
@@ -723,7 +798,7 @@ impl OnnxStage {
         };
         let session = Session::builder()
             .map_err(oerr)?
-            .with_optimization_level(GraphOptimizationLevel::All)
+            .with_optimization_level(graph_optimization)
             .map_err(oerr)?
             .with_execution_providers([directml.build()])
             .map_err(oerr)?
@@ -1065,6 +1140,15 @@ impl OnnxStage {
             register_tensorrt_cache(cache_dir);
         }
         Ok(stage)
+    }
+
+    /// True for ordinary multi-frame temporal restoration models running on
+    /// DirectML. The render chain uses this to apply the DirectML-only
+    /// high-resolution safety cap without relying on a specific model name.
+    pub fn is_directml_temporal_filter(&self) -> bool {
+        self.provider == OnnxProvider::DirectML
+            && self.temporal_frames.is_some()
+            && self.interp == InterpKind::None
     }
 
     pub fn supports_dml_gl_bridge(&self) -> bool {
@@ -1471,6 +1555,7 @@ impl OnnxStage {
             timesteps,
             generation,
             timesteps.len() + 1,
+            false,
         )
     }
 
@@ -1485,6 +1570,7 @@ impl OnnxStage {
         timesteps: &[f32],
         generation: u64,
         capacity_factor: usize,
+        stable_post_handoff: bool,
     ) -> Result<Option<u64>> {
         if !self.supports_interp_gpu() || timesteps.is_empty() {
             return Ok(None);
@@ -1507,7 +1593,20 @@ impl OnnxStage {
                 self.process_tensorrt_interp_gpu(gc, frames, timesteps, generation, capacity_factor)
             }
             OnnxProvider::DirectML => {
-                self.process_dml_interp_gpu(gc, frames, timesteps, generation, capacity_factor)
+                let Some(mode) = dml_interp_interop_mode(gc, stable_post_handoff) else {
+                    log::info!(
+                        "dml-interp-interop-policy: mode=nonresident reason=explicit-safe-fallback"
+                    );
+                    return Ok(None);
+                };
+                self.process_dml_interp_gpu(
+                    gc,
+                    frames,
+                    timesteps,
+                    generation,
+                    capacity_factor,
+                    mode,
+                )
             }
             OnnxProvider::Cuda => Ok(None),
         };
@@ -1532,7 +1631,7 @@ impl OnnxStage {
                 } else {
                     INTERP_CPU_FALLBACK_FRAMES.fetch_add(1, Ordering::Relaxed);
                     log::warn!(
-                        "interp-gpu-path-disabled: backend={} model={} reason={error:#}; CPU fallback enabled for this session",
+                        "interp-gpu-path-disabled: backend={} model={} reason={error:#}; safe non-resident transfer fallback enabled for this session",
                         self.provider_desc,
                         self.name
                     );
@@ -1570,7 +1669,8 @@ impl OnnxStage {
         let started = Instant::now();
         let padded = match self.provider {
             OnnxProvider::TensorRT => {
-                let size = {
+                let model_name = self.name.clone();
+                let (size, run_call_ms, output_sync_ms) = {
                     let bridge = self
                         .tensorrt_interp_bridge
                         .as_mut()
@@ -1579,12 +1679,40 @@ impl OnnxStage {
                         .invocations
                         .get_mut(index)
                         .ok_or_else(|| anyhow!("TensorRT interpolation slot {index} missing"))?;
+                    let run_started = Instant::now();
                     self.session
                         .run_binding_with_options(&invocation.binding, self.run_options.armed()?)
                         .map_err(oerr)?;
+                    let run_call_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+                    let sync_started = Instant::now();
                     invocation.binding.synchronize_outputs().map_err(oerr)?;
-                    bridge.size
+                    let output_sync_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
+                    (bridge.size, run_call_ms, output_sync_ms)
                 };
+                let provider_total_ms = run_call_ms + output_sync_ms;
+                if provider_total_ms >= 50.0 {
+                    log::warn!(
+                        "tensorrt-interp-slot-slow: model={} input={}x{} slot={} run_call_ms={:.2} output_sync_ms={:.2} provider_total_ms={:.2}",
+                        model_name,
+                        size.0,
+                        size.1,
+                        index + 1,
+                        run_call_ms,
+                        output_sync_ms,
+                        provider_total_ms
+                    );
+                } else if provider_total_ms >= 15.0 {
+                    log::debug!(
+                        "tensorrt-interp-slot-timing: model={} input={}x{} slot={} run_call_ms={:.2} output_sync_ms={:.2} provider_total_ms={:.2}",
+                        model_name,
+                        size.0,
+                        size.1,
+                        index + 1,
+                        run_call_ms,
+                        output_sync_ms,
+                        provider_total_ms
+                    );
+                }
                 self.complete_successful_tensorrt_shape(size.0, size.1);
                 self.tensorrt_interp_bridge
                     .as_ref()
@@ -1600,7 +1728,8 @@ impl OnnxStage {
                     .invocations
                     .get_mut(index)
                     .ok_or_else(|| anyhow!("DirectML interpolation slot {index} missing"))?;
-                self.session
+                let mut provider_outputs = self
+                    .session
                     .run_binding_with_options(&invocation.output.binding, self.run_options.armed()?)
                     .map_err(oerr)?;
                 invocation
@@ -1608,6 +1737,78 @@ impl OnnxStage {
                     .binding
                     .synchronize_outputs()
                     .map_err(oerr)?;
+                if bridge.interop_mode != DmlInterpInteropMode::Direct {
+                    if self.fp16 {
+                        let provider = provider_outputs
+                            .remove(self.out_name.as_str())
+                            .ok_or_else(|| anyhow!("DirectML provider output missing"))?
+                            .downcast::<TensorValueType<f16>>()?;
+                        anyhow::ensure!(
+                            provider.memory_info().allocation_device().as_str() == "DML",
+                            "DirectML interpolation output silently fell back to CPU"
+                        );
+                        let provider_dims: Vec<i64> = provider.shape().iter().copied().collect();
+                        anyhow::ensure!(
+                            provider_dims == invocation.output.dims,
+                            "DirectML provider output shape changed: {:?} != {:?}",
+                            provider_dims,
+                            invocation.output.dims
+                        );
+                        let api = dml_api()?;
+                        let mut raw_resource = std::ptr::null_mut();
+                        ort_status(unsafe {
+                            (api.GetD3D12ResourceFromAllocation)(
+                                invocation.output.dml_allocator.ptr().cast_mut(),
+                                provider.data_ptr().cast_mut(),
+                                &mut raw_resource,
+                            )
+                        })?;
+                        let borrowed = unsafe { ID3D12Resource::from_raw_borrowed(&raw_resource) }
+                            .ok_or_else(|| anyhow!("DirectML provider output resource is null"))?;
+                        let provider_resource = borrowed.clone();
+                        let _ = invocation.output.copy.copy_and_wait(
+                            &provider_resource,
+                            &invocation.output.resource,
+                            invocation.output.byte_len,
+                        )?;
+                        drop(provider);
+                    } else {
+                        let provider = provider_outputs
+                            .remove(self.out_name.as_str())
+                            .ok_or_else(|| anyhow!("DirectML provider output missing"))?
+                            .downcast::<TensorValueType<f32>>()?;
+                        anyhow::ensure!(
+                            provider.memory_info().allocation_device().as_str() == "DML",
+                            "DirectML interpolation output silently fell back to CPU"
+                        );
+                        let provider_dims: Vec<i64> = provider.shape().iter().copied().collect();
+                        anyhow::ensure!(
+                            provider_dims == invocation.output.dims,
+                            "DirectML provider output shape changed: {:?} != {:?}",
+                            provider_dims,
+                            invocation.output.dims
+                        );
+                        let api = dml_api()?;
+                        let mut raw_resource = std::ptr::null_mut();
+                        ort_status(unsafe {
+                            (api.GetD3D12ResourceFromAllocation)(
+                                invocation.output.dml_allocator.ptr().cast_mut(),
+                                provider.data_ptr().cast_mut(),
+                                &mut raw_resource,
+                            )
+                        })?;
+                        let borrowed = unsafe { ID3D12Resource::from_raw_borrowed(&raw_resource) }
+                            .ok_or_else(|| anyhow!("DirectML provider output resource is null"))?;
+                        let provider_resource = borrowed.clone();
+                        let _ = invocation.output.copy.copy_and_wait(
+                            &provider_resource,
+                            &invocation.output.resource,
+                            invocation.output.byte_len,
+                        )?;
+                        drop(provider);
+                    }
+                }
+                drop(provider_outputs);
                 bridge.padded_size
             }
             OnnxProvider::Cuda => anyhow::bail!("unsupported interpolation backend"),
@@ -1618,6 +1819,7 @@ impl OnnxStage {
     pub(crate) fn prepared_interp_gpu_outputs(
         &self,
         count: usize,
+        preserve_float_after_dml: bool,
     ) -> Result<Vec<PreparedInterpGpuOutput>> {
         let (size, padded, keys) = match self.provider {
             OnnxProvider::TensorRT => {
@@ -1665,6 +1867,8 @@ impl OnnxStage {
                 size,
                 padded,
                 fp16: self.fp16,
+                preserve_float: preserve_float_after_dml
+                    && matches!(self.provider, OnnxProvider::DirectML),
             })
             .collect())
     }
@@ -1673,22 +1877,35 @@ impl OnnxStage {
         gc: &mut GlContext,
         output: PreparedInterpGpuOutput,
     ) -> Result<GpuTex> {
-        let texture = if output.fp16 {
-            gc.external_nchw_f16_to_rgba8_crop(
+        let texture = match (output.fp16, output.preserve_float) {
+            (true, true) => gc.external_nchw_f16_to_rgba16f_crop(
                 output.key,
                 output.size.0,
                 output.size.1,
                 output.padded.0,
                 output.padded.1,
-            )
-        } else {
-            gc.external_nchw_f32_to_rgba8_crop(
+            ),
+            (false, true) => gc.external_nchw_f32_to_rgba16f_crop(
                 output.key,
                 output.size.0,
                 output.size.1,
                 output.padded.0,
                 output.padded.1,
-            )
+            ),
+            (true, false) => gc.external_nchw_f16_to_rgba8_crop(
+                output.key,
+                output.size.0,
+                output.size.1,
+                output.padded.0,
+                output.padded.1,
+            ),
+            (false, false) => gc.external_nchw_f32_to_rgba8_crop(
+                output.key,
+                output.size.0,
+                output.size.1,
+                output.padded.0,
+                output.padded.1,
+            ),
         }
         .map_err(anyhow::Error::msg)?;
         INTERP_GPU_OUTPUT_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -1700,7 +1917,7 @@ impl OnnxStage {
         gc: &mut GlContext,
         count: usize,
     ) -> Result<Vec<GpuTex>> {
-        let slots = self.prepared_interp_gpu_outputs(count)?;
+        let slots = self.prepared_interp_gpu_outputs(count, false)?;
         let mut outputs = Vec::with_capacity(count);
         for slot in slots {
             outputs.push(Self::finish_prepared_interp_gpu_output(gc, slot)?);
@@ -2284,8 +2501,40 @@ impl OnnxStage {
         gc: &mut GlContext,
         input_texture: GpuTex,
     ) -> Result<Option<GpuTex>> {
+        self.process_gpu_texture_with_context(gc, input_texture, false)
+    }
+
+    /// Fast path for an ordinary ONNX stage that is executed *after* a GPU
+    /// interpolation stage.  The stable v440 path downloaded the interpolated
+    /// texture to RGB8, packed it again on the CPU, ran DirectML, converted the
+    /// result back to RGB8 and uploaded it to GL.  That round-trip is especially
+    /// expensive for RIFE/DRBA + ONNX upscaling.
+    ///
+    /// On non-conservative GL drivers we instead auto-select the already
+    /// validated provider-owned-copy bridge: GL packs directly into an app-owned
+    /// D3D12 input buffer, DirectML keeps ownership of its native output, and a
+    /// D3D12 copy places the completed tensor in the GL-imported output buffer.
+    /// Any setup/runtime failure falls back to the unchanged CPU handoff in the
+    /// same frame.  Conservative drivers (currently AMD/ATI in GlContext) retain
+    /// the v440 path unless CHIDESCALER_DML_GL_INTEROP explicitly opts in.
+    pub fn process_gpu_texture_after_interpolation(
+        &mut self,
+        gc: &mut GlContext,
+        input_texture: GpuTex,
+    ) -> Result<Option<GpuTex>> {
+        self.process_gpu_texture_with_context(gc, input_texture, true)
+    }
+
+    fn process_gpu_texture_with_context(
+        &mut self,
+        gc: &mut GlContext,
+        input_texture: GpuTex,
+        after_interpolation: bool,
+    ) -> Result<Option<GpuTex>> {
         match self.provider {
-            OnnxProvider::DirectML => self.process_dml_gpu_texture(gc, input_texture),
+            OnnxProvider::DirectML => {
+                self.process_dml_gpu_texture(gc, input_texture, after_interpolation)
+            }
             OnnxProvider::TensorRT => self.process_tensorrt_gpu_texture(gc, input_texture),
             OnnxProvider::Cuda => Ok(None),
         }
@@ -2295,6 +2544,7 @@ impl OnnxStage {
         &mut self,
         gc: &mut GlContext,
         input_texture: GpuTex,
+        after_interpolation: bool,
     ) -> Result<Option<GpuTex>> {
         if self.temporal_frames.is_some()
             && self.interp == InterpKind::None
@@ -2315,19 +2565,23 @@ impl OnnxStage {
                 }
             };
         }
-        // The shared-input route remains opt-in until its production parity
-        // suite passes on both AMD and NVIDIA. In particular, some DirectML
-        // Resize graphs reject the app-owned output binding and can render a
-        // moving mostly-black image. Never expose that experimental failure
-        // through a normal multi-ONNX chain.
-        let interop_mode = std::env::var("CHIDESCALER_DML_GL_INTEROP")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if !matches!(
-            interop_mode.as_str(),
-            "1" | "input" | "copy" | "direct" | "auto"
-        ) || !self.fp16
+        // The shared-input route stays opt-in for ordinary chains.  For the
+        // specific interpolation -> ONNX case, v441 can automatically use the
+        // safer provider-owned-copy bridge on non-conservative GL drivers.
+        // This avoids the CPU readback/repack/output-conversion round-trip that
+        // made a ~9-10 ms DirectML upscaler grow to ~16-17 ms when stacked after
+        // RIFE in the v440 diagnostics.  Explicit environment settings always
+        // win, including an explicit 0/off opt-out.
+        let configured_interop = std::env::var("CHIDESCALER_DML_GL_INTEROP").unwrap_or_default();
+        let interop_mode = resolve_dml_gl_interop_mode(
+            &configured_interop,
+            after_interpolation,
+            gc.external_interop_conservative_recommended(),
+        );
+        let Some(interop_mode) = interop_mode else {
+            return Ok(None);
+        };
+        if !self.fp16
             || self.input_channels != Some(3)
             || self.interp != InterpKind::None
             || self.temporal_frames.is_some()
@@ -2337,7 +2591,7 @@ impl OnnxStage {
         {
             return Ok(None);
         }
-        match self.process_gpu_texture_inner(gc, input_texture, &interop_mode) {
+        match self.process_gpu_texture_inner(gc, input_texture, interop_mode) {
             Ok(texture) => Ok(Some(texture)),
             Err(error) => {
                 self.retire_direct_output(gc);
@@ -2902,6 +3156,7 @@ impl OnnxStage {
         timesteps: &[f32],
         generation: u64,
         capacity_factor: usize,
+        interop_mode: DmlInterpInteropMode,
     ) -> Result<Option<u64>> {
         let size = (frames[0].w(), frames[0].h());
         let (channels, frame_count, padded) = self.interp_gpu_layout(size)?;
@@ -2915,6 +3170,7 @@ impl OnnxStage {
                 // output counts. Never shrink the bridge on the lower-count
                 // frame; grow only when a larger user factor needs capacity.
                 || Self::interp_bridge_needs_growth(bridge.slot_count, slot_count)
+                || bridge.interop_mode != interop_mode
         }) {
             self.retire_dml_interp_gpu_bridge(gc);
         }
@@ -2982,7 +3238,7 @@ impl OnnxStage {
             let mut pending_outputs = VecDeque::from([first_output]);
             let mut invocations = Vec::with_capacity(slot_count);
             for _ in 0..slot_count {
-                let output = if let Some(output) = pending_outputs.pop_front() {
+                let mut output = if let Some(output) = pending_outputs.pop_front() {
                     output
                 } else {
                     if self.fp16 {
@@ -3016,35 +3272,52 @@ impl OnnxStage {
                     channels,
                     if self.fp16 { 2 } else { 4 },
                 )?;
+                let safe_input = if interop_mode == DmlInterpInteropMode::ConservativeCopy {
+                    Some(create_direct_input_channels_typed_state(
+                        &device,
+                        luid,
+                        padded,
+                        channels,
+                        if self.fp16 { 2 } else { 4 },
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )?)
+                } else {
+                    None
+                };
+                let bound_input = safe_input.as_ref().unwrap_or(&input);
                 let input_value = unsafe {
                     if self.fp16 {
                         InterpTensorValue::F16(TensorRefMut::from_raw(
                             memory.clone(),
-                            input.allocation,
-                            Shape::new(input.dims),
+                            bound_input.allocation,
+                            Shape::new(bound_input.dims),
                         )?)
                     } else {
                         InterpTensorValue::F32(TensorRefMut::from_raw(
                             memory.clone(),
-                            input.allocation,
-                            Shape::new(input.dims),
+                            bound_input.allocation,
+                            Shape::new(bound_input.dims),
                         )?)
                     }
                 };
-                let output_value = unsafe {
-                    if self.fp16 {
-                        InterpTensorValue::F16(TensorRefMut::from_raw(
-                            memory.clone(),
-                            output.allocation,
-                            Shape::new(output.dims.iter().copied()),
-                        )?)
-                    } else {
-                        InterpTensorValue::F32(TensorRefMut::from_raw(
-                            memory.clone(),
-                            output.allocation,
-                            Shape::new(output.dims.iter().copied()),
-                        )?)
-                    }
+                let output_value = if interop_mode == DmlInterpInteropMode::Direct {
+                    Some(unsafe {
+                        if self.fp16 {
+                            InterpTensorValue::F16(TensorRefMut::from_raw(
+                                memory.clone(),
+                                output.allocation,
+                                Shape::new(output.dims.iter().copied()),
+                            )?)
+                        } else {
+                            InterpTensorValue::F32(TensorRefMut::from_raw(
+                                memory.clone(),
+                                output.allocation,
+                                Shape::new(output.dims.iter().copied()),
+                            )?)
+                        }
+                    })
+                } else {
+                    None
                 };
                 let input_name = CString::new(self.in_name.as_bytes())?;
                 let output_name = CString::new(self.out_name.as_bytes())?;
@@ -3055,13 +3328,20 @@ impl OnnxStage {
                         input_value.ptr(),
                     )
                 })?;
-                ort_status(unsafe {
-                    (ort::api().BindOutput)(
-                        output.binding.ptr().cast_mut(),
-                        output_name.as_ptr(),
-                        output_value.ptr(),
-                    )
-                })?;
+                if let Some(output_value) = output_value.as_ref() {
+                    ort_status(unsafe {
+                        (ort::api().BindOutput)(
+                            output.binding.ptr().cast_mut(),
+                            output_name.as_ptr(),
+                            output_value.ptr(),
+                        )
+                    })?;
+                } else {
+                    output
+                        .binding
+                        .bind_output_to_device(self.out_name.clone(), &memory)
+                        .map_err(oerr)?;
+                }
                 invocations.push(DmlInterpInvocation {
                     input,
                     output,
@@ -3069,6 +3349,7 @@ impl OnnxStage {
                     _output_value: output_value,
                     _input_name: input_name,
                     _output_name: output_name,
+                    safe_input,
                 });
             }
             let mut imported_keys = Vec::with_capacity(history.len() + invocations.len() * 2);
@@ -3125,9 +3406,31 @@ impl OnnxStage {
                 frame_count,
                 slot_count,
                 generation,
+                interop_mode,
             });
+            // A driver may reveal the unsafe DSA external-buffer path only
+            // during the first import. Rebuild before any GL packing/inference
+            // is submitted, so no potentially unsafe direct frame is shown.
+            if interop_mode == DmlInterpInteropMode::Direct
+                && gc.external_interop_conservative_recommended()
+            {
+                log::warn!(
+                    "dml-interp-interop-upgrade: mode=provider-copy-safe reason=external-storage-driver-fallback vendor='{}' bound_storage_fallbacks={}",
+                    gc.gl_vendor(),
+                    gc.external_storage_fallback_count()
+                );
+                self.retire_dml_interp_gpu_bridge(gc);
+                return self.process_dml_interp_gpu(
+                    gc,
+                    frames,
+                    timesteps,
+                    generation,
+                    capacity_factor,
+                    DmlInterpInteropMode::ConservativeCopy,
+                );
+            }
             log::info!(
-                "interp-gpu-bridge-created: backend=DirectML kind={:?} factor_capacity={} current_factor={} input={}x{} padded={}x{} worker=async input_payload=gpu-slot output_payload=gpu-slot slots={}",
+                "interp-gpu-bridge-created: backend=DirectML kind={:?} factor_capacity={} current_factor={} input={}x{} padded={}x{} worker=async input_payload=gpu-slot output_payload=gpu-slot slots={} interop={} safe_sync={}",
                 self.interp,
                 capacity_factor,
                 timesteps.len() + 1,
@@ -3135,13 +3438,28 @@ impl OnnxStage {
                 size.1,
                 padded.0,
                 padded.1,
-                slot_count
+                slot_count,
+                interop_mode.label(),
+                match interop_mode {
+                    DmlInterpInteropMode::Direct => "gl-fence+ort-sync",
+                    DmlInterpInteropMode::ProviderOutputCopy => {
+                        "gl-fence+ort-sync+d3d12-output-copy"
+                    }
+                    DmlInterpInteropMode::ConservativeCopy => {
+                        "glFinish+d3d12-state-correct-copy-fence+immediate-ready"
+                    }
+                }
             );
             log::info!(
                 "interp-gpu-slots: backend=DirectML count={} peak_in_flight={} state=ready",
                 slot_count,
                 timesteps.len()
             );
+            if interop_mode == DmlInterpInteropMode::ConservativeCopy {
+                log::info!(
+                    "dml-interp-copy-state: queue=direct gl_input=common->copy_source->common dml_input=uav->copy_dest->uav provider_output=uav->copy_source->uav gl_output=common->copy_dest->common"
+                );
+            }
             let dml = dml_shared_stats();
             log::info!(
                 "interp-gpu-resource-state: backend=DirectML gl_active={} gl_active_mb={:.1} gl_quarantine={} dml_active_allocations={} dml_active_mb={:.1} dml_created={} dml_freed={} dml_release_failures={}",
@@ -3184,13 +3502,58 @@ impl OnnxStage {
             )?;
         }
         // Output slots are not reused until the previous GL conversion has
-        // completed. This wait is bounded inside GlContext; the expensive GL
-        // input handoff itself is represented by a non-blocking fence token.
+        // completed. On conservative drivers, fully complete the GL writes,
+        // then copy the packed input into a DirectML-only D3D12 buffer.
+        // This is still GPU-resident: only command completion is synchronized;
+        // no frame pixels are read back to system memory.
         for invocation in bridge.invocations.iter().take(timesteps.len()) {
             gc.wait_external_buffer_idle(invocation.output.key)
                 .map_err(anyhow::Error::msg)?;
         }
-        let fence = gc.submit_commands_fence().map_err(anyhow::Error::msg)?;
+        if bridge.interop_mode == DmlInterpInteropMode::ConservativeCopy {
+            // Preserve the proven refresh-aware interpolation cadence.  Only the
+            // AMD-safe GPU transfer is optimized here: all packed timestep inputs
+            // are copied by one state-correct D3D12 direct-queue submission and one fence wait.
+            // Pixel data remains GPU-resident and presentation phase scheduling is
+            // intentionally untouched.
+            gc.finish();
+            let copies = bridge
+                .invocations
+                .iter()
+                .take(timesteps.len())
+                .map(|invocation| {
+                    let safe_input = invocation
+                        .safe_input
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("DirectML conservative input buffer missing"))?;
+                    Ok((
+                        invocation.input.resource.clone(),
+                        safe_input.resource.clone(),
+                        invocation.input.byte_len,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !copies.is_empty() {
+                let copy = &mut bridge
+                    .invocations
+                    .first_mut()
+                    .expect("non-empty conservative interpolation copy batch")
+                    .output
+                    .copy;
+                let _ = copy.copy_many_and_wait(&copies)?;
+            }
+        }
+        // ConservativeCopy has already completed all GL writes with glFinish
+        // and then synchronously waited for the batched D3D12 input copy. A
+        // second GL fence is therefore redundant. Returning token 0 is safe:
+        // GlContext::poll_commands_fence treats an absent token as complete,
+        // so the worker can start immediately without dropping either of the
+        // visibility barriers that fixed AMD's green/flickering frames.
+        let fence = if bridge.interop_mode == DmlInterpInteropMode::ConservativeCopy {
+            0
+        } else {
+            gc.submit_commands_fence().map_err(anyhow::Error::msg)?
+        };
         Ok(Some(fence))
     }
 
@@ -3657,7 +4020,7 @@ impl OnnxStage {
         &mut self,
         gc: &mut GlContext,
         input_texture: GpuTex,
-        interop_mode: &str,
+        interop_mode: DmlGlInteropMode,
     ) -> Result<GpuTex> {
         let (w, h) = (input_texture.w(), input_texture.h());
         if self
@@ -3692,11 +4055,12 @@ impl OnnxStage {
             )?);
             let output = self.direct_output.as_ref().unwrap();
             log::info!(
-                "ONNX GPU-resident chain ready: model='{}' input={}x{} output={:?} safe_sync=glFinish disable=CHIDESCALER_DML_GL_INTEROP=0",
+                "ONNX GPU-resident chain ready: model='{}' input={}x{} output={:?} mode={} safe_sync=glFinish fallback=cpu-on-error",
                 self.name,
                 w,
                 h,
-                output.dims
+                output.dims,
+                interop_mode.label()
             );
         }
         if self.direct_input.is_none() {
@@ -3751,7 +4115,7 @@ impl OnnxStage {
         let run_start = Instant::now();
         let mut copy_ms = 0.0;
         let mut fence_wait_ms = 0.0;
-        if interop_mode == "direct" {
+        if interop_mode == DmlGlInteropMode::Direct {
             let output_value = unsafe {
                 TensorRefMut::<f16>::from_raw(
                     memory,
@@ -3838,11 +4202,7 @@ impl OnnxStage {
             output.byte_len,
             copy_ms,
             fence_wait_ms,
-            if interop_mode == "direct" {
-                "AppOwnedDirect"
-            } else {
-                "ProviderOwnedCopyBridge"
-            }
+            interop_mode.label()
         );
         Ok(texture)
     }
@@ -4459,14 +4819,38 @@ impl Drop for TensorRtInterpInvocation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmlInterpInteropMode {
+    Direct,
+    // Keep the fast direct-shared input path, but ask ORT/DirectML to own its
+    // output allocation and copy that result into the GL-shared D3D12 buffer
+    // before downstream GLSL samples it. This isolates the provider output
+    // lifetime/visibility issue without adding CPU readback or glFinish.
+    ProviderOutputCopy,
+    ConservativeCopy,
+}
+
+impl DmlInterpInteropMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct-shared",
+            Self::ProviderOutputCopy => "provider-output-copy",
+            Self::ConservativeCopy => "provider-copy-safe",
+        }
+    }
+}
+
 struct DmlInterpInvocation {
     // Same lifetime rule as TensorRT: release ORT values before the DirectML
     // allocations backing their raw pointers.
     _input_value: InterpTensorValue,
-    _output_value: InterpTensorValue,
+    _output_value: Option<InterpTensorValue>,
     _input_name: CString,
     _output_name: CString,
+    // Conservative mode stages GL writes here, then copies them on D3D12 into
+    // `safe_input`, so DirectML never directly consumes a GL-imported buffer.
     input: DmlDirectInput,
+    safe_input: Option<DmlDirectInput>,
     output: DmlDirectOutput,
 }
 
@@ -4479,6 +4863,7 @@ struct DmlInterpGpuBridge {
     frame_count: usize,
     slot_count: usize,
     generation: u64,
+    interop_mode: DmlInterpInteropMode,
 }
 
 unsafe impl Send for DmlInterpInvocation {}
@@ -4611,19 +4996,23 @@ impl Drop for DmlCopyContext {
 
 impl DmlCopyContext {
     fn new(device: &ID3D12Device) -> Result<Self> {
+        // v479: state transitions involving UAV resources are not legal work for
+        // a COPY command queue.  Use a DIRECT queue so every transfer can state
+        // exactly what DirectML and OpenGL own before/after the copy.
         let queue = unsafe {
             device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
             })?
         };
         let allocator = unsafe {
-            device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_COPY)?
+            device
+                .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)?
         };
         let list = unsafe {
             device.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(
                 0,
-                D3D12_COMMAND_LIST_TYPE_COPY,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
                 &allocator,
                 None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
             )?
@@ -4641,6 +5030,52 @@ impl DmlCopyContext {
         })
     }
 
+    fn transition(
+        list: &ID3D12GraphicsCommandList,
+        resource: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) {
+        if before == after {
+            return;
+        }
+        // windows-rs models the COM pointer inside the transition barrier as
+        // ManuallyDrop.  Release our temporary clone immediately after command
+        // recording so per-frame barriers do not retain the resource forever.
+        let mut barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: ManuallyDrop::new(Some(resource.clone())),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        unsafe {
+            list.ResourceBarrier(std::slice::from_ref(&barrier));
+            let transition = &mut *barrier.Anonymous.Transition;
+            ManuallyDrop::drop(&mut transition.pResource);
+        }
+    }
+
+    fn wait_submitted(&mut self, copy_start: Instant) -> Result<(f64, f64)> {
+        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
+        let wait_start = Instant::now();
+        if unsafe { self.fence.GetCompletedValue() } < self.value {
+            unsafe {
+                self.fence.SetEventOnCompletion(self.value, self.event)?;
+                let _ = WaitForSingleObject(self.event, INFINITE);
+            }
+        }
+        Ok((copy_ms, wait_start.elapsed().as_secs_f64() * 1000.0))
+    }
+
+    /// Copy an ORT/DirectML-owned tensor into the OpenGL-shared buffer.
+    /// DirectML allocator resources are kept in UAV state; GL-shared buffers
+    /// are kept in COMMON whenever D3D12 is not actively copying them.
     fn copy_and_wait(
         &mut self,
         source: &ID3D12Resource,
@@ -4654,22 +5089,96 @@ impl DmlCopyContext {
                 &self.allocator,
                 None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
             )?;
+            Self::transition(
+                &self.list,
+                source,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            Self::transition(
+                &self.list,
+                dest,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
             self.list.CopyBufferRegion(dest, 0, source, 0, bytes as u64);
+            Self::transition(
+                &self.list,
+                source,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            );
+            Self::transition(
+                &self.list,
+                dest,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
             self.list.Close()?;
             let command: ID3D12CommandList = self.list.cast()?;
             self.queue.ExecuteCommandLists(&[Some(command)]);
             self.value = self.value.saturating_add(1);
             self.queue.Signal(&self.fence, self.value)?;
         }
-        let copy_ms = copy_start.elapsed().as_secs_f64() * 1000.0;
-        let wait_start = Instant::now();
-        if unsafe { self.fence.GetCompletedValue() } < self.value {
-            unsafe {
-                self.fence.SetEventOnCompletion(self.value, self.event)?;
-                let _ = WaitForSingleObject(self.event, INFINITE);
-            }
+        self.wait_submitted(copy_start)
+    }
+
+    /// Copy GL-packed COMMON buffers into DirectML-private UAV buffers.  The
+    /// destination is returned to UAV before ORT starts inference, and the
+    /// shared source is returned to COMMON before OpenGL sees it again.
+    fn copy_many_and_wait(
+        &mut self,
+        copies: &[(ID3D12Resource, ID3D12Resource, usize)],
+    ) -> Result<(f64, f64)> {
+        if copies.is_empty() {
+            return Ok((0.0, 0.0));
         }
-        Ok((copy_ms, wait_start.elapsed().as_secs_f64() * 1000.0))
+        let copy_start = Instant::now();
+        unsafe {
+            self.allocator.Reset()?;
+            self.list.Reset(
+                &self.allocator,
+                None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
+            )?;
+            for (source, dest, _) in copies {
+                Self::transition(
+                    &self.list,
+                    source,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                );
+                Self::transition(
+                    &self.list,
+                    dest,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+            }
+            for (source, dest, bytes) in copies {
+                self.list
+                    .CopyBufferRegion(dest, 0, source, 0, *bytes as u64);
+            }
+            for (source, dest, _) in copies {
+                Self::transition(
+                    &self.list,
+                    source,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                );
+                Self::transition(
+                    &self.list,
+                    dest,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+            }
+            self.list.Close()?;
+            let command: ID3D12CommandList = self.list.cast()?;
+            self.queue.ExecuteCommandLists(&[Some(command)]);
+            self.value = self.value.saturating_add(1);
+            self.queue.Signal(&self.fence, self.value)?;
+        }
+        self.wait_submitted(copy_start)
     }
 }
 
@@ -4734,6 +5243,24 @@ fn create_direct_input_channels_typed(
     channels: usize,
     element_bytes: usize,
 ) -> Result<DmlDirectInput> {
+    create_direct_input_channels_typed_state(
+        device,
+        luid,
+        input_size,
+        channels,
+        element_bytes,
+        D3D12_RESOURCE_STATE_COMMON,
+    )
+}
+
+fn create_direct_input_channels_typed_state(
+    device: &ID3D12Device,
+    luid: [u8; 8],
+    input_size: (i32, i32),
+    channels: usize,
+    element_bytes: usize,
+    initial_state: D3D12_RESOURCE_STATES,
+) -> Result<DmlDirectInput> {
     let (w, h) = input_size;
     let elements = usize::try_from(w)?
         .checked_mul(usize::try_from(h)?)
@@ -4772,7 +5299,7 @@ fn create_direct_input_channels_typed(
             &heap,
             D3D12_HEAP_FLAG_SHARED,
             &desc,
-            D3D12_RESOURCE_STATE_COMMON,
+            initial_state,
             None,
             &mut resource,
         )?;
@@ -4955,6 +5482,37 @@ fn create_direct_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
         copy,
         dml_allocator,
     })
+}
+
+fn dml_interp_interop_mode(
+    _gc: &GlContext,
+    _stable_post_handoff: bool,
+) -> Option<DmlInterpInteropMode> {
+    let requested = std::env::var("CHIDESCALER_DML_INTERP_INTEROP")
+        .unwrap_or_else(|_| "auto".into())
+        .trim()
+        .to_ascii_lowercase();
+    match requested.as_str() {
+        "0" | "off" | "disable" | "cpu" | "nonresident" => None,
+        // Keep the old modes available only as explicit diagnostics.  The
+        // default must not let DirectML consume a buffer that OpenGL has just
+        // written directly.  On NVIDIA the GL fence can report completion while
+        // DirectML still observes incompletely visible shared-buffer contents;
+        // the result looks like nearest-neighbour blocks/mosaic before any
+        // post-GLSL stage is applied.
+        "direct" | "fast" => Some(DmlInterpInteropMode::Direct),
+        "output-copy" | "post-safe" => Some(DmlInterpInteropMode::ProviderOutputCopy),
+        "copy" | "safe" | "conservative" => Some(DmlInterpInteropMode::ConservativeCopy),
+        _ => {
+            // v479: isolate *both* sides of DirectML interpolation by default,
+            // but now keep every D3D12 resource in an explicit legal state at
+            // each ownership boundary. GL-shared staging/output stays COMMON,
+            // DirectML-private/provider tensors stay UAV, and a DIRECT queue
+            // performs state-correct GPU copies between them. No CPU frame
+            // readback/upload is introduced.
+            Some(DmlInterpInteropMode::ConservativeCopy)
+        }
+    }
 }
 
 fn dml_api() -> Result<&'static ort::sys::OrtDmlApi> {
@@ -6615,6 +7173,30 @@ mod tests {
         .unwrap();
         assert_eq!(providers_from_ort_profile(&root).unwrap(), (false, true));
         let _ = std::fs::remove_file(root);
+    }
+
+    #[test]
+    fn dml_post_interp_auto_bridge_is_safe_copy_only_on_non_conservative_driver() {
+        assert_eq!(
+            resolve_dml_gl_interop_mode("", true, false),
+            Some(DmlGlInteropMode::ProviderOwnedCopy)
+        );
+        assert_eq!(resolve_dml_gl_interop_mode("", true, true), None);
+        assert_eq!(resolve_dml_gl_interop_mode("", false, false), None);
+    }
+
+    #[test]
+    fn dml_interop_environment_override_has_priority_over_auto_policy() {
+        assert_eq!(
+            resolve_dml_gl_interop_mode("direct", true, true),
+            Some(DmlGlInteropMode::Direct)
+        );
+        assert_eq!(
+            resolve_dml_gl_interop_mode("copy", false, true),
+            Some(DmlGlInteropMode::ProviderOwnedCopy)
+        );
+        assert_eq!(resolve_dml_gl_interop_mode("0", true, false), None);
+        assert_eq!(resolve_dml_gl_interop_mode("off", true, false), None);
     }
 
     #[test]

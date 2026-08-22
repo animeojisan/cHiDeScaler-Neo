@@ -13,7 +13,7 @@
 //!   confined real cursor away from the source.
 //! - Every stop path releases cursor confinement.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
@@ -52,6 +52,33 @@ pub const PANEL_ACTION_EXPAND: u32 = 1 << 2;
 pub const PANEL_ACTION_SCREENSHOT: u32 = 1 << 3;
 pub const PANEL_ACTION_GUI_TOPMOST: u32 = 1 << 4;
 static PANEL_ACTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Lock-free snapshot of the currently visible floating panel. The LL mouse
+/// hook must never lose a panel click merely because the main cursor state
+/// mutex is momentarily busy on another thread.
+static ACTIVE_PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Matching button-up for a lock-free direct panel DOWN is swallowed here,
+/// independently of the main State mutex.
+static PANEL_DIRECT_SWALLOW_UP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// v348u: lock-free main-window Start/Stop routing. Both directions use the
+/// same physical pointer-DOWN edge so the control has symmetric latency and
+/// cannot lose Start to egui focus/ownership settling after a fast Stop.
+pub const MAIN_ACTION_STOP: u32 = 1 << 0;
+pub const MAIN_ACTION_START: u32 = 1 << 1;
+pub const MAIN_CONTROL_DISABLED: u32 = 0;
+pub const MAIN_CONTROL_START: u32 = 1;
+pub const MAIN_CONTROL_STOP: u32 = 2;
+static MAIN_ACTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GUI_MINIMIZE_CURSOR: AtomicI64 = AtomicI64::new(0);
+static GUI_MINIMIZE_CURSOR_AT_MS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_MAIN_GUI_HWND: AtomicIsize = AtomicIsize::new(0);
+static MAIN_CONTROL_MODE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(MAIN_CONTROL_DISABLED);
+static MAIN_DIRECT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MAIN_CONTROL_LEFT: AtomicI32 = AtomicI32::new(0);
+static MAIN_CONTROL_TOP: AtomicI32 = AtomicI32::new(0);
+static MAIN_CONTROL_RIGHT: AtomicI32 = AtomicI32::new(0);
+static MAIN_CONTROL_BOTTOM: AtomicI32 = AtomicI32::new(0);
 /// Engagement is committed synchronously inside the hook. A hardware move that
 /// was queued before the cursor warp can still arrive with stale screen-space
 /// coordinates, so edge-exit detection is briefly suppressed after engagement.
@@ -73,7 +100,37 @@ const TELEPORT_SETTLE_TIMEOUT_MS: u64 = 250;
 // Keep a short commit-relative firewall so those late events can never be
 // interpreted as source-space and fling the virtual cursor to a screen corner.
 const POST_COMMIT_STALE_GUARD_MS: u64 = 250;
+// v378: capture-wide sprite ownership means edge exit no longer waits for a native-cursor reveal.
+// Keep only one mouse-sample-sized defer so the triggering WH_MOUSE_LL event has returned before
+// SetCursorPos moves the hidden native cursor into desktop coordinates.
+const EDGE_TRANSFER_DEFER_MS: u64 = 8;
+/// A cursor reveal must never wait forever. A bad/off-desktop target used to
+/// leave Magnification hiding the native cursor until capture was stopped.
+const CURSOR_REVEAL_MAX_ATTEMPTS: u8 = 8;
+/// Capture-wide sprite mode must not depend on the render/ONNX thread to
+/// complete an edge handoff. A cold TensorRT shape can stall that thread for
+/// seconds, while the mouse hook remains responsive. Use a one-shot timer on
+/// the hook-owned sprite window after the triggering WH_MOUSE_LL callback has
+/// returned, then move the hidden real cursor from source space to desktop
+/// space there.
+const CURSOR_EDGE_TRANSFER_TIMER_ID: usize = 2;
+static DRAG_GEOMETRY_DIAG_NEXT_MS: AtomicU64 = AtomicU64::new(0);
 const POST_COMMIT_RAW_DIVERGENCE_PX: i32 = 96;
+/// After an edge handoff the LL-hook queue can still deliver one or more
+/// pre-warp source/content-space points even though GetCursorPos already sits
+/// at the verified desktop target.  Quarantine only those large-divergence
+/// events for a short bounded window; normal desktop motion takes over as soon
+/// as the two coordinate streams converge again.
+const POST_EDGE_RAW_GUARD_MS: u64 = 250;
+const POST_EDGE_RAW_DIVERGENCE_PX: i32 = 96;
+const POST_EDGE_RAW_CATCHUP_PX: i32 = 24;
+
+fn post_edge_raw_is_stale(dx: i32, dy: i32, domain_disagrees: bool) -> bool {
+    dx > POST_EDGE_RAW_DIVERGENCE_PX
+        || dy > POST_EDGE_RAW_DIVERGENCE_PX
+        || (domain_disagrees && (dx > POST_EDGE_RAW_CATCHUP_PX || dy > POST_EDGE_RAW_CATCHUP_PX))
+}
+
 const OSC_SHORT_MS: u64 = 250;
 const OSC_MAX: u32 = 6;
 /// Kept public for source compatibility with older diagnostic binaries.
@@ -83,6 +140,28 @@ pub const PANEL_NO_ENGAGE_HALO_PX: i32 = 0;
 const BTN_LEFT: u8 = 0x01;
 const BTN_RIGHT: u8 = 0x02;
 const BTN_MIDDLE: u8 = 0x04;
+
+/// HWND of the source that owns the current client-surface LEFT-button
+/// gesture.  This is deliberately stricter than GetAsyncKeyState(VK_LBUTTON):
+/// a physical hold may have started on Neo's GUI/desktop, or source ownership
+/// may already have been released after a failed/off-desktop handoff.  The
+/// engine may mirror native source movement into the visible overlay ONLY while
+/// this token still names the active source.
+static SOURCE_CLIENT_DRAG_OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Raw WH_MOUSE_LL screen coordinate at the exact LEFT-down that armed the
+/// client-only source gesture, plus the latest raw move from that same owner.
+/// Unlike GetCursorPos these raw coordinates keep travelling past ClipCursor
+/// and even past the physical monitor edge, so they remain a usable visual
+/// drag authority after Windows/Chromium stops moving the hidden source HWND.
+static SOURCE_CLIENT_DRAG_RAW_ORIGIN: AtomicI64 = AtomicI64::new(0);
+static SOURCE_CLIENT_DRAG_RAW_CURRENT: AtomicI64 = AtomicI64::new(0);
+
+/// Lock-free provenance check used by the render/geometry thread.  A client
+/// drag is valid only when its LEFT-down began while Neo actually owned source
+/// input; merely observing the physical button held is not sufficient.
+pub fn source_client_drag_owns(hwnd: isize) -> bool {
+    hwnd != 0 && SOURCE_CLIENT_DRAG_OWNER_HWND.load(Ordering::Acquire) == hwnd
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -199,6 +278,22 @@ fn tracked_ui_for_top_hwnd(no_engage: &[NoEngageRect], top_hwnd: isize) -> Optio
 /// IMPORTANT: this function is read-only. It must not raise/reorder a window;
 /// changing Z-order while deciding Z-order makes ownership self-modifying and
 /// was one of the sources of enter/exit oscillation.
+fn native_hit_is_covered_by_active_overlay(hwnd: isize, x: i32, y: i32) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let overlay = ACTIVE_OVERLAY_HWND.load(Ordering::Acquire);
+    if overlay == 0
+        || overlay == hwnd
+        || !crate::platform::win32::is_window_valid(overlay)
+        || !crate::platform::win32::is_window_visible(overlay)
+        || !crate::platform::win32::point_is_inside_window(overlay, x, y)
+    {
+        return false;
+    }
+    !crate::platform::win32::window_is_above(hwnd, overlay)
+}
+
 fn hit_ui_for_cursor_ownership(no_engage: &[NoEngageRect], x: i32, y: i32) -> Option<NoEngageRect> {
     // Unit/synthetic geometry has no live HWND at all. Resolve that case before
     // WindowFromPoint so desktop/test-runner windows cannot accidentally become
@@ -215,6 +310,20 @@ fn hit_ui_for_cursor_ownership(no_engage: &[NoEngageRect], x: i32, y: i32) -> Op
     // overrule the actual top-level window under this point.
     let top = crate::platform::win32::direct_top_level_window_at_point(x, y);
     if top == 0 {
+        return None;
+    }
+    // The magnified overlay is intentionally WS_EX_TRANSPARENT, so the Win32
+    // hit test can report a GUI/source/external window that is physically
+    // underneath the visible magnified image.  Never let such a covered HWND
+    // become native cursor owner.  A GUI that is genuinely raised above the
+    // overlay still passes this test and remains fully interactive.
+    if native_hit_is_covered_by_active_overlay(top, x, y) {
+        if COVERED_NATIVE_HIT_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) % 128 == 0 {
+            log::debug!(
+                "covered-native-hit ignored: hwnd={top:#x} overlay={:#x} point=({x},{y}) reason=overlay-visual-priority",
+                ACTIVE_OVERLAY_HWND.load(Ordering::Acquire)
+            );
+        }
         return None;
     }
     let tracked = tracked_ui_for_top_hwnd(no_engage, top);
@@ -259,6 +368,7 @@ fn own_main_gui_at_visible_point(
             || zone.hwnd == 0
             || !crate::platform::win32::is_own_window(zone.hwnd)
             || !crate::platform::win32::is_window_valid(zone.hwnd)
+            || crate::platform::win32::is_minimized(zone.hwnd)
         {
             return None;
         }
@@ -276,9 +386,18 @@ fn own_main_gui_at_visible_point(
     })
 }
 
+fn own_main_gui_at_visible_point_for_ownership(
+    no_engage: &[NoEngageRect],
+    x: i32,
+    y: i32,
+) -> Option<NoEngageRect> {
+    own_main_gui_at_visible_point(no_engage, x, y)
+        .filter(|gui| !native_hit_is_covered_by_active_overlay(gui.hwnd, x, y))
+}
+
 fn hit_ui_for_visible_cursor(g: &State, x: i32, y: i32) -> Option<NoEngageRect> {
     if g.engaged {
-        if let Some(gui) = own_main_gui_at_visible_point(&g.no_engage, x, y) {
+        if let Some(gui) = own_main_gui_at_visible_point_for_ownership(&g.no_engage, x, y) {
             return Some(gui);
         }
     }
@@ -291,6 +410,78 @@ fn route_clock_ms() -> u64 {
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis() as u64
+}
+
+pub fn record_gui_minimize_cursor() {
+    let pos = read_cursor_pos_or((i32::MIN, i32::MIN), "gui native minimize");
+    if pos.0 == i32::MIN || pos.1 == i32::MIN {
+        return;
+    }
+    GUI_MINIMIZE_CURSOR.store(pack_drag_pair(pos.0, pos.1), Ordering::Release);
+    GUI_MINIMIZE_CURSOR_AT_MS.store(route_clock_ms(), Ordering::Release);
+    log::info!("gui-native-minimize-cursor-saved: pos=({},{})", pos.0, pos.1);
+}
+
+/// Fail-visible handoff for native root-GUI minimization during capture.
+///
+/// The real system cursor is intentionally Magnification-hidden while the
+/// capture sprite owns presentation. Minimizing the root GUI removes its native
+/// UI ownership immediately; waiting for the next mouse move to rebuild source
+/// ownership creates a cursor-less gap. Preserve the visible desktop coordinate
+/// and hand presentation back to the capture sprite synchronously. The explicit
+/// idle auto-hide option remains authoritative: when it intentionally hid the
+/// sprite, minimization does not override that user setting.
+pub fn handle_main_gui_minimize_begin() {
+    record_gui_minimize_cursor();
+    end_native_gui_caption_drag("native-minimize");
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+
+    if !capture_sprite_active() {
+        return;
+    }
+
+    let saved = unpack_drag_pair(GUI_MINIMIZE_CURSOR.load(Ordering::Acquire));
+    if saved.0 == i32::MIN || saved.1 == i32::MIN {
+        return;
+    }
+
+    let mut idle_hidden = false;
+    if let Ok(mut g) = state().try_lock() {
+        idle_hidden = g.hidden_by_idle;
+        g.native_ui_hold_bits = 0;
+        g.ui_hold_bits = 0;
+        g.last_ui_hover = None;
+        g.ui_hover_active = false;
+        g.pending_engage = None;
+        g.virt = (saved.0 as f64, saved.1 as f64);
+        // A title-bar click is current user activity. Do not manufacture an
+        // idle timeout, but preserve an already-committed idle-hide state.
+        if !idle_hidden {
+            g.last_move = Some(std::time::Instant::now());
+        }
+    }
+
+    // During active capture the native cursor stays hidden by design. Keep a
+    // visible Neo sprite at the exact pre-minimize point until normal source or
+    // panel ownership takes over. If idle auto-hide intentionally hid it, keep
+    // the sprite hidden and only maintain the native-hide contract.
+    request_cursor_hidden(true);
+    if idle_hidden {
+        sprite_hide();
+        log::info!(
+            "gui-minimize-cursor-handoff: pos=({},{}) mode=idle-autohide-preserved",
+            saved.0,
+            saved.1
+        );
+    } else {
+        sprite_move_now(saved.0, saved.1, true);
+        keep_cursor_sprite_on_top();
+        log::info!(
+            "gui-minimize-cursor-handoff: pos=({},{}) mode=capture-sprite-fail-visible",
+            saved.0,
+            saved.1
+        );
+    }
 }
 
 fn publish_main_gui_passthrough(hwnd: isize, passthrough: bool, reason: &str) {
@@ -316,6 +507,36 @@ fn set_own_main_gui_passthrough(g: &State, passthrough: bool, reason: &str) {
         {
             publish_main_gui_passthrough(zone.hwnd, passthrough, reason);
         }
+    }
+}
+
+/// Source ownership only needs the main GUI to be click-through when the HIDDEN
+/// native cursor's mapped source point physically falls underneath that GUI.
+/// v377 toggled the whole GUI on every overlay enter/exit, forcing
+/// SWP_FRAMECHANGED across the LL-hook path (~50-65ms in user logs) even when
+/// the source cursor was nowhere near the GUI.  Keep normal GUI hit testing
+/// intact and shield lazily only for the rare physical overlap case.
+fn shield_main_gui_for_source_target(
+    g: &State,
+    source_x: i32,
+    source_y: i32,
+    visible_x: i32,
+    visible_y: i32,
+) {
+    let Some(gui) = own_main_gui_at_visible_point(&g.no_engage, source_x, source_y) else {
+        return;
+    };
+    if own_main_gui_at_visible_point(&g.no_engage, visible_x, visible_y)
+        .is_some_and(|visible_gui| visible_gui.hwnd == gui.hwnd)
+    {
+        return;
+    }
+    if !crate::platform::win32::window_input_passthrough(gui.hwnd) {
+        publish_main_gui_passthrough(gui.hwnd, true, "source-target-overlap-shield");
+        log::debug!(
+            "source-target GUI shield: hwnd={:#x} source=({source_x},{source_y}) visible=({visible_x},{visible_y})",
+            gui.hwnd
+        );
     }
 }
 
@@ -686,36 +907,18 @@ fn post_mouse_move_to_hwnd(hwnd: isize, sx: i32, sy: i32) {
     }
 }
 
-fn post_mouse_button_to_hwnd(hwnd: isize, sx: i32, sy: i32, bit: u8) {
-    if hwnd == 0 {
-        return;
-    }
-    let (down_msg, up_msg, mk) = match bit {
-        BTN_LEFT => (WM_LBUTTONDOWN, WM_LBUTTONUP, 0x0001usize),
-        BTN_RIGHT => (WM_RBUTTONDOWN, WM_RBUTTONUP, 0x0002usize),
-        BTN_MIDDLE => (WM_MBUTTONDOWN, WM_MBUTTONUP, 0x0010usize),
-        _ => return,
-    };
-    unsafe {
-        let h = HWND(hwnd as *mut _);
-        let mut pt = POINT { x: sx, y: sy };
-        let _ = ScreenToClient(h, &mut pt);
-        let lp = (((pt.y as u32 & 0xFFFF) << 16) | (pt.x as u32 & 0xFFFF)) as isize;
-        let _ = PostMessageW(Some(h), WM_MOUSEMOVE, WPARAM(0), LPARAM(lp));
-        let _ = PostMessageW(Some(h), down_msg, WPARAM(mk), LPARAM(lp));
-        let _ = PostMessageW(Some(h), up_msg, WPARAM(0), LPARAM(lp));
-    }
-}
-
 fn queue_panel_action(hover: UiHover, bit: u8) {
     if bit != BTN_LEFT || !is_panel_hit(hover.hit) {
         return;
     }
     let land = hover.hit.land;
     let rel_x = hover.pos.0 - land.x;
-    let action = panel_action_for_relative_x(land.w, rel_x);
+    let action = panel_action_for_relative_x(land.w, land.h, rel_x);
     let Some(action) = action else { return };
     PANEL_ACTIONS.fetch_or(action, Ordering::Release);
+    // Same logical action as Ctrl+Alt+G: wake the GUI event loop only. Do not
+    // minimize, restore, or otherwise alter GUI visibility from the panel.
+    crate::platform::win32::wake_main_gui_for_panel_action(false);
     log::info!(
         "panel direct action queued: action={} hwnd={:#x} pos=({},{}) land={:?}",
         match action {
@@ -736,11 +939,16 @@ fn queue_panel_action(hover: UiHover, bit: u8) {
 /// Hit-test the fixed [stop][fps][camera][GUI][collapse] panel layout. Boundaries
 /// sit in the middle of each 3pt visual gap, so direct hook actions and the
 /// painted controls cannot disagree near an edge.
-pub fn panel_action_for_relative_x(width: i32, relative_x: i32) -> Option<u32> {
-    if width <= 0 || relative_x < 0 || relative_x >= width {
+pub fn panel_action_for_relative_x(width: i32, height: i32, relative_x: i32) -> Option<u32> {
+    if width <= 0 || height <= 0 || relative_x < 0 || relative_x >= width {
         return None;
     }
-    if width <= 60 {
+    // Lurk geometry must be recognized independently of DPI. The old <=60px
+    // width heuristic only worked while the transparent chip was 34pt wide;
+    // after widening the hit area to 68pt it can exceed 60 physical pixels even
+    // at ordinary Windows scaling. The lurk target is compact (~2.8:1), while
+    // the full control bar is wide (~9:1), so classify by aspect ratio instead.
+    if width <= height.saturating_mul(4) {
         return Some(PANEL_ACTION_EXPAND);
     }
     const LAYOUT_UNITS: i32 = 270;
@@ -766,6 +974,185 @@ pub fn take_panel_actions() -> u32 {
     PANEL_ACTIONS.swap(0, Ordering::AcqRel)
 }
 
+/// Consume only the emergency Stop bit. The render thread uses this while the
+/// root GUI is minimized and its normal egui action drain is suspended.
+pub fn take_panel_stop_action() -> bool {
+    PANEL_ACTIONS.fetch_and(!PANEL_ACTION_STOP, Ordering::AcqRel) & PANEL_ACTION_STOP != 0
+}
+
+/// Publish the physical client-space rectangle and current action of the main
+/// capture control. The LL hook combines this client rectangle with the live
+/// window origin on every click, so moving the GUI cannot leave stale hit-test
+/// coordinates behind.
+pub fn set_main_control_surface(hwnd: isize, rect: Option<(i32, i32, i32, i32)>, mode: u32) {
+    if mode == MAIN_CONTROL_DISABLED || hwnd == 0 {
+        MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        ACTIVE_MAIN_GUI_HWND.store(hwnd, Ordering::Release);
+        return;
+    }
+    let Some((x, y, w, h)) = rect else {
+        MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        return;
+    };
+    if w <= 0 || h <= 0 {
+        MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        return;
+    }
+    // A few physical pixels cover rounding between egui points, DPI scaling
+    // and Win32 client coordinates. The control is isolated at the left edge
+    // of its row, so this does not overlap a neighbouring action.
+    const PAD: i32 = 4;
+    MAIN_CONTROL_LEFT.store(x - PAD, Ordering::Relaxed);
+    MAIN_CONTROL_TOP.store(y - PAD, Ordering::Relaxed);
+    MAIN_CONTROL_RIGHT.store(x + w + PAD, Ordering::Relaxed);
+    MAIN_CONTROL_BOTTOM.store(y + h + PAD, Ordering::Relaxed);
+    ACTIVE_MAIN_GUI_HWND.store(hwnd, Ordering::Release);
+    MAIN_CONTROL_MODE.store(mode, Ordering::Release);
+}
+
+pub fn take_main_actions() -> u32 {
+    MAIN_ACTIONS.swap(0, Ordering::AcqRel)
+}
+
+pub fn main_control_direct_pressed() -> bool {
+    MAIN_DIRECT_ACTIVE.load(Ordering::Acquire)
+}
+
+fn try_main_control_lockfree(msg: u32, px: i32, py: i32) -> bool {
+    // The matching UP is deliberately still delivered to winit/egui so its
+    // pointer state stays balanced. GUI release/click is presentation-only;
+    // the actual Start/Stop action is committed on this physical DOWN.
+    if msg == WM_LBUTTONUP && MAIN_DIRECT_ACTIVE.swap(false, Ordering::AcqRel) {
+        return true;
+    }
+    if msg != WM_LBUTTONDOWN {
+        return false;
+    }
+    let mode = MAIN_CONTROL_MODE.load(Ordering::Acquire);
+    if mode == MAIN_CONTROL_DISABLED {
+        return false;
+    }
+    let hwnd = ACTIVE_MAIN_GUI_HWND.load(Ordering::Acquire);
+    if hwnd == 0
+        || !crate::platform::win32::is_window_valid(hwnd)
+        || !crate::platform::win32::is_window_visible(hwnd)
+        || crate::platform::win32::window_input_passthrough(hwnd)
+    {
+        return false;
+    }
+    let Some((cx, cy, _, _)) = crate::platform::win32::client_rect_on_screen(hwnd) else {
+        return false;
+    };
+    let left = cx + MAIN_CONTROL_LEFT.load(Ordering::Relaxed);
+    let top = cy + MAIN_CONTROL_TOP.load(Ordering::Relaxed);
+    let right = cx + MAIN_CONTROL_RIGHT.load(Ordering::Relaxed);
+    let bottom = cy + MAIN_CONTROL_BOTTOM.load(Ordering::Relaxed);
+    if px < left || px >= right || py < top || py >= bottom {
+        return false;
+    }
+    if crate::platform::win32::direct_top_level_window_at_point(px, py) != hwnd {
+        return false;
+    }
+    let (action, name) = match mode {
+        MAIN_CONTROL_START => (MAIN_ACTION_START, "start"),
+        MAIN_CONTROL_STOP => (MAIN_ACTION_STOP, "stop"),
+        _ => return false,
+    };
+    MAIN_ACTIONS.fetch_or(action, Ordering::Release);
+    MAIN_DIRECT_ACTIVE.store(true, Ordering::Release);
+    log::info!(
+        "main-control-direct: action={name} hwnd={:#x} pos=({px},{py}) rect=({left},{top})-({right},{bottom}) lockfree=true",
+        hwnd
+    );
+    true
+}
+
+fn direct_panel_point(px: i32, py: i32) -> (i32, i32, &'static str) {
+    // When the mapped sprite owns the cursor, its coalesced target is the
+    // visible screen-space pointer. Otherwise the hook's hardware point is
+    // already the visible native cursor position.
+    if SPRITE_SHOW.load(Ordering::Acquire) && CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        let packed = SPRITE_TARGET.load(Ordering::Acquire);
+        (packed as i32, (packed >> 32) as i32, "sprite")
+    } else {
+        (px, py, "native")
+    }
+}
+
+/// First-chance, lock-free floating-panel click routing. This runs before any
+/// State::try_lock() path. It fixes the long-standing intermittent case where
+/// the first click only changed ownership/focus and the second click performed
+/// the action, or where a brief state-mutex collision let the first DOWN fall
+/// through. The panel still has to be the actual top interactive window at the
+/// visible point, so a main GUI genuinely above it remains authoritative.
+fn try_panel_direct_lockfree(msg: u32, px: i32, py: i32) -> bool {
+    let Some((bit, down)) = button_transition(msg) else {
+        return false;
+    };
+    if bit != BTN_LEFT {
+        return false;
+    }
+
+    if !down {
+        if PANEL_DIRECT_SWALLOW_UP.load(Ordering::Acquire) & bit != 0 {
+            PANEL_DIRECT_SWALLOW_UP.fetch_and(!bit, Ordering::AcqRel);
+            return true;
+        }
+        return false;
+    }
+
+    let hwnd = ACTIVE_PANEL_HWND.load(Ordering::Acquire);
+    if hwnd == 0
+        || !crate::platform::win32::is_window_valid(hwnd)
+        || !crate::platform::win32::is_window_visible(hwnd)
+        || crate::platform::win32::window_input_passthrough(hwnd)
+    {
+        return false;
+    }
+
+    let (vx, vy, owner) = direct_panel_point(px, py);
+    let Some((rx, ry, rw, rh)) = crate::platform::win32::window_rect(hwnd) else {
+        return false;
+    };
+    if rw <= 0 || rh <= 0 || vx < rx || vx >= rx + rw || vy < ry || vy >= ry + rh {
+        return false;
+    }
+    if crate::platform::win32::direct_top_level_window_at_point(vx, vy) != hwnd {
+        return false;
+    }
+
+    if let Some(action) = panel_action_for_relative_x(rw, rh, vx - rx) {
+        if action == PANEL_ACTION_STOP {
+            let gui = crate::platform::win32::main_gui_hwnd();
+            if gui != 0 && crate::platform::win32::is_minimized(gui) {
+                // Return to this panel click after emergency release, not to
+                // the old title-bar point saved when minimization began.
+                record_gui_minimize_cursor();
+            }
+        }
+        PANEL_ACTIONS.fetch_or(action, Ordering::Release);
+        // Keep the GUI button identical to Ctrl+Alt+G. It only requests the
+        // existing TOPMOST toggle and never changes minimize/restore state.
+        crate::platform::win32::wake_main_gui_for_panel_action(false);
+        PANEL_DIRECT_SWALLOW_UP.fetch_or(bit, Ordering::AcqRel);
+        log::debug!(
+            "panel first-click direct: action={} hwnd={:#x} pos=({vx},{vy}) owner={} lockfree=true",
+            match action {
+                PANEL_ACTION_STOP => "stop",
+                PANEL_ACTION_COLLAPSE => "collapse",
+                PANEL_ACTION_EXPAND => "expand",
+                PANEL_ACTION_SCREENSHOT => "screenshot",
+                PANEL_ACTION_GUI_TOPMOST => "gui-topmost",
+                _ => "unknown",
+            },
+            hwnd,
+            owner
+        );
+        return true;
+    }
+    false
+}
+
 /// Returns true when this move handed ownership to a native GUI and moved the
 /// real cursor there. The hook must consume that triggering source-space event,
 /// or Windows will apply its old source coordinate after the handoff.
@@ -773,31 +1160,35 @@ fn post_ui_hover_from_state(g: &mut State, now: std::time::Instant) -> bool {
     if let Some(hover) = note_ui_hover(g, now) {
         if hover.hit.hwnd != 0 {
             if is_panel_hit(hover.hit) {
-                // The floating control panel keeps the sprite treatment:
-                // hover posts for highlight, clicks redirected explicitly.
-                let should_post = match g.last_ui_post {
-                    Some((hwnd, pos, at)) => {
-                        hwnd != hover.hit.hwnd
-                            || pos != hover.pos
-                            || now.duration_since(at) >= std::time::Duration::from_millis(8)
-                    }
-                    None => true,
-                };
-                if should_post {
-                    post_mouse_move_to_hwnd(hover.hit.hwnd, hover.pos.0, hover.pos.1);
-                    g.last_ui_post = Some((hover.hit.hwnd, hover.pos, now));
+                // v370: treat the floating panel as an ordinary native-owned
+                // window, exactly like the main GUI. The old sprite-only hover
+                // path kept the real cursor clipped in source space and relied
+                // on synthetic WM_MOUSEMOVE/click redirection; near the panel's
+                // 66px boundary that ownership could be lost before the user
+                // could settle on a control. Release source ownership at the
+                // first exact panel pixel and let normal Win32 hover/capture
+                // semantics own the gesture until the pointer leaves.
+                if handoff_to_gui(g, hover, now) {
+                    log::info!(
+                        "panel entry handoff to hwnd={:#x} at ({},{}) owner=native",
+                        hover.hit.hwnd,
+                        hover.pos.0,
+                        hover.pos.1
+                    );
+                    return true;
                 }
-                g.hidden_by_idle = false;
-                g.ui_hover_active = true;
-                sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
-                keep_cursor_sprite_on_top();
+                log::warn!(
+                    "panel entry deferred after unverified warp: hwnd={:#x} at ({},{})",
+                    hover.hit.hwnd,
+                    hover.pos.0,
+                    hover.pos.1
+                );
             } else {
                 // The GUI is our own window; the moment
-                // the virtual cursor enters it, switch to the plain system
-                // cursor entirely (disengage + real cursor at the sprite
-                // position + activate). No sprite/synthetic-hover hybrid: that
-                // hybrid is what flickered until a real click activated the
-                // window. Inside the GUI everything is ordinary Windows;
+                // the virtual cursor enters it, switch to native input ownership
+                // (real cursor at the sprite position, visually represented by
+                // the proven Neo sprite during active capture). Inside the GUI
+                // everything follows ordinary Windows hit-test/capture rules;
                 // leaving it is classified immediately by the live HWND edge.
                 if handoff_to_gui(g, hover, now) {
                     log::info!(
@@ -976,6 +1367,11 @@ fn exit_point_for_escape(g: &State, px: i32, py: i32) -> (i32, i32) {
     let virt = g.virt;
     let margin = if g.fullscreen {
         EXIT_PLACE_MARGIN_PX
+    } else if g.window_frame_input {
+        // Full-frame input and visible WGC coordinates are now identical, so
+        // the native cursor can cross at the same one-pixel boundary as an
+        // ordinary Windows window.
+        1
     } else {
         EXIT_WINDOW_MARGIN_PX
     };
@@ -1014,14 +1410,17 @@ fn clip_rect(src: Rect) -> RECT {
 /// Injecting an unconditional RIGHTUP here can be interpreted by Explorer as
 /// a completed right-click and opened its context menu before Neo appeared.
 pub fn startup_recover_input_state() {
+    SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     // ask the render-engine thread (Mag owner) to reveal the cursor if it is
     // still alive; also do a best-effort local reveal for the standalone rescue
     // exe (where no engine thread exists — the OS restores the cursor on the
     // hidden process's exit anyway, so a residual no-op here is harmless).
     WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
     CURSOR_HIDE_APPLIED.store(false, Ordering::Release);
+    DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
     MAG_REINIT_REQUESTED.store(true, Ordering::Release);
     NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    ACTIVE_OVERLAY_HWND.store(0, Ordering::Release);
     cancel_cursor_reveal();
     sprite_hide();
     restore_configured_system_cursors();
@@ -1034,8 +1433,31 @@ pub fn startup_recover_input_state() {
 
 /// Stop/panic recovery. Button release is allowed only on an active teardown;
 /// startup paths must call startup_recover_input_state instead.
+///
+/// IMPORTANT: unlike startup recovery, teardown must not publish
+/// CURSOR_HIDE_APPLIED=false or hide Neo's sprite before the Magnification
+/// owner thread has actually completed MagShowSystemCursor(true). TensorRT
+/// teardown can keep that owner busy for >1 s; clearing the visual contract
+/// first creates a visible cursor-less gap immediately after Stop.
 pub fn emergency_release_all() {
-    startup_recover_input_state();
+    SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+    // Disable capture ownership lock-free first so the render/Mag thread cannot
+    // reassert WANT_CURSOR_HIDDEN=true while teardown is trying to reveal the
+    // native cursor. Keep the sprite itself alive until native reveal commits.
+    CAPTURE_SPRITE_ACTIVE.store(false, Ordering::Release);
+    cancel_source_caption_drag_contract();
+    end_native_gui_caption_drag("emergency-release");
+    WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    ACTIVE_OVERLAY_HWND.store(0, Ordering::Release);
+    cancel_cursor_reveal();
+    unsafe {
+        let _ = ClipCursor(None);
+    }
+    restore_mouse_speed();
+    heal_leftover_mouse_speed();
+    restore_configured_system_cursors();
+
     // The GUI can currently be click-through while source ownership is armed.
     // Restoring it must not depend on acquiring the input-state mutex: Stop can
     // race a high-rate LL-hook move which briefly owns that lock. Previously a
@@ -1044,20 +1466,57 @@ pub fn emergency_release_all() {
     let gui_hwnd = MAIN_GUI_HWND.load(Ordering::Acquire);
     if gui_hwnd != 0 && crate::platform::win32::is_window_valid(gui_hwnd) {
         publish_main_gui_passthrough(gui_hwnd, false, "emergency-release");
-        // A leftover WS_EX_TRANSPARENT bit can be repaired, but a later queued
-        // winit/egui passthrough command could still land after that check.
-        // Reassert the native interactive route even when the bit was already
-        // clear, which also forces a SWP_FRAMECHANGED hit-test refresh.
         crate::platform::win32::set_window_input_passthrough(gui_hwnd, false);
     }
+
     // Release only state that Neo itself is tracking. Never synthesize a
     // process-wide UP merely because the physical button happens to be held.
     for attempt in 1..=8 {
         if let Ok(mut g) = state().try_lock() {
-            release_locked(&mut g);
+            let fallback = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+            let minimize_at = GUI_MINIMIZE_CURSOR_AT_MS.load(Ordering::Acquire);
+            let minimize_cursor = unpack_drag_pair(GUI_MINIMIZE_CURSOR.load(Ordering::Acquire));
+            let gui_is_minimized = gui_hwnd != 0
+                && crate::platform::win32::is_minimized(gui_hwnd)
+                && minimize_at != 0
+                && route_clock_ms().saturating_sub(minimize_at) <= 60_000;
+            // While engaged, GetCursorPos is intentionally in hidden-source
+            // space, so the visible sprite coordinate is authoritative. Once
+            // disengaged (for example the Stop button on Neo's GUI), the real
+            // cursor is already at the visible desktop point and is preferable.
+            let visible = if gui_is_minimized {
+                minimize_cursor
+            } else if g.engaged || g.cursor_hidden {
+                fallback
+            } else {
+                read_cursor_pos_or(fallback, "emergency release visible bridge")
+            };
+            g.virt = (visible.0 as f64, visible.1 as f64);
+            GUI_MINIMIZE_CURSOR_AT_MS.store(0, Ordering::Release);
             g.active = false;
+            clear_capture_sprite_contract(&mut g);
+            release_locked(&mut g);
             g.buttons_down = 0;
             g.native_ui_hold_bits = 0;
+
+            if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+                // Fail-visible bridge: keep the Neo sprite following the user
+                // until the Mag-owner thread actually reveals native. Do not
+                // lie by clearing CURSOR_HIDE_APPLIED here; only
+                // pump_cursor_visibility() may publish that transition.
+                DESKTOP_REVEAL_BRIDGE_ACTIVE.store(true, Ordering::Release);
+                SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
+                sprite_move_now(visible.0, visible.1, true);
+                request_cursor_hidden(false);
+                log::info!(
+                    "emergency-cursor-reveal-bridge: armed=true pos=({},{}) native_hidden=true",
+                    visible.0,
+                    visible.1
+                );
+            } else {
+                DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
+                sprite_hide();
+            }
             log::info!("emergency-input-state-release: result=complete attempt={attempt}");
             return;
         }
@@ -1065,8 +1524,21 @@ pub fn emergency_release_all() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+
+    // Even if the state mutex is poisoned/busy, never trade an input recovery
+    // failure for an invisible cursor. The hook can continue moving this
+    // bridge lock-free until the native reveal is confirmed.
+    if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        DESKTOP_REVEAL_BRIDGE_ACTIVE.store(true, Ordering::Release);
+        SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
+        let fallback = unpack_drag_pair(SPRITE_TARGET.load(Ordering::Acquire));
+        let visible = read_cursor_pos_or(fallback, "emergency release lock-timeout bridge");
+        sprite_move(visible.0, visible.1, true);
+        request_cursor_hidden(false);
+    }
     log::error!(
-        "emergency-input-state-release: result=state-lock-timeout gui_passthrough_recovered=true"
+        "emergency-input-state-release: result=state-lock-timeout gui_passthrough_recovered=true cursor_bridge={}",
+        DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire)
     );
 }
 
@@ -1096,6 +1568,14 @@ struct State {
     /// fullscreen/"clip" policy keeps the cursor confined and only the optional
     /// peek reveals the desktop. Windowed (Fixed) mode still exits on a push.
     fullscreen: bool,
+    /// Windowed full-frame capture maps input against the same DWM/outer
+    /// coordinate space as the visible WGC frame. In this mode boundaries
+    /// should behave like an ordinary window: no hidden re-entry band/timer.
+    window_frame_input: bool,
+    /// Exact native rectangle family used for the current source mapping.
+    /// Change-only diagnostics make WGC/input coordinate mismatches obvious
+    /// without flooding the log on every render tick.
+    input_reference_kind: &'static str,
     overlay: Rect,
     content: Rect, // on-screen rect where the source image is displayed
     src: Rect,     // source client rect on screen
@@ -1169,6 +1649,11 @@ struct State {
     /// the SetCursorPos-consistent event overtake older screen-space moves; the
     /// latter must remain quarantined briefly even after expect_teleport clears.
     teleport_guard_until: Option<std::time::Instant>,
+    /// Post-edge screen-space settle.  The verified desktop warp can overtake
+    /// older WH_MOUSE_LL events that were queued while the hardware cursor was
+    /// still inside source space.  During this short window a wildly divergent
+    /// raw point must not reclaim coordinate authority from GetCursorPos.
+    edge_release_settle_until: Option<std::time::Instant>,
     oscillations: u32,
     /// Set after a windowed edge exit: suppress re-engage while the cursor still
     /// lingers in the edge band, so it cannot immediately snap back in.
@@ -1186,6 +1671,16 @@ struct State {
     /// Geometry refreshes may invalidate `last_ui_hover` while the physical
     /// cursor is still inside the same HWND; they must not retrigger entry.
     native_gui_owner_hwnd: isize,
+    /// Last synchronous sprite update while Neo's native GUI owns the pointer.
+    /// Normal GUI hover uses a bounded low-latency path: direct compositor
+    /// updates at most every few milliseconds, with the existing coalesced
+    /// message path handling intermediate/high-polling samples.
+    last_gui_sprite_sync_at: Option<std::time::Instant>,
+    /// Rate-limited desktop cursor ownership heartbeat. This remains
+    /// diagnostic-only; it records both native/sprite state when the user is
+    /// outside every Neo-owned surface so a reported invisible cursor can be
+    /// matched to the exact internal visual-owner state.
+    last_desktop_cursor_diag_at: Option<std::time::Instant>,
     /// Quarantines source-coordinate mouse moves already queued when ownership
     /// is handed to the real GUI cursor.
     native_gui_settle: Option<NativeGuiSettle>,
@@ -1200,10 +1695,97 @@ struct UiHover {
 static STATE: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
 static SPRITE_HWND: OnceLock<isize> = OnceLock::new();
 /// Native GUI ownership is published independently from the render cadence.
-/// While non-zero, the real Windows cursor must win over every stale hide
-/// request. This is intentionally atomic so a heavy filter cannot delay the
-/// ownership decision or add work to the capture path.
+/// Native GUI ownership is published independently from render cadence. During
+/// an active capture v382 keeps the real cursor Magnification-hidden and uses
+/// the Neo sprite at the same screen coordinate; outside capture/provider
+/// guards this owner still participates in ordinary native cursor restoration.
 static NATIVE_GUI_OWNER: AtomicIsize = AtomicIsize::new(0);
+/// The currently visible magnified overlay.  It is WS_EX_TRANSPARENT for the
+/// native mouse, so WindowFromPoint can see a GUI that is actually BEHIND the
+/// magnified image.  Ownership must follow visual Z-order instead: a window
+/// covered by this overlay cannot steal the virtual/source cursor merely
+/// because the overlay is click-through.
+static ACTIVE_OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
+/// During active capture Neo's sprite is the sole visual cursor on overlay,
+/// GUI/panel and desktop. The real Windows cursor remains at the native input
+/// coordinate but stays Magnification-hidden until Stop/provider guard.
+static CAPTURE_SPRITE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Classification only: a physical left-button gesture that began on the
+/// mapped source title bar. Unlike v376 this NEVER changes clip, mouse speed,
+/// or moves the overlay from the LL hook; engine.rs alone follows source HWND.
+///
+/// v379 also treats each drag as a generation-scoped transaction. The visible
+/// sprite is anchored to the exact grab offset inside the overlay for the whole
+/// gesture, while the hidden native cursor remains the sole Windows input
+/// authority. This prevents render/input geometry publication skew from making
+/// the cursor creep across the title bar during aggressive moves.
+static SOURCE_CAPTION_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SOURCE_CAPTION_DRAG_EPOCH: AtomicU64 = AtomicU64::new(0);
+static SOURCE_CAPTION_DRAG_ANCHOR_VALID: AtomicBool = AtomicBool::new(false);
+/// Packed signed `(y << 32) | x` pairs. A single atomic load/store keeps X/Y
+/// from coming from different follower samples during fast diagonal drags.
+static SOURCE_CAPTION_DRAG_ANCHOR: AtomicI64 = AtomicI64::new(0);
+static SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN: AtomicI64 = AtomicI64::new(0);
+/// Generation tag for OVERLAY_ORIGIN. The origin and epoch are published as a
+/// tiny seqlock-like pair: readers only use the origin when this tag matches
+/// the currently active drag. This prevents a follower from an old drag from
+/// overwriting the new drag's visual anchor during a fast release/re-press.
+static SOURCE_CAPTION_DRAG_OVERLAY_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Serializes the very small caption-drag geometry commit. The follower holds
+/// this only while it moves the overlay, reads the committed HWND position and
+/// publishes the matching sprite position. BUTTON-UP takes the same guard before
+/// closing the generation, so no old follower can move the overlay after the
+/// drag contract has ended.
+static SOURCE_CAPTION_DRAG_WRITE_LOCK: AtomicBool = AtomicBool::new(false);
+static SOURCE_CAPTION_DRAG_VISUAL_COMMIT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Counts generic sprite writes rejected while the source-caption follower owns
+/// the visual cursor. Any non-zero value is diagnostic evidence that another
+/// clock tried to overwrite the fixed drag anchor; v382 blocks the write at
+/// the common sprite API boundary instead of relying on every caller to guard.
+static SOURCE_CAPTION_DRAG_SUPPRESSED_SPRITE_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic anchor for a native Neo GUI title-bar drag. Windows continues to
+/// own the actual move gesture, while v382 keeps the Neo sprite at the raw
+/// WH_MOUSE_LL screen coordinate. The live-window anchor is retained only so
+/// logs can quantify DWM/window lag without feeding it back into cursor position.
+static NATIVE_GUI_CAPTION_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+static NATIVE_GUI_CAPTION_DRAG_HWND: AtomicIsize = AtomicIsize::new(0);
+static NATIVE_GUI_CAPTION_DRAG_ANCHOR: AtomicI64 = AtomicI64::new(0);
+static NATIVE_GUI_CAPTION_DRAG_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct SourceCaptionDragWriterGuard;
+
+impl Drop for SourceCaptionDragWriterGuard {
+    fn drop(&mut self) {
+        SOURCE_CAPTION_DRAG_WRITE_LOCK.store(false, Ordering::Release);
+    }
+}
+
+fn lock_source_caption_drag_writer() -> SourceCaptionDragWriterGuard {
+    let mut spins = 0u32;
+    loop {
+        if SOURCE_CAPTION_DRAG_WRITE_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return SourceCaptionDragWriterGuard;
+        }
+        if spins < 64 {
+            std::hint::spin_loop();
+            spins += 1;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+fn try_lock_source_caption_drag_writer() -> Option<SourceCaptionDragWriterGuard> {
+    SOURCE_CAPTION_DRAG_WRITE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| SourceCaptionDragWriterGuard)
+}
+static COVERED_NATIVE_HIT_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 static MAIN_GUI_MOUSE_PASSTHROUGH: AtomicBool = AtomicBool::new(false);
 static MAIN_GUI_HWND: AtomicIsize = AtomicIsize::new(0);
 static MAIN_GUI_ROUTE_REPAIR_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
@@ -1220,6 +1802,349 @@ pub fn main_gui_mouse_passthrough() -> bool {
     MAIN_GUI_MOUSE_PASSTHROUGH.load(Ordering::Acquire)
 }
 
+/// Lock-free read used by the low-end GLSL responsiveness guard. True only
+/// when the native cursor is currently owned by Neo's MAIN GUI window; the
+/// floating panel and overlay do not trigger the interactive render pause.
+pub fn main_gui_has_native_cursor_ownership() -> bool {
+    let main = MAIN_GUI_HWND.load(Ordering::Acquire);
+    main != 0 && NATIVE_GUI_OWNER.load(Ordering::Acquire) == main
+}
+
+pub fn source_caption_drag_active() -> bool {
+    SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+}
+
+pub fn source_caption_drag_epoch() -> u64 {
+    SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire)
+}
+
+fn pack_drag_pair(x: i32, y: i32) -> i64 {
+    (((y as u32) as i64) << 32) | ((x as u32) as i64)
+}
+
+fn unpack_drag_pair(packed: i64) -> (i32, i32) {
+    (packed as i32, (packed >> 32) as i32)
+}
+
+/// Exact raw screen-space span for the currently owned client-only LEFT drag.
+/// The owner is read before and after the packed coordinates so a release or
+/// new gesture cannot mix samples from two generations.  The engine uses this
+/// absolute span (not per-frame source HWND deltas) to move the visible overlay.
+pub fn source_client_drag_raw_span(hwnd: isize) -> Option<((i32, i32), (i32, i32))> {
+    if hwnd == 0 {
+        return None;
+    }
+    let owner_before = SOURCE_CLIENT_DRAG_OWNER_HWND.load(Ordering::Acquire);
+    if owner_before != hwnd {
+        return None;
+    }
+    let origin = unpack_drag_pair(SOURCE_CLIENT_DRAG_RAW_ORIGIN.load(Ordering::Acquire));
+    let current = unpack_drag_pair(SOURCE_CLIENT_DRAG_RAW_CURRENT.load(Ordering::Acquire));
+    let owner_after = SOURCE_CLIENT_DRAG_OWNER_HWND.load(Ordering::Acquire);
+    if owner_after == hwnd {
+        Some((origin, current))
+    } else {
+        None
+    }
+}
+
+fn source_caption_drag_visual_position() -> Option<(i32, i32)> {
+    if !SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        || !SOURCE_CAPTION_DRAG_ANCHOR_VALID.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let epoch = SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire);
+    if SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.load(Ordering::Acquire) != epoch {
+        return None;
+    }
+    let (ox, oy) = unpack_drag_pair(SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN.load(Ordering::Acquire));
+    // Re-check the generation after the coordinate load. A stale follower can
+    // race a fast release/re-press, but it can never become visual authority
+    // for a different drag generation.
+    if SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.load(Ordering::Acquire) != epoch
+        || SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire) != epoch
+        || !SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let (ax, ay) = unpack_drag_pair(SOURCE_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire));
+    Some((ox.saturating_add(ax), oy.saturating_add(ay)))
+}
+
+/// Execute one high-rate overlay move as an epoch-scoped drag transaction.
+/// The closure performs the Win32 move and returns the position Windows really
+/// committed. Normal BUTTON-UP uses the same writer guard, therefore after it
+/// returns no follower from this generation can perform a late window move.
+/// Emergency stop/provider cancellation invalidates the epoch lock-free to avoid
+/// any render-thread/cross-thread SetWindowPos dependency cycle.
+pub fn commit_source_caption_drag_overlay_update<F>(epoch: u64, update: F) -> bool
+where
+    F: FnOnce() -> Option<(i32, i32)>,
+{
+    let Some(writer) = try_lock_source_caption_drag_writer() else {
+        return false;
+    };
+    if !SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        || SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire) != epoch
+        || !SOURCE_CAPTION_DRAG_ANCHOR_VALID.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let Some((x, y)) = update() else {
+        return true;
+    };
+    // Stop/provider/geometry cancellation is intentionally lock-free so the
+    // render thread can never deadlock against this follower's cross-thread
+    // SetWindowPos. If such a cancellation happened while the closure ran, do
+    // not publish its now-stale geometry or cursor target. Normal BUTTON-UP is
+    // stronger: it takes this writer guard and therefore excludes the move.
+    if !SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        || SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire) != epoch
+        || !SOURCE_CAPTION_DRAG_ANCHOR_VALID.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN.store(pack_drag_pair(x, y), Ordering::Release);
+    SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.store(epoch, Ordering::Release);
+    let (ax, ay) = unpack_drag_pair(SOURCE_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire));
+    let sprite = (x.saturating_add(ax), y.saturating_add(ay));
+    set_sprite_caption_anchor_target(sprite.0, sprite.1);
+    // Do not call SetWindowPos on the sprite while holding the writer guard.
+    // The sprite HWND belongs to the LL-hook thread; BUTTON-UP on that thread
+    // also takes this guard. A cross-thread SetWindowPos here while locked can
+    // therefore form a lock/message-pump cycle. Publish geometry atomically,
+    // release the guard, then perform the immediate visual commit.
+    drop(writer);
+    sprite_move_source_caption_writer_now(sprite.0, sprite.1, true);
+    let visual_commit = SOURCE_CAPTION_DRAG_VISUAL_COMMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if visual_commit % 32 == 0 {
+        log::debug!(
+            "source-caption-drag-visual-commit: epoch={} overlay=({x},{y}) sprite=({},{}) writer=source-follower-direct",
+            epoch,
+            sprite.0,
+            sprite.1
+        );
+    }
+    // If BUTTON-UP/Stop changed the generation during that cross-thread window
+    // call, immediately converge to the newest published target. This closes
+    // the only late-follower race without making the input hook wait on a
+    // render/follower-owned HWND operation.
+    if !SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        || SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire) != epoch
+    {
+        // Do not let a late follower rewrite SPRITE_TARGET after BUTTON-UP.
+        // Restore the HWND from the newest target published by the release path.
+        sprite_restore_window_if_requested_now();
+    }
+    true
+}
+
+fn cancel_source_caption_drag_contract() {
+    // Emergency/transition cancellation must never wait on the follower: that
+    // follower can be inside a cross-thread SetWindowPos to the render-owned
+    // overlay HWND. Invalidate the generation first; commit() re-checks it after
+    // the Win32 move and refuses stale publication. Normal BUTTON-UP uses the
+    // stronger finish_source_caption_drag_contract() writer transaction.
+    let was_active = SOURCE_CAPTION_DRAG_ACTIVE.swap(false, Ordering::AcqRel);
+    SOURCE_CAPTION_DRAG_ANCHOR_VALID.store(false, Ordering::Release);
+    if was_active {
+        SOURCE_CAPTION_DRAG_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Close a caption drag as one transaction, returning the generation, final
+/// visual point and immutable grab anchor for diagnostics. The overlay origin
+/// is sampled while the writer guard excludes the follower; after ACTIVE is
+/// cleared, the follower can no longer move this generation's overlay.
+fn finish_source_caption_drag_contract(g: &mut State) -> (u64, Option<(i32, i32)>, (i32, i32)) {
+    let _writer = lock_source_caption_drag_writer();
+    let epoch = SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire);
+    let anchor = unpack_drag_pair(SOURCE_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire));
+    let valid = SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        && SOURCE_CAPTION_DRAG_ANCHOR_VALID.load(Ordering::Acquire)
+        && SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.load(Ordering::Acquire) == epoch;
+
+    let overlay_hwnd = ACTIVE_OVERLAY_HWND.load(Ordering::Acquire);
+    let origin = if overlay_hwnd != 0 {
+        crate::platform::win32::window_rect(overlay_hwnd).map(|r| (r.0, r.1))
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        unpack_drag_pair(SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN.load(Ordering::Acquire))
+    });
+
+    SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN.store(pack_drag_pair(origin.0, origin.1), Ordering::Release);
+    SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.store(epoch, Ordering::Release);
+    let visual = valid.then(|| {
+        (
+            origin.0.saturating_add(anchor.0),
+            origin.1.saturating_add(anchor.1),
+        )
+    });
+    if let Some((vx, vy)) = visual {
+        g.content.x = origin.0;
+        g.content.y = origin.1;
+        g.virt = (vx as f64, vy as f64);
+        set_sprite_caption_anchor_target(vx, vy);
+    }
+
+    let was_active = SOURCE_CAPTION_DRAG_ACTIVE.swap(false, Ordering::AcqRel);
+    SOURCE_CAPTION_DRAG_ANCHOR_VALID.store(false, Ordering::Release);
+    if was_active {
+        SOURCE_CAPTION_DRAG_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+    drop(_writer);
+    if let Some((vx, vy)) = visual {
+        // BUTTON-UP runs on the LL-hook/sprite owner thread. Commit the final
+        // fixed-anchor point synchronously before ordinary mapping resumes; do
+        // not leave the release position to a later coalesced WM_APP message.
+        sprite_move_now(vx, vy, true);
+        log::debug!(
+            "source-caption-drag-release-visual-commit: epoch={epoch} sprite=({vx},{vy}) writer=button-up-final"
+        );
+    }
+
+    // Re-sample the same full-window coordinate family used for input. This
+    // makes the first post-drag move start from one coherent source/content
+    // snapshot instead of waiting for a later render configure tick.
+    if g.src_hwnd != 0 && g.window_frame_input {
+        let live = match g.input_reference_kind {
+            "dwm" => crate::platform::win32::extended_frame_bounds(g.src_hwnd),
+            "outer" => crate::platform::win32::window_rect(g.src_hwnd),
+            _ => crate::platform::win32::client_rect_on_screen(g.src_hwnd),
+        };
+        if let Some((x, y, w, h)) = live.filter(|r| r.2 > 0 && r.3 > 0) {
+            g.src = Rect { x, y, w, h };
+            let clip = clip_rect(g.src);
+            unsafe {
+                let _ = ClipCursor(Some(&clip));
+            }
+        }
+    }
+    g.expect_teleport = None;
+    g.teleport_guard_until = None;
+    (epoch, visual, anchor)
+}
+
+fn capture_sprite_active() -> bool {
+    CAPTURE_SPRITE_ACTIVE.load(Ordering::Acquire) && !tensorrt_build_native_cursor_guard()
+}
+
+fn clear_capture_sprite_contract(_g: &mut State) {
+    CAPTURE_SPRITE_ACTIVE.store(false, Ordering::Release);
+    cancel_source_caption_drag_contract();
+    end_native_gui_caption_drag("capture-contract-clear");
+}
+
+fn point_is_window_titlebar(hwnd: isize, px: i32, py: i32) -> bool {
+    let Some((wx, wy, ww, wh)) = crate::platform::win32::window_rect(hwnd) else {
+        return false;
+    };
+    let Some((cx, cy, _, _)) = crate::platform::win32::client_rect_on_screen(hwnd) else {
+        return false;
+    };
+    if cy <= wy || ww <= 16 || wh <= 16 {
+        return false;
+    }
+    let inset = ((cx - wx).abs().max(6)).min((ww / 8).max(6));
+    px >= wx + inset && px < wx + ww - inset && py >= wy + 4 && py < cy
+}
+
+fn point_is_source_titlebar(hwnd: isize, px: i32, py: i32) -> bool {
+    // Keep the conservative resize-border exclusion for the HIDDEN SOURCE.
+    // Misclassifying a resize as a source-caption move would move the overlay.
+    point_is_window_titlebar(hwnd, px, py)
+}
+
+fn gui_caption_band(
+    hwnd: isize,
+    px: i32,
+    py: i32,
+) -> Option<((i32, i32, i32, i32), (i32, i32, i32, i32), bool)> {
+    let window = crate::platform::win32::window_rect(hwnd)?;
+    let client = crate::platform::win32::client_rect_on_screen(hwnd)?;
+    let (wx, wy, ww, wh) = window;
+    let (_cx, cy, _cw, _ch) = client;
+    if cy <= wy || ww <= 0 || wh <= 0 {
+        return Some((window, client, false));
+    }
+    // GUI caption classification is diagnostic/gesture tracking only in v382;
+    // visual ownership no longer changes based on this result. Cover the full
+    // horizontal non-client caption band so the left icon/system-menu side does
+    // not silently take a different cursor path. The SOURCE classifier above
+    // remains conservative because it has geometry side effects.
+    let inside = px >= wx && px < wx.saturating_add(ww) && py >= wy && py < cy;
+    Some((window, client, inside))
+}
+
+fn begin_native_gui_caption_drag(hwnd: isize, px: i32, py: i32) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let Some((window, client, is_caption)) = gui_caption_band(hwnd, px, py) else {
+        log::warn!(
+            "native-gui-caption-classify: hwnd={hwnd:#x} cursor=({px},{py}) result=unavailable visual_owner=neo-sprite"
+        );
+        return false;
+    };
+    log::info!(
+        "native-gui-caption-classify: hwnd={hwnd:#x} cursor=({px},{py}) window={window:?} client={client:?} result={} visual_owner=neo-sprite",
+        if is_caption { "caption" } else { "non-caption" }
+    );
+    if !is_caption {
+        return false;
+    }
+    let (wx, wy, _, _) = window;
+    let anchor = (px.saturating_sub(wx), py.saturating_sub(wy));
+    NATIVE_GUI_CAPTION_DRAG_ANCHOR.store(pack_drag_pair(anchor.0, anchor.1), Ordering::Release);
+    NATIVE_GUI_CAPTION_DRAG_HWND.store(hwnd, Ordering::Release);
+    NATIVE_GUI_CAPTION_DRAG_SAMPLE_COUNT.store(0, Ordering::Release);
+    NATIVE_GUI_CAPTION_DRAG_ACTIVE.store(true, Ordering::Release);
+    // v382 keeps capture-wide Neo sprite ownership even for a native GUI
+    // caption drag. The real cursor stays at the exact Win32 input coordinate
+    // for hit-testing/WM_NCLBUTTON semantics but remains Magnification-hidden.
+    // This removes the unprovable native-reveal transition that could leave
+    // both native and sprite visually absent on some title-bar grab positions.
+    if external_native_cursor_owner(hwnd) {
+        request_cursor_hidden(false);
+    } else {
+        request_cursor_hidden(true);
+        sprite_move_now(px, py, true);
+    }
+    log::info!(
+        "native-gui-caption-drag-begin: hwnd={hwnd:#x} cursor=({px},{py}) window=({wx},{wy}) anchor=({},{}) visual_owner={} raw-authority=true",
+        anchor.0,
+        anchor.1,
+        if external_native_cursor_owner(hwnd) { "native" } else { "neo-sprite" }
+    );
+    true
+}
+
+fn native_gui_caption_drag_visual(hwnd: isize) -> Option<(i32, i32)> {
+    if !NATIVE_GUI_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        || NATIVE_GUI_CAPTION_DRAG_HWND.load(Ordering::Acquire) != hwnd
+    {
+        return None;
+    }
+    let (wx, wy, _, _) = crate::platform::win32::window_rect(hwnd)?;
+    let (ax, ay) = unpack_drag_pair(NATIVE_GUI_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire));
+    Some((wx.saturating_add(ax), wy.saturating_add(ay)))
+}
+
+fn end_native_gui_caption_drag(reason: &str) {
+    if NATIVE_GUI_CAPTION_DRAG_ACTIVE.swap(false, Ordering::AcqRel) {
+        let hwnd = NATIVE_GUI_CAPTION_DRAG_HWND.swap(0, Ordering::AcqRel);
+        let (ax, ay) = unpack_drag_pair(NATIVE_GUI_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire));
+        log::info!(
+            "native-gui-caption-drag-end: hwnd={hwnd:#x} anchor=({ax},{ay}) reason={reason}"
+        );
+    } else {
+        NATIVE_GUI_CAPTION_DRAG_HWND.store(0, Ordering::Release);
+    }
+}
+
 // ---------------- sprite cursor (layered arrow window) ----------------
 
 /// Sprite box at 96dpi with the default cursor size. The REAL system cursor
@@ -1230,11 +2155,6 @@ pub fn main_gui_mouse_passthrough() -> bool {
 const SPRITE_BASE_SIZE: i32 = 24;
 static SPRITE_SIZE_PX: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(SPRITE_BASE_SIZE);
-
-#[allow(dead_code)] // retained for cursor-sprite diagnostics
-fn sprite_size_px() -> i32 {
-    SPRITE_SIZE_PX.load(Ordering::Relaxed)
-}
 
 /// Match the system cursor scale: monitor/system DPI × the Windows 11
 /// accessibility cursor size (HKCU\Control Panel\Cursors\CursorBaseSize,
@@ -1310,9 +2230,61 @@ static SPRITE_TARGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI6
 /// CURSOR_HIDE_APPLIED so the native cursor and sprite are never shown together.
 static SPRITE_SHOW: AtomicBool = AtomicBool::new(false);
 static SPRITE_MOVE_PENDING: AtomicBool = AtomicBool::new(false);
+/// v348g: closes the last sprite/native race during a hidden -> visible
+/// Magnification ownership transfer. While this gate is set, *every* sprite
+/// show path (LL-hook move, coalesced WM_APP move, z-order reassert) is denied.
+/// v348f only hid the layered window synchronously, so a mouse event arriving
+/// in the few milliseconds before MagShowSystemCursor(true) completed could
+/// re-show the white sprite at a slightly stale coordinate.
+static SPRITE_NATIVE_REVEAL_BLOCK: AtomicBool = AtomicBool::new(false);
+/// GUI/panel -> desktop visual bridge. While the native cursor is still hidden
+/// by the Magnification owner thread, keep Neo's sprite at the CURRENT desktop
+/// mouse point so there is never a cursor-less gap during the asynchronous reveal.
+static DESKTOP_REVEAL_BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// TensorRT can lazily build a shape-specific engine while the GUI remains
+/// interactive. During that epoch the Windows cursor must remain the sole
+/// visual owner; otherwise moving onto Neo's GUI can re-enter sprite ownership
+/// and strand the sprite at the last render-thread update for many seconds.
+static TENSORRT_BUILD_NATIVE_CURSOR_GUARD: AtomicBool = AtomicBool::new(false);
+
+fn tensorrt_build_native_cursor_guard() -> bool {
+    TENSORRT_BUILD_NATIVE_CURSOR_GUARD.load(Ordering::Acquire)
+}
+
+/// While capture is active and Neo's own native GUI/panel owns the pointer,
+/// keep native hit-testing at the real GUI coordinate but use Neo's sprite as
+/// the visual cursor. This avoids relying on the Magnification cursor reveal
+/// being visually committed even when Win32 reports a valid visible HCURSOR.
+/// Read-only diagnostic/runtime signal for the eframe event loop.
+/// True only while a physical left-button gesture that began on Neo's native
+/// caption is actively moving the main GUI. This does not alter cursor/input
+/// ownership; consumers may use it to avoid unnecessary GUI surface redraws.
+pub fn native_gui_caption_drag_active() -> bool {
+    NATIVE_GUI_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+}
+
+fn native_gui_caption_drag_active_for_owner(owner: isize) -> bool {
+    owner != 0
+        && NATIVE_GUI_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire)
+        && NATIVE_GUI_CAPTION_DRAG_HWND.load(Ordering::Acquire) == owner
+}
+
+fn external_native_cursor_owner(owner: isize) -> bool {
+    owner != 0 && !crate::platform::win32::is_own_window(owner)
+}
+
+fn active_native_gui_sprite_mode(owner: isize) -> bool {
+    owner != 0
+        && !external_native_cursor_owner(owner)
+        && ACTIVE_OVERLAY_HWND.load(Ordering::Acquire) != 0
+        && !tensorrt_build_native_cursor_guard()
+}
 
 fn sprite_visibility_allowed(requested: bool, real_cursor_hidden: bool) -> bool {
-    requested && real_cursor_hidden
+    requested
+        && real_cursor_hidden
+        && !SPRITE_NATIVE_REVEAL_BLOCK.load(Ordering::Acquire)
+        && !tensorrt_build_native_cursor_guard()
 }
 
 /// Timer that RE-ASSERTS the system-cursor hide while engaged (the cursor-routing design's
@@ -1327,6 +2299,13 @@ const CURSOR_REASSERT_TIMER_ID: usize = 1;
 
 unsafe fn set_sprite_window_pos(h: HWND, x: i32, y: i32, show: bool) {
     unsafe {
+        // Keep the logical cursor target untouched, but never place the
+        // layered sprite so far beyond a physical monitor edge that its arrow
+        // becomes completely invisible. This is especially important at the
+        // bottom/right edge: the arrow shape starts one pixel inside its
+        // top-left transparent border, so a 24px sprite positioned at y=1079
+        // on a 1080p monitor has no visible arrow pixels at all.
+        let (x, y) = sprite_window_visual_position((x, y));
         let flags = SWP_NOACTIVATE
             | SWP_NOSIZE
             | SWP_NOSENDCHANGING
@@ -1367,7 +2346,17 @@ unsafe extern "system" fn sprite_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> 
             set_sprite_window_pos(h, x, y, show);
             return LRESULT(0);
         }
+        if m == WM_TIMER && w.0 == CURSOR_EDGE_TRANSFER_TIMER_ID {
+            let _ = KillTimer(Some(h), CURSOR_EDGE_TRANSFER_TIMER_ID);
+            complete_capture_sprite_cursor_transfer_on_hook_thread();
+            return LRESULT(0);
+        }
         if m == WM_TIMER && w.0 == CURSOR_REASSERT_TIMER_ID {
+            // Fallback in case the one-shot edge timer was coalesced/lost.
+            // This remains independent of the render/ONNX thread.
+            if capture_sprite_active() && cursor_reveal_pending() {
+                complete_capture_sprite_cursor_transfer_on_hook_thread();
+            }
             // The hide itself is driven by the render-engine thread; here we only
             // keep the desired-visibility flag in sync with the engaged state, so
             // a missed engage/disengage edge cannot strand the real cursor.
@@ -1380,7 +2369,12 @@ unsafe extern "system" fn sprite_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> 
                 return LRESULT(0);
             };
             let stale_buttons = reconcile_stale_buttons(&mut g, now);
-            let state_wants_hidden = g.active && g.engaged && g.cursor_hidden;
+            // One visual owner for the whole active capture. Native stays
+            // hidden on overlay, GUI/panel and desktop; Stop/provider guard
+            // explicitly restores it.
+            let state_wants_hidden = !tensorrt_build_native_cursor_guard()
+                && g.active
+                && !external_native_cursor_owner(g.native_gui_owner_hwnd);
             drop(g);
             if stale_buttons != 0 {
                 // begin_ui_hold injects the DOWN that gives the native GUI full
@@ -1398,6 +2392,24 @@ unsafe extern "system" fn sprite_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> 
             let want_hidden =
                 cursor_reassert_want_hidden(state_wants_hidden, cursor_reveal_pending());
             request_cursor_hidden(want_hidden);
+            if state_wants_hidden
+                && CURSOR_HIDE_APPLIED.load(Ordering::Acquire)
+                && SPRITE_SHOW.load(Ordering::Acquire)
+                && !SPRITE_NATIVE_REVEAL_BLOCK.load(Ordering::Acquire)
+            {
+                let visible = SPRITE_HWND
+                    .get()
+                    .is_some_and(|&hwnd| IsWindowVisible(HWND(hwnd as *mut _)).as_bool());
+                if !visible {
+                    sprite_restore_window_if_requested_now();
+                    let packed = SPRITE_TARGET.load(Ordering::Acquire);
+                    log::warn!(
+                        "cursor-sprite-watchdog-restored: target=({},{}) hide_applied=true",
+                        packed as i32,
+                        (packed >> 32) as i32
+                    );
+                }
+            }
             return LRESULT(0);
         }
         DefWindowProcW(h, m, w, l)
@@ -1505,22 +2517,24 @@ fn post_sprite_update() {
     }
 }
 
-fn sprite_move(x: i32, y: i32, show: bool) {
-    // record the latest target + post ONE message if none is pending yet
-    // (bursts of moves collapse to a single SetWindowPos on the hook thread).
-    SPRITE_TARGET.store(
-        (((y as u32) as i64) << 32) | ((x as u32) as i64),
-        Ordering::Release,
-    );
+fn note_suppressed_source_drag_sprite_write(kind: &str, x: i32, y: i32, show: bool) {
+    let count = SOURCE_CAPTION_DRAG_SUPPRESSED_SPRITE_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 4 || count % 32 == 0 {
+        let expected = source_caption_drag_visual_position();
+        log::warn!(
+            "source-caption-drag-generic-sprite-write-suppressed: kind={kind} requested=({x},{y}) show={show} expected={expected:?} count={count}"
+        );
+    }
+}
+
+fn sprite_move_unchecked(x: i32, y: i32, show: bool) {
+    SPRITE_TARGET.store(pack_drag_pair(x, y), Ordering::Release);
     SPRITE_SHOW.store(show, Ordering::Release);
     post_sprite_update();
 }
 
-fn sprite_move_now(x: i32, y: i32, show: bool) {
-    SPRITE_TARGET.store(
-        (((y as u32) as i64) << 32) | ((x as u32) as i64),
-        Ordering::Release,
-    );
+fn sprite_move_now_unchecked(x: i32, y: i32, show: bool) {
+    SPRITE_TARGET.store(pack_drag_pair(x, y), Ordering::Release);
     SPRITE_SHOW.store(show, Ordering::Release);
     if let Some(&h) = SPRITE_HWND.get() {
         unsafe {
@@ -1531,6 +2545,188 @@ fn sprite_move_now(x: i32, y: i32, show: bool) {
                 sprite_visibility_allowed(show, CURSOR_HIDE_APPLIED.load(Ordering::Acquire)),
             );
         }
+    }
+}
+
+fn sprite_move(x: i32, y: i32, show: bool) {
+    // v382 hard single-writer boundary. While a source-caption drag is active,
+    // ONLY commit_source_caption_drag_overlay_update() may publish/move the
+    // sprite. This blocks configure(), UI hover, LL-hook and any future caller
+    // that forgets a local guard.
+    if source_caption_drag_active() {
+        note_suppressed_source_drag_sprite_write("coalesced", x, y, show);
+        return;
+    }
+    sprite_move_unchecked(x, y, show);
+}
+
+fn sprite_move_now(x: i32, y: i32, show: bool) {
+    if source_caption_drag_active() {
+        note_suppressed_source_drag_sprite_write("immediate", x, y, show);
+        return;
+    }
+    sprite_move_now_unchecked(x, y, show);
+}
+
+/// Privileged source-caption visual commit. The writer transaction already
+/// published SPRITE_TARGET atomically with the overlay origin. This function
+/// therefore moves only the HWND and deliberately does NOT rewrite the target
+/// after releasing the writer lock. If BUTTON-UP wins that race, its newer
+/// target remains authoritative and the stale follower can be converged below.
+fn sprite_move_source_caption_writer_now(x: i32, y: i32, show: bool) {
+    let Some(&h) = SPRITE_HWND.get() else {
+        return;
+    };
+    unsafe {
+        set_sprite_window_pos(
+            HWND(h as *mut _),
+            x,
+            y,
+            sprite_visibility_allowed(show, CURSOR_HIDE_APPLIED.load(Ordering::Acquire)),
+        );
+    }
+}
+
+/// Ordered caption-drag target publication. Geometry transactions update this
+/// target while holding the drag writer guard. The follower may move the sprite
+/// HWND after releasing the guard, but it never rewrites this atomic afterward;
+/// BUTTON-UP can therefore publish a newer final target without being clobbered.
+fn set_sprite_caption_anchor_target(x: i32, y: i32) {
+    SPRITE_TARGET.store(pack_drag_pair(x, y), Ordering::Release);
+    SPRITE_SHOW.store(true, Ordering::Release);
+}
+
+/// Keep the Neo cursor sprite physically above the magnified overlay.
+///
+/// On the AMD/DWM reproduction, WS_EX_TOPMOST plus SetWindowPos could report a
+/// visible/topmost sprite while the WGL overlay was still the surface actually
+/// scanned out above it. While GUI-topmost is OFF, use a USER32 owner chain as
+/// the authoritative ordering contract:
+///   cursor -> visible panel -> overlay
+/// or, when the panel is hidden:
+///   cursor -> overlay
+/// When GUI-topmost is ON the owner is removed and the established sibling
+/// stack is retained. This function never changes the requested cursor
+/// visibility, so configured idle auto-hide remains authoritative.
+pub fn enforce_cursor_overlay_priority(
+    _gui_topmost: bool,
+    _panel_hwnd: isize,
+    _overlay_hwnd: isize,
+) {
+    // v235-compatible cursor model: the sprite is an independent TOPMOST
+    // helper window. Never make it an owned popup of the panel/overlay: hiding
+    // or reordering an owner can otherwise take the cursor with it.  Re-raise
+    // it after the panel so the stable order is cursor > panel > overlay.
+    if let Some(&sprite_hwnd) = SPRITE_HWND.get() {
+        if crate::platform::win32::window_owner(sprite_hwnd) != 0 {
+            crate::platform::win32::set_owned_popup_owner(sprite_hwnd, 0);
+        }
+    }
+    keep_cursor_sprite_on_top();
+}
+
+/// Stop/failure boundary: never leave the cursor sprite owned by an overlay or
+/// panel that is about to be hidden. The sprite itself is still hidden/revealed
+/// by the existing cursor ownership state machine.
+pub fn detach_cursor_sprite_owner() {
+    let Some(&sprite_hwnd) = SPRITE_HWND.get() else {
+        return;
+    };
+    crate::platform::win32::set_owned_popup_owner(sprite_hwnd, 0);
+}
+
+pub fn cursor_sprite_owner() -> isize {
+    SPRITE_HWND
+        .get()
+        .map(|&hwnd| crate::platform::win32::window_owner(hwnd))
+        .unwrap_or(0)
+}
+
+pub fn cursor_sprite_hwnd() -> isize {
+    SPRITE_HWND.get().copied().unwrap_or(0)
+}
+
+/// Sample the desktop pixels under the layered cursor sprite and compare them
+/// with Neo's own opaque black/white arrow template. This gives diagnostics a
+/// direct "API visible, but pixels not found" signal instead of trusting only
+/// IsWindowVisible/TOPMOST. The result is still a capture-side proxy; hardware
+/// overlay/MPO scanout can be outside some desktop-readback APIs, so logs keep
+/// the raw match ratio as well as the classification.
+///
+/// Returns (requested, api_visible, matched, sampled, average_rgb_delta).
+pub fn cursor_sprite_screen_probe() -> (bool, bool, usize, usize, u32) {
+    let requested = sprite_visibility_allowed(
+        SPRITE_SHOW.load(Ordering::Acquire),
+        CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+    );
+    let Some(&raw_hwnd) = SPRITE_HWND.get() else {
+        return (requested, false, 0, 0, 0);
+    };
+    let hwnd = HWND(raw_hwnd as *mut _);
+    let api_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+    if !requested || !api_visible {
+        return (requested, api_visible, 0, 0, 0);
+    }
+    let Some((sx, sy, sw, sh)) = crate::platform::win32::window_rect(raw_hwnd) else {
+        return (requested, api_visible, 0, 0, 0);
+    };
+    let size = SPRITE_SIZE_PX.load(Ordering::Relaxed).max(1).min(sw.max(sh).max(1));
+    let expected = arrow_pixels(size);
+    let mut opaque = Vec::new();
+    for (idx, pixel) in expected.iter().copied().enumerate() {
+        if (pixel >> 24) != 0 {
+            opaque.push((idx, pixel));
+        }
+    }
+    if opaque.is_empty() {
+        return (requested, api_visible, 0, 0, 0);
+    }
+    let stride = (opaque.len() / 16).max(1);
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return (requested, api_visible, 0, 0, 0);
+        }
+        let mut matched = 0usize;
+        let mut sampled = 0usize;
+        let mut delta_sum = 0u64;
+        for (sample_idx, (idx, pixel)) in opaque.into_iter().enumerate() {
+            if sample_idx % stride != 0 || sampled >= 20 {
+                continue;
+            }
+            let x = (idx as i32) % size;
+            let y = (idx as i32) / size;
+            if x >= sw || y >= sh {
+                continue;
+            }
+            let actual = GetPixel(screen_dc, sx + x, sy + y).0;
+            if actual == 0xffff_ffff {
+                continue;
+            }
+            // arrow_pixels is opaque black/white. COLORREF stores 0x00BBGGRR;
+            // black and white are byte-order invariant, so the low 24 bits are
+            // directly comparable.
+            let expected_rgb = pixel & 0x00ff_ffff;
+            let ar = actual & 0xff;
+            let ag = (actual >> 8) & 0xff;
+            let ab = (actual >> 16) & 0xff;
+            let er = expected_rgb & 0xff;
+            let eg = (expected_rgb >> 8) & 0xff;
+            let eb = (expected_rgb >> 16) & 0xff;
+            let delta = ar.abs_diff(er) + ag.abs_diff(eg) + ab.abs_diff(eb);
+            if delta <= 48 {
+                matched += 1;
+            }
+            sampled += 1;
+            delta_sum += delta as u64;
+        }
+        let _ = ReleaseDC(None, screen_dc);
+        let avg = if sampled == 0 {
+            0
+        } else {
+            (delta_sum / sampled as u64) as u32
+        };
+        (requested, api_visible, matched, sampled, avg)
     }
 }
 
@@ -1554,14 +2750,40 @@ pub fn keep_cursor_sprite_on_top() {
     }
 }
 
-fn sprite_hide() {
-    // hide immediately (disengage) and make sure a pending move cannot re-show it
-    SPRITE_SHOW.store(false, Ordering::Release);
+fn sprite_hide_window_only() {
+    // Physically hide the sprite without changing the desired visibility.
+    // This is used during sprite -> native cursor ownership transfer: the
+    // sprite must leave the compositor BEFORE MagShowSystemCursor(true), but
+    // if that native reveal fails we still need to restore the bridge sprite.
     if let Some(&h) = SPRITE_HWND.get() {
         unsafe {
             let _ = ShowWindow(HWND(h as *mut _), SW_HIDE);
         }
     }
+}
+
+fn sprite_restore_window_if_requested_now() {
+    if !sprite_visibility_allowed(
+        SPRITE_SHOW.load(Ordering::Acquire),
+        CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+    ) {
+        return;
+    }
+    let Some(&h) = SPRITE_HWND.get() else {
+        return;
+    };
+    let packed = SPRITE_TARGET.load(Ordering::Acquire);
+    let x = packed as i32;
+    let y = (packed >> 32) as i32;
+    unsafe {
+        set_sprite_window_pos(HWND(h as *mut _), x, y, true);
+    }
+}
+
+fn sprite_hide() {
+    // hide immediately (disengage) and make sure a pending move cannot re-show it
+    SPRITE_SHOW.store(false, Ordering::Release);
+    sprite_hide_window_only();
 }
 
 // ---------------- low-level mouse hook ----------------
@@ -1619,9 +2841,32 @@ fn reconcile_stale_buttons_with_physical(
     let stale = tracked & !physical;
     if stale != 0 {
         g.buttons_down &= physical;
+        if stale & BTN_LEFT != 0 {
+            SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+        }
         g.ui_hold_bits &= physical;
         g.native_ui_hold_bits &= physical;
         g.swallow_up &= physical;
+        if stale & BTN_LEFT != 0 && SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire) {
+            let (epoch, visual, anchor) = finish_source_caption_drag_contract(g);
+            log::warn!(
+                "source-caption-drag stale-button recovery: physical_left=false action=end-classification epoch={} visual={visual:?} anchor=({},{})",
+                epoch,
+                anchor.0,
+                anchor.1
+            );
+        }
+        if stale & BTN_LEFT != 0 && NATIVE_GUI_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire) {
+            end_native_gui_caption_drag("stale-button-watchdog");
+            if g.active {
+                if external_native_cursor_owner(g.native_gui_owner_hwnd) {
+                    request_cursor_hidden(false);
+                } else {
+                    request_cursor_hidden(true);
+                    sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
+                }
+            }
+        }
         g.last_button_event = Some(now);
     }
     stale
@@ -1631,6 +2876,13 @@ fn track_button_state(msg: u32, px: i32, py: i32) {
     let Some((bit, down)) = button_transition(msg) else {
         return;
     };
+    // Reset LEFT-drag provenance before taking the state lock. Even if the LL
+    // hook loses this edge to transient mutex contention, a stale source owner
+    // must never survive into a later GUI/desktop hold. A successful source
+    // DOWN re-arms the exact HWND below after classification.
+    if bit == BTN_LEFT {
+        SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+    }
     // A click can be the first physical input after Stop. Repair the native
     // route before CallNextHookEx delivers this very button edge so the user
     // does not need an extra mouse move to unstick the GUI.
@@ -1639,8 +2891,118 @@ fn track_button_state(msg: u32, px: i32, py: i32) {
         return;
     };
     let now = std::time::Instant::now();
+    if bit == BTN_RIGHT && crate::logging::diagnostics_enabled() {
+        log::info!(
+            "physical-right-button: edge={} raw=({},{}) active={} engaged={} src={:#x} native_gui={:#x} sprite_hwnd={:#x}",
+            if down { "down" } else { "up" },
+            px,
+            py,
+            g.active,
+            g.engaged,
+            g.src_hwnd,
+            MAIN_GUI_HWND.load(Ordering::Acquire),
+            cursor_sprite_hwnd(),
+        );
+    }
+    // v421: a provider/session transition means Neo cursor mapping is explicitly
+    // suspended. Do not start native-GUI caption/sprite ownership or mutate
+    // Neo button bookkeeping during this epoch. The low-level hook will still
+    // pass the physical edge to Windows/eframe, so presets, mode buttons and
+    // the title bar remain ordinary native GUI controls while the provider is
+    // preparing. set_transition_suspended(true) already cleared any previous
+    // Neo-held button/cursor state before entering this branch.
+    if g.transition_suspended {
+        return;
+    }
     if down {
         g.buttons_down |= bit;
+        if bit == BTN_LEFT {
+            let client_source_owner = if g.active
+                && g.engaged
+                && !g.window_frame_input
+                && g.pending_engage.is_none()
+                && g.src_hwnd != 0
+            {
+                g.src_hwnd
+            } else {
+                0
+            };
+            if client_source_owner != 0 {
+                let raw = pack_drag_pair(px, py);
+                // Publish the generation's coordinates first and ownership
+                // last. Readers that observe this HWND are therefore guaranteed
+                // to see the matching raw origin/current pair.
+                SOURCE_CLIENT_DRAG_RAW_ORIGIN.store(raw, Ordering::Release);
+                SOURCE_CLIENT_DRAG_RAW_CURRENT.store(raw, Ordering::Release);
+                SOURCE_CLIENT_DRAG_OWNER_HWND.store(client_source_owner, Ordering::Release);
+                log::debug!(
+                    "source-client-drag-owner-armed: hwnd={:#x} source_pt=({px},{py}) raw_anchor=armed",
+                    client_source_owner
+                );
+            } else {
+                SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+            }
+        }
+        if bit == BTN_LEFT
+            && g.active
+            && g.engaged
+            && g.window_frame_input
+            && g.src_hwnd != 0
+            && point_is_source_titlebar(g.src_hwnd, px, py)
+        {
+            if SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire) {
+                log::warn!(
+                    "source-caption-drag duplicate-down ignored: hwnd={:#x} source_pt=({px},{py}) epoch={}",
+                    g.src_hwnd,
+                    SOURCE_CAPTION_DRAG_EPOCH.load(Ordering::Acquire)
+                );
+            } else {
+                let visual = if SPRITE_SHOW.load(Ordering::Acquire)
+                    && CURSOR_HIDE_APPLIED.load(Ordering::Acquire)
+                {
+                    unpack_drag_pair(SPRITE_TARGET.load(Ordering::Acquire))
+                } else {
+                    (g.virt.0.round() as i32, g.virt.1.round() as i32)
+                };
+                let overlay_hwnd = ACTIVE_OVERLAY_HWND.load(Ordering::Acquire);
+                let (ox, oy) = if overlay_hwnd != 0 {
+                    crate::platform::win32::window_rect(overlay_hwnd)
+                        .map(|r| (r.0, r.1))
+                        .unwrap_or((g.content.x, g.content.y))
+                } else {
+                    (g.content.x, g.content.y)
+                };
+                let _writer = lock_source_caption_drag_writer();
+                let epoch = SOURCE_CAPTION_DRAG_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+                SOURCE_CAPTION_DRAG_ANCHOR.store(
+                    pack_drag_pair(visual.0.saturating_sub(ox), visual.1.saturating_sub(oy)),
+                    Ordering::Release,
+                );
+                SOURCE_CAPTION_DRAG_OVERLAY_ORIGIN.store(pack_drag_pair(ox, oy), Ordering::Release);
+                SOURCE_CAPTION_DRAG_OVERLAY_EPOCH.store(epoch, Ordering::Release);
+                SOURCE_CAPTION_DRAG_ANCHOR_VALID.store(true, Ordering::Release);
+                // A physical button edge on the mapped source title bar is
+                // authoritative current input. Any pre-drag teleport quarantine
+                // belongs to the previous ownership transition and must not
+                // survive into this native caption gesture.
+                g.expect_teleport = None;
+                g.teleport_guard_until = None;
+                g.last_hw = (px, py);
+                SOURCE_CAPTION_DRAG_VISUAL_COMMIT_COUNT.store(0, Ordering::Release);
+                SOURCE_CAPTION_DRAG_SUPPRESSED_SPRITE_WRITES.store(0, Ordering::Release);
+                SOURCE_CAPTION_DRAG_ACTIVE.store(true, Ordering::Release);
+                drop(_writer);
+                log::info!(
+                    "source-caption-drag-begin: hwnd={:#x} source_pt=({px},{py}) visual=({},{}) anchor=({},{}) overlay=({ox},{oy}) epoch={} owner=anchored-engine-follow",
+                    g.src_hwnd,
+                    visual.0,
+                    visual.1,
+                    visual.0.saturating_sub(ox),
+                    visual.1.saturating_sub(oy),
+                    epoch
+                );
+            }
+        }
         // Re-sample the real HWND before classifying the gesture. The render
         // thread can be hundreds of milliseconds behind under a heavy GLSL
         // chain, but native window dragging must never depend on that cadence.
@@ -1655,6 +3017,21 @@ fn track_button_state(msg: u32, px: i32, py: i32) {
             g.native_ui_hold_bits |= bit;
             g.native_gui_owner_hwnd = hit.hwnd;
             NATIVE_GUI_OWNER.store(hit.hwnd, Ordering::Release);
+            if bit == BTN_LEFT {
+                NATIVE_GUI_CAPTION_DRAG_SAMPLE_COUNT.store(0, Ordering::Release);
+                end_native_gui_caption_drag("new-left-down-reset");
+                let _ = begin_native_gui_caption_drag(hit.hwnd, px, py);
+            }
+            if g.active {
+                if external_native_cursor_owner(hit.hwnd) {
+                    request_cursor_hidden(false);
+                } else {
+                    // v382 behavior remains unchanged for Neo GUI/panel.
+                    request_cursor_hidden(true);
+                    sprite_move(px, py, true);
+                    keep_cursor_sprite_on_top();
+                }
+            }
             log::info!(
                 "native-gui-gesture-begin: bit={bit:#04x} hwnd={:#x} pos=({px},{py}) rect={:?}",
                 hit.hwnd,
@@ -1663,9 +3040,40 @@ fn track_button_state(msg: u32, px: i32, py: i32) {
         }
     } else {
         g.buttons_down &= !bit;
+        if bit == BTN_LEFT && SOURCE_CAPTION_DRAG_ACTIVE.load(Ordering::Acquire) {
+            let (epoch, visual, anchor) = finish_source_caption_drag_contract(&mut g);
+            let visual = visual.unwrap_or((g.virt.0.round() as i32, g.virt.1.round() as i32));
+            let actual = read_cursor_pos_or((px, py), "caption drag release");
+            g.last_hw = (px, py);
+            g.last_set = actual;
+            let suppressed = SOURCE_CAPTION_DRAG_SUPPRESSED_SPRITE_WRITES.load(Ordering::Acquire);
+            log::info!(
+                "source-caption-drag-end: hwnd={:#x} source_pt=({px},{py}) actual=({},{}) visual=({},{}) anchor=({},{}) epoch={} owner=anchored-engine-follow suppressed_generic_sprite_writes={suppressed}",
+                g.src_hwnd,
+                actual.0,
+                actual.1,
+                visual.0,
+                visual.1,
+                anchor.0,
+                anchor.1,
+                epoch
+            );
+        }
         let was_native_ui = g.native_ui_hold_bits & bit != 0;
         g.native_ui_hold_bits &= !bit;
         if was_native_ui && g.native_ui_hold_bits == 0 {
+            if bit == BTN_LEFT {
+                end_native_gui_caption_drag("button-up");
+            }
+            if g.active && g.native_gui_owner_hwnd != 0 {
+                if external_native_cursor_owner(g.native_gui_owner_hwnd) {
+                    request_cursor_hidden(false);
+                } else {
+                    // v382 behavior remains unchanged for Neo GUI/panel.
+                    request_cursor_hidden(true);
+                    sprite_move_now(px, py, true);
+                }
+            }
             // The next move re-samples the live HWND rectangle. A time gate here
             // makes ownership crossing-speed dependent.
             log::info!(
@@ -1710,7 +3118,8 @@ fn inject_mouse_button(bit: u8, down: bool) {
 /// user's real drag/move/UP continue natively on that GUI.
 fn begin_ui_hold(g: &mut State, hover: UiHover, bit: u8) -> bool {
     let click = hover.pos;
-    let Some(actual) = release_windows_to_native_at(g, click, "native UI click handoff") else {
+    let Some(actual) = release_windows_to_native_at(g, click, "native UI click handoff", true)
+    else {
         // The visible cursor was over native UI, so never let the physical DOWN
         // fall through to the hidden source when the ownership warp could not
         // be verified. Swallow the matching UP and retry on the next gesture.
@@ -1734,6 +3143,9 @@ fn begin_ui_hold(g: &mut State, hover: UiHover, bit: u8) -> bool {
     g.virt = (actual.0 as f64, actual.1 as f64);
     g.last_set = actual;
     g.last_hw = actual;
+    if external_native_cursor_owner(hover.hit.hwnd) {
+        request_cursor_hidden(false);
+    }
     inject_mouse_button(bit, true);
     true
 }
@@ -1751,7 +3163,8 @@ fn handoff_to_gui(g: &mut State, hover: UiHover, _now: std::time::Instant) -> bo
     // Crossing from sprite ownership to native UI is a read-only ownership
     // transfer. The dedicated GUI/panel z-order manager decides topmost policy;
     // the input classifier must never mutate Z-order while deciding ownership.
-    let Some(actual) = release_windows_to_native_at(g, pos, "native GUI hover handoff") else {
+    let Some(actual) = release_windows_to_native_at(g, pos, "native GUI hover handoff", true)
+    else {
         if native_own_gui {
             publish_main_gui_passthrough(hover.hit.hwnd, true, "native-gui-handoff-failed");
         }
@@ -1789,9 +3202,12 @@ fn handoff_to_gui(g: &mut State, hover: UiHover, _now: std::time::Instant) -> bo
         until: std::time::Instant::now() + std::time::Duration::from_millis(45),
         reasserted: false,
     });
-    // The native cursor may need one Mag-owner tick to become visible. Keep
-    // the bridge sprite above the topmost GUI until that confirmation arrives.
-    keep_cursor_sprite_on_top();
+    if external_native_cursor_owner(hover.hit.hwnd) {
+        request_cursor_hidden(false);
+    } else {
+        // Neo GUI/panel keeps the established capture-wide sprite behavior.
+        keep_cursor_sprite_on_top();
+    }
     log::debug!(
         "native-ui-ownership-enter: hwnd={:#x} boundary=exact zorder=win32 pos=({},{})",
         hover.hit.hwnd,
@@ -1808,7 +3224,7 @@ fn hold_native_gui_ownership_if_inside(
     g: &mut State,
     px: i32,
     py: i32,
-    _now: std::time::Instant,
+    now: std::time::Instant,
 ) -> bool {
     // A physical gesture that STARTED on a native window follows normal Win32
     // capture semantics until button-up. This is the only ownership latch: it
@@ -1819,6 +3235,48 @@ fn hold_native_gui_ownership_if_inside(
         g.virt = (px as f64, py as f64);
         g.last_set = pos;
         g.last_hw = pos;
+        if g.active {
+            let external_native_owner = external_native_cursor_owner(g.native_gui_owner_hwnd);
+            if external_native_owner {
+                request_cursor_hidden(false);
+            } else {
+                // v382 behavior remains unchanged for Neo GUI/panel.
+                request_cursor_hidden(true);
+                sprite_move_now(px, py, true);
+            }
+            if !external_native_owner && g.native_ui_hold_bits & BTN_LEFT != 0 {
+                let sample = NATIVE_GUI_CAPTION_DRAG_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if sample % 16 == 0 {
+                    let caption_tracked =
+                        native_gui_caption_drag_active_for_owner(g.native_gui_owner_hwnd);
+                    let anchored =
+                        native_gui_caption_drag_visual(g.native_gui_owner_hwnd).unwrap_or((px, py));
+                    let (ax, ay) = if caption_tracked {
+                        unpack_drag_pair(NATIVE_GUI_CAPTION_DRAG_ANCHOR.load(Ordering::Acquire))
+                    } else {
+                        (i32::MIN, i32::MIN)
+                    };
+                    let target = unpack_drag_pair(SPRITE_TARGET.load(Ordering::Acquire));
+                    let visible = SPRITE_HWND.get().is_some_and(|&hwnd| unsafe {
+                        IsWindowVisible(HWND(hwnd as *mut _)).as_bool()
+                    });
+                    log::debug!(
+                        "native-gui-left-hold-sample: hwnd={:#x} raw=({px},{py}) caption_tracked={} sprite_target=({},{}) sprite_visible={} hide_applied={} want_hidden={} window_anchor=({},{}) anchor=({ax},{ay}) raw_anchor_delta=({},{}) visual_owner=neo-sprite",
+                        g.native_gui_owner_hwnd,
+                        caption_tracked,
+                        target.0,
+                        target.1,
+                        visible,
+                        CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+                        WANT_CURSOR_HIDDEN.load(Ordering::Acquire),
+                        anchored.0,
+                        anchored.1,
+                        px - anchored.0,
+                        py - anchored.1
+                    );
+                }
+            }
+        }
         return true;
     }
 
@@ -1826,23 +3284,184 @@ fn hold_native_gui_ownership_if_inside(
     // cursor is outside it. Therefore WindowFromPoint cannot be used to enter
     // it again; its exact live HWND rectangle is authoritative for this one
     // owned window, and the first pixel inside restores native hit-testing.
-    let hit = own_main_gui_at_visible_point(&g.no_engage, px, py)
+    let hit = own_main_gui_at_visible_point_for_ownership(&g.no_engage, px, py)
         .or_else(|| hit_ui_for_cursor_ownership(&g.no_engage, px, py));
     let new_owner = hit.map_or(0, |h| h.hwnd);
     let old_owner = g.native_gui_owner_hwnd;
 
     if new_owner == 0 {
+        let content_hit = g.content.contains(px, py);
+        let hide_applied = CURSOR_HIDE_APPLIED.load(Ordering::Acquire);
+
+        // Publish ownership exit immediately. The render/Mag thread reads this
+        // atomic without taking the input mutex, so native reveal can proceed
+        // in parallel even if the following GUI style mutation is slow.
+        g.native_gui_owner_hwnd = 0;
+        g.last_gui_sprite_sync_at = None;
+        NATIVE_GUI_OWNER.store(0, Ordering::Release);
+
+        // Active capture keeps a single visual cursor owner on every surface.
+        // The real cursor remains at this exact desktop/content coordinate for
+        // normal Windows hit-testing, but stays Magnification-hidden; the Neo
+        // sprite is therefore deterministic even if Windows' native visual
+        // cursor state cannot be queried reliably.
+        if g.active && capture_sprite_active() {
+            g.virt = (px as f64, py as f64);
+            g.last_set = (px, py);
+            g.last_hw = (px, py);
+            DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
+            request_cursor_hidden(true);
+            sprite_move_now(px, py, true);
+            keep_cursor_sprite_on_top();
+
+            if old_owner != 0 {
+                log::debug!(
+                    "native-ui-ownership-exit: hwnd={:#x} boundary=exact pos=({px},{py})",
+                    old_owner
+                );
+                if crate::platform::win32::is_own_window(old_owner) {
+                    // Do NOT flip the whole GUI to WS_EX_TRANSPARENT merely
+                    // because the visible cursor left its rectangle. That
+                    // FRAMECHANGED path costs tens of milliseconds and is the
+                    // hitch felt when GUI and overlay overlap. Keep the GUI
+                    // interactive; apply click-through lazily only if the
+                    // *hidden mapped source cursor* actually lands under it.
+                    if MAIN_GUI_MOUSE_PASSTHROUGH.load(Ordering::Acquire) {
+                        log::debug!(
+                            "native-ui-exit keeps existing overlap shield: hwnd={:#x} desktop_owner=sprite",
+                            old_owner
+                        );
+                    }
+                }
+            }
+
+            if !content_hit
+                && g.last_desktop_cursor_diag_at.map_or(true, |last| {
+                    now.saturating_duration_since(last) >= std::time::Duration::from_millis(100)
+                })
+            {
+                g.last_desktop_cursor_diag_at = Some(now);
+                let sprite_requested = SPRITE_SHOW.load(Ordering::Acquire);
+                let sprite_blocked = SPRITE_NATIVE_REVEAL_BLOCK.load(Ordering::Acquire);
+                let sprite_window_visible = SPRITE_HWND
+                    .get()
+                    .is_some_and(|&h| unsafe { IsWindowVisible(HWND(h as *mut _)).as_bool() });
+                let sprite_rect = SPRITE_HWND
+                    .get()
+                    .and_then(|&h| crate::platform::win32::window_rect(h));
+                let top = unsafe { WindowFromPoint(POINT { x: px, y: py }) };
+                log::info!(
+                    "desktop-cursor-heartbeat: pos=({px},{py}) visual_owner=sprite want_hidden={} hide_applied={} sprite_requested={} sprite_blocked={} sprite_window_visible={} sprite_rect={:?} top_hwnd={:#x}",
+                    WANT_CURSOR_HIDDEN.load(Ordering::Acquire),
+                    CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+                    sprite_requested,
+                    sprite_blocked,
+                    sprite_window_visible,
+                    sprite_rect,
+                    top.0 as isize
+                );
+            }
+            g.ui_hover_active = false;
+            g.last_ui_hover = None;
+            g.last_ui_post = None;
+            return false;
+        }
+
+        // IMPORTANT: own-main-GUI passthrough mutation can take tens of
+        // milliseconds on some systems. Start the desktop visual bridge and
+        // publish native reveal BEFORE that potentially blocking Win32 route.
+        // Otherwise the cursor has already crossed the GUI boundary but both
+        // the native reveal request and the sprite update wait behind the GUI
+        // style transition, producing the periodic 40-70 ms invisible gap.
+        if g.active && old_owner != 0 && !content_hit && hide_applied {
+            let bridge_started = !DESKTOP_REVEAL_BRIDGE_ACTIVE.swap(true, Ordering::AcqRel);
+            sprite_move_now(px, py, true);
+            keep_cursor_sprite_on_top();
+            request_cursor_hidden(false);
+            if bridge_started {
+                log::info!(
+                    "desktop-reveal-bridge-start: from_hwnd={:#x} pos=({px},{py}) hide_applied=true phase=pre-gui-route",
+                    old_owner
+                );
+            }
+        }
+
         if old_owner != 0 {
             log::debug!(
                 "native-ui-ownership-exit: hwnd={:#x} boundary=exact pos=({px},{py})",
                 old_owner
             );
             if crate::platform::win32::is_own_window(old_owner) {
+                let route_started = std::time::Instant::now();
                 set_own_main_gui_passthrough(g, true, "exact-gui-exit");
+                let route_ms = route_started.elapsed().as_millis();
+                if route_ms >= 8 {
+                    log::info!(
+                        "native-ui-exit-route-latency: hwnd={:#x} elapsed_ms={} desktop_bridge={}",
+                        old_owner,
+                        route_ms,
+                        DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire)
+                    );
+                }
             }
         }
-        g.native_gui_owner_hwnd = 0;
-        NATIVE_GUI_OWNER.store(0, Ordering::Release);
+        if g.active {
+            // The Mag thread may have completed native reveal while the GUI
+            // passthrough call above was blocked. Re-read APPLIED here; never
+            // resurrect the sprite bridge after native has already become the
+            // visual owner.
+            let hide_applied_now = CURSOR_HIDE_APPLIED.load(Ordering::Acquire);
+            // After the first exit sample, keep the bridge sprite following
+            // every desktop LL event until the Mag owner reports successful
+            // native reveal. No hidden margin or time latch is introduced.
+            if !content_hit && hide_applied_now {
+                let bridge_started = !DESKTOP_REVEAL_BRIDGE_ACTIVE.swap(true, Ordering::AcqRel);
+                sprite_move_now(px, py, true);
+                keep_cursor_sprite_on_top();
+                if bridge_started {
+                    log::info!(
+                        "desktop-reveal-bridge-start: from_hwnd={:#x} pos=({px},{py}) hide_applied=true phase=desktop-follow",
+                        old_owner
+                    );
+                }
+            } else {
+                DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
+            }
+            log::info!(
+                "native-ui-exit-visibility: hwnd={:#x} actual=({px},{py}) content_hit={} hide_applied={} desktop_bridge={} action=request-native",
+                old_owner,
+                content_hit,
+                hide_applied_now,
+                DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire)
+            );
+            request_cursor_hidden(false);
+
+            if !content_hit
+                && !hide_applied_now
+                && g.last_desktop_cursor_diag_at.map_or(true, |last| {
+                    now.saturating_duration_since(last) >= std::time::Duration::from_millis(250)
+                })
+            {
+                g.last_desktop_cursor_diag_at = Some(now);
+                let sprite_requested = SPRITE_SHOW.load(Ordering::Acquire);
+                let sprite_blocked = SPRITE_NATIVE_REVEAL_BLOCK.load(Ordering::Acquire);
+                let sprite_window_visible = SPRITE_HWND
+                    .get()
+                    .is_some_and(|&h| unsafe { IsWindowVisible(HWND(h as *mut _)).as_bool() });
+                let top = unsafe { WindowFromPoint(POINT { x: px, y: py }) };
+                log::info!(
+                    "desktop-cursor-heartbeat: pos=({px},{py}) want_hidden={} hide_applied={} mag_showcursor_diag={} sprite_requested={} sprite_blocked={} sprite_window_visible={} bridge={} top_hwnd={:#x}",
+                    WANT_CURSOR_HIDDEN.load(Ordering::Acquire),
+                    CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+                    system_cursor_showing(),
+                    sprite_requested,
+                    sprite_blocked,
+                    sprite_window_visible,
+                    DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire),
+                    top.0 as isize
+                );
+            }
+        }
         g.ui_hover_active = false;
         g.last_ui_hover = None;
         g.last_ui_post = None;
@@ -1860,6 +3479,7 @@ fn hold_native_gui_ownership_if_inside(
 
     g.native_gui_owner_hwnd = new_owner;
     NATIVE_GUI_OWNER.store(new_owner, Ordering::Release);
+    DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
     if crate::platform::win32::is_own_window(new_owner) && !is_panel_hit(hit) {
         publish_main_gui_passthrough(new_owner, false, "native-gui-owner-enter");
     }
@@ -1869,15 +3489,61 @@ fn hold_native_gui_ownership_if_inside(
     g.virt = (px as f64, py as f64);
     g.last_set = pos;
     g.last_hw = pos;
-    if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
-        sprite_move(px, py, true);
-        keep_cursor_sprite_on_top();
+    if g.active {
+        if external_native_cursor_owner(new_owner) {
+            request_cursor_hidden(false);
+            if old_owner != new_owner {
+                log::debug!(
+                    "external-native cursor ownership entered: hwnd={:#x} pos=({px},{py})",
+                    new_owner
+                );
+            }
+        } else {
+            // Existing Neo GUI/panel capture-wide sprite path.
+            request_cursor_hidden(true);
+            let force_sync = old_owner != new_owner;
+            let sync_due = g
+                .last_gui_sprite_sync_at
+                .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(4));
+            if force_sync || sync_due {
+                sprite_move_now(px, py, true);
+                g.last_gui_sprite_sync_at = Some(now);
+            } else {
+                sprite_move(px, py, true);
+            }
+            if old_owner != new_owner {
+                keep_cursor_sprite_on_top();
+                log::debug!(
+                    "native-gui sprite ownership entered: hwnd={:#x} pos=({px},{py})",
+                    new_owner
+                );
+            }
+        }
+    } else if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+        if old_owner == new_owner {
+            // Idle/non-capture fallback retains the proven native-cursor path.
+            if SPRITE_SHOW.swap(false, Ordering::AcqRel) {
+                sprite_hide_window_only();
+                log::debug!(
+                    "native-gui stable ownership cancelled stale bridge sprite: hwnd={:#x} pos=({px},{py})",
+                    new_owner
+                );
+            }
+        } else {
+            sprite_move(px, py, true);
+            keep_cursor_sprite_on_top();
+        }
+    } else if old_owner == new_owner && SPRITE_SHOW.swap(false, Ordering::AcqRel) {
+        sprite_hide_window_only();
+        log::debug!(
+            "native-gui stable ownership drained queued sprite after native reveal: hwnd={:#x} pos=({px},{py})",
+            new_owner
+        );
     }
     true
 }
 
 fn click_panel_once(g: &mut State, hover: UiHover, bit: u8, _now: std::time::Instant) {
-    let pos = hover.pos;
     g.edge_out_accum = 0.0;
     g.last_engage_at = None;
     g.must_leave_content = false;
@@ -1886,7 +3552,14 @@ fn click_panel_once(g: &mut State, hover: UiHover, bit: u8, _now: std::time::Ins
     g.ui_hover_active = true;
     g.hidden_by_idle = false;
     g.last_ui_hover = Some(hover);
-    post_mouse_button_to_hwnd(hover.hit.hwnd, pos.0, pos.1, bit);
+
+    // v348j: panel buttons have exactly one authoritative action path.  Older
+    // builds both posted a synthetic native button sequence to the egui panel
+    // AND queued the low-level direct action.  Depending on whether cursor
+    // ownership had already handed off to the native panel, the first physical
+    // click could therefore become a focus/ownership click while the action was
+    // only observed on the second gesture.  Keep hover messages for visual
+    // feedback, but execute panel controls only through PANEL_ACTIONS.
     queue_panel_action(hover, bit);
     if g.cursor_hidden {
         request_cursor_hidden(true);
@@ -1946,6 +3619,30 @@ fn try_panel_redirect(msg: u32, px: i32, py: i32) -> bool {
         return false;
     }
     if !g.engaged {
+        // v348j: the floating panel must not require a first click merely to
+        // activate/focus its native viewport.  When the real Windows cursor is
+        // already over the visible topmost panel, route the very first LEFT
+        // button-down through the same direct action queue used while engaged.
+        // Swallow the matching UP so egui cannot also treat this physical click
+        // as a second, duplicate action.  Other buttons keep normal Win32
+        // semantics.
+        if bit == BTN_LEFT {
+            refresh_live_own_no_engage_geometry(&mut g, std::time::Instant::now());
+            if let Some(hit) =
+                hit_ui_for_cursor_ownership(&g.no_engage, px, py).filter(|hit| is_panel_hit(*hit))
+            {
+                let hover = UiHover { hit, pos: (px, py) };
+                g.swallow_up |= bit;
+                g.ui_hover_active = true;
+                g.last_ui_hover = Some(hover);
+                queue_panel_action(hover, bit);
+                log::debug!(
+                    "panel first-click direct: hwnd={:#x} pos=({px},{py}) owner=native",
+                    hit.hwnd
+                );
+                return true;
+            }
+        }
         return false;
     }
     // Is the VISIBLE virtual cursor exactly over the current topmost panel /
@@ -1964,7 +3661,7 @@ fn try_panel_redirect(msg: u32, px: i32, py: i32) -> bool {
         if is_panel_hit(hit) {
             click_panel_once(&mut g, hover, bit, now);
             drop(g);
-            log::info!(
+            log::debug!(
                 "panel click handoff to hwnd={:#x} at ({},{}) virt=({vx},{vy}) raw=({px},{py})",
                 hit.hwnd,
                 click.0,
@@ -2074,6 +3771,30 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                     }
                     WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP
                     | WM_RBUTTONUP | WM_MBUTTONUP => {
+                        // Floating-panel buttons are latency-critical controls.
+                        // Resolve them before any mutex-backed cursor state so
+                        // a first click cannot be lost to focus/ownership or a
+                        // transient try_lock collision.
+                        if try_panel_direct_lockfree(msg, info.pt.x, info.pt.y) {
+                            return LRESULT(1);
+                        }
+                        // The main capture control uses the same lock-free
+                        // physical-DOWN routing for Start and Stop. Passing the
+                        // edge onward keeps winit/egui pointer state balanced;
+                        // the atomic action is consumed at the start of that frame.
+                        if try_main_control_lockfree(msg, info.pt.x, info.pt.y) {
+                            // This is unquestionably a native main-GUI control
+                            // gesture. Bypass source/pending-engage routing but
+                            // still deliver the edge to winit/egui so its event
+                            // loop wakes immediately and consumes the action.
+                            return CallNextHookEx(None, code, wp, lp);
+                        }
+                        if tensorrt_build_native_cursor_guard() {
+                            // The TensorRT progress popup and the rest of Neo's
+                            // GUI stay fully interactive, but source cursor
+                            // routing is disabled for the whole build epoch.
+                            return CallNextHookEx(None, code, wp, lp);
+                        }
                         // A GUI -> overlay handoff may be waiting a few
                         // milliseconds for the owner-thread cursor hide. Never
                         // let a click warp or land at source coordinates during
@@ -2093,6 +3814,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                         }
                     }
                     WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                        if tensorrt_build_native_cursor_guard() {
+                            return CallNextHookEx(None, code, wp, lp);
+                        }
                         if pending_engage_active() {
                             return LRESULT(1);
                         }
@@ -2177,7 +3901,7 @@ fn forward_engaged_button(msg: u32) -> bool {
     if !g.content.contains(vx, vy) {
         let now = std::time::Instant::now();
         if let Some(actual) =
-            release_windows_to_native_at(&mut g, (vx, vy), "button edge native handoff")
+            release_windows_to_native_at(&mut g, (vx, vy), "button edge native handoff", false)
         {
             disengage_state(&mut g, now);
             g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
@@ -2232,7 +3956,9 @@ fn align_engaged_cursor_for_input(_px: i32, _py: i32) {
     let vy = g.virt.1.round() as i32;
     if !g.content.contains(vx, vy) {
         let now = std::time::Instant::now();
-        if release_windows_to_native_at(&mut g, (vx, vy), "input edge native handoff").is_some() {
+        if release_windows_to_native_at(&mut g, (vx, vy), "input edge native handoff", false)
+            .is_some()
+        {
             disengage_state(&mut g, now);
             g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
         }
@@ -2315,7 +4041,10 @@ fn set_system_cursor_visible(visible: bool) -> bool {
     }
 }
 
-/// Is the real system cursor currently being drawn? (GetCursorInfo CURSOR_SHOWING)
+/// Diagnostic only: ordinary ShowCursor/CURSOR_SHOWING state.
+/// Magnification's MagShowSystemCursor(false) does not change this flag, so
+/// `true` is normal even while Magnification is correctly hiding native.
+/// Never use this helper to decide native-vs-sprite ownership.
 fn system_cursor_showing() -> bool {
     unsafe {
         let mut ci = CURSORINFO {
@@ -2354,11 +4083,104 @@ static WANT_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 static CURSOR_HIDE_APPLIED: AtomicBool = AtomicBool::new(false);
 /// Cross-thread request; consumed only by the render-engine/Mag owner thread.
 static MAG_REINIT_REQUESTED: AtomicBool = AtomicBool::new(true);
-static CURSOR_DIAG_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Clamp a point to the inclusive pixel bounds of a monitor rectangle.
+/// Kept pure so the exact 1920x1080 regression can be unit-tested without Win32.
+fn clamp_point_to_monitor_rect(pos: (i32, i32), monitor: Rect) -> (i32, i32) {
+    if monitor.w <= 0 || monitor.h <= 0 {
+        return pos;
+    }
+    let right = monitor.x.saturating_add(monitor.w.saturating_sub(1));
+    let bottom = monitor.y.saturating_add(monitor.h.saturating_sub(1));
+    (
+        pos.0.clamp(monitor.x, right),
+        pos.1.clamp(monitor.y, bottom),
+    )
+}
+
+/// Return a SetCursorPos-reachable desktop pixel. If `pos` is already on any
+/// monitor it is preserved exactly; if it lies beyond an outer screen edge or
+/// in a monitor gap, Windows' nearest monitor is used and the point is clamped
+/// to that monitor's real rcMonitor (not the work area).
+fn reachable_desktop_cursor_point(pos: (i32, i32)) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: pos.0, y: pos.1 }, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let r = info.rcMonitor;
+            return clamp_point_to_monitor_rect(
+                pos,
+                Rect {
+                    x: r.left,
+                    y: r.top,
+                    w: r.right.saturating_sub(r.left),
+                    h: r.bottom.saturating_sub(r.top),
+                },
+            );
+        }
+    }
+    pos
+}
+
+/// Pure visual clamp for the layered sprite window. `target` is the logical
+/// cursor point; only the HWND top-left is adjusted. Keep the ENTIRE sprite
+/// inside the nearest physical monitor so an edge/corner exit can never make
+/// the Neo cursor look absent. Input geometry is deliberately untouched.
+fn clamp_sprite_origin_to_monitor(target: (i32, i32), monitor: Rect, sprite_px: i32) -> (i32, i32) {
+    if monitor.w <= 0 || monitor.h <= 0 {
+        return target;
+    }
+    let sprite_px = sprite_px.max(1);
+    let right_exclusive = monitor.x.saturating_add(monitor.w);
+    let bottom_exclusive = monitor.y.saturating_add(monitor.h);
+    let max_x = right_exclusive.saturating_sub(sprite_px).max(monitor.x);
+    let max_y = bottom_exclusive.saturating_sub(sprite_px).max(monitor.y);
+    // One rectangle rule for all four edges/corners: clamp the sprite WINDOW,
+    // not the logical/hardware cursor. Left/top naturally remain at monitor.x/y;
+    // right/bottom pull the HWND inward by its full size. SetCursorPos,
+    // ClipCursor and all content/source mapping still use the exact target.
+    (
+        target.0.clamp(monitor.x, max_x),
+        target.1.clamp(monitor.y, max_y),
+    )
+}
+
+/// Physical top-left used only for the layered cursor sprite window. The
+/// logical cursor target remains exact in SPRITE_TARGET and in all input
+/// mapping. At every monitor edge keep the full arrow HWND visible while the
+/// logical/hardware point remains exactly at that edge.
+fn sprite_window_visual_position(pos: (i32, i32)) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: pos.0, y: pos.1 }, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return pos;
+        }
+        let r = info.rcMonitor;
+        clamp_sprite_origin_to_monitor(
+            pos,
+            Rect {
+                x: r.left,
+                y: r.top,
+                w: r.right.saturating_sub(r.left),
+                h: r.bottom.saturating_sub(r.top),
+            },
+            SPRITE_SIZE_PX.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingCursorReveal {
     at: std::time::Instant,
     pos: (i32, i32),
+    attempts: u8,
 }
 
 static PENDING_CURSOR_REVEAL: OnceLock<Mutex<Option<PendingCursorReveal>>> = OnceLock::new();
@@ -2391,9 +4213,41 @@ fn pending_cursor_reveal() -> &'static Mutex<Option<PendingCursorReveal>> {
 }
 
 fn defer_cursor_reveal(pos: (i32, i32)) {
-    let reveal_at = std::time::Instant::now() + std::time::Duration::from_millis(45);
-    *pending_cursor_reveal().lock().unwrap() = Some(PendingCursorReveal { at: reveal_at, pos });
+    let safe_pos = reachable_desktop_cursor_point(pos);
+    if safe_pos != pos {
+        log::info!(
+            "cursor-reveal target clamped to reachable desktop: requested=({},{}) safe=({},{})",
+            pos.0,
+            pos.1,
+            safe_pos.0,
+            safe_pos.1
+        );
+    }
+    let reveal_at =
+        std::time::Instant::now() + std::time::Duration::from_millis(EDGE_TRANSFER_DEFER_MS);
+    *pending_cursor_reveal().lock().unwrap() = Some(PendingCursorReveal {
+        at: reveal_at,
+        pos: safe_pos,
+        attempts: 0,
+    });
     request_cursor_hidden(true);
+
+    // Capture-wide sprite mode never needs MagShowSystemCursor(true) for an
+    // edge exit; it only needs the hidden real cursor moved out of source
+    // space. Do that on the hook-owned sprite window timer so a cold
+    // TensorRT/ONNX render-thread stall cannot freeze this transaction.
+    if capture_sprite_active() {
+        if let Some(&h) = SPRITE_HWND.get() {
+            unsafe {
+                let _ = SetTimer(
+                    Some(HWND(h as *mut _)),
+                    CURSOR_EDGE_TRANSFER_TIMER_ID,
+                    EDGE_TRANSFER_DEFER_MS as u32,
+                    None,
+                );
+            }
+        }
+    }
 }
 
 fn cancel_cursor_reveal() {
@@ -2402,6 +4256,107 @@ fn cancel_cursor_reveal() {
 
 fn cursor_reveal_pending() -> bool {
     pending_cursor_reveal().lock().unwrap().is_some()
+}
+
+/// Complete a capture-wide sprite edge transfer on the mouse-hook thread,
+/// outside the WH_MOUSE_LL callback itself. This path deliberately does not
+/// call Magnification APIs; the native cursor remains hidden and Neo's sprite
+/// stays the visual owner. The render/ONNX thread may be blocked for seconds
+/// during the first TensorRT inference without affecting cursor escape.
+fn complete_capture_sprite_cursor_transfer_on_hook_thread() {
+    if !capture_sprite_active() {
+        return;
+    }
+
+    let now = std::time::Instant::now();
+    let pending = {
+        let guard = pending_cursor_reveal().lock().unwrap();
+        *guard
+    };
+    let Some(p) = pending else {
+        return;
+    };
+    if now < p.at {
+        if let Some(&h) = SPRITE_HWND.get() {
+            unsafe {
+                let _ = SetTimer(
+                    Some(HWND(h as *mut _)),
+                    CURSOR_EDGE_TRANSFER_TIMER_ID,
+                    EDGE_TRANSFER_DEFER_MS as u32,
+                    None,
+                );
+            }
+        }
+        return;
+    }
+
+    let (reached, actual) =
+        warp_unclipped_verified(p.pos, "capture sprite hook-timer edge transfer");
+    if reached {
+        *pending_cursor_reveal().lock().unwrap() = None;
+        WANT_CURSOR_HIDDEN.store(true, Ordering::Release);
+        sprite_move_now(actual.0, actual.1, true);
+        log::debug!(
+            "cursor-desktop-transfer verified: target=({},{}) actual=({},{}) visual_owner=sprite executor=hook-timer",
+            p.pos.0,
+            p.pos.1,
+            actual.0,
+            actual.1
+        );
+        return;
+    }
+
+    let mut exhausted = false;
+    let mut attempts = 0u8;
+    {
+        let mut guard = pending_cursor_reveal().lock().unwrap();
+        if let Some(mut current) = *guard {
+            current.attempts = current.attempts.saturating_add(1);
+            attempts = current.attempts;
+            if current.attempts >= CURSOR_REVEAL_MAX_ATTEMPTS {
+                *guard = None;
+                exhausted = true;
+            } else {
+                current.at = std::time::Instant::now()
+                    + std::time::Duration::from_millis(EDGE_TRANSFER_DEFER_MS);
+                *guard = Some(current);
+            }
+        }
+    }
+
+    let safe_actual = reachable_desktop_cursor_point(actual);
+    sprite_move_now(safe_actual.0, safe_actual.1, true);
+    WANT_CURSOR_HIDDEN.store(true, Ordering::Release);
+    if exhausted {
+        log::error!(
+            "cursor-edge-transfer fail-safe released pending state after {} attempts: target=({},{}) actual=({},{}) safe_actual=({},{}) executor=hook-timer",
+            attempts,
+            p.pos.0,
+            p.pos.1,
+            actual.0,
+            actual.1,
+            safe_actual.0,
+            safe_actual.1
+        );
+    } else if let Some(&h) = SPRITE_HWND.get() {
+        unsafe {
+            let _ = SetTimer(
+                Some(HWND(h as *mut _)),
+                CURSOR_EDGE_TRANSFER_TIMER_ID,
+                EDGE_TRANSFER_DEFER_MS as u32,
+                None,
+            );
+        }
+        log::warn!(
+            "cursor-edge-transfer deferred: attempt={}/{} target=({},{}) actual=({},{}) executor=hook-timer",
+            attempts,
+            CURSOR_REVEAL_MAX_ATTEMPTS,
+            p.pos.0,
+            p.pos.1,
+            actual.0,
+            actual.1
+        );
+    }
 }
 
 fn restore_configured_system_cursors() {
@@ -2448,27 +4403,35 @@ pub fn pump_cursor_visibility() {
     });
     if reinit_requested {
         LAST_CURSOR_ASSERT.with(|c| c.set(None));
-        CURSOR_DIAG_DONE.store(false, Ordering::Relaxed);
     }
     let native_gui_owner = NATIVE_GUI_OWNER.load(Ordering::Acquire);
+    let capture_sprite_mode = capture_sprite_active();
+    let external_native_owner = external_native_cursor_owner(native_gui_owner);
     let mut want_hidden = WANT_CURSOR_HIDDEN.load(Ordering::Relaxed);
-    // Native GUI ownership is the highest-priority cursor contract. A timer,
-    // stale engaged flag, or delayed render publication must never keep the
-    // Magnification cursor hidden while Windows is routing input to our GUI.
+    if capture_sprite_mode && !external_native_owner {
+        want_hidden = true;
+        WANT_CURSOR_HIDDEN.store(true, Ordering::Release);
+    }
+    // While capture is active, native GUI ownership deliberately keeps the
+    // system cursor hidden and uses Neo's sprite at the real GUI point. Native
+    // hit-testing remains unchanged; outside capture, retain the normal native
+    // cursor path.
+    let gui_sprite_mode = active_native_gui_sprite_mode(native_gui_owner);
     if native_gui_owner != 0 {
-        want_hidden = false;
-        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+        want_hidden = gui_sprite_mode;
+        WANT_CURSOR_HIDDEN.store(gui_sprite_mode, Ordering::Release);
     }
     let mut reveal_due = false;
     let mut reveal_target = None;
     {
         let pending = pending_cursor_reveal().lock().unwrap();
         if let Some(p) = *pending {
-            if std::time::Instant::now() >= p.at {
+            if !capture_sprite_mode && std::time::Instant::now() >= p.at {
                 reveal_target = Some(p.pos);
             }
-            // A pending reveal always keeps native hidden until the requested
-            // screen point has been independently verified.
+            // Capture-wide sprite edge transfers are completed by the
+            // hook-window timer. Native-reveal cases still use this
+            // Magnification-owner thread.
             want_hidden = true;
         }
     }
@@ -2476,40 +4439,107 @@ pub fn pump_cursor_visibility() {
         let (reached, actual) = warp_unclipped_verified(pos, "deferred cursor reveal");
         if reached {
             *pending_cursor_reveal().lock().unwrap() = None;
-            reveal_due = true;
-            want_hidden = false;
-            WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
-            log::info!(
-                "cursor-reveal verified: target=({},{}) actual=({},{})",
-                pos.0,
-                pos.1,
-                actual.0,
-                actual.1
-            );
-        } else {
-            let mut pending = pending_cursor_reveal().lock().unwrap();
-            if let Some(mut p) = *pending {
-                p.at = std::time::Instant::now() + std::time::Duration::from_millis(8);
-                *pending = Some(p);
+            if capture_sprite_mode {
+                reveal_due = false;
+                want_hidden = true;
+                WANT_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+                sprite_move_now(actual.0, actual.1, true);
+                log::debug!(
+                    "cursor-desktop-transfer verified: target=({},{}) actual=({},{}) visual_owner=sprite stable-deferred",
+                    pos.0,
+                    pos.1,
+                    actual.0,
+                    actual.1
+                );
+            } else {
+                reveal_due = true;
+                want_hidden = false;
+                WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+                log::debug!(
+                    "cursor-reveal verified: target=({},{}) actual=({},{})",
+                    pos.0,
+                    pos.1,
+                    actual.0,
+                    actual.1
+                );
             }
-            want_hidden = true;
-            WANT_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
-            log::warn!(
-                "cursor-reveal deferred: target=({},{}) actual=({},{})",
-                pos.0,
-                pos.1,
-                actual.0,
-                actual.1
-            );
+        } else {
+            let mut exhausted = false;
+            let mut attempts = 0u8;
+            {
+                let mut pending = pending_cursor_reveal().lock().unwrap();
+                if let Some(mut p) = *pending {
+                    p.attempts = p.attempts.saturating_add(1);
+                    attempts = p.attempts;
+                    if p.attempts >= CURSOR_REVEAL_MAX_ATTEMPTS {
+                        *pending = None;
+                        exhausted = true;
+                    } else {
+                        p.at = std::time::Instant::now()
+                            + std::time::Duration::from_millis(EDGE_TRANSFER_DEFER_MS);
+                        *pending = Some(p);
+                    }
+                }
+            }
+            if exhausted {
+                // Fail visible instead of holding the desktop cursor hidden
+                // forever. During active capture the Neo sprite remains the
+                // visual owner at the best OS-reported reachable point. Outside
+                // capture, allow the native cursor to be shown there.
+                let safe_actual = reachable_desktop_cursor_point(actual);
+                sprite_move_now(safe_actual.0, safe_actual.1, true);
+                if capture_sprite_mode {
+                    want_hidden = true;
+                    WANT_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+                } else {
+                    reveal_due = true;
+                    want_hidden = false;
+                    WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+                }
+                log::error!(
+                    "cursor-reveal fail-safe released pending state after {} attempts: target=({},{}) actual=({},{}) safe_actual=({},{}) capture_sprite={}",
+                    attempts,
+                    pos.0,
+                    pos.1,
+                    actual.0,
+                    actual.1,
+                    safe_actual.0,
+                    safe_actual.1,
+                    capture_sprite_mode
+                );
+            } else {
+                want_hidden = true;
+                WANT_CURSOR_HIDDEN.store(true, Ordering::Relaxed);
+                log::warn!(
+                    "cursor-reveal deferred: attempt={}/{} target=({},{}) actual=({},{})",
+                    attempts,
+                    CURSOR_REVEAL_MAX_ATTEMPTS,
+                    pos.0,
+                    pos.1,
+                    actual.0,
+                    actual.1
+                );
+            }
         }
     }
-    // Re-check ownership after deferred-reveal processing. That work may have
-    // inherited a stale source-side request and set `want_hidden` again while
-    // the native GUI already owns the pointer. GUI ownership is the final
-    // authority: cancel the obsolete warp and keep the system cursor visible.
+    // Re-check ownership after deferred-reveal processing. GUI ownership is
+    // final authority, but during active capture that authority is now the
+    // deterministic GUI-sprite contract rather than native visual reveal.
     if native_gui_owner != 0 {
         *pending_cursor_reveal().lock().unwrap() = None;
         reveal_due = false;
+        want_hidden = gui_sprite_mode;
+        WANT_CURSOR_HIDDEN.store(gui_sprite_mode, Ordering::Release);
+    }
+    if capture_sprite_mode && !external_native_owner {
+        want_hidden = true;
+        WANT_CURSOR_HIDDEN.store(true, Ordering::Release);
+    }
+    // v382: GUI caption drag is no longer a native-reveal exception. Active
+    // capture keeps Neo sprite ownership independent of where the title bar was grabbed.
+    if tensorrt_build_native_cursor_guard() {
+        // Final authority during a build epoch: stale timer/GUI requests must
+        // never re-hide native even if they were queued before the guard rose.
         want_hidden = false;
         WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
     }
@@ -2522,14 +4552,58 @@ pub fn pump_cursor_visibility() {
         return;
     }
     LAST_CURSOR_ASSERT.with(|c| c.set(Some(std::time::Instant::now())));
+
+    // Native reveal must never overlap the white Neo cursor sprite. v348f
+    // physically hid the sprite before MagShowSystemCursor(true), but the LL
+    // mouse hook could still arrive in that tiny interval and issue another
+    // sprite_move(..., true). That explains the remaining one-frame white
+    // cursor, often slightly offset because the async sprite position was one
+    // mouse sample behind the native cursor. v348g makes the reveal a real
+    // transaction: all sprite show paths are atomically blocked until native
+    // reveal either succeeds or fails.
+    let native_reveal_transition = !want_hidden && CURSOR_HIDE_APPLIED.load(Ordering::Acquire);
+    let desktop_bridge_active =
+        native_reveal_transition && DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire);
+    let bridge_sprite_for_native_reveal =
+        native_reveal_transition && SPRITE_SHOW.load(Ordering::Acquire);
+    if native_reveal_transition && !desktop_bridge_active {
+        SPRITE_NATIVE_REVEAL_BLOCK.store(true, Ordering::Release);
+        // Ordinary native reveal keeps the strict no-overlap transaction.
+        // Desktop exit is the fail-visible bridge; GUI caption drag no longer
+        // enters this native-reveal path in v382.
+        sprite_hide_window_only();
+    }
+
+    let reveal_started = std::time::Instant::now();
     let ok = set_system_cursor_visible(!want_hidden);
+    // GetCursorInfo/CURSOR_SHOWING tracks the ordinary ShowCursor display
+    // state and does NOT reflect MagShowSystemCursor(false). Keep it only as
+    // a diagnostic signal; never use it to decide whether Magnification hide
+    // succeeded (v372 did that and could hide both native and Neo sprite).
+    let refcount_visible = system_cursor_showing();
+    if changed || reveal_due || !ok {
+        let actual = read_cursor_pos_or((i32::MIN, i32::MIN), "cursor visibility safe apply");
+        log::info!(
+            "cursor-visibility-safe: request_hidden={} mag_ok={} showcursor_refcount_visible={} diagnostic_only=true hide_applied_before={} owner={:#x} actual=({},{})",
+            want_hidden,
+            ok,
+            refcount_visible,
+            CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+            native_gui_owner,
+            actual.0,
+            actual.1
+        );
+    }
     if want_hidden {
+        // Defensive reset: a hidden-cursor request is outside the native-reveal
+        // transaction, so the sprite may become visible after Mag hide succeeds.
+        SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
         if ok {
             if !CURSOR_HIDE_APPLIED.swap(true, Ordering::AcqRel) {
                 // The initial engage move recorded the sprite position but kept
                 // its window hidden. Reveal it only after native hide succeeds.
                 post_sprite_update();
-                log::info!("cursor handoff committed: native hidden -> sprite visible");
+                log::debug!("cursor handoff committed: native hidden -> sprite visible");
             }
         } else {
             CURSOR_HIDE_APPLIED.store(false, Ordering::Release);
@@ -2537,15 +4611,42 @@ pub fn pump_cursor_visibility() {
         }
     } else {
         if ok {
+            // Once native reveal has succeeded, close the bridge atomically:
+            // block any queued sprite re-show, publish native ownership, then
+            // synchronously remove the bridge window.
+            if desktop_bridge_active {
+                SPRITE_NATIVE_REVEAL_BLOCK.store(true, Ordering::Release);
+            }
             let was_hidden = CURSOR_HIDE_APPLIED.swap(false, Ordering::AcqRel);
+            let desktop_bridge = DESKTOP_REVEAL_BRIDGE_ACTIVE.swap(false, Ordering::AcqRel);
+            if desktop_bridge {
+                let actual =
+                    read_cursor_pos_or((i32::MIN, i32::MIN), "desktop reveal bridge complete");
+                log::info!(
+                    "desktop-reveal-bridge-complete: native_visible=true actual=({},{}) bridge_ms={}",
+                    actual.0,
+                    actual.1,
+                    reveal_started.elapsed().as_millis()
+                );
+            }
             if was_hidden {
-                // Native is now visible; recompute sprite visibility in this
-                // same owner-thread tick.
-                post_sprite_update();
+                SPRITE_SHOW.store(false, Ordering::Release);
+                sprite_hide_window_only();
+            }
+            if native_reveal_transition {
+                SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
             }
         } else {
-            // If show failed, native is still presumed hidden. Keep the sprite
-            // visible and retry on the next owner-thread heartbeat.
+            // If show failed, native is still presumed hidden. Re-open sprite
+            // visibility first, then restore the bridge immediately and retry on
+            // the next owner-thread heartbeat. This avoids trading the flash for
+            // a cursor-less frame.
+            if native_reveal_transition {
+                SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
+            }
+            if bridge_sprite_for_native_reveal {
+                sprite_restore_window_if_requested_now();
+            }
             log::warn!("native cursor reveal deferred: MagShowSystemCursor(true) failed");
         }
         if reveal_due && ok {
@@ -2562,17 +4663,6 @@ pub fn pump_cursor_visibility() {
             }
         }
     }
-    // One-time state dump. NOTE: GetCursorInfo's CURSOR_SHOWING tracks the
-    // ShowCursor() display REF-COUNT only — the Magnification hide does not
-    // touch it, so showing=true here is NORMAL and does not mean the hide
-    // failed. Trust the explicit API result rather than stale diagnostic state.
-    if want_hidden && !CURSOR_DIAG_DONE.swap(true, Ordering::Relaxed) {
-        let showing = system_cursor_showing();
-        log::info!(
-            "cursor-hide DIAG (engine thread): MagShowSystemCursor(false).ok={ok} \
-             showcursor_refcount_visible={showing} (refcount ignores Mag; showing=true is normal)"
-        );
-    }
     let previous_owner = LAST_CURSOR_CONTRACT_OWNER.swap(native_gui_owner, Ordering::AcqRel);
     if previous_owner != native_gui_owner {
         let actual = read_cursor_pos_or((i32::MIN, i32::MIN), "cursor ownership contract");
@@ -2581,7 +4671,7 @@ pub fn pump_cursor_visibility() {
         } else {
             crate::platform::win32::direct_top_level_window_at_point(actual.0, actual.1)
         };
-        log::info!(
+        log::debug!(
             "cursor-ownership-contract: native_gui={:#x} previous={:#x} want_hidden={} mag_ok={} hide_applied={} actual=({},{}) top_hwnd={:#x}",
             native_gui_owner,
             previous_owner,
@@ -2914,6 +5004,7 @@ fn mark_engage_committed(g: &mut State, target: (i32, i32), now: std::time::Inst
     g.expect_teleport = Some(target);
     g.teleport_guard_until =
         Some(now + std::time::Duration::from_millis(POST_COMMIT_STALE_GUARD_MS));
+    g.edge_release_settle_until = None;
 }
 
 fn suppress_post_commit_stale_move(
@@ -3047,9 +5138,30 @@ fn plan_engaged(
     let ay = actual.1.clamp(s.y, s.y + s.h - 1);
     g.last_set = (ax, ay);
     let mapped = map_source_to_content_unclamped(c, s, px as f64, py as f64);
-    g.virt = mapped;
+    let caption_drag_visual = if g.buttons_down & BTN_LEFT != 0 && source_caption_drag_active() {
+        source_caption_drag_visual_position()
+    } else {
+        None
+    };
+    if let Some((vx, vy)) = caption_drag_visual {
+        // Native Windows dragging already keeps the hidden real cursor at a
+        // fixed grab offset inside the source caption. Re-mapping that cursor
+        // through independently published source/content rectangles introduces
+        // a second geometry clock and is exactly what made the visible sprite
+        // creep across the title bar. During a caption drag the visual cursor
+        // has one authority only: overlay_origin + grab_anchor.
+        g.virt = (vx as f64, vy as f64);
+    } else {
+        g.virt = mapped;
+    }
     let prev_hw = g.last_hw;
     g.last_hw = (px, py);
+
+    if caption_drag_visual.is_some() {
+        g.edge_out_accum = 0.0;
+        return MovePlan::Stay;
+    }
+
     if fullscreen_ui_virtual_move(g, old_virt, (px, py), (px - prev_hw.0, py - prev_hw.1)) {
         g.edge_out_accum = 0.0;
         return MovePlan::Stay;
@@ -3070,6 +5182,21 @@ fn plan_engaged(
             g.edge_out_accum = 0.0;
             return MovePlan::Stay;
         }
+    }
+
+    // v370: the windowed floating panel sits immediately outside the content
+    // edge. EXIT_TRAVEL_PX is intentionally one physical pixel for ordinary
+    // window-like escape, but that also meant the first pixel toward the panel
+    // escaped to desktop before `post_ui_hover_from_state()` could hand native
+    // ownership to the panel. Give ONLY the panel's exact visible rectangle
+    // priority over edge-release; there is no halo, timer or hidden margin.
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    if let Some(hit) = ui_target_at(g, vx, vy, 0, now).filter(|h| is_panel_hit(h.hit)) {
+        g.last_ui_hover = Some(hit);
+        g.ui_hover_active = true;
+        g.edge_out_accum = 0.0;
+        return MovePlan::Stay;
     }
 
     // Edge push. The LL hook reports PRE-clip coordinates, so a push beyond the
@@ -3113,7 +5240,11 @@ fn plan_engaged(
             let place = exit_point_for_escape(g, px, py);
             let sprite = place;
             disengage_state(g, now);
-            g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
+            g.cooldown_until = if g.window_frame_input {
+                None
+            } else {
+                Some(reenter_cooldown(now, g.oscillations))
+            };
             return MovePlan::Escape { place, sprite };
         }
         return MovePlan::Stay;
@@ -3161,11 +5292,14 @@ fn handle_move(
                 MoveOutcome::Stay { sprite }
             }
             MovePlan::Escape { place, sprite } => {
-                g.must_leave_content = true;
+                // With full-frame window coordinates the exit/re-entry boundary
+                // is exact and needs no hidden hysteresis. Keep the legacy
+                // guard only for client-space mapping.
+                g.must_leave_content = !g.window_frame_input;
                 MoveOutcome::Disengage { place, sprite }
             }
         }
-    } else if let Some(e) = plan_engage(g, px, py, now) {
+    } else if let Some(e) = plan_engage(g, actual.0, actual.1, now) {
         // Guard against a small bounce immediately after an edge exit: only a
         // DELIBERATE return re-engages — the ENGAGE point (mapped source pos)
         // must sit well inside every source edge. A shallow drift back near the
@@ -3185,12 +5319,31 @@ fn handle_move(
             if !deliberate {
                 return MoveOutcome::Stay { sprite: None };
             }
+            log::info!(
+                "post-edge reengage accepted: raw=({px},{py}) actual=({},{}) mapped_source=({},{}) content={:?} src={:?}",
+                actual.0,
+                actual.1,
+                e.tx,
+                e.ty,
+                g.content,
+                g.src
+            );
         }
+        log::info!(
+            "source-reentry-authority: raw=({px},{py}) actual=({},{}) mapped_source=({},{}) window_frame={} action=engage",
+            actual.0,
+            actual.1,
+            e.tx,
+            e.ty,
+            g.window_frame_input
+        );
         g.must_leave_content = false;
         g.engaged = true;
         g.virt = (e.vx, e.vy);
         g.last_set = (e.tx, e.ty);
-        g.last_hw = (px, py);
+        // New ownership starts from the verified visible desktop point. Raw
+        // hook coordinates may still belong to the pre-warp source domain.
+        g.last_hw = actual;
         g.edge_out_accum = 0.0;
         g.last_engage_at = Some(now);
         g.expect_teleport = Some((e.tx, e.ty));
@@ -3230,6 +5383,23 @@ fn read_cursor_pos_or(fallback: (i32, i32), context: &str) -> (i32, i32) {
 /// Returns true only when this move engaged the mapper and successfully warped
 /// the real cursor. The low-level hook must consume that one triggering event.
 fn on_hardware_move(px: i32, py: i32) -> bool {
+    // Stop/native-reveal fail-visible bridge. This update is deliberately
+    // lock-free/coalesced: TensorRT teardown may hold the render thread and the
+    // shared input mutex must never be allowed to freeze the only visible
+    // cursor while Windows' real cursor is still Magnification-hidden.
+    if DESKTOP_REVEAL_BRIDGE_ACTIVE.load(Ordering::Acquire)
+        && CURSOR_HIDE_APPLIED.load(Ordering::Acquire)
+    {
+        sprite_move(px, py, true);
+    }
+    // Publish owned client-drag raw movement before touching the shared input
+    // mutex. WH_MOUSE_LL must never block; under heavy interpolation/render
+    // load try_lock can fail, but visual dragging still needs the newest raw
+    // pointer position. The owner token is published only for a validated
+    // source LEFT gesture and cleared lock-free on release/recovery.
+    if SOURCE_CLIENT_DRAG_OWNER_HWND.load(Ordering::Acquire) != 0 {
+        SOURCE_CLIENT_DRAG_RAW_CURRENT.store(pack_drag_pair(px, py), Ordering::Release);
+    }
     let st = state();
     let mut g = match st.try_lock() {
         Ok(g) => g,
@@ -3238,19 +5408,96 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
     let now = std::time::Instant::now();
     repair_main_gui_passthrough_if_needed();
     g.last_move = Some(now);
-    if !g.transition_suspended
-        && (g.active || g.engaged || g.src_hwnd != 0)
-        && g.last_configure_at
-            .is_none_or(|last| now.duration_since(last) > std::time::Duration::from_millis(1500))
-    {
-        // If the render thread stalls or dies while Windows still owns a
-        // source clip, the first physical mouse movement must free the user
-        // without depending on the GUI or provider thread.
-        log::warn!("input-heartbeat-timeout: releasing stale cursor mapping");
-        release_locked(&mut g);
+    if tensorrt_build_native_cursor_guard() {
+        // Build-progress is modal only for cursor routing. Keep Windows at the
+        // real desktop point and never re-engage source mapping until the engine
+        // reports ready; GUI hover/click continues through normal Win32 input.
+        clear_capture_sprite_contract(&mut g);
+        if g.engaged || g.cursor_hidden || g.pending_engage.is_some() {
+            release_locked(&mut g);
+        }
         g.active = false;
         g.buttons_down = 0;
         g.native_ui_hold_bits = 0;
+        return false;
+    }
+    let stale_source_mapping = g.engaged || g.pending_engage.is_some();
+    if !g.transition_suspended
+        && stale_source_mapping
+        && g.last_configure_at
+            .is_none_or(|last| now.duration_since(last) > std::time::Duration::from_millis(1500))
+    {
+        // A stalled render/provider thread must never strand the user inside a
+        // source ClipCursor.  However, active capture intentionally uses the
+        // Neo sprite as the visual cursor on *all* surfaces.  v429 cleared that
+        // sprite contract first and only then requested native reveal; if the
+        // first TensorRT job blocked the render/Magnification owner for several
+        // seconds, both cursors were invisible for that entire interval.
+        //
+        // Recover only the stale SOURCE mapping here. Preserve capture/overlay
+        // and sprite ownership, unclip synchronously on the LL-hook thread, put
+        // the hidden real cursor back at the visible virtual point, and keep the
+        // sprite alive.  No render-thread acknowledgement is required.
+        let held = g.ui_hold_bits;
+        for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+            if held & bit != 0 {
+                inject_mouse_button(bit, false);
+            }
+        }
+        if held != 0 {
+            log::warn!("input-heartbeat-timeout: released stale GUI hold bits={held:#04x}");
+        }
+        SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+        cancel_source_caption_drag_contract();
+        end_native_gui_caption_drag("input-heartbeat-timeout");
+        if g.src_hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(g.src_hwnd as *mut _)),
+                    WM_CANCELMODE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                let _ = ClipCursor(None);
+            }
+        } else {
+            unsafe {
+                let _ = ClipCursor(None);
+            }
+        }
+        restore_mouse_speed();
+
+        let logical = (g.virt.0.round() as i32, g.virt.1.round() as i32);
+        let visible = reachable_desktop_cursor_point(logical);
+        let (reached, actual) = warp_unclipped_verified(visible, "heartbeat stale mapping release");
+        let visual = if reached { actual } else { visible };
+
+        disengage_state(&mut g, now);
+        g.pending_engage = None;
+        g.must_leave_content = true;
+        g.cooldown_until = Some(now + std::time::Duration::from_millis(500));
+        // Start a fresh watchdog epoch so a still-cold provider does not fire
+        // the same recovery on every subsequent desktop mouse sample.
+        g.last_configure_at = Some(now);
+        g.buttons_down = 0;
+        g.native_ui_hold_bits = 0;
+        g.virt = (visual.0 as f64, visual.1 as f64);
+        g.last_set = visual;
+        g.last_hw = visual;
+
+        request_cursor_hidden(true);
+        sprite_move_now(visual.0, visual.1, true);
+        keep_cursor_sprite_on_top();
+        log::warn!(
+            "input-heartbeat-timeout: stale source mapping released fail-visible=true capture_preserved={} sprite_preserved={} logical=({},{}) visual=({},{}) warp_verified={}",
+            g.active,
+            capture_sprite_active(),
+            logical.0,
+            logical.1,
+            visual.0,
+            visual.1,
+            reached
+        );
         return false;
     }
     // A low-level button-up can be lost while a synthetic UI handoff changes
@@ -3277,6 +5524,18 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
         }
         return false;
     }
+    // The stable edge-release path intentionally completes warp+native reveal
+    // on the Magnification owner thread after the triggering LL event returns.
+    // Until that transaction finishes, never re-arm source mapping.
+    if !g.engaged && cursor_reveal_pending() {
+        let pending_actual = read_cursor_pos_or((px, py), "edge reveal pending move");
+        log::debug!(
+            "edge-release reveal pending: reengage blocked raw=({px},{py}) actual=({},{})",
+            pending_actual.0,
+            pending_actual.1
+        );
+        return false;
+    }
     if let Some(pending) = g.pending_engage {
         if now.duration_since(pending.requested_at) <= std::time::Duration::from_millis(250) {
             // Keep the native cursor at its GUI-side position while the owner
@@ -3300,15 +5559,18 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
         g.teleport_guard_until = None;
         g.cursor_hidden = false;
         // The native cursor was never warped on this path. Rebase bookkeeping
-        // to the currently visible hook point and briefly suppress immediate
-        // re-arm, which otherwise forms timeout->arm loops under 100% GPU load.
-        g.last_set = (px, py);
-        g.last_hw = (px, py);
+        // to GetCursorPos, not the timeout-triggering LL sample: the latter can
+        // still be a pre-warp/source-space coordinate.
+        let recovered = read_cursor_pos_or((px, py), "pending engage timeout recovery");
+        g.last_set = recovered;
+        g.last_hw = recovered;
         g.cooldown_until = Some(now + std::time::Duration::from_millis(REENTER_COOLDOWN_MS));
         request_cursor_hidden(false);
         sprite_hide();
         log::info!(
-            "cursor handoff timeout recovered: native=({px},{py}) cooldown_ms={REENTER_COOLDOWN_MS}"
+            "cursor handoff timeout recovered: raw=({px},{py}) actual=({},{}) cooldown_ms={REENTER_COOLDOWN_MS}",
+            recovered.0,
+            recovered.1
         );
         return false;
     }
@@ -3319,16 +5581,34 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
         let dx = px - settle.target.0;
         let dy = py - settle.target.1;
         let near_target = dx.abs() <= 24 && dy.abs() <= 24;
+
+        // A stale post-handoff event should still resemble the OLD source-space
+        // coordinate. v361 treated every point farther than 24px from the GUI
+        // entry point as stale, which incorrectly caught ordinary continued
+        // mouse motion inside the GUI (especially across its top edge) and
+        // re-warped the hidden native cursor back toward the entry point.
+        //
+        // Compare the raw event against both coordinate domains instead:
+        // quarantine only when it is genuinely closer to the old source point
+        // than to the verified GUI entry point. Ambiguous/GUI-side motion is
+        // released immediately and handled by the normal exact-GUI path.
+        let source_dx = px - settle.source_origin.0;
+        let source_dy = py - settle.source_origin.1;
+        let target_dist2 = i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy);
+        let source_dist2 = i64::from(source_dx) * i64::from(source_dx)
+            + i64::from(source_dy) * i64::from(source_dy);
+        let source_like = source_dist2 < target_dist2;
+
         if near_target {
             g.native_gui_settle = None;
-        } else if now <= settle.until {
+        } else if now <= settle.until && source_like {
             if !settle.reasserted {
                 let (_, actual) =
                     warp_unclipped_verified(settle.target, "native GUI stale-source quarantine");
                 settle.target = actual;
                 settle.reasserted = true;
                 log::warn!(
-                    "native-gui stale move quarantined: target=({},{}) source_origin=({},{}) stale=({px},{py})",
+                    "native-gui stale-source move quarantined: target=({},{}) source_origin=({},{}) stale=({px},{py})",
                     settle.target.0,
                     settle.target.1,
                     settle.source_origin.0,
@@ -3337,18 +5617,26 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
             }
             g.native_gui_settle = Some(settle);
             return true;
-        } else {
+        } else if now <= settle.until {
+            // Normal GUI-side continuation: do not fight the user's motion
+            // with another SetCursorPos. Clearing the settle guard here keeps
+            // the v350g/v361 GUI-sprite ownership contract while removing the
+            // visible top-edge "snap back" caused by the over-broad quarantine.
+            g.native_gui_settle = None;
+        } else if source_like {
             let (_, actual) =
                 warp_unclipped_verified(settle.target, "native GUI settle timeout recovery");
             g.native_gui_settle = None;
             g.last_set = actual;
             g.last_hw = actual;
             log::warn!(
-                "native-gui settle timeout recovered: target=({},{}) stale=({px},{py})",
+                "native-gui stale-source settle timeout recovered: target=({},{}) stale=({px},{py})",
                 actual.0,
                 actual.1
             );
             return true;
+        } else {
+            g.native_gui_settle = None;
         }
     }
     // Bypass render-thread geometry latency while Neo's GUI is moving/resizing.
@@ -3356,13 +5644,84 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
     // changes and native title-bar dragging cannot leave a stale exclusion rect
     // long enough to arm a source engage.
     refresh_live_own_no_engage_geometry(&mut g, now);
-    // Disengaged ownership is exact and native: if the current OS cursor is
-    // inside Neo's live GUI rectangle, Windows owns it immediately. The first
-    // pixel outside falls through to plan_engage in this SAME event.
-    if !g.engaged && hold_native_gui_ownership_if_inside(&mut g, px, py, now) {
+
+    // v372: WH_MOUSE_LL gives the CURRENT hardware event in
+    // MSLLHOOKSTRUCT.pt. GetCursorPos inside the callback can still describe the
+    // PREVIOUS event because Windows has not yet applied this one. v371 treated
+    // that one-event-behind value as ground truth, which made a GUI/edge exit
+    // look as if the pointer were still inside magnified content and immediately
+    // re-armed source ownership. Use the hook point for ownership decisions;
+    // sample GetCursorPos only as a diagnostic comparison.
+    let mut disengaged_event = (px, py);
+    if !g.engaged {
+        let observed = read_cursor_pos_or(disengaged_event, "disengaged event diagnostic");
+        let dx = (px - observed.0).abs();
+        let dy = (py - observed.1).abs();
+        let event_in_content = g.content.contains(px, py);
+        let observed_in_content = g.content.contains(observed.0, observed.1);
+        let event_in_ui = hit_ui_for_cursor_ownership(&g.no_engage, px, py).is_some();
+        let observed_in_ui =
+            hit_ui_for_cursor_ownership(&g.no_engage, observed.0, observed.1).is_some();
+
+        let mut authority = "use-event";
+        if let Some(until) = g.edge_release_settle_until {
+            if now >= until {
+                g.edge_release_settle_until = None;
+            } else {
+                let caught_up = dx <= POST_EDGE_RAW_CATCHUP_PX && dy <= POST_EDGE_RAW_CATCHUP_PX;
+                let domain_disagrees =
+                    event_in_content != observed_in_content || event_in_ui != observed_in_ui;
+                let raw_is_stale = post_edge_raw_is_stale(dx, dy, domain_disagrees);
+                if raw_is_stale {
+                    // The verified edge warp has already moved the hardware
+                    // cursor to desktop space; this hook point belongs to the
+                    // pre-warp queue.  Use GetCursorPos for this sample only
+                    // instead of letting stale content/source coordinates
+                    // immediately suck the cursor back into the overlay.
+                    disengaged_event = observed;
+                    g.last_hw = observed;
+                    authority = "use-getcursor-post-edge";
+                    log::info!(
+                        "post-edge stale raw cursor event suppressed: raw=({px},{py}) actual=({},{}) divergence=({dx},{dy}) event_content={} actual_content={} event_ui={} actual_ui={} guard_remaining_ms={}",
+                        observed.0,
+                        observed.1,
+                        event_in_content,
+                        observed_in_content,
+                        event_in_ui,
+                        observed_in_ui,
+                        until.saturating_duration_since(now).as_millis()
+                    );
+                } else if caught_up {
+                    g.edge_release_settle_until = None;
+                }
+            }
+        }
+
+        if dx > 8
+            || dy > 8
+            || event_in_content != observed_in_content
+            || event_in_ui != observed_in_ui
+        {
+            log::info!(
+                "disengaged-coordinate-authority: event=({px},{py}) getcursor=({},{}) divergence=({dx},{dy}) event_content={} getcursor_content={} event_ui={} getcursor_ui={} action={authority}",
+                observed.0,
+                observed.1,
+                event_in_content,
+                observed_in_content,
+                event_in_ui,
+                observed_in_ui
+            );
+        }
+    }
+
+    if !g.engaged
+        && hold_native_gui_ownership_if_inside(&mut g, disengaged_event.0, disengaged_event.1, now)
+    {
         return false;
     }
-    // TRUTH position while engaged = the OS-clipped cursor.
+
+    // TRUTH while engaged = OS-clipped source cursor. While disengaged = this
+    // hardware event's screen point, not one-event-behind GetCursorPos.
     let actual = if g.engaged {
         let s = g.src;
         if s.w <= 1 || s.h <= 1 {
@@ -3373,7 +5732,7 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
         }
         read_cursor_pos_or(g.last_set, "engaged hardware move")
     } else {
-        (px, py)
+        disengaged_event
     };
     // Do not reissue SetCursorPos while stale pre-handoff moves are draining.
     // Repeated warps erase genuine reversal input at a GUI boundary and are the
@@ -3418,7 +5777,15 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
                 request_cursor_hidden(true);
             }
             if let Some((sx, sy)) = sprite {
-                sprite_move(sx, sy, true);
+                if g.buttons_down & BTN_LEFT != 0 && source_caption_drag_active() {
+                    // v382: source-caption drag has exactly ONE visual writer:
+                    // commit_source_caption_drag_overlay_update(). The common
+                    // sprite API also hard-blocks any missed generic writer, so
+                    // a mouse event from another clock cannot overwrite it.
+                    let _ = (sx, sy);
+                } else {
+                    sprite_move(sx, sy, true);
+                }
             }
             let gui_handoff_applied = if g.engaged && !g.hidden_by_idle && g.buttons_down == 0 {
                 post_ui_hover_from_state(&mut g, now)
@@ -3426,20 +5793,40 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
                 false
             };
             if gui_handoff_applied {
-                log::info!("gui handoff trigger consumed: raw=({px},{py})");
+                log::debug!("gui handoff trigger consumed: raw=({px},{py})");
             }
             gui_handoff_applied
         }
         MoveOutcome::Engage { tx, ty, vx, vy } => {
-            apply_engage_windows(&mut g, px, py, tx, ty, vx, vy, now, false)
+            // MoveOutcome::Engage is only produced from the disengaged state.
+            // Preserve the actual visible cursor as the handoff origin so an
+            // old LL-hook sample can never become the pending-engage origin.
+            apply_engage_windows(&mut g, actual.0, actual.1, tx, ty, vx, vy, now, false)
         }
-        MoveOutcome::Disengage { place, sprite } => {
+        MoveOutcome::Disengage { place, sprite: _ } => {
             set_own_main_gui_passthrough(&g, false, "edge-release");
+            let requested_place = place;
+            let place = reachable_desktop_cursor_point(requested_place);
+            let sprite = place;
+            if place != requested_place {
+                log::info!(
+                    "edge-release target clamped to monitor: requested=({},{}) safe=({},{})",
+                    requested_place.0,
+                    requested_place.1,
+                    place.0,
+                    place.1
+                );
+            }
+            // Keep the native cursor hidden while we move it out of source
+            // space. The old path waited ~45ms for the render-thread reveal
+            // pump before even attempting this warp. During that gap the LL
+            // hook could still receive source-space coordinates and later
+            // mistake them for a fresh screen-space re-entry.
             if g.cursor_hidden {
                 request_cursor_hidden(true);
             }
             sprite_move_now(sprite.0, sprite.1, true);
-            log::info!(
+            log::debug!(
                 "edge-release detail: raw=({px},{py}) actual=({},{}) sprite=({},{}) place=({},{}) content={:?} src={:?}",
                 actual.0,
                 actual.1,
@@ -3452,27 +5839,36 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
             );
             DEBUG_LAST_EDGE_PLACE_X.store(place.0, Ordering::Release);
             DEBUG_LAST_EDGE_PLACE_Y.store(place.1, Ordering::Release);
-            // Move the STILL-HIDDEN real cursor to the exit point FIRST (unclip
-            // so it can leave the source), THEN reveal it. Revealing it before
-            // the move (as release_windows does) would flash it at the source
-            // position — offset from the sprite — so it looks like the cursor
-            // jumps back into the view once before leaving.
+
+            // Keep the stable deferred edge transaction: never SetCursorPos
+            // from inside this WH_MOUSE_LL callback and then pass the same
+            // hardware move onward.  With capture-wide sprite ownership we no
+            // longer need the old 45ms native-reveal grace. After one short
+            // mouse-sample defer, capture-wide sprite mode completes the
+            // verified desktop transfer on the hook-owned sprite timer; native
+            // reveal cases remain on the Magnification owner thread. A cold ONNX/TensorRT
+            // render-thread stall cannot hold the cursor transaction open.
+            // Pending state still blocks stale re-entry until the warp verifies.
             unsafe {
                 let _ = ClipCursor(None);
             }
-            // Do not expose an unverified SetCursorPos result. The Mag-owner
-            // thread keeps native hidden, verifies `place`, and only then shows
-            // it via the deferred reveal transaction.
             defer_cursor_reveal(place);
+            g.edge_release_settle_until =
+                Some(now + std::time::Duration::from_millis(POST_EDGE_RAW_GUARD_MS));
+            let transfer_mode = if capture_sprite_active() {
+                "hook-timer-deferred"
+            } else {
+                "owner-thread-deferred"
+            };
             log::info!(
-                "edge-release deferred until verified native position: target=({},{})",
+                "edge-release transaction armed: event=({px},{py}) target=({},{}) mode={transfer_mode} defer_ms={EDGE_TRANSFER_DEFER_MS}",
                 place.0,
                 place.1
             );
             restore_mouse_speed();
             g.cursor_hidden = false;
             g.hidden_by_idle = false;
-            log::info!("disengage(edge push): cursor=({},{})", place.0, place.1);
+            log::debug!("disengage(edge push): cursor=({},{})", place.0, place.1);
             false
         }
     }
@@ -3495,25 +5891,30 @@ fn apply_engage_windows(
     commit_hide_before_warp: bool,
 ) -> bool {
     let s = g.src;
-    set_own_main_gui_passthrough(g, true, "source-ownership-arm");
+    DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
+    // Do not make the entire GUI click-through merely because source ownership
+    // starts.  Only shield it if the mapped hidden-source point is physically
+    // underneath the GUI; the engaged-move ghost-route guard maintains that
+    // shield if the hidden cursor later crosses beneath it.
+    shield_main_gui_for_source_target(g, tx, ty, px, py);
     if !g.cursor_hidden {
         request_cursor_hidden(true);
         g.cursor_hidden = true;
     }
+    let capture_sprite_fast_path =
+        capture_sprite_active() && CURSOR_HIDE_APPLIED.load(Ordering::Acquire);
     if commit_hide_before_warp {
         pump_cursor_visibility();
         if !CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
             log::warn!("pre-reveal cursor hide not committed; keeping overlay hidden");
+            clear_capture_sprite_contract(g);
             release_locked(g);
             g.active = false;
             return false;
         }
-    } else {
-        // Normal GUI -> overlay entry originates on the LL-hook thread, while
-        // Magnification cursor visibility is owned by the render thread. Do
-        // not warp the still-visible native cursor into source space. Arm a
-        // transaction; the owner thread hides native first and commits warp +
-        // sprite in the same tick via pump_cursor_engage_commit().
+    } else if !capture_sprite_fast_path {
+        // Outside the capture-wide sprite contract, preserve the conservative
+        // owner-thread hide-before-warp transaction.
         g.pending_engage = Some(PendingEngage {
             origin: (px, py),
             target: (tx, ty),
@@ -3522,10 +5923,17 @@ fn apply_engage_windows(
             requested_at: now,
         });
         sprite_move(vx.round() as i32, vy.round() as i32, true);
-        log::info!(
+        log::debug!(
             "cursor handoff armed: native-visible position=({px},{py}) target-source=({tx},{ty})"
         );
         return true;
+    } else {
+        // v376+ keeps the native cursor hidden for the whole active capture.
+        // There is nothing left to wait for here: consume this LL event, warp
+        // the already-hidden native cursor synchronously into source space and
+        // keep the sprite at the visible point.  This removes the ~60-80ms
+        // render-thread handoff that made overlay re-entry feel heavy.
+        log::debug!("capture-sprite fast engage: visible=({px},{py}) target-source=({tx},{ty})");
     }
     let (warp_applied, warp_actual) = warp_then_clip_source((tx, ty), s);
     if !warp_applied {
@@ -3611,7 +6019,12 @@ fn plan_engage_impl(
             return None;
         }
     }
-    if !contains_for_engage(g.content, px, py) {
+    let inside_visible_content = if !g.fullscreen && g.window_frame_input {
+        g.content.contains(px, py)
+    } else {
+        contains_for_engage(g.content, px, py)
+    };
+    if !inside_visible_content {
         return None;
     }
     // Do not block engage from cached rectangles. A GUI can move many pixels
@@ -3633,7 +6046,8 @@ fn plan_engage_impl(
     // windowed edge cannot oscillate / pull the cursor back. Skipped for a
     // source too small to hold the band.
     let m = ENGAGE_SRC_MARGIN_PX;
-    if s.w > 2 * m
+    if !(g.window_frame_input && !g.fullscreen)
+        && s.w > 2 * m
         && s.h > 2 * m
         && (tx < s.x + m || tx >= s.x + s.w - m || ty < s.y + m || ty >= s.y + s.h - m)
     {
@@ -3659,6 +6073,7 @@ fn plan_engage_impl(
 /// system cursor, hide the sprite. State transitions live in `disengage_state`
 /// so the move planner can stay pure and unit-testable.
 fn release_windows(g: &mut State) {
+    SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     set_own_main_gui_passthrough(g, false, "source-ownership-release");
     g.pending_engage = None;
     g.native_gui_settle = None;
@@ -3666,10 +6081,30 @@ fn release_windows(g: &mut State) {
     let native_is_hidden =
         g.cursor_hidden || CURSOR_HIDE_APPLIED.load(Ordering::Acquire) || cursor_reveal_pending();
 
+    let keep_capture_sprite_owner = g.active && capture_sprite_active();
+
+    if keep_capture_sprite_owner {
+        let (reached, actual) = warp_unclipped_verified(visible, "capture sprite release");
+        if reached {
+            sprite_move_now(actual.0, actual.1, true);
+        } else {
+            sprite_move_now(visible.0, visible.1, true);
+            defer_cursor_reveal(visible);
+        }
+        request_cursor_hidden(true);
+        g.cursor_hidden = false;
+        restore_mouse_speed();
+        return;
+    }
+
     if native_is_hidden {
         let (reached, actual) = warp_unclipped_verified(visible, "generic native release");
         if reached {
             // Bridge with the sprite until the Mag owner confirms native show.
+            // This flag keeps pump_cursor_visibility() from hiding the sprite
+            // one step before MagShowSystemCursor(true) actually succeeds.
+            DESKTOP_REVEAL_BRIDGE_ACTIVE.store(true, Ordering::Release);
+            SPRITE_NATIVE_REVEAL_BLOCK.store(false, Ordering::Release);
             sprite_move_now(actual.0, actual.1, true);
             request_cursor_hidden(false);
         } else {
@@ -3684,6 +6119,7 @@ fn release_windows(g: &mut State) {
         unsafe {
             let _ = ClipCursor(None);
         }
+        DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
         sprite_hide();
     }
     restore_mouse_speed();
@@ -3697,6 +6133,7 @@ fn release_windows_to_native_at(
     g: &mut State,
     pos: (i32, i32),
     reason: &str,
+    keep_native_hidden: bool,
 ) -> Option<(i32, i32)> {
     // State flags can lag the Magnification owner by one pump. Base the reveal
     // decision on BOTH logical and actually-applied hide state so a rapid
@@ -3743,9 +6180,19 @@ fn release_windows_to_native_at(
     }
 
     g.pending_engage = None;
-    if native_was_hidden {
-        // Park the sprite on the exact verified GUI point and retain it until
-        // the Mag owner confirms the native cursor is actually visible.
+    let capture_sprite_owner = g.active && capture_sprite_active();
+    if (keep_native_hidden || capture_sprite_owner) && g.active {
+        // Active capture uses one visual owner on every surface. Preserve the
+        // real cursor at the verified native coordinate for hit-testing while
+        // Neo's sprite remains visible; only Stop/provider guards reveal native.
+        unsafe {
+            let _ = ClipCursor(None);
+        }
+        sprite_move_now(actual.0, actual.1, true);
+        request_cursor_hidden(true);
+        g.cursor_hidden = false;
+    } else if native_was_hidden {
+        // Ordinary edge/desktop release still bridges until native show.
         sprite_move_now(actual.0, actual.1, true);
         request_cursor_hidden(false);
         g.cursor_hidden = false;
@@ -3758,11 +6205,13 @@ fn release_windows_to_native_at(
 
 /// Pure state transition for a disengage (no Windows calls).
 fn disengage_state(g: &mut State, now: std::time::Instant) {
+    SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     mark_disengage(g, now);
     g.engaged = false;
     g.edge_out_accum = 0.0;
     g.last_engage_at = None;
     g.teleport_guard_until = None;
+    g.edge_release_settle_until = None;
     g.swallow_up = 0;
     g.ui_hold_bits = 0;
     g.native_ui_hold_bits = 0;
@@ -3775,6 +6224,7 @@ fn disengage_state(g: &mut State, now: std::time::Instant) {
 }
 
 fn release_locked(g: &mut State) {
+    SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     // begin_ui_hold injects a DOWN at the native GUI so dragging behaves like
     // an ordinary window. A focus transition can occasionally lose the
     // matching physical UP. Close any outstanding synthetic hold before
@@ -3811,6 +6261,7 @@ fn release_locked(g: &mut State) {
     g.edge_out_accum = 0.0;
     g.last_engage_at = None;
     g.teleport_guard_until = None;
+    g.edge_release_settle_until = None;
     g.swallow_up = 0;
     g.ui_hold_bits = 0;
     g.native_ui_hold_bits = 0;
@@ -3820,6 +6271,7 @@ fn release_locked(g: &mut State) {
     g.last_ui_post = None;
     g.native_gui_owner_hwnd = 0;
     NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    ACTIVE_OVERLAY_HWND.store(0, Ordering::Release);
     g.src_hwnd = 0;
 }
 
@@ -3916,6 +6368,54 @@ impl InputSystem {
         }
     }
 
+    /// Force Windows/native cursor ownership while a TensorRT engine is being
+    /// created. This is separate from provider-transition suspension because
+    /// lazy shape builds also occur later after capture-resolution changes.
+    pub fn set_tensorrt_build_cursor_guard(active: bool) {
+        let previous = TENSORRT_BUILD_NATIVE_CURSOR_GUARD.swap(active, Ordering::AcqRel);
+        if previous == active {
+            return;
+        }
+
+        if active {
+            WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+            // Prevent both the currently visible sprite and an already queued
+            // WM_APP move from resurfacing during the native-only build epoch.
+            SPRITE_SHOW.store(false, Ordering::Release);
+            sprite_hide_window_only();
+            if let Ok(mut g) = state().try_lock() {
+                clear_capture_sprite_contract(&mut g);
+                if g.engaged || g.cursor_hidden || g.pending_engage.is_some() {
+                    release_locked(&mut g);
+                }
+                g.active = false;
+                g.buttons_down = 0;
+                g.native_ui_hold_bits = 0;
+                g.last_gui_sprite_sync_at = None;
+            }
+            log::info!("TensorRT build cursor guard: native-only");
+        } else {
+            // Do not force an immediate native->sprite handoff. The next normal
+            // configure/mouse edge re-enters the proven capture cursor contract.
+            LAST_CURSOR_ASSERT.with(|last| last.set(None));
+            log::info!("TensorRT build cursor guard: released");
+        }
+    }
+
+    /// Resume provider-transition input mapping from render paths where the
+    /// local name `input` may refer to a GPU texture rather than InputSystem.
+    /// This is intentionally the exact lightweight `false` half of
+    /// set_transition_suspended(): no cursor ownership is created here.
+    pub(crate) fn resume_transition_suspended() {
+        let mut g = state().lock().unwrap();
+        g.last_configure_at = Some(std::time::Instant::now());
+        if !g.transition_suspended {
+            return;
+        }
+        g.transition_suspended = false;
+        log::info!("input mapping resumed after provider transition");
+    }
+
     /// Explicitly suspend cursor mapping during a provider/session transition.
     /// This is distinct from the emergency heartbeat path: a cold TensorRT
     /// build is expected work, so release ownership immediately and wait for
@@ -3929,15 +6429,42 @@ impl InputSystem {
         g.transition_suspended = suspended;
         g.last_configure_at = Some(std::time::Instant::now());
         if suspended {
+            clear_capture_sprite_contract(&mut g);
             release_locked(&mut g);
             g.active = false;
             g.src_hwnd = 0;
             g.buttons_down = 0;
             g.native_ui_hold_bits = 0;
+            g.last_gui_sprite_sync_at = None;
             log::info!("input mapping suspended during provider transition");
-        } else {
-            log::info!("input mapping resumed after provider transition");
+            drop(g);
+
+            // Provider switches, especially a cold TensorRT shape/engine build,
+            // can block this render/Magnification-owner thread for tens of
+            // seconds immediately after this call. release_locked() only
+            // REQUESTS native-cursor reveal; if we enter ORT/TensorRT before
+            // pump_cursor_visibility() runs, the GUI sprite stops updating while
+            // the real cursor remains hidden and appears frozen over the build
+            // popup. Commit the reveal synchronously before any blocking build.
+            WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+            NATIVE_GUI_OWNER.store(0, Ordering::Release);
+            ACTIVE_OVERLAY_HWND.store(0, Ordering::Release);
+            LAST_CURSOR_ASSERT.with(|last| last.set(None));
+            pump_cursor_visibility();
+            if CURSOR_HIDE_APPLIED.load(Ordering::Acquire) {
+                // One immediate retry is cheap and protects against a transient
+                // Magnification ownership/compositor miss. Never spin here.
+                LAST_CURSOR_ASSERT.with(|last| last.set(None));
+                pump_cursor_visibility();
+            }
+            log::debug!(
+                "provider-transition cursor release committed: native_hidden={}",
+                CURSOR_HIDE_APPLIED.load(Ordering::Acquire)
+            );
+            return;
         }
+
+        log::info!("input mapping resumed after provider transition");
     }
 
     /// Update the geometry/activity for the engage logic (engine tick).
@@ -3945,7 +6472,10 @@ impl InputSystem {
         &self,
         active: bool,
         fullscreen: bool,
+        window_frame_input: bool,
+        input_reference_kind: &'static str,
         overlay: Rect,
+        overlay_hwnd: isize,
         content: Rect,
         src: Rect,
         src_hwnd: isize,
@@ -3953,10 +6483,62 @@ impl InputSystem {
         autohide_secs: f32,
         adjust_speed: bool,
     ) {
+        // Publish the visible panel HWND outside the main state lock so the LL
+        // mouse hook always has a lock-free first-click route. The engine only
+        // includes a panel zone while that panel is logically visible.
+        let active_panel = if active {
+            no_engage
+                .iter()
+                .find(|hit| hit.panel && hit.hwnd != 0)
+                .map_or(0, |hit| hit.hwnd)
+        } else {
+            0
+        };
+        ACTIVE_PANEL_HWND.store(active_panel, Ordering::Release);
+
         let mut g = state().lock().unwrap();
         g.last_configure_at = Some(std::time::Instant::now());
         g.fullscreen = fullscreen;
+        let caption_drag_diag = g.buttons_down != 0 && source_caption_drag_active();
+        let drag_diag_due = if caption_drag_diag {
+            let now_ms = route_clock_ms();
+            let next_ms = DRAG_GEOMETRY_DIAG_NEXT_MS.load(Ordering::Relaxed);
+            if now_ms >= next_ms {
+                DRAG_GEOMETRY_DIAG_NEXT_MS.store(now_ms + 100, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+        let input_space_changed = g.window_frame_input != window_frame_input
+            || g.input_reference_kind != input_reference_kind
+            || g.src != src
+            || g.content != content;
+        if input_space_changed && drag_diag_due {
+            log::info!(
+                "input-coordinate-space: kind={} reference={} src={:?} content={:?} fullscreen={} drag_sampled={}",
+                if window_frame_input {
+                    "window-frame"
+                } else {
+                    "client"
+                },
+                input_reference_kind,
+                src,
+                content,
+                fullscreen,
+                caption_drag_diag
+            );
+        }
+        g.window_frame_input = window_frame_input;
+        g.input_reference_kind = input_reference_kind;
         g.overlay = overlay;
+        ACTIVE_OVERLAY_HWND.store(if active { overlay_hwnd } else { 0 }, Ordering::Release);
+        // During a caption drag the high-rate follower (or its explicit
+        // engine fallback) is the ONLY overlay-origin publisher. The render/WGC
+        // configure path is a different clock and must never overwrite the
+        // fixed visual grab anchor with an asynchronously sampled content rect.
         g.adjust_speed = adjust_speed;
         let was_engaged = g.engaged;
         let had_source_ownership = g.src_hwnd != 0;
@@ -3977,7 +6559,43 @@ impl InputSystem {
             g.teleport_guard_until = None;
         }
         if g.engaged && g.pending_engage.is_none() && (src != g.src || content != g.content) {
-            let (vx, vy) = remap_virtual_between_content(g.content, content, g.virt.0, g.virt.1);
+            // A caption drag has an explicit visual grab anchor. Geometry
+            // publication may arrive from the WGC/render loop at a different
+            // instant than the 8ms source follower, so never derive the sprite
+            // from those two snapshots while the button is held.
+            let anchored_drag_visual = if caption_drag_diag {
+                source_caption_drag_visual_position()
+            } else {
+                None
+            };
+            let (vx, vy) = if g.buttons_down == 0 {
+                remap_virtual_between_content(g.content, content, g.virt.0, g.virt.1)
+            } else if let Some((vx, vy)) = anchored_drag_visual {
+                if drag_diag_due {
+                    log::debug!(
+                        "drag-geometry-anchor-preserved: virt=({vx},{vy}) old_content={:?} new_content={:?} old_src={:?} new_src={:?} sampled_100ms=true",
+                        g.content,
+                        content,
+                        g.src,
+                        src
+                    );
+                }
+                (vx as f64, vy as f64)
+            } else {
+                if drag_diag_due {
+                    log::debug!(
+                        "drag-geometry-remap-bypassed: virt=({:.1},{:.1}) old_content={:?} new_content={:?} old_src={:?} new_src={:?} sampled_100ms={}",
+                        g.virt.0,
+                        g.virt.1,
+                        g.content,
+                        content,
+                        g.src,
+                        src,
+                        caption_drag_diag
+                    );
+                }
+                g.virt
+            };
             g.virt = (vx, vy);
             let (tx, ty) = map_content_to_source(content, src, vx, vy);
             if g.buttons_down == 0 {
@@ -4002,12 +6620,17 @@ impl InputSystem {
                     let _ = ClipCursor(Some(&clip));
                 }
             }
-            if !g.hidden_by_idle {
+            if !g.hidden_by_idle && !caption_drag_diag {
                 sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
             }
         }
-        let effective_active = active && !g.transition_suspended;
+        let effective_active =
+            active && !g.transition_suspended && !tensorrt_build_native_cursor_guard();
         g.active = effective_active;
+        CAPTURE_SPRITE_ACTIVE.store(effective_active, Ordering::Release);
+        if !effective_active {
+            cancel_source_caption_drag_contract();
+        }
         g.content = content;
         g.src = src;
         g.src_hwnd = src_hwnd;
@@ -4113,6 +6736,7 @@ impl InputSystem {
     pub fn prepare_overlay_reveal() -> bool {
         let mut g = state().lock().unwrap();
         g.active = true;
+        CAPTURE_SPRITE_ACTIVE.store(true, Ordering::Release);
         if g.engaged {
             if g.cursor_hidden {
                 request_cursor_hidden(true);
@@ -4135,8 +6759,11 @@ impl InputSystem {
             // on our normal GUI. Keep Windows' native cursor from the outset;
             // engaging here would create a sprite until the delayed GUI rect
             // reaches the engine.
+            sprite_move_now(px, py, true);
+            request_cursor_hidden(true);
+            pump_cursor_visibility();
             log::info!(
-                "pre-reveal cursor remains native over own window: hwnd={:?} at ({px},{py})",
+                "pre-reveal cursor uses capture sprite over own window: hwnd={:?} at ({px},{py})",
                 native_hit.0
             );
             return true;
@@ -4144,8 +6771,9 @@ impl InputSystem {
         let now = std::time::Instant::now();
         g.last_move = Some(now);
         let Some(e) = plan_engage_for_overlay_reveal(&g, px, py, now) else {
-            // Outside mapped content or over the real GUI/panel: keep the one
-            // native cursor. Normal movement can engage later.
+            sprite_move_now(px, py, true);
+            request_cursor_hidden(true);
+            pump_cursor_visibility();
             return true;
         };
 
@@ -4163,6 +6791,8 @@ impl InputSystem {
 
     /// Force-release the clip (stop paths).
     pub fn release(&self) {
+        CAPTURE_SPRITE_ACTIVE.store(false, Ordering::Release);
+        cancel_source_caption_drag_contract();
         let mut g = state().lock().unwrap();
         release_locked(&mut g);
         g.active = false;
@@ -4256,6 +6886,26 @@ pub fn virtual_cursor_pos() -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// Lock-free visible virtual-cursor sample for the floating control panel.
+///
+/// The normal `virtual_cursor_pos()` intentionally reads the full input state,
+/// but its `try_lock()` can transiently fail while the low-level hook is
+/// processing a mouse packet.  A transient `None` must not be interpreted as
+/// "the pointer left the panel" because that makes a custom-painted hover
+/// button blink.  The sprite mover already publishes the latest visible point
+/// atomically, so the panel can consume that exact display coordinate without
+/// touching the input mutex.
+pub fn panel_virtual_cursor_pos_lockfree() -> Option<(i32, i32)> {
+    if !sprite_visibility_allowed(
+        SPRITE_SHOW.load(Ordering::Acquire),
+        CURSOR_HIDE_APPLIED.load(Ordering::Acquire),
+    ) {
+        return None;
+    }
+    let packed = SPRITE_TARGET.load(Ordering::Acquire);
+    Some((packed as i32, (packed >> 32) as i32))
 }
 
 /// Compute the on-screen content rect (letterbox area inside the overlay
@@ -4479,24 +7129,51 @@ mod tests {
     fn panel_action_regions_match_the_painted_layout() {
         let width = 270;
         assert_eq!(
-            panel_action_for_relative_x(width, 42),
+            panel_action_for_relative_x(width, 30, 42),
             Some(PANEL_ACTION_STOP)
         );
-        assert_eq!(panel_action_for_relative_x(width, 120), None);
+        assert_eq!(panel_action_for_relative_x(width, 30, 120), None);
         assert_eq!(
-            panel_action_for_relative_x(width, 174),
+            panel_action_for_relative_x(width, 30, 174),
             Some(PANEL_ACTION_SCREENSHOT)
         );
         assert_eq!(
-            panel_action_for_relative_x(width, 210),
+            panel_action_for_relative_x(width, 30, 210),
             Some(PANEL_ACTION_GUI_TOPMOST)
         );
         assert_eq!(
-            panel_action_for_relative_x(width, 250),
+            panel_action_for_relative_x(width, 30, 250),
             Some(PANEL_ACTION_COLLAPSE)
         );
-        assert_eq!(panel_action_for_relative_x(width, -1), None);
-        assert_eq!(panel_action_for_relative_x(width, width), None);
+        assert_eq!(panel_action_for_relative_x(width, 30, -1), None);
+        assert_eq!(panel_action_for_relative_x(width, 30, width), None);
+    }
+
+    #[test]
+    fn panel_lurk_hit_area_is_dpi_independent() {
+        // 68x24pt lurk geometry at representative physical scales. Every pixel
+        // across the transparent target must restore the full panel.
+        for (w, h) in [(68, 24), (75, 27), (136, 48), (204, 72)] {
+            assert_eq!(
+                panel_action_for_relative_x(w, h, 0),
+                Some(PANEL_ACTION_EXPAND)
+            );
+            assert_eq!(
+                panel_action_for_relative_x(w, h, w - 1),
+                Some(PANEL_ACTION_EXPAND)
+            );
+        }
+
+        // Full-bar geometry must never be mistaken for a lurk target, even at
+        // small or high DPI scales.
+        assert_eq!(
+            panel_action_for_relative_x(135, 15, 10),
+            Some(PANEL_ACTION_STOP)
+        );
+        assert_eq!(
+            panel_action_for_relative_x(540, 60, 240),
+            None
+        );
     }
 
     #[test]
@@ -4514,6 +7191,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn offscreen_cursor_reveal_target_clamps_to_last_reachable_pixel() {
+        // 2026-08-15 regression: a 1024x768 window at y=312 ends exactly at
+        // the 1080p desktop edge. EXIT_WINDOW_MARGIN_PX produced y=1086, so
+        // SetCursorPos was permanently clamped by Windows to y=1079 and the
+        // deferred reveal loop hid the cursor until Stop.
+        let monitor = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        assert_eq!(
+            clamp_point_to_monitor_rect((1426, 1086), monitor),
+            (1426, 1079)
+        );
+        assert_eq!(
+            clamp_point_to_monitor_rect((1926, 500), monitor),
+            (1919, 500)
+        );
+        assert_eq!(clamp_point_to_monitor_rect((-6, 500), monitor), (0, 500));
+    }
+
+    #[test]
+    fn sprite_stays_fully_visible_on_all_four_monitor_edges_and_corners() {
+        // v429 left only ~8px visible at bottom/right. That can still look like
+        // a vanished cursor, especially at the lower-left escape tested by the
+        // user. Clamp the sprite HWND as a whole while leaving the logical point
+        // untouched.
+        let monitor = Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((1205, 1079), monitor, 24),
+            (1205, 1056)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((1919, 500), monitor, 24),
+            (1896, 500)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((0, 500), monitor, 24),
+            (0, 500)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((500, 0), monitor, 24),
+            (500, 0)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((0, 1079), monitor, 24),
+            (0, 1056)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((1919, 1079), monitor, 24),
+            (1896, 1056)
+        );
+        assert_eq!(
+            clamp_sprite_origin_to_monitor((100, 500), monitor, 24),
+            (100, 500)
+        );
+    }
+
+    #[test]
+    fn post_edge_raw_guard_rejects_pre_warp_backlog_but_not_normal_motion() {
+        // v428 log: raw=(602,806), GetCursorPos=(378,804) immediately after
+        // a verified left-edge transfer. That 224px disagreement is stale.
+        assert!(post_edge_raw_is_stale(224, 2, true));
+        // One-event-behind GetCursorPos during ordinary fast motion remains
+        // below the hard divergence threshold and in the same coordinate domain.
+        assert!(!post_edge_raw_is_stale(58, 20, false));
+        // A domain disagreement near a content/UI boundary needs only the
+        // smaller catch-up threshold to stay quarantined.
+        assert!(post_edge_raw_is_stale(31, 5, true));
+        assert!(!post_edge_raw_is_stale(20, 5, true));
     }
 
     #[test]
@@ -5016,6 +7772,35 @@ mod tests {
     }
 
     #[test]
+    fn windowed_panel_first_pixel_beats_edge_release() {
+        // The floating panel is glued immediately above the windowed content.
+        // With a one-pixel escape threshold, the first outward source event must
+        // remain engaged long enough for post_ui_hover_from_state() to perform
+        // the native panel handoff instead of escaping to desktop first.
+        let (c, s) = win();
+        let panel = Rect {
+            x: c.x + 120,
+            y: c.y - 40,
+            w: 300,
+            h: 40,
+        };
+        let mut g = engaged_state(c, s, &[panel]);
+        g.last_engage_at = None;
+        let target_x = panel.x + panel.w / 2;
+        let (raw_x, _) = map_content_to_source(c, s, target_x as f64, c.y as f64);
+        let raw_y = s.y - 1;
+        let actual = (raw_x, s.y);
+        let plan = plan_engaged(&mut g, raw_x, raw_y, std::time::Instant::now(), actual);
+        assert_eq!(plan, MovePlan::Stay);
+        assert!(g.engaged);
+        let hover = g
+            .last_ui_hover
+            .expect("panel first pixel should be recorded");
+        assert!(is_panel_hit(hover.hit));
+        assert!(panel.contains(hover.pos.0, hover.pos.1));
+    }
+
+    #[test]
     fn windowed_moves_stay_engaged_across_interior() {
         let (c, s) = win();
         let mut g = engaged_state(c, s, &[]);
@@ -5192,6 +7977,50 @@ mod tests {
         // after cooldown: re-engages in the interior
         let after = escaped_at + std::time::Duration::from_millis(3000);
         assert!(plan_engage(&g, c.x + c.w / 2, c.y + c.h / 2, after).is_some());
+    }
+
+    #[test]
+    fn move_core_reentry_uses_current_event_point() {
+        // The move core follows the point supplied by the LL-hook path. v372
+        // makes that supplied point the current MSLLHOOKSTRUCT.pt event; a
+        // one-event-behind GetCursorPos sample is diagnostic only.
+        let (c, s) = win_offset();
+        let now = std::time::Instant::now();
+        let mut g = State {
+            active: true,
+            engaged: false,
+            window_frame_input: true,
+            overlay: c,
+            content: c,
+            src: s,
+            last_hw: (c.x - 1, c.y + c.h / 2),
+            last_set: (c.x - 1, c.y + c.h / 2),
+            virt: ((c.x - 1) as f64, (c.y + c.h / 2) as f64),
+            ..Default::default()
+        };
+
+        // If the supplied current event is outside, no engage.
+        let stale_raw = (c.x + 200, c.y + 100);
+        let actual_outside = (c.x - 1, c.y + c.h / 2);
+        let out = handle_move(&mut g, stale_raw.0, stale_raw.1, now, actual_outside);
+        assert!(matches!(out, MoveOutcome::Stay { .. }));
+        assert!(!g.engaged, "outside current event re-engaged from desktop");
+
+        // As soon as the supplied current event crosses one pixel into content,
+        // re-entry remains immediate: no time latch or hidden spatial band.
+        let actual_inside = (c.x + 1, c.y + c.h / 2);
+        let out = handle_move(
+            &mut g,
+            stale_raw.0,
+            stale_raw.1,
+            now + std::time::Duration::from_millis(8),
+            actual_inside,
+        );
+        assert!(matches!(out, MoveOutcome::Engage { .. }));
+        assert!(
+            g.engaged,
+            "one-pixel current-event re-entry did not engage immediately"
+        );
     }
 
     // ---- full-system Sim: models the OS cursor + clip + teleports so we can

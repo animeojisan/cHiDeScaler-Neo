@@ -364,7 +364,6 @@ pub fn legacy_text<'a>(lang: UiLanguage, ja: &'a str, en: &'a str) -> &'a str {
         "GUI" => "shortcut.gui",
         "Panel" => "shortcut.panel",
         "Quit" => "common.quit",
-        " launched" => "browser.launched",
         "more filter errors" => "filter.more_errors",
         "Filter Chain" => "filter.chain",
         "+ Add Filter" => "filter.add_icon",
@@ -442,12 +441,6 @@ pub fn legacy_text<'a>(lang: UiLanguage, ja: &'a str, en: &'a str) -> &'a str {
         "Output frame-rate multiplier used by frame-interpolation filters" => {
             "interpolation.factor_help"
         }
-        "HW Acceleration" => "browser.hw_title",
-        "Launch with HW decode OFF" => "browser.launch_sw",
-        "Launch a dedicated browser with GPU video decoding disabled. Normal browser settings are unchanged; its profile and cache stay inside this tool's cache folder." => {
-            "browser.launch_help"
-        }
-        " was not found or could not be launched" => "browser.launch_failed",
         "Total is the measured time from the captured source frame reaching Neo to the filtered frame being presented.\nDelay frames are total ms divided by the source frame interval, rounded down." => {
             "stats.help"
         }

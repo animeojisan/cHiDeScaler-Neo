@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn bundled_presets_include_registered_models_and_shaders() {
         let presets = default_presets();
-        assert_eq!(presets.len(), 34);
+        assert_eq!(presets.len(), 36);
         assert!(presets.iter().any(|preset| {
             preset.name == "AniSD+ [SD Anime]"
                 && preset
@@ -451,20 +451,20 @@ mod tests {
                     .any(|stage| stage.path == "shaders/ESRGAN/W2xEX_AnimeVideo_Mini_x2.glsl")
         }));
         assert!(presets.iter().any(|preset| {
-            preset.name == "AnimeJaNai HD V3"
+            preset.name == "AnimeJaNai HD V3.1"
                 && preset.chain.iter().any(|stage| {
                     stage.path
-                        == "models/AnimeJaNai/2x_AnimeJaNai_HD_V3_SuperUltraCompact_5k-fp16.onnx"
+                        == "models/AnimeJaNai/2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_fp16.onnx"
                 })
         }));
         assert!(presets.iter().any(|preset| {
-            preset.name == "AnimeJaNai HD V3 Sharp" && preset.chain.iter().any(|stage| {
+            preset.name == "AnimeJaNai HD V3.1 Sharp" && preset.chain.iter().any(|stage| {
                 stage.path
-                    == "models/AnimeJaNai/2x_AnimeJaNai_HD_V3Sharp1_SuperUltraCompact_25k-fp16.onnx"
+                    == "models/AnimeJaNai/2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_fp16.onnx"
             })
         }));
         assert!(presets.iter().any(|preset| {
-            preset.name == "AnimeJaNai V2+  [SD]"
+            preset.name == "SD Anime V2NR"
                 && preset.chain.iter().any(|stage| {
                     stage.path
                         == "models/AnimeJaNai/the_database_AnimeJaNaiV2L1_x2_fp16_opset14.onnx"

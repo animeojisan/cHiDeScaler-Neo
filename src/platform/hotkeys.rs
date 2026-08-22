@@ -168,6 +168,7 @@ pub struct HotkeyEvent {
     pub id: i32,
     pub binding: String,
     pub received_at: Instant,
+    pub handled_while_minimized: bool,
 }
 
 pub struct HotkeyThread {
@@ -179,7 +180,10 @@ pub struct HotkeyThread {
 
 impl HotkeyThread {
     /// `keys` = [(id, "Ctrl+Alt+Z"), ...]
-    pub fn start(keys: Vec<(i32, String)>) -> Self {
+    pub fn start(
+        keys: Vec<(i32, String)>,
+        minimized_stop: crate::engine::EngineStopHandle,
+    ) -> Self {
         let (tx, rx): (Sender<HotkeyEvent>, Receiver<HotkeyEvent>) = channel();
         let (id_tx, id_rx) = channel();
         let (ready_tx, ready_rx) = channel();
@@ -212,11 +216,22 @@ impl HotkeyThread {
                             .map(|(_, binding)| binding.clone())
                             .unwrap_or_else(|| format!("id:{id}"));
                         let received_at = Instant::now();
+                        let gui_hwnd = super::win32::main_gui_hwnd();
+                        let handled_while_minimized = id == HK_TOGGLE
+                            && gui_hwnd != 0
+                            && super::win32::is_minimized(gui_hwnd);
+                        if handled_while_minimized {
+                            log::info!(
+                                "hotkey-minimized-direct-dispatch: id={id} binding='{binding}' action=stop"
+                            );
+                            minimized_stop.request_stop("minimized-global-hotkey");
+                        }
                         log::info!("hotkey-received: id={id} binding='{binding}'");
                         let _ = tx.send(HotkeyEvent {
                             id,
                             binding,
                             received_at,
+                            handled_while_minimized,
                         });
                     }
                     DispatchMessageW(&msg);

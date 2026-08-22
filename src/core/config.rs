@@ -91,15 +91,6 @@ pub enum UiMode {
     Full,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BrowserKind {
-    #[default]
-    Edge,
-    Chrome,
-    Firefox,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnnxBackendPreference {
@@ -196,9 +187,6 @@ pub struct Settings {
     /// relaunch elevated at startup (needed to control elevated windows)
     #[serde(default)]
     pub run_as_admin: bool,
-    /// Browser used by the portable software-video-decode launcher.
-    #[serde(default)]
-    pub browser_kind: BrowserKind,
     /// remembered GUI window placement (logical points)
     #[serde(default)]
     pub win_pos: Option<(f32, f32)>,
@@ -299,7 +287,6 @@ impl Default for Settings {
             cursor_speed_fix: true,
             interp_factor: 2,
             run_as_admin: false,
-            browser_kind: BrowserKind::Edge,
             win_pos: None,
             win_size: None,
             basic_win_size: None,
@@ -378,7 +365,7 @@ pub fn app_dir() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserKind, OnnxBackendPreference, Settings, UiLanguage, UiLanguageMode, UiMode};
+    use super::{OnnxBackendPreference, Settings, UiLanguage, UiLanguageMode, UiMode};
 
     #[test]
     fn smooth_pacing_is_on_for_new_and_legacy_missing_settings() {
@@ -407,9 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_default_to_edge_browser_launcher() {
-        let parsed: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.browser_kind, BrowserKind::Edge);
+    fn removed_browser_launcher_setting_is_ignored_for_legacy_files() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"browser_kind":"firefox","smooth_pacing":true}"#).unwrap();
+        assert!(parsed.smooth_pacing);
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("browser_kind"));
     }
 
     #[test]

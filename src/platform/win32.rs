@@ -1,14 +1,21 @@
 //! Win32 ctypes-style leaf helpers (window queries, monitor geometry).
 
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicIsize, Ordering},
+};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CAPTION_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TEXT_COLOR,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow, RDW_ALLCHILDREN,
-    RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
+    BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT, DEVMODEW,
+    DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+    ENUM_CURRENT_SETTINGS, EndPaint, EnumDisplaySettingsW, FillRect, GetDC, GetMonitorInfoW,
+    GetPixel, GetStockObject, LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
+    MonitorFromWindow, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
+    RedrawWindow, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
@@ -18,6 +25,2106 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PanelGdiMirrorSnapshot {
+    parent: isize,
+    width: i32,
+    height: i32,
+    visible: bool,
+    chip: bool,
+    stop_text: String,
+    fps_tenths: i32,
+    hover_slot: u8,
+    screenshot_feedback: bool,
+}
+
+#[derive(Debug, Default)]
+struct PanelGdiMirrorState {
+    hwnd: isize,
+    snapshot: PanelGdiMirrorSnapshot,
+}
+
+static PANEL_GDI_MIRROR: OnceLock<Mutex<PanelGdiMirrorState>> = OnceLock::new();
+static PANEL_GDI_HOST: OnceLock<Mutex<isize>> = OnceLock::new();
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct OverloadNoticeGdiSnapshot {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    font_px: i32,
+    text: String,
+    visible: bool,
+}
+
+#[derive(Debug, Default)]
+struct OverloadNoticeGdiState {
+    hwnd: isize,
+    snapshot: OverloadNoticeGdiSnapshot,
+}
+
+static OVERLOAD_NOTICE_GDI: OnceLock<Mutex<OverloadNoticeGdiState>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct GuiTransitionSnapshotState {
+    hwnd: isize,
+    bitmap: isize,
+    width: i32,
+    height: i32,
+}
+
+static GUI_TRANSITION_SNAPSHOT: OnceLock<Mutex<GuiTransitionSnapshotState>> = OnceLock::new();
+
+// Keep the native WNDPROC handoff installed for the lifetime of the eframe
+// window. Unlike the former Ctrl+Alt+G route, every message (including
+// SC_MINIMIZE) is forwarded unchanged so Windows owns minimize/restore.
+static MAIN_GUI_SUBCLASS_HWND: AtomicIsize = AtomicIsize::new(0);
+static MAIN_GUI_OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn main_gui_caption_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // Native minimization is a GUI-only presentation transition. The floating
+    // panel has its own lifetime and must never be shown/hidden from this WNDPROC.
+    // Only preserve the cursor fail-visible contract here.
+    if msg == WM_SYSCOMMAND && (wparam.0 & 0xfff0) == SC_MINIMIZE as usize {
+        crate::input::handle_main_gui_minimize_begin();
+    }
+    if msg == WM_SIZE && wparam.0 == SIZE_MINIMIZED as usize {
+        // WM_SYSCOMMAND is not guaranteed for every shell/taskbar route.
+        crate::input::handle_main_gui_minimize_begin();
+    }
+    let old = MAIN_GUI_OLD_WNDPROC.load(Ordering::Acquire);
+    if old != 0 {
+        let old_proc: WNDPROC = unsafe { std::mem::transmute(old) };
+        unsafe { CallWindowProcW(old_proc, hwnd, msg, wparam, lparam) }
+    } else {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
+
+pub fn install_main_gui_native_minimize(hwnd: isize) {
+    if hwnd == 0 || !is_window_valid(hwnd) || MAIN_GUI_SUBCLASS_HWND.load(Ordering::Acquire) == hwnd
+    {
+        return;
+    }
+    unsafe {
+        let old = SetWindowLongPtrW(
+            HWND(hwnd as *mut _),
+            GWL_WNDPROC,
+            main_gui_caption_wndproc as *const () as usize as isize,
+        );
+        if old != 0 {
+            MAIN_GUI_OLD_WNDPROC.store(old, Ordering::Release);
+            MAIN_GUI_SUBCLASS_HWND.store(hwnd, Ordering::Release);
+            log::info!("main-gui-caption-minimize-route: hwnd={hwnd:#x} action=native-minimize");
+        } else {
+            log::warn!("main-gui-caption-minimize-route: hwnd={hwnd:#x} install=failed");
+        }
+    }
+}
+
+pub fn main_gui_hwnd() -> isize {
+    MAIN_GUI_SUBCLASS_HWND.load(Ordering::Acquire)
+}
+
+/// Wake the root GUI as soon as a native panel action is queued.
+///
+/// The panel GUI button is intentionally just another entry point for the
+/// existing Ctrl+Alt+G TOPMOST toggle. Waking must never minimize/restore the
+/// root HWND or alter cursor/panel ownership by itself.
+pub fn wake_main_gui_for_panel_action(_restore_if_minimized: bool) {
+    let hwnd = main_gui_hwnd();
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let _ = PostMessageW(Some(h), WM_NULL, WPARAM(0), LPARAM(0));
+    }
+}
+
+
+fn gui_transition_snapshot_state() -> &'static Mutex<GuiTransitionSnapshotState> {
+    GUI_TRANSITION_SNAPSHOT.get_or_init(|| Mutex::new(GuiTransitionSnapshotState::default()))
+}
+
+// Keep the tiny transition snapshot helper independent of the windows crate's
+// generated GDI signatures. These are stable Win32 ABI functions and are used
+// only for a short desktop-to-memory BitBlt around GUI mode changes.
+type RawWinHandle = *mut core::ffi::c_void;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "GetDC"]
+    fn raw_get_dc(hwnd: RawWinHandle) -> RawWinHandle;
+    #[link_name = "ReleaseDC"]
+    fn raw_release_dc(hwnd: RawWinHandle, hdc: RawWinHandle) -> i32;
+    #[link_name = "SetWindowRgn"]
+    fn raw_set_window_rgn(hwnd: RawWinHandle, region: RawWinHandle, redraw: i32) -> i32;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    #[link_name = "CreateCompatibleDC"]
+    fn raw_create_compatible_dc(hdc: RawWinHandle) -> RawWinHandle;
+    #[link_name = "DeleteDC"]
+    fn raw_delete_dc(hdc: RawWinHandle) -> i32;
+    #[link_name = "CreateCompatibleBitmap"]
+    fn raw_create_compatible_bitmap(hdc: RawWinHandle, width: i32, height: i32) -> RawWinHandle;
+    #[link_name = "SelectObject"]
+    fn raw_select_object(hdc: RawWinHandle, object: RawWinHandle) -> RawWinHandle;
+    #[link_name = "DeleteObject"]
+    fn raw_delete_object(object: RawWinHandle) -> i32;
+    #[link_name = "CreateRoundRectRgn"]
+    fn raw_create_round_rect_rgn(
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        ellipse_width: i32,
+        ellipse_height: i32,
+    ) -> RawWinHandle;
+    #[link_name = "BitBlt"]
+    fn raw_bit_blt(
+        dst: RawWinHandle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        src: RawWinHandle,
+        src_x: i32,
+        src_y: i32,
+        rop: u32,
+    ) -> i32;
+}
+
+const RAW_SRCCOPY: u32 = 0x00CC_0020;
+
+fn panel_gdi_host_state() -> &'static Mutex<isize> {
+    PANEL_GDI_HOST.get_or_init(|| Mutex::new(0))
+}
+
+fn overload_notice_gdi_state() -> &'static Mutex<OverloadNoticeGdiState> {
+    OVERLOAD_NOTICE_GDI.get_or_init(|| Mutex::new(OverloadNoticeGdiState::default()))
+}
+
+/// Return the current native GDI control-panel host HWND.
+///
+/// The render path uses this at the overlay reveal boundary so z-order
+/// normalization observes the actual live helper window instead of relying on
+/// engine-loop locals that are out of scope in frame-processing helpers.
+pub fn panel_gdi_host_hwnd() -> isize {
+    *panel_gdi_host_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn panel_gdi_mirror_state() -> &'static Mutex<PanelGdiMirrorState> {
+    PANEL_GDI_MIRROR.get_or_init(|| Mutex::new(PanelGdiMirrorState::default()))
+}
+
+fn panel_gdi_scale(value: f32, width: i32) -> i32 {
+    ((value * width.max(1) as f32 / 270.0).round() as i32).max(1)
+}
+
+fn panel_gdi_vscale(value: f32, height: i32) -> i32 {
+    ((value * height.max(1) as f32 / 30.0).round() as i32).max(1)
+}
+
+fn panel_gdi_rect_from_points(
+    width: i32,
+    height: i32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+) -> RECT {
+    let px = |v: f32| ((v * width.max(1) as f32 / 270.0).round() as i32).clamp(0, width);
+    let py = |v: f32| ((v * height.max(1) as f32 / 30.0).round() as i32).clamp(0, height);
+    RECT {
+        left: (px(left) - 2).max(0),
+        top: (py(top) - 2).max(0),
+        right: (px(right) + 2).min(width.max(1)),
+        bottom: (py(bottom) + 2).min(height.max(1)),
+    }
+}
+
+fn panel_gdi_union_rect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+fn panel_gdi_slot_dirty_rect(slot: u8, width: i32, height: i32) -> Option<RECT> {
+    let (left, right) = match slot {
+        1 => (3.0, 85.0),
+        2 => (159.0, 193.0),
+        3 => (196.0, 230.0),
+        4 => (233.0, 267.0),
+        _ => return None,
+    };
+    Some(panel_gdi_rect_from_points(
+        width, height, left, 2.0, right, 28.0,
+    ))
+}
+
+fn panel_gdi_visual_dirty_rect(
+    old: &PanelGdiMirrorSnapshot,
+    new: &PanelGdiMirrorSnapshot,
+) -> Option<RECT> {
+    if old.width != new.width
+        || old.height != new.height
+        || old.visible != new.visible
+        || old.chip != new.chip
+    {
+        return None;
+    }
+
+    let mut dirty: Option<RECT> = None;
+    let mut add = |rect: RECT| {
+        dirty = Some(match dirty {
+            Some(current) => panel_gdi_union_rect(current, rect),
+            None => rect,
+        });
+    };
+
+    if old.stop_text != new.stop_text {
+        if let Some(rect) = panel_gdi_slot_dirty_rect(1, new.width, new.height) {
+            add(rect);
+        }
+    }
+    if old.fps_tenths != new.fps_tenths {
+        add(panel_gdi_rect_from_points(
+            new.width, new.height, 88.0, 2.0, 156.0, 28.0,
+        ));
+    }
+    if old.hover_slot != new.hover_slot {
+        if let Some(rect) = panel_gdi_slot_dirty_rect(old.hover_slot, new.width, new.height) {
+            add(rect);
+        }
+        if let Some(rect) = panel_gdi_slot_dirty_rect(new.hover_slot, new.width, new.height) {
+            add(rect);
+        }
+    }
+    if old.screenshot_feedback != new.screenshot_feedback {
+        if let Some(rect) = panel_gdi_slot_dirty_rect(2, new.width, new.height) {
+            add(rect);
+        }
+    }
+    dirty
+}
+
+/// Publish only a small changed part of the already double-buffered panel.
+///
+/// v508 fixed panel flicker by drawing a complete frame off-screen before one
+/// BitBlt. Keep that contract, but do not invalidate/replace all 297x33 pixels
+/// for a periodic FPS-number update or a single hover-face change. On AMD the
+/// fullscreen child repaint could momentarily disturb the independent layered
+/// cursor even though the cursor HWND itself never hid. A region BitBlt keeps
+/// the exact same GDI pixels while leaving unrelated pixels under the cursor
+/// untouched.
+unsafe fn publish_panel_gdi_region(
+    child: HWND,
+    snapshot: &PanelGdiMirrorSnapshot,
+    rect: RECT,
+) -> bool {
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return true;
+    }
+    unsafe {
+        let hdc = raw_get_dc(child.0);
+        if hdc.is_null() {
+            return false;
+        }
+        let mem = raw_create_compatible_dc(hdc);
+        let bitmap = if !mem.is_null() {
+            raw_create_compatible_bitmap(
+                hdc,
+                snapshot.width.max(1),
+                snapshot.height.max(1),
+            )
+        } else {
+            core::ptr::null_mut()
+        };
+        let mut published = false;
+        if !mem.is_null() && !bitmap.is_null() {
+            let old = raw_select_object(mem, bitmap);
+            if !old.is_null() {
+                paint_panel_gdi_mirror(
+                    windows::Win32::Graphics::Gdi::HDC(mem),
+                    snapshot,
+                );
+                published = raw_bit_blt(
+                    hdc,
+                    rect.left,
+                    rect.top,
+                    (rect.right - rect.left).max(1),
+                    (rect.bottom - rect.top).max(1),
+                    mem,
+                    rect.left,
+                    rect.top,
+                    RAW_SRCCOPY,
+                ) != 0;
+                let _ = raw_select_object(mem, old);
+            }
+        }
+        if !bitmap.is_null() {
+            let _ = raw_delete_object(bitmap);
+        }
+        if !mem.is_null() {
+            let _ = raw_delete_dc(mem);
+        }
+        let _ = raw_release_dc(child.0, hdc);
+        published
+    }
+}
+
+unsafe fn panel_gdi_fill(hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, color: COLORREF) {
+    unsafe {
+        if rect.right <= rect.left || rect.bottom <= rect.top {
+            return;
+        }
+        let brush = CreateSolidBrush(color);
+        let _ = FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(brush.into());
+    }
+}
+
+/// Rasterize a tiny rounded rectangle with FillRect only. Keeping this helper
+/// brush-only avoids introducing another swap/present path while reproducing
+/// egui's 3 px panel-button corner radius closely at the 30 px bar scale.
+unsafe fn panel_gdi_round_fill(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    radius: i32,
+    color: COLORREF,
+) {
+    unsafe {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let r = radius.max(0).min(width / 2).min(height / 2);
+        if r <= 1 {
+            panel_gdi_fill(hdc, rect, color);
+            return;
+        }
+        let rf = r as f32;
+        for row in 0..height {
+            let edge = row.min(height - 1 - row);
+            let inset = if edge >= r {
+                0
+            } else {
+                let y = rf - edge as f32 - 0.5;
+                (rf - (rf * rf - y * y).max(0.0).sqrt()).ceil() as i32
+            }
+            .min(r);
+            panel_gdi_fill(
+                hdc,
+                RECT {
+                    left: rect.left + inset,
+                    top: rect.top + row,
+                    right: rect.right - inset,
+                    bottom: rect.top + row + 1,
+                },
+                color,
+            );
+        }
+    }
+}
+
+unsafe fn panel_gdi_round_frame(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: RECT,
+    radius: i32,
+    stroke: i32,
+    color: COLORREF,
+    interior: COLORREF,
+) {
+    unsafe {
+        let stroke = stroke.max(1);
+        panel_gdi_round_fill(hdc, rect, radius, color);
+        let inner = RECT {
+            left: rect.left + stroke,
+            top: rect.top + stroke,
+            right: rect.right - stroke,
+            bottom: rect.bottom - stroke,
+        };
+        if inner.right > inner.left && inner.bottom > inner.top {
+            panel_gdi_round_fill(hdc, inner, (radius - stroke).max(1), interior);
+        }
+    }
+}
+
+unsafe fn panel_gdi_circle_fill(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    color: COLORREF,
+) {
+    unsafe {
+        let r = radius.max(1);
+        let rf = r as f32;
+        for dy in -r..=r {
+            let yf = dy as f32;
+            let half = (rf * rf - yf * yf).max(0.0).sqrt().round() as i32;
+            panel_gdi_fill(
+                hdc,
+                RECT {
+                    left: cx - half,
+                    top: cy + dy,
+                    right: cx + half + 1,
+                    bottom: cy + dy + 1,
+                },
+                color,
+            );
+        }
+    }
+}
+
+unsafe fn panel_gdi_circle_frame(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    stroke: i32,
+    color: COLORREF,
+    interior: COLORREF,
+) {
+    unsafe {
+        let r = radius.max(1);
+        panel_gdi_circle_fill(hdc, cx, cy, r, color);
+        let inner = (r - stroke.max(1)).max(0);
+        if inner > 0 {
+            panel_gdi_circle_fill(hdc, cx, cy, inner, interior);
+        }
+    }
+}
+
+fn panel_gdi_font_face(text: &str) -> (&'static str, i32) {
+    let cjk = text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3040..=0x30ff | 0x31f0..=0x31ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff
+        )
+    });
+    if cjk {
+        // The egui Japanese family is YuGothM.ttc (medium weight).
+        ("Yu Gothic UI", 500)
+    } else {
+        ("Segoe UI", 400)
+    }
+}
+
+unsafe fn panel_gdi_text(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    mut rect: RECT,
+    text: &str,
+    color: COLORREF,
+    pixel_height: i32,
+    face: &str,
+    weight: i32,
+) {
+    unsafe {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        if wide.is_empty() {
+            return;
+        }
+
+        // Match the egui panel's explicit 12.0/11.5 px fonts instead of the
+        // DPI-dependent DEFAULT_GUI_FONT, which made v449 text visibly too big.
+        let mut lf = LOGFONTW::default();
+        lf.lfHeight = -pixel_height.max(1);
+        lf.lfWeight = weight;
+        lf.lfCharSet = windows::Win32::Graphics::Gdi::FONT_CHARSET(1); // DEFAULT_CHARSET
+        lf.lfQuality = windows::Win32::Graphics::Gdi::FONT_QUALITY(5); // CLEARTYPE_QUALITY
+        for (dst, src) in lf.lfFaceName.iter_mut().take(31).zip(face.encode_utf16()) {
+            *dst = src;
+        }
+        let font = CreateFontIndirectW(&lf);
+        let font_ok = !font.0.is_null();
+        let old_font = if font_ok {
+            SelectObject(hdc, font.into())
+        } else {
+            SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT))
+        };
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, color);
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(hdc, old_font);
+        if font_ok {
+            let _ = DeleteObject(font.into());
+        }
+    }
+}
+
+unsafe fn paint_panel_gdi_mirror(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    snapshot: &PanelGdiMirrorSnapshot,
+) {
+    unsafe {
+        let w = snapshot.width.max(1);
+        let h = snapshot.height.max(1);
+        let sx = |v: f32| panel_gdi_scale(v, w);
+        let sy = |v: f32| panel_gdi_vscale(v, h);
+        let px = |v: f32| ((v * w as f32 / 270.0).round() as i32).clamp(0, w);
+        let py = |v: f32| ((v * h as f32 / 30.0).round() as i32).clamp(0, h);
+
+        const BG: COLORREF = COLORREF(0x002B2B2B);
+        const BUTTON: COLORREF = COLORREF(0x003C3C3C);
+        const HOVER: COLORREF = COLORREF(0x00505050);
+        // COLORREF is 0x00BBGGRR. PANEL_ACTIVE is rgb(0x2f,0x7d,0x4a).
+        const ACTIVE: COLORREF = COLORREF(0x004A7D2F);
+        const FG: COLORREF = COLORREF(0x00F2F2F2);
+        const GRIP: COLORREF = COLORREF(0x001F1F1F);
+
+        if snapshot.chip {
+            panel_gdi_fill(
+                hdc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                BG,
+            );
+            let inset = panel_gdi_scale(1.0, w).max(1);
+            panel_gdi_round_fill(
+                hdc,
+                RECT {
+                    left: inset,
+                    top: inset,
+                    right: (w - inset).max(inset + 1),
+                    bottom: (h - inset).max(inset + 1),
+                },
+                panel_gdi_scale(2.0, w).max(2),
+                GRIP,
+            );
+            return;
+        }
+
+        panel_gdi_fill(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
+            BG,
+        );
+
+        // egui CentralPanel has 2 pt inner margin, then horizontal_centered
+        // centers 264 pt of controls in the remaining 266 pt -> 3 pt left/right.
+        let y0 = py(3.0);
+        let y1 = py(27.0).max(y0 + 1);
+        let corner = sx(3.0).max(2);
+        let mut x_pts = 3.0_f32;
+
+        macro_rules! panel_button {
+            ($width_pts:expr, $slot:expr, $active:expr) => {{
+                let rect = RECT {
+                    left: px(x_pts),
+                    top: y0,
+                    right: px(x_pts + $width_pts),
+                    bottom: y1,
+                };
+                let color = if $active {
+                    ACTIVE
+                } else if snapshot.hover_slot == $slot {
+                    HOVER
+                } else {
+                    BUTTON
+                };
+                panel_gdi_round_fill(hdc, rect, corner, color);
+                x_pts += $width_pts + 3.0;
+                (rect, color)
+            }};
+        }
+
+        let (stop, _stop_fill) = panel_button!(82.0, 1, false);
+        let stop_cx = (stop.left + stop.right) / 2;
+        let stop_cy = (stop.top + stop.bottom) / 2;
+        let stop_square = sx(6.0).max(2);
+        let square_cx = stop_cx - sx(22.0);
+        panel_gdi_round_fill(
+            hdc,
+            RECT {
+                left: square_cx - stop_square / 2,
+                top: stop_cy - stop_square / 2,
+                right: square_cx + (stop_square + 1) / 2,
+                bottom: stop_cy + (stop_square + 1) / 2,
+            },
+            1,
+            FG,
+        );
+        let stop_target_x = stop_cx + sx(5.0);
+        let (stop_face, stop_weight) = panel_gdi_font_face(&snapshot.stop_text);
+        panel_gdi_text(
+            hdc,
+            RECT {
+                left: stop_target_x - sx(31.0),
+                top: stop.top,
+                right: stop_target_x + sx(31.0),
+                bottom: stop.bottom,
+            },
+            &snapshot.stop_text,
+            FG,
+            sy(12.0),
+            stop_face,
+            stop_weight,
+        );
+
+        let fps_rect = RECT {
+            left: px(x_pts),
+            top: y0 - sy(1.0),
+            right: px(x_pts + 68.0),
+            bottom: y1 - sy(1.0),
+        };
+        let fps = format!("{:.1} fps", snapshot.fps_tenths as f32 / 10.0);
+        panel_gdi_text(hdc, fps_rect, &fps, FG, sy(11.5), "Segoe UI", 400);
+        x_pts += 68.0 + 3.0;
+
+        let (camera, camera_fill) = panel_button!(34.0, 2, snapshot.screenshot_feedback);
+        let cx = (camera.left + camera.right) / 2;
+        let cy = (camera.top + camera.bottom) / 2;
+        let body_w = sx(16.0);
+        let body_h = sy(10.0);
+        let body_cy = cy + sy(1.5);
+        let body = RECT {
+            left: cx - body_w / 2,
+            top: body_cy - body_h / 2,
+            right: cx + (body_w + 1) / 2,
+            bottom: body_cy + (body_h + 1) / 2,
+        };
+        panel_gdi_round_frame(hdc, body, sx(2.0).max(2), 1, FG, camera_fill);
+        let bump_w = sx(6.0);
+        let bump_h = sy(3.0);
+        let bump_cx = cx - sx(3.0);
+        let bump_cy = cy - sy(5.0);
+        panel_gdi_round_fill(
+            hdc,
+            RECT {
+                left: bump_cx - bump_w / 2,
+                top: bump_cy - bump_h / 2,
+                right: bump_cx + (bump_w + 1) / 2,
+                bottom: bump_cy + (bump_h + 1) / 2,
+            },
+            1,
+            FG,
+        );
+        panel_gdi_circle_frame(hdc, cx, body_cy, sx(2.7).max(2), 1, FG, camera_fill);
+
+        let (gui, gui_fill) = panel_button!(34.0, 3, false);
+        let gx = (gui.left + gui.right) / 2;
+        let gy = (gui.top + gui.bottom) / 2;
+        let gw = sx(16.0);
+        let gh = sy(12.0);
+        let window = RECT {
+            left: gx - gw / 2,
+            top: gy - gh / 2,
+            right: gx + (gw + 1) / 2,
+            bottom: gy + (gh + 1) / 2,
+        };
+        panel_gdi_round_frame(hdc, window, sx(2.0).max(2), 1, FG, gui_fill);
+        let chrome_y = window.top + sy(3.5);
+        panel_gdi_fill(
+            hdc,
+            RECT {
+                left: window.left + sx(1.5),
+                top: chrome_y,
+                right: window.right - sx(1.5),
+                bottom: chrome_y + 1,
+            },
+            FG,
+        );
+        for dot_x in [3.0_f32, 5.3, 7.6] {
+            panel_gdi_circle_fill(hdc, window.left + sx(dot_x), window.top + sy(2.0), 1, FG);
+        }
+
+        // Final button: same 34x24 pt rounded face as egui, without advancing x.
+        let collapse = RECT {
+            left: px(x_pts),
+            top: y0,
+            right: px(x_pts + 34.0),
+            bottom: y1,
+        };
+        let collapse_fill = if snapshot.hover_slot == 4 {
+            HOVER
+        } else {
+            BUTTON
+        };
+        panel_gdi_round_fill(hdc, collapse, corner, collapse_fill);
+        let ccx = (collapse.left + collapse.right) / 2;
+        let ccy = (collapse.top + collapse.bottom) / 2;
+        let half_line = sx(6.0);
+        let line_h = sy(1.6).max(1);
+        panel_gdi_fill(
+            hdc,
+            RECT {
+                left: ccx - half_line,
+                top: ccy - line_h / 2,
+                right: ccx + half_line + 1,
+                bottom: ccy + (line_h + 1) / 2,
+            },
+            FG,
+        );
+    }
+}
+
+unsafe extern "system" fn gui_transition_snapshot_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let snapshot = gui_transition_snapshot_state()
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    (state.hwnd == hwnd.0 as isize && state.bitmap != 0).then_some((
+                        state.bitmap,
+                        state.width,
+                        state.height,
+                    ))
+                });
+            if let Some((bitmap, width, height)) = snapshot {
+                let mem = raw_create_compatible_dc(hdc.0);
+                if !mem.is_null() {
+                    let old = raw_select_object(mem, bitmap as RawWinHandle);
+                    let _ = raw_bit_blt(hdc.0, 0, 0, width, height, mem, 0, 0, RAW_SRCCOPY);
+                    if !old.is_null() {
+                        let _ = raw_select_object(mem, old);
+                    }
+                    let _ = raw_delete_dc(mem);
+                }
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        },
+        WM_DESTROY => {
+            if let Ok(mut state) = gui_transition_snapshot_state().try_lock() {
+                if state.hwnd == hwnd.0 as isize {
+                    state.hwnd = 0;
+                }
+            }
+            LRESULT(0)
+        },
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+unsafe fn create_gui_transition_snapshot_window(
+    owner_hwnd: isize,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+        let class: Vec<u16> = "NeoGuiTransitionSnapshot\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(gui_transition_snapshot_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // zero when already registered is fine.
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            windows::core::PCWSTR(class.as_ptr()),
+            windows::core::PCWSTR(class.as_ptr()),
+            WS_POPUP,
+            x,
+            y,
+            width.max(1),
+            height.max(1),
+            Some(HWND(owner_hwnd as *mut _)),
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()
+    }
+}
+
+/// Cover the root GUI's entire old/new footprint with a snapshot of the screen
+/// as it looked immediately before the WGPU resize. The capture rectangle is
+/// the union of the current outer window and the expected target outer window,
+/// so growing and shrinking mode changes both remain visually frozen until the
+/// final target layout has been presented behind this helper.
+pub fn show_gui_transition_snapshot(
+    gui_hwnd: isize,
+    target_inner_width_pts: f32,
+    target_inner_height_pts: f32,
+    pixels_per_point: f32,
+) -> bool {
+    hide_gui_transition_snapshot();
+    if gui_hwnd == 0 || !is_window_valid(gui_hwnd) || !is_own_window(gui_hwnd) {
+        return false;
+    }
+    let Some((outer_x, outer_y, outer_w, outer_h)) = window_rect(gui_hwnd) else {
+        return false;
+    };
+    let Some((client_x, client_y, client_w, client_h)) = client_rect_on_screen(gui_hwnd) else {
+        return false;
+    };
+    let scale = pixels_per_point.max(0.1);
+    let target_client_w = (target_inner_width_pts * scale).round().max(1.0) as i32;
+    let target_client_h = (target_inner_height_pts * scale).round().max(1.0) as i32;
+    let frame_left = client_x - outer_x;
+    let frame_top = client_y - outer_y;
+    let frame_right = (outer_w - frame_left - client_w).max(0);
+    let frame_bottom = (outer_h - frame_top - client_h).max(0);
+    let target_outer_w = (target_client_w + frame_left + frame_right).max(1);
+    let target_outer_h = (target_client_h + frame_top + frame_bottom).max(1);
+    let capture_w = outer_w.max(target_outer_w).max(1);
+    let capture_h = outer_h.max(target_outer_h).max(1);
+
+    let desktop = unsafe { raw_get_dc(core::ptr::null_mut()) };
+    if desktop.is_null() {
+        return false;
+    }
+    let mem = unsafe { raw_create_compatible_dc(desktop) };
+    if mem.is_null() {
+        unsafe {
+            let _ = raw_release_dc(core::ptr::null_mut(), desktop);
+        }
+        return false;
+    }
+    let bitmap = unsafe { raw_create_compatible_bitmap(desktop, capture_w, capture_h) };
+    if bitmap.is_null() {
+        unsafe {
+            let _ = raw_delete_dc(mem);
+            let _ = raw_release_dc(core::ptr::null_mut(), desktop);
+        }
+        return false;
+    }
+    let old = unsafe { raw_select_object(mem, bitmap) };
+    if old.is_null() {
+        unsafe {
+            let _ = raw_delete_object(bitmap);
+            let _ = raw_delete_dc(mem);
+            let _ = raw_release_dc(core::ptr::null_mut(), desktop);
+        }
+        return false;
+    }
+    let copied = unsafe {
+        raw_bit_blt(
+            mem,
+            0,
+            0,
+            capture_w,
+            capture_h,
+            desktop,
+            outer_x,
+            outer_y,
+            RAW_SRCCOPY,
+        ) != 0
+    };
+    unsafe {
+        if !old.is_null() {
+            let _ = raw_select_object(mem, old);
+        }
+        let _ = raw_delete_dc(mem);
+        let _ = raw_release_dc(core::ptr::null_mut(), desktop);
+    }
+    if !copied {
+        unsafe {
+            let _ = raw_delete_object(bitmap);
+        }
+        return false;
+    }
+
+    let Some(hwnd) = (unsafe {
+        create_gui_transition_snapshot_window(gui_hwnd, outer_x, outer_y, capture_w, capture_h)
+    }) else {
+        unsafe {
+            let _ = raw_delete_object(bitmap);
+        }
+        return false;
+    };
+
+    {
+        let Ok(mut state) = gui_transition_snapshot_state().lock() else {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+                let _ = raw_delete_object(bitmap);
+            }
+            return false;
+        };
+        state.hwnd = hwnd.0 as isize;
+        state.bitmap = bitmap as isize;
+        state.width = capture_w;
+        state.height = capture_h;
+    }
+
+    unsafe {
+        // Prime the hidden helper's own GDI surface before it is shown, so DWM
+        // never sees an empty/background frame from this temporary window.
+        let window_dc = raw_get_dc(hwnd.0);
+        if !window_dc.is_null() {
+            let paint_dc = raw_create_compatible_dc(window_dc);
+            if !paint_dc.is_null() {
+                let paint_old = raw_select_object(paint_dc, bitmap);
+                if !paint_old.is_null() {
+                    let _ = raw_bit_blt(
+                        window_dc,
+                        0,
+                        0,
+                        capture_w,
+                        capture_h,
+                        paint_dc,
+                        0,
+                        0,
+                        RAW_SRCCOPY,
+                    );
+                    let _ = raw_select_object(paint_dc, paint_old);
+                }
+                let _ = raw_delete_dc(paint_dc);
+            }
+            let _ = raw_release_dc(hwnd.0, window_dc);
+        }
+        // Show without activation. The helper is click-through and is removed
+        // after two complete target-layout frames.
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            outer_x,
+            outer_y,
+            capture_w,
+            capture_h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = RedrawWindow(
+            Some(hwnd),
+            None,
+            None,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME,
+        );
+        // The egui viewport resize is applied as soon as the current update
+        // returns.  Merely showing and synchronously painting this helper does
+        // not mean DWM has composed it yet: on the next desktop frame the root
+        // WGPU surface could therefore be seen briefly with the old layout
+        // squeezed into the new size.  Wait for the helper to reach DWM before
+        // allowing that queued resize to proceed.  This runs only on explicit
+        // GUI mode changes and never touches the video presentation path.
+        let _ = DwmFlush();
+    }
+    log::debug!(
+        "gui-transition-snapshot: shown hwnd={:#x} rect=({},{} {}x{}) current_outer={}x{} target_outer={}x{} scale={:.3}",
+        hwnd.0 as isize,
+        outer_x,
+        outer_y,
+        capture_w,
+        capture_h,
+        outer_w,
+        outer_h,
+        target_outer_w,
+        target_outer_h,
+        scale
+    );
+    true
+}
+
+pub fn keep_gui_transition_snapshot_topmost() {
+    let hwnd = gui_transition_snapshot_state()
+        .lock()
+        .ok()
+        .map(|state| state.hwnd)
+        .unwrap_or(0);
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(hwnd as *mut _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Wait for one DWM composition boundary while the transition snapshot is
+/// still visible. This is intentionally used only for explicit GUI mode
+/// changes; it must never be called from the video rendering/pacing path.
+pub fn sync_gui_transition_with_dwm() {
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+/// Wait for one DWM composition boundary after the floating panel and its
+/// compositor keep-alive backing surface have both reached their final state.
+/// This is GUI-only transition work; it is never called from video pacing.
+pub fn sync_panel_composition_with_dwm() {
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+pub fn hide_gui_transition_snapshot() {
+    let (hwnd, bitmap) = {
+        let Ok(mut state) = gui_transition_snapshot_state().lock() else {
+            return;
+        };
+        let hwnd = state.hwnd;
+        let bitmap = state.bitmap;
+        *state = GuiTransitionSnapshotState::default();
+        (hwnd, bitmap)
+    };
+    unsafe {
+        if hwnd != 0 && is_window_valid(hwnd) {
+            let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
+            let _ = DestroyWindow(HWND(hwnd as *mut _));
+        }
+        if bitmap != 0 {
+            let _ = raw_delete_object(bitmap as RawWinHandle);
+        }
+    }
+    if hwnd != 0 || bitmap != 0 {
+        log::debug!(
+            "gui-transition-snapshot: hidden hwnd={:#x} bitmap={:#x}",
+            hwnd,
+            bitmap
+        );
+    }
+}
+
+unsafe extern "system" fn panel_gdi_mirror_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let snapshot = panel_gdi_mirror_state().lock().ok().and_then(|state| {
+                (state.hwnd == hwnd.0 as isize && state.snapshot.visible)
+                    .then(|| state.snapshot.clone())
+            });
+            if let Some(snapshot) = snapshot {
+                // v508: compose the complete panel off-screen, then publish it
+                // with one BitBlt.  v454-v507 painted background/buttons/text
+                // directly into the visible child DC; periodic FPS updates can
+                // therefore expose an intermediate paint state on some DWM/AMD
+                // compositions.  This changes only the GDI paint transaction:
+                // window lifetime, z-order, WGPU keep-alive, input and cursor
+                // ownership remain untouched.
+                let mem = raw_create_compatible_dc(hdc.0);
+                let bitmap = if !mem.is_null() {
+                    raw_create_compatible_bitmap(
+                        hdc.0,
+                        snapshot.width.max(1),
+                        snapshot.height.max(1),
+                    )
+                } else {
+                    core::ptr::null_mut()
+                };
+                let mut published = false;
+                if !mem.is_null() && !bitmap.is_null() {
+                    let old = raw_select_object(mem, bitmap);
+                    if !old.is_null() {
+                        paint_panel_gdi_mirror(
+                            windows::Win32::Graphics::Gdi::HDC(mem),
+                            &snapshot,
+                        );
+                        published = raw_bit_blt(
+                            hdc.0,
+                            0,
+                            0,
+                            snapshot.width.max(1),
+                            snapshot.height.max(1),
+                            mem,
+                            0,
+                            0,
+                            RAW_SRCCOPY,
+                        ) != 0;
+                        let _ = raw_select_object(mem, old);
+                    }
+                }
+                if !bitmap.is_null() {
+                    let _ = raw_delete_object(bitmap);
+                }
+                if !mem.is_null() {
+                    let _ = raw_delete_dc(mem);
+                }
+                if !published {
+                    // Allocation/BitBlt failure must never blank the panel.
+                    // Preserve the proven legacy direct-paint fallback.
+                    paint_panel_gdi_mirror(hdc, &snapshot);
+                }
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        },
+        WM_DESTROY => {
+            // DestroyWindow can synchronously re-enter this wndproc while the
+            // updater owns the mirror-state mutex. Never block here.
+            if let Ok(mut state) = panel_gdi_mirror_state().try_lock() {
+                if state.hwnd == hwnd.0 as isize {
+                    state.hwnd = 0;
+                    state.snapshot.visible = false;
+                }
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+unsafe extern "system" fn panel_gdi_host_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        // The low-level input hook owns all panel buttons. Keep the host a real
+        // hit-test target so direct_top_level_window_at_point() can verify that
+        // the click still belongs to this panel, but never activate/focus it.
+        WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => unsafe {
+            // The child GDI mirror covers the full client area. Validate the
+            // host paint region without drawing a second surface underneath it.
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        },
+        WM_DESTROY => {
+            if let Ok(mut host) = panel_gdi_host_state().try_lock() {
+                if *host == hwnd.0 as isize {
+                    *host = 0;
+                }
+            }
+            LRESULT(0)
+        },
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+/// Apply only the visible outer shape of the native control panel.
+///
+/// This changes neither z-order nor ownership. The region is updated only
+/// when the host is created/resized, so the v508 repaint path remains intact.
+/// SetWindowRgn takes ownership of the HRGN on success.
+fn apply_panel_gdi_host_round_region(hwnd: isize, width: i32, height: i32) {
+    if hwnd == 0 || width <= 0 || height <= 0 {
+        return;
+    }
+    let radius = 5.min(width / 2).min(height / 2).max(1);
+    let diameter = (radius * 2).max(2);
+    unsafe {
+        let region = raw_create_round_rect_rgn(
+            0,
+            0,
+            width.saturating_add(1),
+            height.saturating_add(1),
+            diameter,
+            diameter,
+        );
+        if region.is_null() {
+            log::debug!(
+                "panel-round-region: create failed hwnd={hwnd:#x} size={}x{}",
+                width,
+                height
+            );
+            return;
+        }
+        if raw_set_window_rgn(hwnd as RawWinHandle, region, 0) == 0 {
+            let _ = raw_delete_object(region);
+            log::debug!(
+                "panel-round-region: apply failed hwnd={hwnd:#x} size={}x{}",
+                width,
+                height
+            );
+        }
+    }
+}
+
+fn overload_gdi_font_face(text: &str) -> (&'static str, i32) {
+    let hangul = text.chars().any(|ch| matches!(ch as u32, 0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af));
+    if hangul {
+        return ("Malgun Gothic", 500);
+    }
+    let cjk = text.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x3040..=0x30ff | 0x31f0..=0x31ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff
+        )
+    });
+    if cjk {
+        ("Yu Gothic UI", 500)
+    } else {
+        ("Segoe UI", 500)
+    }
+}
+
+unsafe fn overload_gdi_make_font(text: &str, pixel_height: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+    unsafe {
+        let (face, weight) = overload_gdi_font_face(text);
+        let mut lf = LOGFONTW::default();
+        lf.lfHeight = -pixel_height.max(1);
+        lf.lfWeight = weight;
+        lf.lfCharSet = windows::Win32::Graphics::Gdi::FONT_CHARSET(1);
+        lf.lfQuality = windows::Win32::Graphics::Gdi::FONT_QUALITY(5);
+        for (dst, src) in lf.lfFaceName.iter_mut().take(31).zip(face.encode_utf16()) {
+            *dst = src;
+        }
+        CreateFontIndirectW(&lf)
+    }
+}
+
+fn overload_gdi_measure_text(text: &str, pixel_height: i32) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.0.is_null() {
+            return (text.chars().count() as i32 * pixel_height.max(1) / 2).max(1);
+        }
+        let font = overload_gdi_make_font(text, pixel_height);
+        let font_ok = !font.0.is_null();
+        let old_font = if font_ok {
+            SelectObject(hdc, font.into())
+        } else {
+            SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT))
+        };
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 32767,
+            bottom: 32767,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(hdc, old_font);
+        if font_ok {
+            let _ = DeleteObject(font.into());
+        }
+        let _ = ReleaseDC(None, hdc);
+        (rect.right - rect.left).max(1)
+    }
+}
+
+unsafe fn paint_overload_notice_gdi(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    snapshot: &OverloadNoticeGdiSnapshot,
+) {
+    unsafe {
+        const BG: COLORREF = COLORREF(0x00122732); // rgb(50,39,18)
+        const BORDER: COLORREF = COLORREF(0x0042A4D6); // rgb(214,164,66)
+        const FG: COLORREF = COLORREF(0x00F2F2F2);
+
+        let w = snapshot.width.max(1);
+        let h = snapshot.height.max(1);
+        // Always initialize every pixel. The helper is layered/click-through,
+        // and leaving the rounded-corner pixels unpainted could expose stale
+        // GDI backing-store data precisely on the low-spec path we are trying
+        // to keep artifact-free.
+        panel_gdi_fill(
+            hdc,
+            RECT { left: 0, top: 0, right: w, bottom: h },
+            BG,
+        );
+        let radius = (h / 6).max(3);
+        panel_gdi_round_frame(
+            hdc,
+            RECT { left: 0, top: 0, right: w, bottom: h },
+            radius,
+            1,
+            BORDER,
+            BG,
+        );
+
+        let icon_h = ((h as f32) * 0.36).round() as i32;
+        let icon_h = icon_h.clamp(10, (h - 8).max(10));
+        let icon_w = ((icon_h as f32) * 1.08).round() as i32;
+        let gap = ((h as f32) * 0.16).round() as i32;
+        let text_w = overload_gdi_measure_text(&snapshot.text, snapshot.font_px);
+        let group_w = icon_w + gap + text_w;
+        let group_left = ((w - group_w) / 2).max(4);
+        let cx = group_left + icon_w / 2;
+        let cy = h / 2;
+
+        // Font-independent warning triangle. Both outer and inner triangles are
+        // scanline-filled, so the icon's physical bounds are centered exactly
+        // in the native warning window in every language/font.
+        let half_h = icon_h / 2;
+        let half_w = icon_w / 2;
+        for dy in -half_h..=half_h {
+            let t = (dy + half_h) as f32 / (icon_h.max(1) as f32);
+            let span = (half_w as f32 * t).round() as i32;
+            panel_gdi_fill(
+                hdc,
+                RECT {
+                    left: cx - span,
+                    top: cy + dy,
+                    right: cx + span + 1,
+                    bottom: cy + dy + 1,
+                },
+                FG,
+            );
+        }
+        let inner_h = (icon_h - 4).max(4);
+        let inner_w = (icon_w - 5).max(4);
+        let inner_half_h = inner_h / 2;
+        let inner_half_w = inner_w / 2;
+        for dy in -inner_half_h..=inner_half_h {
+            let t = (dy + inner_half_h) as f32 / (inner_h.max(1) as f32);
+            let span = (inner_half_w as f32 * t).round() as i32;
+            panel_gdi_fill(
+                hdc,
+                RECT {
+                    left: cx - span,
+                    top: cy + dy,
+                    right: cx + span + 1,
+                    bottom: cy + dy + 1,
+                },
+                BG,
+            );
+        }
+        let mark_h = (icon_h / 3).max(3);
+        panel_gdi_fill(
+            hdc,
+            RECT {
+                left: cx,
+                top: cy - mark_h / 2,
+                right: cx + 1,
+                bottom: cy + mark_h / 2 + 1,
+            },
+            FG,
+        );
+        panel_gdi_circle_fill(hdc, cx, cy + icon_h / 4, 1, FG);
+
+        let font = overload_gdi_make_font(&snapshot.text, snapshot.font_px);
+        let font_ok = !font.0.is_null();
+        let old_font = if font_ok {
+            SelectObject(hdc, font.into())
+        } else {
+            SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT))
+        };
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let _ = SetTextColor(hdc, FG);
+        let mut wide: Vec<u16> = snapshot.text.encode_utf16().collect();
+        let text_left = group_left + icon_w + gap;
+        let mut text_rect = RECT {
+            left: text_left,
+            top: 0,
+            right: (text_left + text_w + 2).min(w - 4),
+            bottom: h,
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(hdc, old_font);
+        if font_ok {
+            let _ = DeleteObject(font.into());
+        }
+    }
+}
+
+unsafe extern "system" fn overload_notice_gdi_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => unsafe {
+            let snapshot = overload_notice_gdi_state()
+                .lock()
+                .ok()
+                .map(|state| state.snapshot.clone())
+                .unwrap_or_default();
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if snapshot.visible {
+                paint_overload_notice_gdi(hdc, &snapshot);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        },
+        WM_DESTROY => {
+            if let Ok(mut state) = overload_notice_gdi_state().try_lock() {
+                if state.hwnd == hwnd.0 as isize {
+                    state.hwnd = 0;
+                    state.snapshot.visible = false;
+                }
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+unsafe fn create_overload_notice_gdi_host() -> Option<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+        let class: Vec<u16> = "NeoOverloadNoticeGdi\0".encode_utf16().collect();
+        let title: Vec<u16> = "overload-warning\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(overload_notice_gdi_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            windows::core::PCWSTR(class.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            WS_POPUP,
+            -32000,
+            -32000,
+            1,
+            1,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()?;
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        Some(hwnd)
+    }
+}
+
+/// Show the overload-stop notice on the magnified video surface without
+/// creating an eframe/WGPU viewport. The host is a tiny cached native GDI
+/// window, click-through and no-activate. Its geometry is derived from the live
+/// content rect, so fullscreen and windowed magnification share exactly the
+/// same path and it follows overlay moves/resizes without touching rendering.
+pub fn show_overload_notice_gdi(
+    overlay_hwnd: isize,
+    content_rect: (i32, i32, i32, i32),
+    text: &str,
+) {
+    if overlay_hwnd == 0 || !is_window_valid(overlay_hwnd) || !is_own_window(overlay_hwnd) {
+        hide_overload_notice_gdi();
+        return;
+    }
+    let (mut cx, mut cy, mut cw, mut ch) = content_rect;
+    if cw <= 0 || ch <= 0 {
+        let Some((x, y, w, h)) = window_rect(overlay_hwnd) else {
+            hide_overload_notice_gdi();
+            return;
+        };
+        cx = x;
+        cy = y;
+        cw = w;
+        ch = h;
+    }
+    if cw <= 8 || ch <= 8 {
+        hide_overload_notice_gdi();
+        return;
+    }
+
+    let dpi = unsafe {
+        windows::Win32::UI::HiDpi::GetDpiForWindow(HWND(overlay_hwnd as *mut _))
+    };
+    let scale = ((dpi.max(72) as f32) / 96.0).clamp(0.75, 2.5);
+    let height = ((38.0 * scale).round() as i32).clamp(28, ch.saturating_sub(4).max(28));
+    let pad_x = ((14.0 * scale).round() as i32).max(8);
+    let icon_w = ((14.0 * scale).round() as i32).max(10);
+    let gap = ((6.0 * scale).round() as i32).max(4);
+    let max_width = (cw - ((12.0 * scale).round() as i32).max(8)).max(32);
+    let base_font = ((15.0 * scale).round() as i32).max(10);
+    let min_font = ((9.0 * scale).round() as i32).max(8);
+    let mut font_px = base_font;
+    let mut text_w = overload_gdi_measure_text(text, font_px);
+    let available_text = (max_width - pad_x * 2 - icon_w - gap).max(16);
+    if text_w > available_text {
+        let fitted = ((font_px as f32) * (available_text as f32 / text_w.max(1) as f32)).floor() as i32;
+        font_px = fitted.clamp(min_font, base_font);
+        text_w = overload_gdi_measure_text(text, font_px);
+    }
+    let width = (pad_x * 2 + icon_w + gap + text_w)
+        .min(max_width)
+        .max((96.0 * scale).round() as i32)
+        .min(cw.max(1));
+    let x = cx + ((cw - width) / 2).max(0);
+    // The native control panel/keepalive helper occupies the very top-center
+    // of the overlay. Keep the warning below that stable helper band so it is
+    // readable without changing any existing z-order contract. In a very small
+    // windowed overlay, fall back to vertical centering rather than clipping.
+    let desired_top = ((50.0 * scale).round() as i32).max(10);
+    let max_top = (ch - height).max(0);
+    let top_inset = if max_top >= desired_top {
+        desired_top
+    } else {
+        max_top / 2
+    };
+    let y = cy + top_inset;
+
+    let mut state = match overload_notice_gdi_state().lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    if state.hwnd == 0 || !is_window_valid(state.hwnd) || !is_own_window(state.hwnd) {
+        let Some(hwnd) = (unsafe { create_overload_notice_gdi_host() }) else {
+            log::warn!("overload-notice-gdi: create failed");
+            state.hwnd = 0;
+            return;
+        };
+        state.hwnd = hwnd.0 as isize;
+        log::info!(
+            "overload-notice-gdi: created hwnd={:#x} backend=native-gdi-no-wgpu",
+            state.hwnd
+        );
+    }
+
+    let next = OverloadNoticeGdiSnapshot {
+        x,
+        y,
+        width,
+        height,
+        font_px,
+        text: text.to_owned(),
+        visible: true,
+    };
+    let geometry_changed = state.snapshot.x != next.x
+        || state.snapshot.y != next.y
+        || state.snapshot.width != next.width
+        || state.snapshot.height != next.height;
+    let visual_changed = state.snapshot.text != next.text
+        || state.snapshot.font_px != next.font_px
+        || !state.snapshot.visible;
+    let was_visible = state.snapshot.visible && is_window_visible(state.hwnd);
+    state.snapshot = next;
+    let hwnd = state.hwnd;
+    drop(state);
+
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        if geometry_changed || !was_visible {
+            let _ = SetWindowPos(
+                h,
+                None,
+                x,
+                y,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER | SWP_NOZORDER,
+            );
+        }
+        if !was_visible {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        // Keep the notice above the magnified overlay but do not raise it to
+        // the top of the TOPMOST band. This preserves Task Manager/other
+        // external topmost windows and Neo's cursor/panel ordering.
+        if !was_visible || !window_is_above(hwnd, overlay_hwnd) {
+            let above = GetWindow(HWND(overlay_hwnd as *mut _), GW_HWNDPREV).unwrap_or_default();
+            if !above.0.is_null() && above.0 as isize != hwnd {
+                let _ = SetWindowPos(
+                    h,
+                    Some(above),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER,
+                );
+            } else {
+                let _ = SetWindowPos(
+                    h,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER,
+                );
+            }
+        }
+        if visual_changed || geometry_changed || !was_visible {
+            let _ = RedrawWindow(Some(h), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+    }
+    if !was_visible {
+        log::info!(
+            "overload-notice-gdi: shown hwnd={hwnd:#x} rect=({x},{y} {width}x{height}) content=({cx},{cy} {cw}x{ch}) clickthrough=true"
+        );
+    } else if geometry_changed {
+        log::debug!(
+            "overload-notice-gdi: reposition rect=({x},{y} {width}x{height}) content=({cx},{cy} {cw}x{ch})"
+        );
+    }
+}
+
+pub fn hide_overload_notice_gdi() {
+    let Ok(mut state) = overload_notice_gdi_state().lock() else {
+        return;
+    };
+    if state.hwnd != 0 && is_window_valid(state.hwnd) && state.snapshot.visible {
+        unsafe {
+            let _ = ShowWindow(HWND(state.hwnd as *mut _), SW_HIDE);
+        }
+        log::info!("overload-notice-gdi: hidden hwnd={:#x}", state.hwnd);
+    }
+    state.snapshot.visible = false;
+}
+
+unsafe fn create_panel_gdi_host(width: i32, height: i32) -> Option<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+        let class: Vec<u16> = "NeoPanelGdiHost\0".encode_utf16().collect();
+        let title: Vec<u16> = "panel\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(panel_gdi_host_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // zero when already registered is fine.
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            windows::core::PCWSTR(class.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            WS_POPUP | WS_CLIPCHILDREN,
+            0,
+            0,
+            width.max(1),
+            height.max(1),
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()
+    }
+}
+
+/// Create (or recover) the floating control panel as a native GDI host.
+///
+/// v448 already made the visible panel pixels a cached GDI child and input.rs
+/// already owns every panel action through the low-level Win32 hook. Keeping an
+/// eframe/WGPU child viewport solely as that GDI child's parent therefore adds
+/// an otherwise unrelated swapchain Present to every root-GUI repaint. This
+/// host preserves the same HWND/geometry/z-order/input contract without any
+/// WGPU surface, so main-GUI hover and mode switches cannot force a panel GPU
+/// Present.
+pub fn ensure_panel_gdi_host(width: i32, height: i32) -> Option<isize> {
+    let mut host = panel_gdi_host_state().lock().ok()?;
+    if *host != 0 && is_window_valid(*host) && is_own_window(*host) {
+        return Some(*host);
+    }
+    *host = 0;
+    let hwnd = unsafe { create_panel_gdi_host(width, height)? };
+    *host = hwnd.0 as isize;
+    apply_panel_gdi_host_round_region(*host, width.max(1), height.max(1));
+    log::info!(
+        "panel-gdi-host: created hwnd={:#x} size={}x{} backend=native-gdi-no-wgpu",
+        *host,
+        width.max(1),
+        height.max(1)
+    );
+    Some(*host)
+}
+
+pub fn set_panel_gdi_host_visible(hwnd: isize, visible: bool) {
+    if !is_panel_gdi_host(hwnd) {
+        return;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let _ = ShowWindow(h, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+    }
+}
+
+pub fn is_panel_gdi_host(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    panel_gdi_host_state()
+        .lock()
+        .is_ok_and(|host| *host == hwnd && is_window_valid(hwnd) && is_own_window(hwnd))
+}
+
+unsafe fn create_panel_gdi_mirror(parent: HWND, width: i32, height: i32) -> Option<HWND> {
+    unsafe {
+        let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()?;
+        let class: Vec<u16> = "NeoPanelGdiMirror\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(panel_gdi_mirror_wndproc),
+            hInstance: instance.into(),
+            lpszClassName: windows::core::PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // zero when already registered is fine.
+        CreateWindowExW(
+            WS_EX_NOPARENTNOTIFY,
+            windows::core::PCWSTR(class.as_ptr()),
+            windows::core::PCWSTR(class.as_ptr()),
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0,
+            0,
+            width.max(1),
+            height.max(1),
+            Some(parent),
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .ok()
+    }
+}
+
+/// Draw the floating panel into a cached CPU/GDI child surface. v465 uses a
+/// native GDI top-level host instead of an eframe/WGPU panel viewport, so this
+/// child is the only panel drawing surface. It paints both the ordinary bar and
+/// the tiny lurk chip without creating a second GPU swapchain.
+///
+/// The child returns HTTRANSPARENT so the low-level Win32 input path continues
+/// to target the native panel host for exact top-level ownership checks.
+pub fn update_panel_gdi_mirror(
+    parent_hwnd: isize,
+    width: i32,
+    height: i32,
+    visible: bool,
+    chip: bool,
+    stop_text: &str,
+    present_fps: f64,
+    hover_slot: u8,
+    screenshot_feedback: bool,
+) {
+    if parent_hwnd == 0 || !is_window_valid(parent_hwnd) || !is_own_window(parent_hwnd) {
+        return;
+    }
+
+    let snapshot = PanelGdiMirrorSnapshot {
+        parent: parent_hwnd,
+        width: width.max(1),
+        height: height.max(1),
+        visible,
+        chip,
+        stop_text: stop_text.to_owned(),
+        fps_tenths: (present_fps * 10.0).round() as i32,
+        hover_slot,
+        screenshot_feedback,
+    };
+
+    let mut created = false;
+    let (child_hwnd, visual_changed, geometry_changed, visibility_changed, dirty_rect) = {
+        let Ok(mut state) = panel_gdi_mirror_state().lock() else {
+            return;
+        };
+        let current_valid =
+            state.hwnd != 0 && is_window_valid(state.hwnd) && state.snapshot.parent == parent_hwnd;
+        if !current_valid {
+            if state.hwnd != 0 && is_window_valid(state.hwnd) {
+                unsafe {
+                    let _ = DestroyWindow(HWND(state.hwnd as *mut _));
+                }
+            }
+            let Some(child) = (unsafe {
+                create_panel_gdi_mirror(
+                    HWND(parent_hwnd as *mut _),
+                    snapshot.width,
+                    snapshot.height,
+                )
+            }) else {
+                log::warn!(
+                    "panel-gdi-mirror: create failed parent={parent_hwnd:#x} size={}x{}",
+                    snapshot.width,
+                    snapshot.height
+                );
+                state.hwnd = 0;
+                state.snapshot = snapshot;
+                return;
+            };
+            state.hwnd = child.0 as isize;
+            created = true;
+        }
+
+        let old = state.snapshot.clone();
+        let geometry_changed =
+            created || old.width != snapshot.width || old.height != snapshot.height;
+        let visibility_changed = created || old.visible != snapshot.visible;
+        let visual_changed = created
+            || old.chip != snapshot.chip
+            || old.stop_text != snapshot.stop_text
+            || old.fps_tenths != snapshot.fps_tenths
+            || old.hover_slot != snapshot.hover_slot
+            || old.screenshot_feedback != snapshot.screenshot_feedback;
+        let dirty_rect = if visual_changed && !geometry_changed && !visibility_changed {
+            panel_gdi_visual_dirty_rect(&old, &snapshot)
+        } else {
+            None
+        };
+        state.snapshot = snapshot.clone();
+        (
+            state.hwnd,
+            visual_changed,
+            geometry_changed,
+            visibility_changed,
+            dirty_rect,
+        )
+    };
+
+    if child_hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let child = HWND(child_hwnd as *mut _);
+
+        // Geometry must be committed even while the mirror is hidden. During a
+        // lurk->bar restore the parent is deliberately alpha=0 until the full
+        // 297x33 visual stack is ready. v526 only resized this child when it was
+        // shown, so its cached snapshot could already say 297x33 while the real
+        // child HWND still had the previous lurk geometry. Pre-size it
+        // invisibly instead.
+        if geometry_changed {
+            if visible {
+                let _ = SetWindowPos(
+                    child,
+                    Some(HWND_TOP),
+                    0,
+                    0,
+                    snapshot.width,
+                    snapshot.height,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            } else {
+                let _ = SetWindowPos(
+                    child,
+                    None,
+                    0,
+                    0,
+                    snapshot.width,
+                    snapshot.height,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+        } else if visible && visibility_changed {
+            let _ = SetWindowPos(
+                child,
+                Some(HWND_TOP),
+                0,
+                0,
+                snapshot.width,
+                snapshot.height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+
+        let full_rect = RECT {
+            left: 0,
+            top: 0,
+            right: snapshot.width.max(1),
+            bottom: snapshot.height.max(1),
+        };
+
+        if visible {
+            // Ordinary FPS/hover changes keep the small-region BitBlt path.
+            // Geometry/visibility transitions are different: publish one
+            // complete double-buffered frame before allowing the child to be
+            // observed, rather than relying on USER32's invalid-region timing.
+            if visual_changed || geometry_changed || visibility_changed {
+                let partial_published = if visual_changed
+                    && !geometry_changed
+                    && !visibility_changed
+                    && dirty_rect.is_some()
+                {
+                    publish_panel_gdi_region(child, &snapshot, dirty_rect.unwrap())
+                } else {
+                    false
+                };
+                let full_published = if !partial_published
+                    && (geometry_changed || visibility_changed)
+                {
+                    publish_panel_gdi_region(child, &snapshot, full_rect)
+                } else {
+                    false
+                };
+                if !partial_published && !full_published {
+                    let _ = RedrawWindow(Some(child), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                }
+            }
+        } else {
+            if visibility_changed {
+                let _ = ShowWindow(child, SW_HIDE);
+            }
+            if geometry_changed {
+                // Prime the entire hidden child now. When the parent/child are
+                // atomically revealed on the next pass, every pixel already
+                // exists and no pointer-driven invalidation can progressively
+                // expose the bar.
+                let _ = publish_panel_gdi_region(child, &snapshot, full_rect);
+            }
+        }
+    }
+
+    if created {
+        log::info!(
+            "panel-gdi-mirror: created child={child_hwnd:#x} parent={parent_hwnd:#x} size={}x{}",
+            snapshot.width,
+            snapshot.height
+        );
+    } else if (visual_changed || geometry_changed || visibility_changed)
+        && crate::logging::diagnostics_enabled()
+    {
+        log::debug!(
+            "panel-gdi-mirror-state: child={child_hwnd:#x} parent={parent_hwnd:#x} visible={} chip={} size={}x{} fps={:.1} hover_slot={} screenshot_feedback={} visual_changed={} geometry_changed={} visibility_changed={}",
+            visible,
+            chip,
+            snapshot.width,
+            snapshot.height,
+            snapshot.fps_tenths as f32 / 10.0,
+            hover_slot,
+            screenshot_feedback,
+            visual_changed,
+            geometry_changed,
+            visibility_changed
+        );
+    }
+}
+
+/// Re-publish the complete cached panel frame after the native host has become
+/// visible. Hidden pre-paint remains the primary anti-flicker path; this is a
+/// one-shot reveal guard for rare USER32/DWM cases where only part of the child
+/// surface is exposed on the first visible composition.
+///
+/// Ordinary FPS/hover updates continue to use `update_panel_gdi_mirror` and its
+/// small dirty-region BitBlt path.
+pub fn republish_panel_gdi_mirror_full(parent_hwnd: isize) -> bool {
+    if parent_hwnd == 0 || !is_window_valid(parent_hwnd) || !is_own_window(parent_hwnd) {
+        return false;
+    }
+
+    let (child_hwnd, snapshot) = {
+        let Ok(state) = panel_gdi_mirror_state().lock() else {
+            return false;
+        };
+        if state.hwnd == 0
+            || state.snapshot.parent != parent_hwnd
+            || !state.snapshot.visible
+            || !is_window_valid(state.hwnd)
+        {
+            return false;
+        }
+        (state.hwnd, state.snapshot.clone())
+    };
+
+    let full_rect = RECT {
+        left: 0,
+        top: 0,
+        right: snapshot.width.max(1),
+        bottom: snapshot.height.max(1),
+    };
+    let published = unsafe {
+        let child = HWND(child_hwnd as *mut _);
+        let ok = publish_panel_gdi_region(child, &snapshot, full_rect);
+        if !ok {
+            let _ = RedrawWindow(Some(child), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+        ok
+    };
+
+    if crate::logging::diagnostics_enabled() {
+        log::debug!(
+            "panel-gdi-reveal-republish: child={child_hwnd:#x} parent={parent_hwnd:#x} size={}x{} result={}",
+            snapshot.width,
+            snapshot.height,
+            if published { "bitblt" } else { "redraw-fallback" }
+        );
+    }
+    true
+}
+
+pub fn hide_panel_gdi_mirror() {
+    let child_hwnd = panel_gdi_mirror_state()
+        .lock()
+        .ok()
+        .map(|mut state| {
+            state.snapshot.visible = false;
+            state.hwnd
+        })
+        .unwrap_or(0);
+    if child_hwnd != 0 && is_window_valid(child_hwnd) {
+        unsafe {
+            let _ = ShowWindow(HWND(child_hwnd as *mut _), SW_HIDE);
+        }
+    }
+}
+
+pub fn panel_gdi_mirror_status(parent_hwnd: isize) -> (bool, bool) {
+    let Ok(state) = panel_gdi_mirror_state().lock() else {
+        return (false, false);
+    };
+    if state.hwnd == 0 || state.snapshot.parent != parent_hwnd || !is_window_valid(state.hwnd) {
+        return (false, false);
+    }
+    (true, is_window_visible(state.hwnd))
+}
+
+/// True once the cached GDI child has been created and its completed pixels are
+/// logically staged for display. Unlike `IsWindowVisible`, this deliberately
+/// remains true while the parent host is still physically hidden for an atomic
+/// reveal; a hidden parent makes Windows report the child as not visible even
+/// though its WS_VISIBLE state and paint are already committed.
+pub fn panel_gdi_mirror_ready(parent_hwnd: isize) -> bool {
+    let Ok(state) = panel_gdi_mirror_state().lock() else {
+        return false;
+    };
+    state.hwnd != 0
+        && state.snapshot.parent == parent_hwnd
+        && state.snapshot.visible
+        && is_window_valid(state.hwnd)
+}
 
 /// Give only the egui/Win32 event-loop thread a small CPU scheduling boost.
 /// This does not change process priority and does not alter capture/render/GPU
@@ -70,20 +2177,23 @@ pub fn set_dark_title_bar(hwnd: isize) {
     }
 }
 
-/// Remove the native maximize command while retaining ordinary resizing and
-/// minimize/close. The GUI has no useful maximized layout and changing its
-/// desktop footprint during capture destabilizes cursor handoff geometry.
-pub fn disable_maximize(hwnd: isize) {
+#[inline]
+fn caption_style_with_disabled_maximize(style: u32) -> u32 {
+    // Keep WS_SYSMENU and WS_MINIMIZEBOX so Close and Minimize remain normal
+    // Windows caption buttons. Clearing only WS_MAXIMIZEBOX leaves the square
+    // Maximize button present but disabled/greyed, matching Neo's older UI.
+    style & !WS_MAXIMIZEBOX.0
+}
+
+/// Keep the standard Close and Minimize glyphs, while disabling only Maximize.
+pub fn disable_native_maximize_button(hwnd: isize) {
     if hwnd == 0 || !is_window_valid(hwnd) {
         return;
     }
     unsafe {
         let h = HWND(hwnd as *mut _);
-        if IsZoomed(h).as_bool() {
-            let _ = ShowWindow(h, SW_RESTORE);
-        }
         let style = GetWindowLongW(h, GWL_STYLE) as u32;
-        let next = style & !WS_MAXIMIZEBOX.0;
+        let next = caption_style_with_disabled_maximize(style);
         if next != style {
             SetWindowLongW(h, GWL_STYLE, next as i32);
             let _ = SetWindowPos(
@@ -94,6 +2204,9 @@ pub fn disable_maximize(hwnd: isize) {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            log::info!(
+                "main-gui-caption-buttons: hwnd={hwnd:#x} close=enabled minimize=enabled maximize=disabled native_titlebar=preserved"
             );
         }
     }
@@ -255,6 +2368,42 @@ pub fn set_window_alpha(hwnd: isize, alpha: u8) {
     }
 }
 
+/// Present a fully opaque UI window through the normal DWM redirection path.
+///
+/// The floating control panel must stay physically visible while capture is
+/// active (hiding its child viewport can stall presentation on some AMD
+/// drivers), but it does not need WS_EX_LAYERED while it is fully opaque.
+/// Keeping an opaque panel layered can make DWM briefly expose the fast-moving
+/// overlay underneath when the GPU compositor is busy. Removing only the
+/// layered bit avoids that extra composition path without changing visibility,
+/// z-order, activation, or input routing. Transparent/lurk states continue to
+/// use `set_window_alpha`, which re-adds WS_EX_LAYERED on demand.
+pub fn set_window_opaque_unlayered(hwnd: isize) {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        log::error!(
+            "foreign-window opaque mutation rejected: hwnd={hwnd:#x} pid={} current_pid={}",
+            window_pid(hwnd),
+            unsafe { GetCurrentProcessId() }
+        );
+        return;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_LAYERED.0 != 0 {
+            // Restore full opacity before leaving layered mode so there is no
+            // transparent transition frame. Do not hide/show the HWND.
+            let _ = SetLayeredWindowAttributes(
+                h,
+                windows::Win32::Foundation::COLORREF(0),
+                255,
+                LWA_ALPHA,
+            );
+            SetWindowLongW(h, GWL_EXSTYLE, (ex & !WS_EX_LAYERED.0) as i32);
+        }
+    }
+}
+
 /// Keep an invisible helper window from intercepting mouse input without
 /// hiding its OpenGL surface. Hiding an eframe child viewport can make AMD's
 /// shared WGL context block while it keeps swapping the hidden surface.
@@ -300,6 +2449,13 @@ pub fn set_window_input_passthrough(hwnd: isize, passthrough: bool) {
     }
 }
 
+pub fn is_window_layered(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe { GetWindowLongW(HWND(hwnd as *mut _), GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0 }
+}
+
 pub fn window_input_passthrough(hwnd: isize) -> bool {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
@@ -309,6 +2465,14 @@ pub fn window_input_passthrough(hwnd: isize) -> bool {
 
 /// Move+resize without activation or z change.
 pub fn set_window_rect(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
+    let panel_size_changed = if is_panel_gdi_host(hwnd) {
+        match window_rect(hwnd) {
+            Some((_, _, old_w, old_h)) => old_w != w || old_h != h,
+            None => true,
+        }
+    } else {
+        false
+    };
     unsafe {
         let _ = SetWindowPos(
             HWND(hwnd as *mut _),
@@ -320,16 +2484,49 @@ pub fn set_window_rect(hwnd: isize, x: i32, y: i32, w: i32, h: i32) {
             SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOZORDER,
         );
     }
+    if panel_size_changed {
+        apply_panel_gdi_host_round_region(hwnd, w.max(1), h.max(1));
+    }
 }
 
 pub fn is_maximized(hwnd: isize) -> bool {
     unsafe { IsZoomed(HWND(hwnd as *mut _)).as_bool() }
 }
 
-/// True for a borderless/browser video window whose outer rectangle covers
-/// its monitor. Resizing such a window changes the hidden browser surface
-/// while Windows keeps fullscreen cursor coordinates, so capture-resolution
-/// overrides must be ignored for that session.
+/// Stable subset of Win32 presentation/chrome state used to distinguish an
+/// application-owned fullscreen transition from a monitor-sized window that
+/// Neo created with SetWindowPos. Z-order bits such as WS_EX_TOPMOST are
+/// deliberately excluded because Neo temporarily changes those itself.
+pub fn fullscreen_presentation_signature(hwnd: isize) -> Option<(u32, u32, bool)> {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return None;
+    }
+    unsafe {
+        let style = GetWindowLongW(HWND(hwnd as *mut _), GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(HWND(hwnd as *mut _), GWL_EXSTYLE) as u32;
+        let style_mask = WS_CAPTION.0
+            | WS_THICKFRAME.0
+            | WS_SYSMENU.0
+            | WS_MINIMIZEBOX.0
+            | WS_MAXIMIZEBOX.0
+            | WS_MAXIMIZE.0;
+        let ex_style_mask = WS_EX_DLGMODALFRAME.0
+            | WS_EX_CLIENTEDGE.0
+            | WS_EX_WINDOWEDGE.0
+            | WS_EX_TOOLWINDOW.0
+            | WS_EX_APPWINDOW.0;
+        Some((
+            style & style_mask,
+            ex_style & ex_style_mask,
+            IsZoomed(HWND(hwnd as *mut _)).as_bool(),
+        ))
+    }
+}
+
+/// True when a source window's outer rectangle covers its monitor.
+/// Such monitor-covering sources are treated as geometry-sensitive fullscreen
+/// surfaces: Neo must avoid source-side resize/Z-order mutations that could
+/// change the application's own layout or presentation geometry.
 pub fn is_monitor_fullscreen(hwnd: isize) -> bool {
     let Some(window) = window_rect(hwnd) else {
         return false;
@@ -384,6 +2581,15 @@ pub fn any_mouse_button_down() -> bool {
             .into_iter()
             .any(|vk| GetAsyncKeyState(vk.0 as i32) < 0)
     }
+}
+
+/// True only while the physical left mouse button is held.
+///
+/// Kept separate from `any_mouse_button_down()` because client-surface window
+/// dragging (Chromium PIP/custom frames) must never be inferred from a right
+/// click or middle-button gesture.
+pub fn left_mouse_button_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 }
 }
 
 fn fit_axis_to_bounds(pos: i32, size: i32, bounds_pos: i32, bounds_size: i32) -> i32 {
@@ -1049,6 +3255,499 @@ pub fn raise_topmost(hwnd: isize) {
     }
 }
 
+/// Recommit the fullscreen WGL overlay into USER32's TOPMOST band, then
+/// immediately place the visible panel above it.  This is intentionally used
+/// only by the GUI-topmost-OFF helper path.  On the RX 9060 XT reproduction,
+/// opening an mpv popup makes the missing panel/cursor appear immediately,
+/// which proves that a top-level z-order/compositor transaction can repair the
+/// presentation even though GetWindow already reports the logical order as
+/// correct.  Recommitting the overlay first and helpers second reproduces that
+/// transaction without requiring an external popup.
+pub fn recommit_overlay_below_helpers(panel_hwnd: isize, overlay_hwnd: isize) {
+    if overlay_hwnd == 0 || !is_window_valid(overlay_hwnd) || !is_own_window(overlay_hwnd) {
+        return;
+    }
+    unsafe {
+        let flags = SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOACTIVATE
+            | SWP_NOSENDCHANGING
+            | SWP_NOOWNERZORDER;
+        let _ = SetWindowPos(
+            HWND(overlay_hwnd as *mut _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            flags,
+        );
+    }
+    if panel_hwnd != 0
+        && is_window_valid(panel_hwnd)
+        && is_own_window(panel_hwnd)
+        && is_window_visible(panel_hwnd)
+    {
+        raise_topmost(panel_hwnd);
+        request_window_repaint(panel_hwnd);
+    }
+}
+
+/// Return visible top-level HWNDs belonging to `pid` in current top-to-bottom
+/// z-order. Used by the compositor diagnostics to detect source-owned popup
+/// creation/removal (for example mpv's right-click menu).
+pub fn visible_top_level_windows_for_pid(pid: u32, limit: usize) -> Vec<isize> {
+    if pid == 0 || limit == 0 {
+        return Vec::new();
+    }
+    unsafe {
+        let mut out = Vec::new();
+        let mut hwnd = GetTopWindow(None).unwrap_or_default();
+        let mut guard = 0usize;
+        while !hwnd.0.is_null() && guard < 4096 && out.len() < limit {
+            let raw = hwnd.0 as isize;
+            if window_pid(raw) == pid && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+                out.push(raw);
+            }
+            hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+            guard += 1;
+        }
+        out
+    }
+}
+
+fn z_prev(hwnd: isize) -> isize {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return 0;
+    }
+    unsafe { GetWindow(HWND(hwnd as *mut _), GW_HWNDPREV).unwrap_or_default().0 as isize }
+}
+
+fn z_next(hwnd: isize) -> isize {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return 0;
+    }
+    unsafe { GetWindow(HWND(hwnd as *mut _), GW_HWNDNEXT).unwrap_or_default().0 as isize }
+}
+
+fn compact_window_diag(hwnd: isize) -> String {
+    if hwnd == 0 {
+        return "0".to_string();
+    }
+    let valid = is_window_valid(hwnd);
+    if !valid {
+        return format!("{hwnd:#x}:invalid");
+    }
+    let ex = unsafe { GetWindowLongW(HWND(hwnd as *mut _), GWL_EXSTYLE) as u32 };
+    format!(
+        "{:#x}[pid={} cls='{}' title='{}' vis={} min={} top={} cloak={} owner={:#x} prev={:#x} next={:#x} ex={:#010x} rect={:?}]",
+        hwnd,
+        window_pid(hwnd),
+        window_class(hwnd),
+        window_title(hwnd).replace('\n', " ").chars().take(80).collect::<String>(),
+        is_window_visible(hwnd),
+        is_minimized(hwnd),
+        is_topmost(hwnd),
+        is_cloaked(hwnd),
+        window_owner(hwnd),
+        z_prev(hwnd),
+        z_next(hwnd),
+        ex,
+        window_rect(hwnd),
+    )
+}
+
+fn rgb_abs_delta(a: u32, b: u32) -> u32 {
+    let ar = a & 0xff;
+    let ag = (a >> 8) & 0xff;
+    let ab = (a >> 16) & 0xff;
+    let br = b & 0xff;
+    let bg = (b >> 8) & 0xff;
+    let bb = (b >> 16) & 0xff;
+    ar.abs_diff(br) + ag.abs_diff(bg) + ab.abs_diff(bb)
+}
+
+/// Compare the pixels painted by the native panel child with the pixels that
+/// the desktop DC reports at the panel's screen rectangle. This is deliberately
+/// independent from IsWindowVisible/TOPMOST: the RX 9060 XT failure reports
+/// those API states as correct even while the user cannot see the helper.
+///
+/// The desktop DC is still a diagnostic proxy (hardware overlay/MPO scanout is
+/// not guaranteed to be observable through every capture API), so callers must
+/// log this as a screen-sample result rather than an infallible DWM truth.
+pub fn panel_screen_visibility_probe(panel_hwnd: isize) -> Option<(usize, usize, u32)> {
+    if panel_hwnd == 0 || !is_window_valid(panel_hwnd) || !is_window_visible(panel_hwnd) {
+        return None;
+    }
+    let (child_hwnd, snapshot) = {
+        let state = panel_gdi_mirror_state().lock().ok()?;
+        if state.hwnd == 0
+            || !is_window_valid(state.hwnd)
+            || state.snapshot.parent != panel_hwnd
+            || !state.snapshot.visible
+        {
+            return None;
+        }
+        (state.hwnd, state.snapshot.clone())
+    };
+    let (sx, sy, sw, sh) = window_rect(panel_hwnd)?;
+    let w = snapshot.width.min(sw).max(1);
+    let h = snapshot.height.min(sh).max(1);
+    unsafe {
+        let screen_dc = GetDC(None);
+        let child_dc = GetDC(Some(HWND(child_hwnd as *mut _)));
+        if screen_dc.is_invalid() || child_dc.is_invalid() {
+            if !screen_dc.is_invalid() {
+                let _ = ReleaseDC(None, screen_dc);
+            }
+            if !child_dc.is_invalid() {
+                let _ = ReleaseDC(Some(HWND(child_hwnd as *mut _)), child_dc);
+            }
+            return None;
+        }
+
+        // Spread samples over the complete 297x33 bar. Comparing against the
+        // mirror's own pixels makes the probe valid for localized text, hover,
+        // screenshot feedback, chip mode and DPI-scaled panel geometry.
+        let xs = [2, w / 4, w / 2, w * 3 / 4, w - 3];
+        let ys = [2, h / 2, h - 3];
+        let mut matched = 0usize;
+        let mut sampled = 0usize;
+        let mut delta_sum = 0u64;
+        for &x0 in &xs {
+            for &y0 in &ys {
+                let x = x0.clamp(0, w - 1);
+                let y = y0.clamp(0, h - 1);
+                let expected = GetPixel(child_dc, x, y).0;
+                let actual = GetPixel(screen_dc, sx + x, sy + y).0;
+                if expected == 0xffff_ffff || actual == 0xffff_ffff {
+                    continue;
+                }
+                let delta = rgb_abs_delta(expected, actual);
+                // 24 total RGB levels tolerates small desktop color-management
+                // or GDI rounding differences while still rejecting video pixels.
+                if delta <= 24 {
+                    matched += 1;
+                }
+                sampled += 1;
+                delta_sum += delta as u64;
+            }
+        }
+        let _ = ReleaseDC(Some(HWND(child_hwnd as *mut _)), child_dc);
+        let _ = ReleaseDC(None, screen_dc);
+        if sampled == 0 {
+            None
+        } else {
+            Some((matched, sampled, (delta_sum / sampled as u64) as u32))
+        }
+    }
+}
+
+fn visibility_probe_state(matched: usize, sampled: usize) -> &'static str {
+    if sampled == 0 {
+        "unknown"
+    } else if matched * 100 >= sampled * 70 {
+        "visible"
+    } else if matched * 100 <= sampled * 40 {
+        "missing"
+    } else {
+        "uncertain"
+    }
+}
+
+/// Log physical-visibility evidence for the two helper surfaces. A WARN with
+/// `helper-visibility-mismatch` is the requested explicit record that USER32
+/// says a helper is visible while screen sampling cannot find its pixels.
+pub fn log_helper_physical_visibility(
+    tag: &str,
+    gui_topmost: bool,
+    panel_hwnd: isize,
+    overlay_hwnd: isize,
+    cursor_hwnd: isize,
+) {
+    let panel_api_visible = panel_hwnd != 0
+        && is_window_valid(panel_hwnd)
+        && is_window_visible(panel_hwnd);
+    let panel_probe = panel_screen_visibility_probe(panel_hwnd);
+    let panel_state = panel_probe
+        .map(|(m, n, _)| visibility_probe_state(m, n))
+        .unwrap_or("unknown");
+    let (cursor_requested, cursor_api_visible, cursor_matched, cursor_sampled, cursor_avg_delta) =
+        crate::input::cursor_sprite_screen_probe();
+    let cursor_state = if !cursor_requested {
+        "not-requested"
+    } else if cursor_sampled == 0 {
+        "unknown"
+    } else {
+        visibility_probe_state(cursor_matched, cursor_sampled)
+    };
+    let panel_ratio = panel_probe
+        .map(|(m, n, _)| format!("{m}/{n}"))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let panel_avg_delta = panel_probe.map(|(_, _, d)| d).unwrap_or(0);
+    let mismatch = (panel_api_visible && panel_state == "missing")
+        || (cursor_requested && cursor_api_visible && cursor_state == "missing");
+    let msg = format!(
+        "tag={tag} probe=desktop-dc gui_topmost={gui_topmost} overlay={overlay_hwnd:#x} panel={panel_hwnd:#x} panel_api_visible={panel_api_visible} panel_screen={panel_state} panel_match={panel_ratio} panel_avg_rgb_delta={panel_avg_delta} cursor={cursor_hwnd:#x} cursor_requested={cursor_requested} cursor_api_visible={cursor_api_visible} cursor_screen={cursor_state} cursor_match={cursor_matched}/{cursor_sampled} cursor_avg_rgb_delta={cursor_avg_delta}"
+    );
+    if mismatch {
+        log::warn!("helper-visibility-mismatch: {msg}");
+    } else {
+        log::info!("helper-visibility-probe: {msg}");
+    }
+}
+
+/// High-value DWM/USER32 snapshot for the GUI-topmost-OFF regression. This is
+/// deliberately verbose but rate-limited by the engine caller. It records the
+/// logical sibling order plus visible source-owned popups so a menu-triggered
+/// compositor repair can be compared with the broken state from one log file.
+pub fn log_helper_compositor_snapshot(
+    tag: &str,
+    gui_hwnd: isize,
+    panel_hwnd: isize,
+    overlay_hwnd: isize,
+    cursor_hwnd: isize,
+    source_hwnd: isize,
+) {
+    if !crate::logging::diagnostics_enabled() {
+        return;
+    }
+    let foreground = foreground_window();
+    log::info!(
+        "helper-compositor-snapshot: tag={} fg={:#x} gui={} panel={} overlay={} cursor={} source={}",
+        tag,
+        foreground,
+        compact_window_diag(gui_hwnd),
+        compact_window_diag(panel_hwnd),
+        compact_window_diag(overlay_hwnd),
+        compact_window_diag(cursor_hwnd),
+        compact_window_diag(source_hwnd),
+    );
+
+    let source_pid = window_pid(source_hwnd);
+    let source_windows = visible_top_level_windows_for_pid(source_pid, 12);
+    let source_desc = source_windows
+        .iter()
+        .map(|&h| compact_window_diag(h))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    log::info!(
+        "helper-compositor-source-windows: tag={} source_pid={} count={} windows={}",
+        tag,
+        source_pid,
+        source_windows.len(),
+        source_desc
+    );
+
+    unsafe {
+        let mut top = GetTopWindow(None).unwrap_or_default();
+        let mut rows = Vec::new();
+        let mut guard = 0usize;
+        while !top.0.is_null() && guard < 4096 && rows.len() < 18 {
+            let raw = top.0 as isize;
+            if IsWindowVisible(top).as_bool() && !IsIconic(top).as_bool() {
+                let pid = window_pid(raw);
+                if pid == GetCurrentProcessId() || pid == source_pid || is_topmost(raw) {
+                    rows.push(compact_window_diag(raw));
+                }
+            }
+            top = GetWindow(top, GW_HWNDNEXT).unwrap_or_default();
+            guard += 1;
+        }
+        log::info!(
+            "helper-compositor-zlist: tag={} rows={}",
+            tag,
+            rows.join(" | ")
+        );
+    }
+}
+
+/// Return the owner HWND of a top-level popup, or 0 when unowned.
+pub fn window_owner(hwnd: isize) -> isize {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return 0;
+    }
+    unsafe {
+        GetWindow(HWND(hwnd as *mut _), GW_OWNER)
+            .unwrap_or_default()
+            .0 as isize
+    }
+}
+
+/// Change the owner of one of Neo's top-level popup helper windows.
+///
+/// For a top-level WS_POPUP, GWLP_HWNDPARENT changes the owner (not the
+/// parent/child relationship). USER32 guarantees that an owned popup remains
+/// above its owner, which is stronger than a passive sibling Z-order query on
+/// the AMD/DWM reproduction. Both HWNDs must belong to this process.
+pub fn set_owned_popup_owner(popup_hwnd: isize, owner_hwnd: isize) {
+    if popup_hwnd == 0 || !is_window_valid(popup_hwnd) || !is_own_window(popup_hwnd) {
+        return;
+    }
+    if owner_hwnd != 0
+        && (!is_window_valid(owner_hwnd) || !is_own_window(owner_hwnd) || popup_hwnd == owner_hwnd)
+    {
+        return;
+    }
+    if window_owner(popup_hwnd) == owner_hwnd {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowLongPtrW(
+            HWND(popup_hwnd as *mut _),
+            GWLP_HWNDPARENT,
+            owner_hwnd,
+        );
+    }
+}
+
+/// Attach/detach the native control panel as an owned popup of the magnified
+/// overlay. The relationship is used only while GUI-topmost is OFF. It does
+/// not involve the main GUI, so the panel never follows GUI minimize/restore or
+/// always-on-top state. Panel visibility remains controlled solely by the
+/// "Show control panel" setting / panel hotkey.
+pub fn set_panel_overlay_owner(panel_hwnd: isize, overlay_hwnd: isize, attach: bool) {
+    set_owned_popup_owner(panel_hwnd, if attach { overlay_hwnd } else { 0 });
+}
+
+/// Keep the floating control panel above the magnified overlay without
+/// continuously promoting it to the front of the TOPMOST band.
+///
+/// The panel, cursor sprite and optional TOPMOST GUI are independent helper
+/// HWNDs. Re-raising the panel on every housekeeping tick creates a visible
+/// intermediate stack (panel > cursor/GUI) before the later cursor/GUI repair,
+/// which DWM can scan out as a one-frame blink. Only perform the heavy repair
+/// when USER32 says the panel actually fell below the overlay.
+pub fn force_panel_above_overlay(panel_hwnd: isize, overlay_hwnd: isize) {
+    let own_live = |hwnd: isize| {
+        hwnd != 0 && is_window_valid(hwnd) && is_own_window(hwnd) && is_window_visible(hwnd)
+    };
+    if !own_live(panel_hwnd) || !own_live(overlay_hwnd) {
+        return;
+    }
+
+    // Keep panel/overlay as independent top-level helpers. A stale owner can
+    // couple panel lifetime to the overlay and is never part of the steady
+    // ordering contract.
+    if window_owner(panel_hwnd) != 0 {
+        set_panel_overlay_owner(panel_hwnd, overlay_hwnd, false);
+    }
+    if !is_topmost(overlay_hwnd) {
+        set_own_topmost(overlay_hwnd, true);
+    }
+    if !is_topmost(panel_hwnd) {
+        set_own_topmost(panel_hwnd, true);
+    }
+
+    // Steady state is intentionally a no-op. In particular, do not call
+    // raise_topmost()+DwmFlush while the cursor is hovering the panel or while
+    // the main GUI overlaps it: that transiently places the panel over the
+    // cursor/GUI and is the source of the visible flashing.
+    if window_is_above(panel_hwnd, overlay_hwnd) {
+        return;
+    }
+
+    log::debug!(
+        "panel-zorder-repair: panel={panel_hwnd:#x} overlay={overlay_hwnd:#x} reason=panel-below-overlay"
+    );
+    raise_topmost(panel_hwnd);
+    request_window_repaint(panel_hwnd);
+    unsafe {
+        let _ = DwmFlush();
+    }
+}
+
+/// Keep the floating control panel independent from the main GUI's
+/// always-on-top preference. When both are live the panel is always TOPMOST
+/// and immediately above the magnified overlay. This function never reads or
+/// mutates the main GUI state and never changes panel visibility.
+pub fn normalize_panel_overlay_stack(panel_hwnd: isize, overlay_hwnd: isize) {
+    let own_live = |hwnd: isize| {
+        hwnd != 0 && is_window_valid(hwnd) && is_own_window(hwnd) && is_window_visible(hwnd)
+    };
+    let panel = if own_live(panel_hwnd) { panel_hwnd } else { 0 };
+    let overlay = if own_live(overlay_hwnd) { overlay_hwnd } else { 0 };
+    if overlay == 0 {
+        return;
+    }
+    if panel != 0 {
+        force_panel_above_overlay(panel, overlay);
+    } else if !is_topmost(overlay) {
+        set_own_topmost(overlay, true);
+    }
+}
+
+/// Normalize Neo's owned topmost siblings without activating any of them.
+/// Desired order is GUI > panel > overlay when GUI-topmost is ON. When it is
+/// OFF, the GUI is left entirely alone and the panel is force-reinserted above
+/// the overlay; this is the broken RX 9060 XT path that cannot trust a passive
+/// GetWindow z-order query.
+pub fn normalize_neo_topmost_stack(
+    gui_hwnd: isize,
+    gui_topmost: bool,
+    panel_hwnd: isize,
+    overlay_hwnd: isize,
+) {
+    let own_live = |hwnd: isize| {
+        hwnd != 0 && is_window_valid(hwnd) && is_own_window(hwnd) && is_window_visible(hwnd)
+    };
+    let gui = if gui_topmost && own_live(gui_hwnd) && !is_minimized(gui_hwnd) {
+        gui_hwnd
+    } else {
+        0
+    };
+    let panel_valid = panel_hwnd != 0 && is_window_valid(panel_hwnd) && is_own_window(panel_hwnd);
+    let panel = if own_live(panel_hwnd) { panel_hwnd } else { 0 };
+    let overlay = if own_live(overlay_hwnd) { overlay_hwnd } else { 0 };
+
+    // v235 never coupled panel/cursor lifetime to the overlay through GW_OWNER.
+    // Always clean up a stale owner relationship before doing ordinary TOPMOST
+    // ordering. This makes GUI-topmost OFF, GUI minimize and panel visibility
+    // independent again.
+    if panel_valid && window_owner(panel_hwnd) != 0 {
+        set_owned_popup_owner(panel_hwnd, 0);
+    }
+
+    if overlay == 0 {
+        keep_gui_transition_snapshot_topmost();
+        return;
+    }
+    if !is_topmost(overlay) {
+        set_own_topmost(overlay, true);
+    }
+
+    if panel != 0 {
+        // This is now a conditional repair. When panel > overlay is already
+        // true it must not perturb the cursor/GUI sibling order.
+        force_panel_above_overlay(panel, overlay);
+    }
+
+    if gui == 0 {
+        // GUI-topmost OFF: leave the GUI untouched. Panel/cursor ordering is
+        // stable because the steady panel path above performs no front-raise.
+        keep_gui_transition_snapshot_topmost();
+        return;
+    }
+
+    if !is_topmost(gui) {
+        set_own_topmost(gui, true);
+    }
+
+    // GUI is the highest ordinary Neo surface. Do not re-raise it every tick;
+    // doing so makes it race the panel/cursor TOPMOST helpers. Repair only when
+    // the observed sibling order is actually wrong. The cursor sprite is raised
+    // separately by the input owner and remains the visual pointer above GUI.
+    let gui_below_panel = panel != 0 && !window_is_above(gui, panel);
+    let gui_below_overlay = !window_is_above(gui, overlay);
+    if gui_below_panel || gui_below_overlay {
+        log::debug!(
+            "neo-topmost-zorder-repair: gui={gui:#x} panel={panel:#x} overlay={overlay:#x} below_panel={gui_below_panel} below_overlay={gui_below_overlay}"
+        );
+        raise_topmost(gui);
+    }
+    keep_gui_transition_snapshot_topmost();
+}
+
 pub fn set_visible_no_activate(hwnd: isize, visible: bool) {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         log::error!(
@@ -1474,6 +4173,25 @@ pub fn window_class(hwnd: isize) -> String {
     }
 }
 
+/// Temporarily cloak/uncloak an owned top-level window at the DWM layer.
+/// Used only as a short visual shield around root-GUI WGPU surface resizes;
+/// unlike ShowWindow(SW_HIDE), this keeps the HWND/style/z-order intact.
+pub fn set_window_cloaked(hwnd: isize, cloaked: bool) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return false;
+    }
+    let value: i32 = if cloaked { 1 } else { 0 };
+    unsafe {
+        DwmSetWindowAttribute(
+            HWND(hwnd as *mut _),
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAK,
+            (&value as *const i32).cast(),
+            size_of::<i32>() as u32,
+        )
+        .is_ok()
+    }
+}
+
 /// DWM-cloaked windows (suspended UWP etc.) are invisible to the user.
 pub fn is_cloaked(hwnd: isize) -> bool {
     unsafe {
@@ -1572,8 +4290,22 @@ pub fn monitor_refresh_hz(hwnd: isize) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        explorer_minimal_nudge_x, exposed_strip_around_gui, fit_axis_to_bounds, rect_covers_monitor,
+        WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SIZEBOX, WS_SYSMENU,
+        caption_style_with_disabled_maximize, explorer_minimal_nudge_x, exposed_strip_around_gui,
+        fit_axis_to_bounds, rect_covers_monitor,
     };
+
+    #[test]
+    fn caption_buttons_keep_close_and_minimize_but_disable_maximize() {
+        let style =
+            WS_CAPTION.0 | WS_SIZEBOX.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0;
+        let configured = caption_style_with_disabled_maximize(style);
+        assert_ne!(configured & WS_CAPTION.0, 0);
+        assert_ne!(configured & WS_SIZEBOX.0, 0);
+        assert_ne!(configured & WS_SYSMENU.0, 0);
+        assert_ne!(configured & WS_MINIMIZEBOX.0, 0);
+        assert_eq!(configured & WS_MAXIMIZEBOX.0, 0);
+    }
 
     #[test]
     fn explorer_is_not_moved_when_a_useful_strip_is_already_visible() {

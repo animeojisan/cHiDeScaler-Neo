@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "DirectML 대체: 필터 {count}개",
   "tensorrt.pack_required": "별도로 배포되는 TensorRT Backend Pack이 필요합니다.",
   "tensorrt.unavailable_help": "TensorRT 백엔드를 현재 사용할 수 없습니다. 자세한 원인은 cHiDeScaler-Neo.log를 확인하십시오.",
+  "glsl_overload.auto_stop": "성능이 부족하여 확대를 중지합니다.",
   "glsl_overload.pause": "필터 부하가 너무 높습니다. GUI를 조작하는 동안 응답성을 보호하기 위해 처리를 일시 중지합니다.",
   "glsl_overload.lighter_filter_help": "더 가벼운 필터로 변경하면 이 경고가 해제됩니다.",
   "capture.fullscreen_notice_title": "캡처 해상도",

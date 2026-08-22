@@ -1,12 +1,20 @@
 //! mpv user-shader (.glsl hook) parser: passes, directives, RPN size exprs.
 //!
 //! Supported grammar (fragment-shader subset):
-//!   //!HOOK (multiple) / BIND (multiple) / SAVE / WIDTH / HEIGHT
+//!   //!HOOK (multiple) / BIND (multiple) / SAVE / WIDTH / HEIGHT / OFFSET
 //!   / COMPONENTS / WHEN / DESC — a directive after body lines starts a new pass.
 //!   WIDTH/HEIGHT/WHEN are RPN over NAME.w/NAME.h, literals and + - * / > < >= <= =
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum PassOffset {
+    #[default]
+    None,
+    Pixels(f32, f32),
+    Align,
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct Pass {
@@ -15,6 +23,7 @@ pub struct Pass {
     pub save: Option<String>,
     pub width: Option<String>,
     pub height: Option<String>,
+    pub offset: PassOffset,
     pub compute: Option<ComputeSpec>,
     pub components: u8,
     pub when: Option<String>,
@@ -270,9 +279,10 @@ pub struct UserShader {
     pub source_hash: u64,
     pub passes: Vec<Pass>,
     pub is_rgb: bool,
-    /// Uses mpv YUV planes (LUMA/CHROMA). RGB capture sources need these planes
-    /// emulated, otherwise many mpv shaders silently do little or nothing.
-    pub uses_yuv: bool,
+    /// Requires an actual CHROMA plane. LUMA-only shaders (FSRCNNX/RAVU-lite)
+    /// do not need full YUV emulation: they can preserve the original RGB
+    /// chroma and substitute only the processed luma.
+    pub uses_chroma: bool,
     pub is_compute: bool,
     /// hooks only OUTPUT/SCALED etc: runs on the final display-size image
     /// after scaling, not on the source planes
@@ -295,7 +305,7 @@ impl UserShader {
         let (passes, params, textures) = parse_passes(src);
         let passes = expand_multi_hook_passes(passes);
         let mut hooks_rgb = false;
-        let mut uses_yuv = false;
+        let mut uses_chroma = false;
         let mut is_compute = false;
         let mut any_hook = false;
         let mut all_post = true;
@@ -305,16 +315,16 @@ impl UserShader {
                 if is_color_hook(h) {
                     hooks_rgb = true;
                 }
-                if is_yuv_hook(h) {
-                    uses_yuv = true;
+                if is_chroma_hook(h) {
+                    uses_chroma = true;
                 }
                 if !is_post_hook(h) {
                     all_post = false;
                 }
             }
             for b in &p.binds {
-                if is_yuv_hook(&b.to_uppercase()) {
-                    uses_yuv = true;
+                if is_chroma_hook(&b.to_uppercase()) {
+                    uses_chroma = true;
                 }
             }
         }
@@ -326,7 +336,7 @@ impl UserShader {
             source_hash,
             passes,
             is_rgb: hooks_rgb,
-            uses_yuv,
+            uses_chroma,
             is_compute,
             is_post: any_hook && all_post,
             params,
@@ -484,6 +494,7 @@ fn parse_passes(src: &str) -> (Vec<Pass>, Vec<Param>, Vec<ShaderTexture>) {
                 "SAVE" => p.save = Some(val),
                 "WIDTH" => p.width = Some(val),
                 "HEIGHT" => p.height = Some(val),
+                "OFFSET" => p.offset = parse_offset(&val),
                 "COMPUTE" => p.compute = parse_compute(&val),
                 "COMPONENTS" => {
                     p.components = val
@@ -534,6 +545,17 @@ fn parse_passes(src: &str) -> (Vec<Pass>, Vec<Param>, Vec<ShaderTexture>) {
     )
 }
 
+fn parse_offset(val: &str) -> PassOffset {
+    if val.trim().eq_ignore_ascii_case("ALIGN") {
+        return PassOffset::Align;
+    }
+    let mut it = val.split_whitespace().filter_map(|v| v.parse::<f32>().ok());
+    match (it.next(), it.next()) {
+        (Some(x), Some(y)) => PassOffset::Pixels(x, y),
+        _ => PassOffset::None,
+    }
+}
+
 fn parse_compute(val: &str) -> Option<ComputeSpec> {
     let nums: Vec<u32> = val
         .split_whitespace()
@@ -558,8 +580,8 @@ fn is_color_hook(h: &str) -> bool {
     )
 }
 
-fn is_yuv_hook(h: &str) -> bool {
-    matches!(h, "LUMA" | "CHROMA")
+fn is_chroma_hook(h: &str) -> bool {
+    h == "CHROMA"
 }
 
 fn is_post_hook(h: &str) -> bool {
@@ -775,6 +797,37 @@ mod tests {
         assert!(t.f16);
         assert_eq!(t.comps, 1);
         assert_eq!(t.data, half::f16::from_f32(1.0).to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn parse_offset_directive_and_align() {
+        let numeric = UserShader::parse(
+            "offset.glsl",
+            "//!HOOK MAIN\n//!BIND HOOKED\n//!OFFSET -0.5 1.25\nvec4 hook(){return HOOKED_tex(HOOKED_pos);}\n",
+        );
+        assert_eq!(numeric.passes[0].offset, PassOffset::Pixels(-0.5, 1.25));
+
+        let align = UserShader::parse(
+            "align.glsl",
+            "//!HOOK MAIN\n//!BIND HOOKED\n//!OFFSET ALIGN\nvec4 hook(){return HOOKED_tex(HOOKED_pos);}\n",
+        );
+        assert_eq!(align.passes[0].offset, PassOffset::Align);
+    }
+
+    #[test]
+    fn luma_only_shader_does_not_require_chroma_emulation() {
+        let luma_only = UserShader::parse(
+            "fsrcnnx.glsl",
+            "//!HOOK LUMA\n//!BIND LUMA\nvec4 hook(){return vec4(LUMA_tex(LUMA_pos));}\n",
+        );
+        assert!(!luma_only.is_rgb);
+        assert!(!luma_only.uses_chroma);
+
+        let chroma = UserShader::parse(
+            "chroma.glsl",
+            "//!HOOK CHROMA\n//!BIND CHROMA\nvec4 hook(){return CHROMA_tex(CHROMA_pos);}\n",
+        );
+        assert!(chroma.uses_chroma);
     }
 
     #[test]

@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "DirectML-Ausweichmodus: {count} Filter",
   "tensorrt.pack_required": "Das separat bereitgestellte TensorRT Backend Pack ist erforderlich.",
   "tensorrt.unavailable_help": "Das TensorRT-Backend ist derzeit nicht verfügbar. Weitere Einzelheiten stehen in cHiDeScaler-Neo.log.",
+  "glsl_overload.auto_stop": "Leistung unzureichend. Die Vergrößerung wird beendet.",
   "glsl_overload.pause": "Der Filter ist überlastet. Während der GUI-Bedienung wird die Verarbeitung pausiert, um die Reaktionsfähigkeit zu schützen.",
   "glsl_overload.lighter_filter_help": "Wechseln Sie zu einem leichteren Filter, um diese Warnung zu löschen.",
   "capture.fullscreen_notice_title": "Aufnahmeauflösung",

@@ -118,6 +118,7 @@
   "tensorrt.directml_fallback_count": "Repli DirectML : {count} filtre(s)",
   "tensorrt.pack_required": "Le TensorRT Backend Pack distribué séparément est requis.",
   "tensorrt.unavailable_help": "Le moteur TensorRT est actuellement indisponible. Consultez cHiDeScaler-Neo.log pour plus de détails.",
+  "glsl_overload.auto_stop": "Performances insuffisantes. L’agrandissement va s’arrêter.",
   "glsl_overload.pause": "Le filtre est en surcharge. Le traitement est suspendu pendant l’utilisation de l’interface afin de préserver sa réactivité.",
   "glsl_overload.lighter_filter_help": "Passez à un filtre plus léger pour effacer cet avertissement.",
   "capture.fullscreen_notice_title": "Résolution de capture",

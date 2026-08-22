@@ -10,7 +10,7 @@ use super::mpv::UserShader;
 use super::onnx_stage::{OnnxProvider, OnnxStage};
 use crate::core::config::{OnnxBackendPreference, StageKind, StageSpec, resolve_path};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 // ONNX stages are Arc<Mutex<…>> (not Rc<RefCell<…>>) so frame-interpolation
@@ -18,6 +18,13 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const BUILTIN_NEOFLOW_ENABLED: bool = false;
+
+// DirectML temporal restoration models have shown corrupted output and a very
+// steep cost increase at high input resolutions. Keep only the temporal ONNX
+// inference at <=1080 pixels high, preserving aspect ratio; following stages
+// can upscale again normally. TensorRT/CUDA, single-frame ONNX and frame
+// interpolation are intentionally untouched.
+const DIRECTML_TEMPORAL_MAX_HEIGHT: i32 = 1080;
 
 pub enum Stage {
     Glsl {
@@ -116,6 +123,7 @@ pub struct StageFactory {
     trt_cache_root: PathBuf,
     shaders: HashMap<String, Rc<UserShader>>,
     onnx: HashMap<OnnxCacheKey, (Arc<Mutex<OnnxStage>>, bool)>,
+    onnx_lru: VecDeque<OnnxCacheKey>,
 }
 
 impl StageFactory {
@@ -128,6 +136,7 @@ impl StageFactory {
             trt_device_id: None,
             shaders: HashMap::new(),
             onnx: HashMap::new(),
+            onnx_lru: VecDeque::new(),
         }
     }
 
@@ -178,6 +187,7 @@ impl StageFactory {
             trt_cache_root,
             shaders: self.shaders.clone(),
             onnx: HashMap::new(),
+            onnx_lru: VecDeque::new(),
         }
     }
 
@@ -227,11 +237,11 @@ impl StageFactory {
                         let shader =
                             UserShader::load(&key).map_err(|e| anyhow!("load {key}: {e}"))?;
                         log::info!(
-                            "glsl-load: name={} passes={} rgb={} yuv_emulation={} compute={} post={}",
+                            "glsl-load: name={} passes={} rgb={} chroma_emulation={} compute={} post={}",
                             shader.name(),
                             shader.passes.len(),
                             shader.is_rgb,
-                            shader.uses_yuv,
+                            shader.uses_chroma,
                             shader.is_compute,
                             shader.is_post
                         );
@@ -261,7 +271,14 @@ impl StageFactory {
                     trt_device: self.trt_device_id,
                 };
                 let (stage, is_interp) = match self.onnx.get(&cache_key) {
-                    Some((s, is_interp)) => (s.clone(), *is_interp),
+                    Some((s, is_interp)) => {
+                        log::info!(
+                            "onnx-session-cache-hit: model={} backend={:?} policy=warm-restart",
+                            name,
+                            self.onnx_preference
+                        );
+                        (s.clone(), *is_interp)
+                    }
                     None => {
                         let s = Arc::new(Mutex::new(OnnxStage::load_with_preference(
                             &path,
@@ -289,6 +306,7 @@ impl StageFactory {
                         (s, is_interp)
                     }
                 };
+                self.touch_onnx_cache_key(&cache_key);
                 Ok(Stage::Onnx {
                     name,
                     key,
@@ -299,19 +317,96 @@ impl StageFactory {
         }
     }
 
+    fn touch_onnx_cache_key(&mut self, key: &OnnxCacheKey) {
+        self.onnx_lru.retain(|existing| existing != key);
+        self.onnx_lru.push_back(key.clone());
+    }
+
     fn prune_onnx_to(&mut self, stages: &[Stage]) {
-        let keep: HashSet<&str> = stages
+        let active_paths: HashSet<&str> = stages
             .iter()
             .filter_map(|st| match st {
                 Stage::Onnx { key, .. } => Some(key.as_str()),
                 _ => None,
             })
             .collect();
-        self.onnx.retain(|key, _| keep.contains(key.path.as_str()));
+
+        // DirectML sessions are cheap to recreate and keep the historical
+        // single-chain cache policy. TensorRT is different: the serialized
+        // engine may already exist on disk while recreating the ORT/TRT
+        // execution session still makes the first live invocation visibly
+        // cold. Keep a very small MRU set so preset A -> B -> A does not throw
+        // away the already-warm TensorRT session. The bound prevents long-run
+        // VRAM/process growth when users browse many presets.
+        const MAX_TENSORRT_WARM_SESSIONS: usize = 3;
+        if self.onnx_preference != OnnxBackendPreference::TensorRT {
+            self.onnx
+                .retain(|key, _| active_paths.contains(key.path.as_str()));
+        } else {
+            let mut keep: HashSet<OnnxCacheKey> = self
+                .onnx
+                .keys()
+                .filter(|key| active_paths.contains(key.path.as_str()))
+                .cloned()
+                .collect();
+            let target = MAX_TENSORRT_WARM_SESSIONS.max(keep.len());
+            for key in self.onnx_lru.iter().rev() {
+                if keep.len() >= target {
+                    break;
+                }
+                if key.preference == OnnxBackendPreference::TensorRT && self.onnx.contains_key(key)
+                {
+                    keep.insert(key.clone());
+                }
+            }
+            let before = self.onnx.len();
+            self.onnx.retain(|key, _| keep.contains(key));
+            let dropped = before.saturating_sub(self.onnx.len());
+            if dropped > 0 {
+                log::info!(
+                    "onnx-session-preset-cache: kept={} dropped={} limit={} policy=tensorrt-mru",
+                    self.onnx.len(),
+                    dropped,
+                    MAX_TENSORRT_WARM_SESSIONS
+                );
+            }
+        }
+        let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
+        self.onnx_lru.retain(|key| remaining.contains(key));
+    }
+
+    fn evict_onnx_path(&mut self, path: &str) -> usize {
+        let before = self.onnx.len();
+        self.onnx.retain(|key, _| key.path != path);
+        let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
+        self.onnx_lru.retain(|key| remaining.contains(key));
+        before.saturating_sub(self.onnx.len())
     }
 
     pub fn clear_onnx_cache(&mut self) {
         self.onnx.clear();
+        self.onnx_lru.clear();
+    }
+
+    /// Capture Stop must release per-capture GL/CUDA/DML bridges, but a TensorRT
+    /// ORT session is intentionally kept warm across Stop -> Start. Preset
+    /// changes keep only a bounded recent TensorRT MRU set via `prune_onnx_to`,
+    /// while real backend/GPU/geometry changes continue to clear everything.
+    pub fn retain_tensorrt_sessions_for_capture_restart(&mut self) -> usize {
+        let before = self.onnx.len();
+        self.onnx
+            .retain(|key, _| key.preference == OnnxBackendPreference::TensorRT);
+        let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
+        self.onnx_lru.retain(|key| remaining.contains(key));
+        let kept = self.onnx.len();
+        if before != kept || kept > 0 {
+            log::info!(
+                "onnx-session-restart-cache: kept_tensorrt={} dropped_non_tensorrt={} policy=warm-restart",
+                kept,
+                before.saturating_sub(kept)
+            );
+        }
+        kept
     }
 }
 
@@ -343,6 +438,38 @@ fn disambiguate_stage_metric_labels(names: &[String]) -> Vec<String> {
 pub struct FilterChain {
     pub stages: Vec<Stage>,
     neodeint_bypass: bool,
+    dml_temporal_limit_log_keys: HashSet<(usize, i32, i32, i32, i32)>,
+}
+
+fn directml_temporal_limited_size(w: i32, h: i32) -> Option<(i32, i32)> {
+    if w <= 0 || h <= DIRECTML_TEMPORAL_MAX_HEIGHT {
+        return None;
+    }
+    let scaled = (w as f64 * DIRECTML_TEMPORAL_MAX_HEIGHT as f64 / h as f64).round() as i32;
+    let limited_w = ((scaled.max(2) + 1) / 2) * 2;
+    Some((limited_w, DIRECTML_TEMPORAL_MAX_HEIGHT))
+}
+
+fn log_directml_temporal_height_limit(
+    keys: &mut HashSet<(usize, i32, i32, i32, i32)>,
+    stage_index: usize,
+    name: &str,
+    source: (i32, i32),
+    limited: (i32, i32),
+) {
+    let key = (stage_index, source.0, source.1, limited.0, limited.1);
+    if keys.insert(key) {
+        log::info!(
+            "directml-temporal-height-limit: model={} source={}x{} limited={}x{} max_height={} stage_index={} scaler=spline36 policy=always-for-directml-temporal",
+            name,
+            source.0,
+            source.1,
+            limited.0,
+            limited.1,
+            DIRECTML_TEMPORAL_MAX_HEIGHT,
+            stage_index
+        );
+    }
 }
 
 impl FilterChain {
@@ -428,12 +555,23 @@ impl FilterChain {
     }
 
     /// OUTPUT/SCALED-hook shaders (sharpeners): the engine runs these on the
-    /// final display-size image after downscaling.
-    pub fn post_shaders(&self) -> Vec<Rc<UserShader>> {
+    /// final display-size image after downscaling. Return the same stable
+    /// per-stage metric label used by the ordinary in-chain GLSL path so post
+    /// shaders participate in GPU timer statistics as well.
+    pub fn post_shaders_with_metric_labels(&self) -> Vec<(String, Rc<UserShader>)> {
+        let metric_names = self
+            .stages
+            .iter()
+            .map(Stage::metrics_name)
+            .collect::<Vec<_>>();
+        let metric_labels = disambiguate_stage_metric_labels(&metric_names);
         self.stages
             .iter()
-            .filter_map(|st| match st {
-                Stage::Glsl { shader, .. } if shader.is_post => Some(shader.clone()),
+            .enumerate()
+            .filter_map(|(index, st)| match st {
+                Stage::Glsl { shader, .. } if shader.is_post => {
+                    Some((metric_labels[index].clone(), shader.clone()))
+                }
                 _ => None,
             })
             .collect()
@@ -482,6 +620,12 @@ impl FilterChain {
             .any(|stage| matches!(stage, Stage::Onnx { .. }))
     }
 
+    pub fn has_glsl(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|stage| matches!(stage, Stage::Glsl { .. }))
+    }
+
     pub fn has_neodeint(&self) -> bool {
         self.stages
             .iter()
@@ -528,6 +672,103 @@ impl FilterChain {
                 }
             )
         })
+    }
+
+    pub fn has_glsl_in_range(&self, start_index: usize) -> bool {
+        self.stages
+            .iter()
+            .skip(start_index)
+            .any(|stage| matches!(stage, Stage::Glsl { .. }))
+    }
+
+    pub fn interp_provider(&self) -> Option<OnnxProvider> {
+        self.stages.iter().find_map(|stage| match stage {
+            Stage::Onnx {
+                stage,
+                is_interp: true,
+                ..
+            } => Some(
+                stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| {
+                        log::error!(
+                            "onnx-stage-lock-poisoned: action=recover-for-interp-provider"
+                        );
+                        poisoned.into_inner()
+                    })
+                    .provider,
+            ),
+            _ => None,
+        })
+    }
+
+    /// Recreate only the active DirectML interpolation session after a live
+    /// chain edit changes the stages that feed it. DirectML/ORT can retain
+    /// shape-specialized execution state even after the per-capture GPU bridge
+    /// has been rebuilt for the new input size; Stop/Start fixed that state by
+    /// dropping the non-TensorRT session. Keep TensorRT warm and leave unrelated
+    /// ONNX stages untouched.
+    pub fn rebuild_directml_interpolation_session(
+        &mut self,
+        factory: &mut StageFactory,
+    ) -> Result<bool> {
+        let Some(index) = self.interp_index() else {
+            return Ok(false);
+        };
+        let key = match &self.stages[index] {
+            Stage::Onnx {
+                key,
+                stage,
+                is_interp: true,
+                ..
+            } => {
+                let provider = stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| {
+                        log::error!(
+                            "onnx-stage-lock-poisoned: action=recover-for-directml-interp-rebuild"
+                        );
+                        poisoned.into_inner()
+                    })
+                    .provider;
+                if provider != OnnxProvider::DirectML {
+                    return Ok(false);
+                }
+                key.clone()
+            }
+            _ => return Ok(false),
+        };
+
+        let evicted = factory.evict_onnx_path(&key);
+        let spec = StageSpec {
+            kind: StageKind::Onnx,
+            path: key.clone(),
+            enabled: true,
+            params: Default::default(),
+        };
+        let replacement = factory.build(&spec).with_context(|| {
+            format!(
+                "rebuild DirectML interpolation session after live pre-chain route change: {}",
+                spec.path
+            )
+        })?;
+        anyhow::ensure!(
+            matches!(
+                &replacement,
+                Stage::Onnx {
+                    is_interp: true,
+                    ..
+                }
+            ),
+            "DirectML interpolation rebuild returned a non-interpolation stage"
+        );
+        self.stages[index] = replacement;
+        log::info!(
+            "directml-interp-session-rebuild: model={} cache_evicted={} result=recreated",
+            key,
+            evicted
+        );
+        Ok(true)
     }
 
     pub fn interpolation_plan(&self) -> Option<(Vec<String>, String, Vec<String>)> {
@@ -702,6 +943,7 @@ impl FilterChain {
             Self {
                 stages,
                 neodeint_bypass,
+                dml_temporal_limit_log_keys: HashSet::new(),
             },
             errors,
         )
@@ -745,6 +987,14 @@ impl FilterChain {
             OnnxProvider::DirectML => format!("{name} [DirectML]"),
             OnnxProvider::Cuda => format!("{name} [CUDA]"),
         };
+        // Let the ordinary GPU chain own over-limit DirectML temporal input so
+        // its Spline36 1080p safety cap is applied before this first stage.
+        // Returning None only bypasses this specialized raw-RGBA fast path.
+        if stage.is_directml_temporal_filter()
+            && directml_temporal_limited_size(w, h).is_some()
+        {
+            return Ok(None);
+        }
         stage.prepare_tensorrt_input_shape(w, h);
         super::onnx_stage::mark_tensorrt_model_started(&stage.name);
         let tex = if stage.should_try_tensorrt_gpu_texture(w, h) {
@@ -810,10 +1060,27 @@ impl FilterChain {
             .map(Stage::metrics_name)
             .collect::<Vec<_>>();
         let metric_labels = disambiguate_stage_metric_labels(&metric_names);
+        // Timer-query results normally become available a few frames after
+        // submission. Polling availability is non-blocking, so statistics do
+        // not insert glFinish or otherwise disturb the measured frame rate.
+        if let Some(p) = probe.as_deref_mut() {
+            for (label, gpu_ms) in gc.poll_gpu_timers() {
+                p(&label, StageKind::Glsl, gpu_ms);
+            }
+        }
         // mpv `frame` builtin: one tick per processed frame (interpolated
         // in-betweens each count as a frame, like mpv's own interpolation)
         crate::render::glsl_engine::advance_frame();
         let range_end = end_index.min(self.stages.len());
+        // When the engine enters the chain after its interpolation stage, the
+        // input texture is already a GPU-resident interpolated frame.  Preserve
+        // that residency for following DirectML image models instead of forcing
+        // a GPU -> CPU -> DML -> CPU -> GPU round-trip.
+        let after_interpolation = self
+            .interp_index()
+            .is_some_and(|interp_index| start_index > interp_index);
+        let neodeint_bypass = self.neodeint_bypass;
+        let dml_temporal_limit_log_keys = &mut self.dml_temporal_limit_log_keys;
         for (stage_index, stage) in self
             .stages
             .iter_mut()
@@ -821,7 +1088,7 @@ impl FilterChain {
             .take(range_end)
             .skip(start_index)
         {
-            if self.neodeint_bypass
+            if neodeint_bypass
                 && matches!(
                     stage,
                     Stage::Glsl { name, .. } if name == "NeoDeint.glsl"
@@ -830,14 +1097,24 @@ impl FilterChain {
                 continue;
             }
             let handled_by_engine = stage.is_interp();
-            let t0 = (probe.is_some() && !handled_by_engine).then(|| std::time::Instant::now());
+            let stage_kind = stage.kind();
+            let t0 = (probe.is_some() && !handled_by_engine && stage_kind != StageKind::Glsl)
+                .then(std::time::Instant::now);
             match stage {
                 Stage::Glsl { shader, .. } if shader.is_post => {
                     // post-stage (OUTPUT/SCALED hook): applied after the
                     // final downscale, not here
                 }
                 Stage::Glsl { shader, .. } => {
-                    cur = GlslEngine::apply(gc, shader, cur, out_size).with_context(|| {
+                    let timer = probe
+                        .is_some()
+                        .then(|| gc.begin_gpu_timer(&metric_labels[stage_index]))
+                        .flatten();
+                    let applied = GlslEngine::apply(gc, shader, cur, out_size);
+                    if let Some(query) = timer {
+                        gc.end_gpu_timer(query, metric_labels[stage_index].clone());
+                    }
+                    cur = applied.with_context(|| {
                         format!("GLSL stage failed: {} ({})", shader.name(), shader.path)
                     })?;
                 }
@@ -851,11 +1128,51 @@ impl FilterChain {
                     // handled by the engine (needs two frames)
                 }
                 Stage::Onnx { stage, .. } => {
+                    // mpv user-shader OFFSET metadata is meant to be consumed
+                    // by the next scaler. ONNX is outside mpv's hook pipeline,
+                    // so normalize the phase before handing pixels to the model
+                    // rather than silently dropping the pending correction.
+                    if cur.has_offset() {
+                        cur = crate::render::scaler::align_offset(gc, cur)
+                            .context("failed to align pending mpv shader OFFSET before ONNX")?;
+                    }
                     let mut stage = stage.lock().unwrap();
+                    if stage.is_directml_temporal_filter() {
+                        if let Some((limited_w, limited_h)) =
+                            directml_temporal_limited_size(cur.w(), cur.h())
+                        {
+                            let source_size = (cur.w(), cur.h());
+                            cur = crate::render::scaler::resample(
+                                gc,
+                                cur,
+                                limited_w,
+                                limited_h,
+                                crate::render::scaler::Kernel::Spline36,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "DirectML temporal height-limit resample failed for {}: {}x{} -> {}x{}",
+                                    stage.name, source_size.0, source_size.1, limited_w, limited_h
+                                )
+                            })?;
+                            log_directml_temporal_height_limit(
+                                dml_temporal_limit_log_keys,
+                                stage_index,
+                                &stage.name,
+                                source_size,
+                                (limited_w, limited_h),
+                            );
+                        }
+                    }
                     let input_size = (cur.w(), cur.h());
                     stage.prepare_tensorrt_input_shape(input_size.0, input_size.1);
                     super::onnx_stage::mark_tensorrt_model_started(&stage.name);
-                    if let Some(texture) = stage.process_gpu_texture(gc, cur)? {
+                    let gpu_texture = if after_interpolation {
+                        stage.process_gpu_texture_after_interpolation(gc, cur)?
+                    } else {
+                        stage.process_gpu_texture(gc, cur)?
+                    };
+                    if let Some(texture) = gpu_texture {
                         cur = texture;
                     } else {
                         let rgb = gc.download_rgb8(cur);
@@ -868,11 +1185,8 @@ impl FilterChain {
                 }
             }
             if let (Some(t0), Some(p)) = (t0, probe.as_deref_mut()) {
-                // Never force GPU completion in the live render path merely
-                // for statistics. glFinish here created a visible periodic
-                // hitch even when sampled once every 30 frames. This value is
-                // intentionally command-submission time; end-to-end latency
-                // remains measured by the engine/presentation metrics.
+                // ONNX providers expose completed inference timing here.
+                // GLSL stages use asynchronous GL_TIME_ELAPSED queries above.
                 p(
                     &metric_labels[stage_index],
                     stage.kind(),
@@ -920,6 +1234,15 @@ mod tests {
             enabled: true,
             params: Default::default(),
         }
+    }
+
+    #[test]
+    fn directml_temporal_height_limit_caps_only_above_1080() {
+        assert_eq!(directml_temporal_limited_size(2304, 1296), Some((1920, 1080)));
+        assert_eq!(directml_temporal_limited_size(3840, 2160), Some((1920, 1080)));
+        assert_eq!(directml_temporal_limited_size(2560, 1440), Some((1920, 1080)));
+        assert_eq!(directml_temporal_limited_size(1920, 1080), None);
+        assert_eq!(directml_temporal_limited_size(1152, 648), None);
     }
 
     #[test]

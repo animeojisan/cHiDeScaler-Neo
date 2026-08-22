@@ -11,7 +11,7 @@
 //!   float conversion on the normal GPU-resident path.
 
 use glow::HasContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::rc::Rc;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -38,6 +38,10 @@ pub struct TexKey {
 pub struct GpuTex {
     pub tex: glow::Texture,
     pub key: TexKey,
+    /// mpv user-shader pixel phase waiting to be corrected by the next scale.
+    /// This is metadata only; pooled storage identity remains TexKey-based.
+    pub offset_x: f32,
+    pub offset_y: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +70,22 @@ impl GpuTex {
     }
     pub fn comps(&self) -> u8 {
         self.key.comps
+    }
+    pub fn offset(&self) -> (f32, f32) {
+        (self.offset_x, self.offset_y)
+    }
+    pub fn has_offset(&self) -> bool {
+        self.offset_x.abs() > 1.0e-6 || self.offset_y.abs() > 1.0e-6
+    }
+    pub fn with_offset(mut self, x: f32, y: f32) -> Self {
+        self.offset_x = x;
+        self.offset_y = y;
+        self
+    }
+    pub fn clear_offset(mut self) -> Self {
+        self.offset_x = 0.0;
+        self.offset_y = 0.0;
+        self
     }
 }
 
@@ -134,11 +154,19 @@ pub struct GlContext {
     // Win32 handle, GL memory object and D3D12 allocation permanently.
     external_retired: Vec<(u64, ExternalBufferImport)>,
     external_import_count: u64,
+    // Some OpenGL drivers (notably AMD) expose the external-memory DSA entry
+    // point but reject it, or require more conservative cross-API ownership
+    // handoff. Keep this as a one-way safety latch for the current GL context.
+    external_conservative_sync: bool,
+    external_storage_fallbacks: u64,
+    gl_vendor: String,
     // GL command fences used by the asynchronous interpolation handoff.
     // Tokens keep glow::Fence values on the render thread; worker threads
     // receive only shared D3D12/CUDA resources and never touch OpenGL.
     command_fences: HashMap<u64, glow::Fence>,
     next_command_fence: u64,
+    gpu_timer_queries: VecDeque<(glow::Query, String)>,
+    gpu_timer_last_sample: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -194,6 +222,11 @@ impl GlContext {
             gl.enable_vertex_attrib_array(1);
             gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 16, 8);
             gl.bind_vertex_array(None);
+            let gl_vendor = gl.get_parameter_string(glow::VENDOR);
+            let vendor_lower = gl_vendor.to_ascii_lowercase();
+            let external_conservative_sync = vendor_lower.contains("amd")
+                || vendor_lower.contains("ati technologies")
+                || vendor_lower.contains("advanced micro devices");
             Self {
                 gl,
                 tracked: Vec::new(),
@@ -207,8 +240,13 @@ impl GlContext {
                 external_imports: HashMap::new(),
                 external_retired: Vec::new(),
                 external_import_count: 0,
+                external_conservative_sync,
+                external_storage_fallbacks: 0,
+                gl_vendor,
                 command_fences: HashMap::new(),
                 next_command_fence: 1,
+                gpu_timer_queries: VecDeque::new(),
+                gpu_timer_last_sample: HashMap::new(),
             }
         }
     }
@@ -268,6 +306,22 @@ impl GlContext {
 
     pub fn external_import_count(&self) -> u64 {
         self.external_import_count
+    }
+
+    /// True when the current OpenGL driver should use a conservative
+    /// OpenGL<->D3D12 handoff. This is deliberately sticky: once the driver
+    /// rejects the DSA external-buffer binding, do not retry the aggressive
+    /// path later in the same process.
+    pub fn external_interop_conservative_recommended(&self) -> bool {
+        self.external_conservative_sync
+    }
+
+    pub fn external_storage_fallback_count(&self) -> u64 {
+        self.external_storage_fallbacks
+    }
+
+    pub fn gl_vendor(&self) -> &str {
+        &self.gl_vendor
     }
 
     pub fn external_import_active_count(&self) -> usize {
@@ -393,8 +447,11 @@ impl GlContext {
                         ));
                         continue;
                     }
+                    self.external_conservative_sync = true;
+                    self.external_storage_fallbacks =
+                        self.external_storage_fallbacks.saturating_add(1);
                     log::info!(
-                        "OpenGL external buffer used bound storage fallback: route={route} named_error=0x{named_error:04x}"
+                        "OpenGL external buffer used bound storage fallback: route={route} named_error=0x{named_error:04x}; conservative_sync=enabled"
                     );
                 }
                 self.external_imports.insert(
@@ -479,6 +536,14 @@ impl GlContext {
         let dest = self.make_tex(width, height, 4, Dtype::U8);
         let program = self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA8)?;
         unsafe {
+            // The producer may be DirectML/D3D12 rather than an earlier GL
+            // command. Its D3D12 fence proves completion, but that alone does
+            // not invalidate OpenGL's cached view of the imported buffer on
+            // every driver. Establish the consumer-side visibility boundary
+            // before the SSBO read. Without it, low-resolution RIFE output can
+            // retain isolated stale cache lines which a following Anime4K CNN
+            // amplifies into alternating dots/cells. This remains GPU-only.
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
             self.gl.use_program(Some(program));
@@ -505,8 +570,15 @@ impl GlContext {
             }
             self.gl
                 .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
-            self.gl
-                .memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            // The conversion compute shader writes `dest` with imageStore,
+            // while the very next operation is commonly an mpv/Anime4K GLSL
+            // pass that reads `dest` through a sampler. IMAGE_ACCESS alone does
+            // not guarantee visibility to texture fetches; include the texture
+            // fetch barrier so interpolation -> GLSL never samples a stale
+            // pre-conversion image on aggressive/asynchronous drivers.
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
             let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
             if let Some(import) = self.external_imports.get_mut(&key) {
                 if let Some(old) = import.read_fence.replace(fence) {
@@ -533,6 +605,7 @@ impl GlContext {
         let dest = self.make_tex(width, height, 4, Dtype::U8);
         let program = self.compute_program(EXTERNAL_NCHW_F32_TO_RGBA8)?;
         unsafe {
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
             self.gl.use_program(Some(program));
@@ -557,8 +630,124 @@ impl GlContext {
             }
             self.gl
                 .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
+            // The conversion compute shader writes `dest` with imageStore,
+            // while the very next operation is commonly an mpv/Anime4K GLSL
+            // pass that reads `dest` through a sampler. IMAGE_ACCESS alone does
+            // not guarantee visibility to texture fetches; include the texture
+            // fetch barrier so interpolation -> GLSL never samples a stale
+            // pre-conversion image on aggressive/asynchronous drivers.
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
+            let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            if let Some(import) = self.external_imports.get_mut(&key) {
+                if let Some(old) = import.read_fence.replace(fence) {
+                    self.gl.delete_sync(old);
+                }
+            }
+        }
+        Ok(dest)
+    }
+
+    /// Convert imported interpolation output to a regular RGBA16F texture.
+    /// Used for DirectML -> post-GLSL handoff so an FP16 RIFE/DRBA result is
+    /// not quantized to 8-bit before a CNN upscaler/restorer consumes it.
+    pub fn external_nchw_f16_to_rgba16f_crop(
+        &mut self,
+        key: u64,
+        width: i32,
+        height: i32,
+        plane_width: i32,
+        plane_height: i32,
+    ) -> Result<GpuTex, String> {
+        let buffer = self
+            .external_imports
+            .get(&key)
+            .map(|item| item.buffer)
+            .ok_or_else(|| "shared D3D12 buffer is not imported".to_string())?;
+        let dest = self.make_tex(width, height, 4, Dtype::F16);
+        let program = self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA16F)?;
+        unsafe {
             self.gl
-                .memory_barrier(glow::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
+            self.gl.use_program(Some(program));
+            self.gl.bind_image_texture(
+                0,
+                Some(dest.tex),
+                0,
+                false,
+                0,
+                glow::WRITE_ONLY,
+                glow::RGBA16F,
+            );
+            for (name, value) in [
+                ("width", width),
+                ("height", height),
+                ("plane_width", plane_width),
+                ("plane_height", plane_height),
+            ] {
+                if let Some(loc) = self.gl.get_uniform_location(program, name) {
+                    self.gl.uniform_1_i32(Some(&loc), value);
+                }
+            }
+            self.gl
+                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
+            let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            if let Some(import) = self.external_imports.get_mut(&key) {
+                if let Some(old) = import.read_fence.replace(fence) {
+                    self.gl.delete_sync(old);
+                }
+            }
+        }
+        Ok(dest)
+    }
+
+    pub fn external_nchw_f32_to_rgba16f_crop(
+        &mut self,
+        key: u64,
+        width: i32,
+        height: i32,
+        plane_width: i32,
+        plane_height: i32,
+    ) -> Result<GpuTex, String> {
+        let buffer = self
+            .external_imports
+            .get(&key)
+            .map(|item| item.buffer)
+            .ok_or_else(|| "shared D3D12 buffer is not imported".to_string())?;
+        let dest = self.make_tex(width, height, 4, Dtype::F16);
+        let program = self.compute_program(EXTERNAL_NCHW_F32_TO_RGBA16F)?;
+        unsafe {
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
+            self.gl.use_program(Some(program));
+            self.gl.bind_image_texture(
+                0,
+                Some(dest.tex),
+                0,
+                false,
+                0,
+                glow::WRITE_ONLY,
+                glow::RGBA16F,
+            );
+            for (name, value) in [
+                ("width", width),
+                ("height", height),
+                ("plane_width", plane_width),
+                ("plane_height", plane_height),
+            ] {
+                if let Some(loc) = self.gl.get_uniform_location(program, name) {
+                    self.gl.uniform_1_i32(Some(&loc), value);
+                }
+            }
+            self.gl
+                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
             let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
             if let Some(import) = self.external_imports.get_mut(&key) {
                 if let Some(old) = import.read_fence.replace(fence) {
@@ -719,7 +908,19 @@ impl GlContext {
             }
             self.gl
                 .dispatch_compute(((plane * 3) as u32).div_ceil(256), 1, 1);
-            self.gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
+            // RIFE's v1 single-input models in this package expose FP32 I/O
+            // even when their internal weights are FP16. The next operation
+            // copies these freshly packed RGB planes with glCopyBufferSubData.
+            // SHADER_STORAGE_BARRIER_BIT alone only publishes SSBO visibility
+            // to later shader accesses; BUFFER_UPDATE_BARRIER_BIT is required
+            // before a GL buffer-copy/update command consumes those writes.
+            // At large pre-upscaled resolutions the missing boundary could
+            // copy the still-pending tail of the buffer, so only the lower
+            // part of generated RIFE frames flickered while real/DRBA frames
+            // remained correct. Keep this fence-free and GPU-resident.
+            self.gl.memory_barrier(
+                glow::SHADER_STORAGE_BARRIER_BIT | glow::BUFFER_UPDATE_BARRIER_BIT,
+            );
             self.gl.bind_texture(source.target(), None);
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, None);
@@ -1042,7 +1243,9 @@ impl GlContext {
             dtype,
         };
         if let Some(free) = self.pool.get_mut(&key) {
-            if let Some(t) = free.pop() {
+            if let Some(mut t) = free.pop() {
+                t.offset_x = 0.0;
+                t.offset_y = 0.0;
                 // a texture may come back with LINEAR filtering if an error
                 // path skipped the restore (this corrupted colours after live
                 // chain edits) — force the pool invariant on every reuse
@@ -1100,7 +1303,12 @@ impl GlContext {
                 glow::TEXTURE_WRAP_T,
                 glow::CLAMP_TO_EDGE as i32,
             );
-            let t = GpuTex { tex, key };
+            let t = GpuTex {
+                tex,
+                key,
+                offset_x: 0.0,
+                offset_y: 0.0,
+            };
             self.tracked.push(t);
             t
         }
@@ -1585,6 +1793,8 @@ impl GlContext {
                     comps,
                     dtype,
                 },
+                offset_x: 0.0,
+                offset_y: 0.0,
             }
         };
         self.persist.insert(key.to_string(), t);
@@ -1718,11 +1928,20 @@ impl GlContext {
             .drain()
             .map(|(_, fence)| fence)
             .collect::<Vec<_>>();
+        let pending_timers = self
+            .gpu_timer_queries
+            .drain(..)
+            .map(|(query, _)| query)
+            .collect::<Vec<_>>();
+        self.gpu_timer_last_sample.clear();
         self.clear_external_buffer();
         let gl = &self.gl;
         unsafe {
             for fence in pending_fences {
                 gl.delete_sync(fence);
+            }
+            for query in pending_timers {
+                gl.delete_query(query);
             }
             for t in self.tracked.drain(..) {
                 gl.delete_texture(t.tex);
@@ -1769,6 +1988,74 @@ impl GlContext {
 
     pub fn finish(&self) {
         unsafe { self.gl.finish() };
+    }
+
+    /// Begin a GPU elapsed-time query. This only inserts query commands and
+    /// never waits for earlier work to finish.
+    pub fn begin_gpu_timer(&mut self, label: &str) -> Option<glow::Query> {
+        let now = std::time::Instant::now();
+        if self
+            .gpu_timer_last_sample
+            .get(label)
+            .is_some_and(|last| now.duration_since(*last) < std::time::Duration::from_millis(500))
+        {
+            return None;
+        }
+        unsafe {
+            let query = self.gl.create_query().ok()?;
+            self.gl.begin_query(glow::TIME_ELAPSED, query);
+            self.gpu_timer_last_sample.insert(label.to_string(), now);
+            Some(query)
+        }
+    }
+
+    pub fn end_gpu_timer(&mut self, query: glow::Query, label: String) {
+        unsafe {
+            self.gl.end_query(glow::TIME_ELAPSED);
+        }
+        self.gpu_timer_queries.push_back((query, label));
+    }
+
+    /// Collect only already-completed queries. The value is the real GPU time
+    /// for one sampled frame; unavailable results remain queued for later.
+    pub fn poll_gpu_timers(&mut self) -> Vec<(String, f64)> {
+        let mut ready = Vec::new();
+        loop {
+            let Some((query, _)) = self.gpu_timer_queries.front() else {
+                break;
+            };
+            let available = unsafe {
+                self.gl
+                    .get_query_parameter_u32(*query, glow::QUERY_RESULT_AVAILABLE)
+                    != 0
+            };
+            if !available {
+                break;
+            }
+            let (query, label) = self.gpu_timer_queries.pop_front().unwrap();
+            let elapsed_ns = unsafe { self.gl.get_query_parameter_u64(query, glow::QUERY_RESULT) };
+            unsafe {
+                self.gl.delete_query(query);
+            }
+            ready.push((label, elapsed_ns as f64 / 1_000_000.0));
+        }
+        ready
+    }
+
+    /// Discard outstanding statistics queries when the live filter chain is
+    /// replaced. No wait is required; queries are owned by this GL context.
+    pub fn clear_gpu_timers(&mut self) {
+        let pending = self
+            .gpu_timer_queries
+            .drain(..)
+            .map(|(query, _)| query)
+            .collect::<Vec<_>>();
+        unsafe {
+            for query in pending {
+                self.gl.delete_query(query);
+            }
+        }
+        self.gpu_timer_last_sample.clear();
     }
 
     /// Submit a fence for commands issued before this point. The returned
@@ -1853,6 +2140,35 @@ void main() {
     uint plane = uint(plane_width * plane_height);
     imageStore(dst, p, vec4(load_half(i), load_half(plane + i), load_half(2u * plane + i), 1.0));
 }
+"#;
+
+const EXTERNAL_NCHW_F16_TO_RGBA16F: &str = r#"#version 430
+layout(local_size_x=16, local_size_y=16) in;
+layout(std430, binding=0) readonly buffer Source { uint words[]; };
+layout(rgba16f, binding=0) uniform writeonly image2D dst;
+uniform int width;
+uniform int height;
+uniform int plane_width;
+uniform int plane_height;
+float load_half(uint index) {
+    vec2 pair = unpackHalf2x16(words[index >> 1u]);
+    return (index & 1u) == 0u ? pair.x : pair.y;
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= width || p.y >= height) return;
+    uint i = uint(p.y * plane_width + p.x);
+    uint plane = uint(plane_width * plane_height);
+    imageStore(dst, p, vec4(load_half(i), load_half(plane + i), load_half(2u * plane + i), 1.0));
+}
+"#;
+
+const EXTERNAL_NCHW_F32_TO_RGBA16F: &str = r#"#version 430
+layout(local_size_x=16,local_size_y=16) in;
+layout(std430,binding=0) readonly buffer Source{float values[];};
+layout(rgba16f,binding=0) uniform writeonly image2D dst;
+uniform int width; uniform int height; uniform int plane_width; uniform int plane_height;
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=width||p.y>=height)return;uint i=uint(p.y*plane_width+p.x);uint plane=uint(plane_width*plane_height);imageStore(dst,p,vec4(values[i],values[plane+i],values[2u*plane+i],1.0));}
 "#;
 
 const EXTERNAL_NCHW_F32_TO_RGBA8: &str = r#"#version 430
