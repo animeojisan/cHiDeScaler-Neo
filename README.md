@@ -31,7 +31,7 @@ The bundled `presets.json`, GLSL shaders, and ONNX models are kept together so t
 
 Requirements:
 
-* Windows 11 (64-bit)
+* Windows 10 / 11 (64-bit)
 * Rust toolchain with `cargo`
 * MSVC-compatible Windows build tools
 
@@ -86,7 +86,7 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 
 必要環境：
 
-* Windows 11（64-bit）
+* Windows 10 / 11 (64-bit)
 * `cargo` を含むRustツールチェーン
 * MSVC互換のWindowsビルドツール
 
