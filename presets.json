@@ -1,6 +1,23 @@
 {
-  "active": "Anime4K Restore S",
+  "active": "OFF",
   "presets": [
+    {
+      "name": "OFF",
+      "chain": [],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "auto_16_9",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 23
+      }
+    },
     {
       "name": "Anime4K Restore S",
       "chain": [
@@ -430,6 +447,29 @@
           "enabled": true
         }
       ]
+    },
+    {
+      "name": "Pixel-Perfect  [Pixel Art]",
+      "chain": [
+        {
+          "kind": "glsl",
+          "path": "shaders/Pixel-art/PixelPerfect.glsl",
+          "enabled": true
+        }
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "auto_16_9",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 23
+      }
     },
     {
       "name": "RIFE Lite S  FG",
