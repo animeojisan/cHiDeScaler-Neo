@@ -26,7 +26,7 @@
 //!TYPE float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
-0.50
+0.16
 
 //!PARAM MAX_SHIFT
 //!TYPE float
@@ -121,9 +121,14 @@ vec4 hook() {
     float sourceY = db_luma(c);
     float liftScale = mix(0.15, 0.55, smoothstep(0.08, 0.60, sourceY));
     float darkenScale = mix(0.55, 0.18, smoothstep(0.40, 0.90, sourceY));
-    vec3 lowerBound = c - vec3(MAX_SHIFT * darkenScale);
-    vec3 upperBound = c + vec3(MAX_SHIFT * liftScale);
-    base = clamp(base, lowerBound, upperBound);
+    float filteredY = db_luma(base);
+    float lumaShift = clamp(filteredY - sourceY,
+                            -MAX_SHIFT * darkenScale,
+                             MAX_SHIFT * liftScale);
+    lumaShift *= mix(0.55, 1.0, step(0.0, lumaShift));
+    // Keep the source chroma exactly. Independent RGB smoothing can turn a
+    // small luminance correction into a visible hue shift on dark gradients.
+    base = c + vec3(lumaShift);
     vec3 l1 = HOOKED_texOff(vec2(-1.0, 0.0)).rgb;
     vec3 r1 = HOOKED_texOff(vec2(1.0, 0.0)).rgb;
     vec3 u1 = HOOKED_texOff(vec2(0.0, -1.0)).rgb;
@@ -153,7 +158,12 @@ vec4 hook() {
     float edgeEnergy = max(slope * 0.45, max(curve1, max(curve2 * 0.75, curve4 * 0.50)));
     float edgeMask = smoothstep(0.010, 0.042, edgeEnergy);
     float protection = max(lineMask, edgeMask);
-    vec3 result = mix(c, base, clamp(STRENGTH * (1.0 - protection), 0.0, 1.0));
+    float appliedShift = lumaShift * clamp(STRENGTH * (1.0 - protection), 0.0, 1.0);
+    float appliedCodes = appliedShift * 255.0;
+    // Strong mode also repairs very faint contour boundaries from 0.30 code
+    // values without relaxing the line and chroma guards.
+    appliedShift = sign(appliedCodes) * floor(abs(appliedCodes) + 0.70) / 255.0;
+    vec3 result = c + vec3(appliedShift);
 
     float sameL = 1.0 - smoothstep(0.35 / 255.0, 1.35 / 255.0, db_max3(abs(l1 - c)));
     float sameR = 1.0 - smoothstep(0.35 / 255.0, 1.35 / 255.0, db_max3(abs(r1 - c)));
