@@ -168,7 +168,7 @@ pub struct HotkeyEvent {
     pub id: i32,
     pub binding: String,
     pub received_at: Instant,
-    pub handled_while_minimized: bool,
+    pub handled_directly: bool,
 }
 
 pub struct HotkeyThread {
@@ -216,22 +216,34 @@ impl HotkeyThread {
                             .map(|(_, binding)| binding.clone())
                             .unwrap_or_else(|| format!("id:{id}"));
                         let received_at = Instant::now();
+                        // v583 stable contract: ordinary Stop uses the proven
+                        // v578 path. Only a minimized GUI bypasses the egui
+                        // queue, exactly as before the emergency-stop rewrite.
                         let gui_hwnd = super::win32::main_gui_hwnd();
-                        let handled_while_minimized = id == HK_TOGGLE
+                        let handled_directly = id == HK_TOGGLE
                             && gui_hwnd != 0
                             && super::win32::is_minimized(gui_hwnd);
-                        if handled_while_minimized {
+                        if handled_directly {
                             log::info!(
                                 "hotkey-minimized-direct-dispatch: id={id} binding='{binding}' action=stop"
                             );
                             minimized_stop.request_stop("minimized-global-hotkey");
+                        }
+                        if id == HK_QUIT {
+                            // The janitor only starts its timeout clock here. It
+                            // does NOT alter ordinary capture/input state. Neo
+                            // gets its normal close path and normal 2 s stable
+                            // shutdown grace plus the janitor safety margin first.
+                            crate::input::notify_cursor_janitor_quit_requested(
+                                "global-quit-hotkey",
+                            );
                         }
                         log::info!("hotkey-received: id={id} binding='{binding}'");
                         let _ = tx.send(HotkeyEvent {
                             id,
                             binding,
                             received_at,
-                            handled_while_minimized,
+                            handled_directly,
                         });
                     }
                     DispatchMessageW(&msg);
@@ -284,6 +296,16 @@ mod tests {
             validate_user_hotkey("Ctrl+Alt+Shift+Z"),
             Err(HotkeyValidationError::KeyCount)
         );
+    }
+
+    #[test]
+    fn ordinary_stop_and_quit_do_not_arm_emergency_input_recovery() {
+        let source = include_str!("hotkeys.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(!production.contains("request_stop_lockfree(\"global-hotkey-direct\""));
+        assert!(!production.contains("request_emergency_input_release(\"global-quit-hotkey\""));
+        assert!(production.contains("request_stop(\"minimized-global-hotkey\""));
+        assert!(production.contains("notify_cursor_janitor_quit_requested"));
     }
 
     #[test]

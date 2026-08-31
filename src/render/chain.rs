@@ -4,13 +4,15 @@
 //! GLSL<->ONNX boundaries. Expensive resources (ONNX sessions, parsed
 //! shaders) are cached by path in the factory so live chain swaps are cheap.
 
-use super::gl::{GlContext, GpuTex};
+use super::gl::{Dtype, GlContext, GpuTex};
 use super::glsl_engine::GlslEngine;
 use super::mpv::UserShader;
-use super::onnx_stage::{OnnxProvider, OnnxStage};
+use super::onnx_stage::{OnnxProvider, OnnxStage, PreparedDmlSharedOutput};
+use super::{vulkan_multipass, vulkan_onepass};
 use crate::core::config::{OnnxBackendPreference, StageKind, StageSpec, resolve_path};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 // ONNX stages are Arc<Mutex<…>> (not Rc<RefCell<…>>) so frame-interpolation
@@ -19,12 +21,60 @@ use std::sync::{Arc, Mutex};
 
 const BUILTIN_NEOFLOW_ENABLED: bool = false;
 
+thread_local! {
+    // v653: zero-resize identity pass used when a cross-GPU DirectML
+    // interpolation output has no post-GLSL stages. Vulkan still imports the
+    // app-owned D3D12 NCHW buffer on the selected compute GPU and performs the
+    // NCHW->RGBA conversion there, so the DirectML output boundary remains
+    // resident even for a RIFE-only chain. The final Vulkan->CPU->presentation
+    // bridge remains unchanged and is the only cross-adapter copy.
+    static DML_VULKAN_IDENTITY_SHADER: Rc<UserShader> = Rc::new(UserShader::parse(
+        "DmlVulkanIdentity.glsl",
+        r#"//!HOOK RGB
+//!BIND HOOKED
+//!DESC DML Vulkan identity handoff
+vec4 hook()
+{
+    return HOOKED_tex(HOOKED_pos);
+}
+"#,
+    ));
+}
+
+fn dml_vulkan_identity_shader() -> Rc<UserShader> {
+    DML_VULKAN_IDENTITY_SHADER.with(Clone::clone)
+}
+
 // DirectML temporal restoration models have shown corrupted output and a very
 // steep cost increase at high input resolutions. Keep only the temporal ONNX
 // inference at <=1080 pixels high, preserving aspect ratio; following stages
 // can upscale again normally. TensorRT/CUDA, single-frame ONNX and frame
 // interpolation are intentionally untouched.
 const DIRECTML_TEMPORAL_MAX_HEIGHT: i32 = 1080;
+
+fn upload_vulkan_bridge_rgba8(
+    gc: &mut GlContext,
+    dtype: Dtype,
+    width: i32,
+    height: i32,
+    rgba8: &[u8],
+) -> GpuTex {
+    match dtype {
+        Dtype::U8 => gc.upload_rgba8(width, height, rgba8),
+        Dtype::F16 => {
+            let mut rgba16 = Vec::with_capacity(rgba8.len() * 2);
+            for &value in rgba8 {
+                rgba16.extend_from_slice(
+                    &half::f16::from_f32(value as f32 * (1.0 / 255.0))
+                        .to_bits()
+                        .to_ne_bytes(),
+                );
+            }
+            gc.upload_rgba16f(width, height, &rgba16)
+        }
+        Dtype::U32 => unreachable!("Vulkan GLSL bridge rejects U32 input"),
+    }
+}
 
 pub enum Stage {
     Glsl {
@@ -179,6 +229,31 @@ impl StageFactory {
         trt_device_id: Option<i32>,
         trt_cache_root: PathBuf,
     ) -> Self {
+        // Backend switching is transactional, but rebuilding the candidate from
+        // an empty cache needlessly throws away a warm TensorRT session. Carry
+        // compatible Arc-backed sessions into the candidate so DirectML ->
+        // TensorRT -> DirectML/Stop -> TensorRT can reuse the same provider
+        // session when the physical GPU, CUDA device and runtime cache root are
+        // unchanged. A real GPU/runtime change still drops TensorRT entries.
+        let same_trt_identity =
+            self.trt_device_id == trt_device_id && self.trt_cache_root == trt_cache_root;
+        let mut onnx = self.onnx.clone();
+        if !same_trt_identity {
+            onnx.retain(|key, _| key.preference != OnnxBackendPreference::TensorRT);
+        }
+        let remaining: HashSet<OnnxCacheKey> = onnx.keys().cloned().collect();
+        let mut onnx_lru = self.onnx_lru.clone();
+        onnx_lru.retain(|key| remaining.contains(key));
+        let carried_tensorrt = onnx
+            .keys()
+            .filter(|key| key.preference == OnnxBackendPreference::TensorRT)
+            .count();
+        if carried_tensorrt > 0 {
+            log::info!(
+                "onnx-session-backend-carry: target={preference:?} kept_tensorrt={} policy=same-gpu-runtime",
+                carried_tensorrt
+            );
+        }
         Self {
             base_dir: self.base_dir.clone(),
             gpu_adapter: self.gpu_adapter,
@@ -186,8 +261,8 @@ impl StageFactory {
             trt_device_id,
             trt_cache_root,
             shaders: self.shaders.clone(),
-            onnx: HashMap::new(),
-            onnx_lru: VecDeque::new(),
+            onnx,
+            onnx_lru,
         }
     }
 
@@ -388,6 +463,37 @@ impl StageFactory {
         self.onnx_lru.clear();
     }
 
+    /// Explicit-GPU live interpolation replacement must be able to emulate the
+    /// DirectML part of Stop -> Start without throwing away warm TensorRT
+    /// Sessions. Drop every cached DirectML stage so the replacement chain gets
+    /// a fresh ORT/DML provider after the old worker and bridges are retired.
+    pub fn drop_directml_sessions(&mut self) -> usize {
+        let before = self.onnx.len();
+        self.onnx.retain(|_key, (stage, _)| {
+            let provider = stage
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    log::error!(
+                        "onnx-stage-lock-poisoned: action=recover-for-explicit-gpu-session-drop"
+                    );
+                    poisoned.into_inner()
+                })
+                .provider;
+            provider != OnnxProvider::DirectML
+        });
+        let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
+        self.onnx_lru.retain(|key| remaining.contains(key));
+        let dropped = before.saturating_sub(self.onnx.len());
+        if dropped > 0 {
+            log::info!(
+                "onnx-session-explicit-gpu-handoff: dropped_directml={} kept_non_directml={} policy=fresh-dml-preserve-tensorrt",
+                dropped,
+                self.onnx.len()
+            );
+        }
+        dropped
+    }
+
     /// Capture Stop must release per-capture GL/CUDA/DML bridges, but a TensorRT
     /// ORT session is intentionally kept warm across Stop -> Start. Preset
     /// changes keep only a bounded recent TensorRT MRU set via `prune_onnx_to`,
@@ -435,10 +541,176 @@ fn disambiguate_stage_metric_labels(names: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Clone)]
+struct VulkanResidentBatch {
+    start: usize,
+    end: usize,
+    shader: Rc<UserShader>,
+    stage_names: Vec<String>,
+    pass_counts: Vec<usize>,
+}
+
+fn vulkan_batch_builtin_resource(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "MAIN"
+            | "HOOKED"
+            | "NATIVE"
+            | "MAINPRESUB"
+            | "OUTPUT"
+            | "SCALED"
+            | "PREKERNEL"
+            | "POSTKERNEL"
+            | "RGB"
+    )
+}
+
+fn vulkan_batch_shader_isolated(shader: &UserShader) -> bool {
+    if shader.passes.is_empty()
+        || shader.name() == "NeoDeint.glsl"
+        || !shader.is_rgb
+        || shader.uses_chroma
+        || shader.is_compute
+        || shader.is_post
+        || shader.textures.iter().any(|texture| texture.storage)
+    {
+        return false;
+    }
+
+    // A standalone shader cannot legally consume a private resource created
+    // by the preceding shader. Reject such ambiguous chains so combining
+    // shader graphs cannot accidentally make an otherwise-missing BIND/HOOK
+    // resolve from a previous stage.
+    let mut local_resources = shader
+        .textures
+        .iter()
+        .map(|texture| texture.name.clone())
+        .collect::<HashSet<_>>();
+    for pass in &shader.passes {
+        for hook in &pass.hooks {
+            if !vulkan_batch_builtin_resource(hook) && !local_resources.contains(hook) {
+                return false;
+            }
+        }
+        for bind in &pass.binds {
+            if !vulkan_batch_builtin_resource(bind) && !local_resources.contains(bind) {
+                return false;
+            }
+        }
+        if let Some(save) = &pass.save {
+            if !vulkan_batch_builtin_resource(save) {
+                local_resources.insert(save.clone());
+            }
+        }
+    }
+    true
+}
+
+fn build_vulkan_resident_batch(
+    stages: &[Stage],
+    start: usize,
+    end: usize,
+    min_stage_count: usize,
+) -> Option<VulkanResidentBatch> {
+    if start >= end || end > stages.len() || end - start < min_stage_count.max(1) {
+        return None;
+    }
+    let first_shader = match &stages[start] {
+        Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader) => shader,
+        _ => return None,
+    };
+    if stages[start..end].iter().any(|stage| {
+        !matches!(stage, Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader))
+    }) {
+        return None;
+    }
+
+    let mut passes = Vec::new();
+    let mut params = Vec::new();
+    let mut textures = Vec::new();
+    let mut param_names = HashSet::new();
+    let mut texture_names = HashSet::new();
+    let mut stage_names = Vec::new();
+    let mut pass_counts = Vec::new();
+    let mut hasher = DefaultHasher::new();
+
+    for stage in &stages[start..end] {
+        let Stage::Glsl { shader, .. } = stage else {
+            unreachable!()
+        };
+        shader.source_hash.hash(&mut hasher);
+        stage_names.push(shader.name());
+        pass_counts.push(shader.passes.len().max(1));
+        passes.extend(shader.passes.iter().cloned());
+        for param in &shader.params {
+            if !param_names.insert(param.name.clone()) {
+                return None;
+            }
+            params.push(param.clone());
+        }
+        for texture in &shader.textures {
+            if !texture_names.insert(texture.name.clone()) {
+                return None;
+            }
+            textures.push(texture.clone());
+        }
+    }
+
+    let shader = UserShader {
+        path: format!("VulkanResidentChain[{}]", stage_names.join("+")),
+        source_hash: hasher.finish(),
+        passes,
+        is_rgb: first_shader.is_rgb,
+        uses_chroma: false,
+        is_compute: false,
+        is_post: false,
+        params,
+        textures,
+    };
+    Some(VulkanResidentBatch {
+        start,
+        end,
+        shader: Rc::new(shader),
+        stage_names,
+        pass_counts,
+    })
+}
+
+fn build_vulkan_resident_batches(stages: &[Stage]) -> Vec<VulkanResidentBatch> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < stages.len() {
+        if !matches!(
+            &stages[start],
+            Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader)
+        ) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < stages.len()
+            && matches!(
+                &stages[end],
+                Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader)
+            )
+        {
+            end += 1;
+        }
+        if let Some(batch) = build_vulkan_resident_batch(stages, start, end, 2) {
+            batches.push(batch);
+        }
+        start = end;
+    }
+    batches
+}
+
 pub struct FilterChain {
     pub stages: Vec<Stage>,
     neodeint_bypass: bool,
     dml_temporal_limit_log_keys: HashSet<(usize, i32, i32, i32, i32)>,
+    vulkan_resident_batches: Vec<VulkanResidentBatch>,
+    dml_vulkan_resident_log_keys: HashSet<u64>,
+    dml_vulkan_image_handoff_disabled: bool,
 }
 
 fn directml_temporal_limited_size(w: i32, h: i32) -> Option<(i32, i32)> {
@@ -473,6 +745,21 @@ fn log_directml_temporal_height_limit(
 }
 
 impl FilterChain {
+    /// Empty placeholder used only while an explicit-GPU live interpolation
+    /// handoff destroys the old provider generation before constructing the
+    /// replacement. Keeping a real DirectML stage alive here would recreate the
+    /// old/new Session overlap that Stop -> Start naturally avoids.
+    pub fn empty() -> Self {
+        Self {
+            stages: Vec::new(),
+            neodeint_bypass: false,
+            dml_temporal_limit_log_keys: HashSet::new(),
+            vulkan_resident_batches: Vec::new(),
+            dml_vulkan_resident_log_keys: HashSet::new(),
+            dml_vulkan_image_handoff_disabled: false,
+        }
+    }
+
     /// Drain and detach GPU-shared ONNX outputs before a resize, chain swap, or
     /// session teardown. OpenGL must release its imported memory object before
     /// the owning DirectML allocation is dropped.
@@ -691,9 +978,7 @@ impl FilterChain {
                 stage
                     .lock()
                     .unwrap_or_else(|poisoned| {
-                        log::error!(
-                            "onnx-stage-lock-poisoned: action=recover-for-interp-provider"
-                        );
+                        log::error!("onnx-stage-lock-poisoned: action=recover-for-interp-provider");
                         poisoned.into_inner()
                     })
                     .provider,
@@ -939,11 +1224,15 @@ impl FilterChain {
         let neodeint_bypass = stages
             .iter()
             .any(|stage| matches!(stage, Stage::Glsl { name, .. } if name == "NeoDeint.glsl"));
+        let vulkan_resident_batches = build_vulkan_resident_batches(&stages);
         (
             Self {
                 stages,
                 neodeint_bypass,
                 dml_temporal_limit_log_keys: HashSet::new(),
+                vulkan_resident_batches,
+                dml_vulkan_resident_log_keys: HashSet::new(),
+                dml_vulkan_image_handoff_disabled: false,
             },
             errors,
         )
@@ -959,6 +1248,111 @@ impl FilterChain {
         probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
     ) -> Result<GpuTex> {
         self.process_from(gc, input, out_size, 0, probe)
+    }
+
+    /// v652 ordinary DirectML -> Vulkan cross-GPU resident handoff.
+    ///
+    /// v664 uses this whenever production GLSL is routed to Vulkan and the
+    /// leading DirectML stage shares that selected LUID.  This covers both the
+    /// original cross-GPU case and the same-GPU `[Vulkan]` selector, avoiding an
+    /// unnecessary DirectML -> OpenGL -> CPU -> Vulkan round trip.
+    /// Keep the ONNX result on that GPU, import it directly into the complete
+    /// following GLSL range (one or more compatible shaders), and return only
+    /// the final Vulkan result to presentation GL. Failure disables this
+    /// optimization for the current chain and leaves the established path
+    /// available immediately.
+    pub fn process_first_onnx_vulkan_resident_rgba8(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        out_size: (i32, i32),
+        probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+    ) -> Result<Option<(GpuTex, String, f64)>> {
+        if self.dml_vulkan_image_handoff_disabled || w <= 0 || h <= 0 {
+            return Ok(None);
+        }
+        let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() else {
+            return Ok(None);
+        };
+        if !vulkan_multipass::production_requested() {
+            return Ok(None);
+        }
+        // v664: `production_selected_luid()` is populated only when GLSL is
+        // actually routed to Vulkan.  That includes the explicit `[Vulkan]`
+        // selector on the same physical GPU as presentation OpenGL.  v652 kept
+        // this handoff cross-GPU-only, which forced same-GPU `[Vulkan]` through
+        // DirectML -> OpenGL -> CPU readback -> Vulkan even though DirectML and
+        // Vulkan already share the selected LUID.  Allow the same D3D12 ->
+        // Vulkan resident handoff here as well.  Ordinary same-GPU explicit
+        // selection without `[Vulkan]` still has no production Vulkan LUID and
+        // therefore never reaches this path.
+        let range_end = self.stages.len();
+        if range_end <= 1 || !self.can_process_range_from_dml_shared(1, range_end) {
+            return Ok(None);
+        }
+
+        let prepared = {
+            let Some(Stage::Onnx {
+                name,
+                stage,
+                is_interp: false,
+                ..
+            }) = self.stages.first_mut()
+            else {
+                return Ok(None);
+            };
+            let mut stage = stage.lock().unwrap_or_else(|poisoned| {
+                log::error!(
+                    "onnx-stage-lock-poisoned: action=recover-for-dml-vulkan-image-handoff"
+                );
+                poisoned.into_inner()
+            });
+            if stage.provider != OnnxProvider::DirectML {
+                return Ok(None);
+            }
+            let metrics_name = format!("{name} [DirectML]");
+            stage
+                .process_rgba8_dml_shared_output(w, h, rgba)
+                .map(|output| output.map(|(shared, ms)| (shared, metrics_name, ms)))
+        };
+
+        let (shared, metrics_name, onnx_ms) = match prepared {
+            Ok(Some(output)) => output,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                self.dml_vulkan_image_handoff_disabled = true;
+                let line = format!(
+                    "dml-vulkan-image-handoff: result=fallback requested_luid={luid:016x} reason={error:#} fallback=legacy-chain disabled_for_chain=true"
+                );
+                log::warn!("{line}");
+                crate::render::vulkan_gpu::record_probe_result(&line);
+                return Ok(None);
+            }
+        };
+
+        match self.process_range_from_dml_shared(gc, &shared, out_size, 1, range_end, probe) {
+            Ok(Some(output)) => Ok(Some((output, metrics_name, onnx_ms))),
+            Ok(None) => {
+                self.dml_vulkan_image_handoff_disabled = true;
+                let line = format!(
+                    "dml-vulkan-image-handoff: result=fallback requested_luid={luid:016x} reason=vulkan-shared-range-unavailable fallback=legacy-chain disabled_for_chain=true"
+                );
+                log::warn!("{line}");
+                crate::render::vulkan_gpu::record_probe_result(&line);
+                Ok(None)
+            }
+            Err(error) => {
+                self.dml_vulkan_image_handoff_disabled = true;
+                let line = format!(
+                    "dml-vulkan-image-handoff: result=fallback requested_luid={luid:016x} reason={error:#} fallback=legacy-chain disabled_for_chain=true"
+                );
+                log::warn!("{line}");
+                crate::render::vulkan_gpu::record_probe_result(&line);
+                Ok(None)
+            }
+        }
     }
 
     /// Fast capture path for a non-interpolation ONNX stage at chain index 0.
@@ -990,9 +1384,7 @@ impl FilterChain {
         // Let the ordinary GPU chain own over-limit DirectML temporal input so
         // its Spline36 1080p safety cap is applied before this first stage.
         // Returning None only bypasses this specialized raw-RGBA fast path.
-        if stage.is_directml_temporal_filter()
-            && directml_temporal_limited_size(w, h).is_some()
-        {
+        if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some() {
             return Ok(None);
         }
         stage.prepare_tensorrt_input_shape(w, h);
@@ -1025,6 +1417,148 @@ impl FilterChain {
         )))
     }
 
+    /// v651 raw-capture fast path for the leading v648 resident Vulkan batch.
+    ///
+    /// WGC already owns an SDR frame as CPU RGBA8.  Previously the generic
+    /// pre-GL Vulkan route consumed stage 0 by itself and uploaded that result
+    /// to OpenGL, which meant `process_from(..., 1, ...)` could no longer match
+    /// the v648 batch `[0..N)`.  A chain such as Anime4K Restore + Upscale
+    /// therefore crossed CPU/OpenGL between the two shaders even though a
+    /// merged resident graph had been prepared.
+    ///
+    /// Execute the complete leading batch directly from the WGC byte buffer,
+    /// keep every intermediate pass on the explicitly selected Vulkan GPU, and
+    /// upload only the final batch result to the presentation OpenGL context.
+    /// Returning `None` preserves the established per-stage pre-GL fallback.
+    pub fn process_leading_vulkan_resident_rgba8(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        out_size: (i32, i32),
+        mut probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+    ) -> Option<(GpuTex, usize)> {
+        let luid = crate::render::vulkan_gpu::production_selected_luid()?;
+        if !vulkan_multipass::production_requested() || w <= 0 || h <= 0 {
+            return None;
+        }
+        // v655: an explicit cross-GPU selection means compatible GLSL must
+        // actually execute on the selected Vulkan adapter even when there is
+        // only one leading shader. v648 intentionally prebuilt only 2+ stage
+        // resident batches, leaving a single leading GLSL dependent on a
+        // separate per-stage route. Build the maximal compatible leading span
+        // here with a minimum of one stage so AMD-selected sessions cannot
+        // silently fall back to the presentation GPU merely because the chain
+        // contains one shader.
+        let leading_end = self
+            .stages
+            .iter()
+            .take_while(|stage| {
+                matches!(stage, Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader))
+            })
+            .count();
+        let batch = self
+            .vulkan_resident_batches
+            .iter()
+            .find(|batch| batch.start == 0 && batch.end == leading_end)
+            .cloned()
+            .or_else(|| build_vulkan_resident_batch(&self.stages, 0, leading_end, 1))?;
+
+        let expected = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        if expected != Some(rgba.len()) {
+            let line = format!(
+                "vulkan-resident-chain: result=fallback route=wgc-pre-gl requested_luid={luid:016x} stages=[{}] reason=input-rgba-size-mismatch expected={:?} actual={} fallback=per-stage",
+                batch.stage_names.join(", "),
+                expected,
+                rgba.len(),
+            );
+            vulkan_onepass::record_route_once(
+                format!(
+                    "resident-chain-wgc-input:{luid:016x}:{}:{}",
+                    batch.start, batch.end
+                ),
+                &line,
+            );
+            return None;
+        }
+
+        let started = std::time::Instant::now();
+        let result = match vulkan_multipass::process_rgba8(
+            luid,
+            &batch.shader,
+            w as u32,
+            h as u32,
+            out_size.0.max(1) as u32,
+            out_size.1.max(1) as u32,
+            rgba,
+        ) {
+            Ok(Some(result)) => result,
+            Ok(None) => return None,
+            Err(error) => {
+                let line = format!(
+                    "vulkan-resident-chain: result=fallback route=wgc-pre-gl requested_luid={luid:016x} stages=[{}] reason={:#} fallback=per-stage",
+                    batch.stage_names.join(", "),
+                    error,
+                );
+                vulkan_onepass::record_route_once(
+                    format!(
+                        "resident-chain-wgc-runtime:{luid:016x}:{}:{}",
+                        batch.start, batch.end
+                    ),
+                    &line,
+                );
+                return None;
+            }
+        };
+
+        let output_w = result.output_width as i32;
+        let output_h = result.output_height as i32;
+        let output = gc.upload_rgba8(output_w, output_h, &result.output_rgba8);
+        let chain_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(p) = probe.as_deref_mut() {
+            let metric_names = self
+                .stages
+                .iter()
+                .map(Stage::metrics_name)
+                .collect::<Vec<_>>();
+            let metric_labels = disambiguate_stage_metric_labels(&metric_names);
+            let total_passes = batch.pass_counts.iter().sum::<usize>().max(1);
+            for (offset, pass_count) in batch.pass_counts.iter().enumerate() {
+                let index = batch.start + offset;
+                p(
+                    &metric_labels[index],
+                    StageKind::Glsl,
+                    chain_ms * (*pass_count as f64 / total_passes as f64),
+                );
+            }
+        }
+
+        if result.first_frame_active {
+            let line = format!(
+                "vulkan-resident-chain: result=active route=wgc-pre-gl requested_luid={:016x} gpu='{}' stages=[{}] stage_count={} passes={} input={}x{} output={}x{} transfer=wgc-cpu-to-vulkan-resident-chain-to-cpu-to-gl gl_readback=false inter_stage_cpu_copies=0 intermediate_gpu_resident=true vulkan_ms={:.3} chain_ms={:.3} metrics=pass-weighted-estimate fallback=per-stage-on-error",
+                luid,
+                result.gpu_name,
+                batch.stage_names.join(", "),
+                batch.stage_names.len(),
+                result.active_passes,
+                w,
+                h,
+                output_w,
+                output_h,
+                result.elapsed_ms,
+                chain_ms,
+            );
+            log::info!("{line}");
+            crate::render::vulkan_gpu::record_probe_result(&line);
+        }
+
+        Some((output, batch.end))
+    }
+
     pub fn process_from(
         &mut self,
         gc: &mut GlContext,
@@ -1035,6 +1569,257 @@ impl FilterChain {
     ) -> Result<GpuTex> {
         let end_index = self.stages.len();
         self.process_range(gc, input, out_size, start_index, end_index, probe)
+    }
+
+    pub(crate) fn can_process_range_from_dml_shared(
+        &self,
+        start_index: usize,
+        end_index: usize,
+    ) -> bool {
+        let range_end = end_index.min(self.stages.len());
+        if crate::render::vulkan_gpu::production_selected_luid().is_none()
+            || !vulkan_multipass::production_requested()
+        {
+            return false;
+        }
+
+        // An empty post range is still useful for RIFE-only chains: Vulkan
+        // performs the D3D12 NCHW -> RGBA handoff on the selected GPU.
+        if start_index == range_end {
+            return true;
+        }
+        if start_index > range_end {
+            return false;
+        }
+
+        // v665: do not use the older resident-batch admission as the gate for
+        // DirectML input.  A shader can be fully valid as a standalone Vulkan
+        // plan yet intentionally fail raw-pass concatenation (FSRCNNX is the
+        // important LUMA example).  Exact consecutive GLSL ranges are eligible
+        // whenever every stage is production-admitted; one stage uses its
+        // ordinary plan and two or more use the boundary-preserving sequence
+        // planner.
+        self.stages[start_index..range_end]
+            .iter()
+            .all(|stage| match stage {
+                Stage::Glsl { shader, .. } => {
+                    !shader.is_post
+                        && shader.name() != "NeoDeint.glsl"
+                        && vulkan_multipass::production_shader_admitted(shader)
+                }
+                _ => false,
+            })
+    }
+
+    /// DirectML -> Vulkan shared-output handoff. v649 introduced this for
+    /// interpolation outputs; v652 also uses it for an ordinary leading image
+    /// model. DirectML and Vulkan must resolve to the same selected-GPU LUID.
+    /// One or more isolated GLSL stages may follow; incompatible ranges return
+    /// None and retain the proven CPU/OpenGL fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn process_range_from_dml_shared(
+        &mut self,
+        gc: &mut GlContext,
+        shared: &PreparedDmlSharedOutput,
+        out_size: (i32, i32),
+        start_index: usize,
+        end_index: usize,
+        mut probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+    ) -> Result<Option<GpuTex>> {
+        let range_end = end_index.min(self.stages.len());
+        let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() else {
+            return Ok(None);
+        };
+        if u64::from_le_bytes(shared.luid) != luid {
+            return Ok(None);
+        }
+        if !vulkan_multipass::production_requested() {
+            return Ok(None);
+        }
+
+        let passthrough_only = start_index == range_end;
+        if start_index > range_end {
+            return Ok(None);
+        }
+
+        let metric_names = self
+            .stages
+            .iter()
+            .map(Stage::metrics_name)
+            .collect::<Vec<_>>();
+        let metric_labels = disambiguate_stage_metric_labels(&metric_names);
+
+        // v665: DirectML shared input no longer depends on the conservative
+        // raw-pass resident-batch builder.  Preserve every shader's standalone
+        // boundary semantics, especially LUMA -> RGB reconstruction in
+        // FSRCNNX, while keeping the whole post range in one Vulkan runtime.
+        let sequence_shaders = if passthrough_only {
+            Vec::new()
+        } else {
+            let shaders = self.stages[start_index..range_end]
+                .iter()
+                .filter_map(|stage| match stage {
+                    Stage::Glsl { shader, .. }
+                        if !shader.is_post
+                            && shader.name() != "NeoDeint.glsl"
+                            && vulkan_multipass::production_shader_admitted(shader) =>
+                    {
+                        Some(Rc::clone(shader))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if shaders.len() != range_end.saturating_sub(start_index) {
+                return Ok(None);
+            }
+            shaders
+        };
+
+        let stage_names = sequence_shaders
+            .iter()
+            .map(|shader| shader.name())
+            .collect::<Vec<_>>();
+        let pass_counts = sequence_shaders
+            .iter()
+            .map(|shader| shader.passes.len().max(1))
+            .collect::<Vec<_>>();
+
+        let stage_started = std::time::Instant::now();
+        let output_ref_w = if passthrough_only {
+            shared.size.0.max(1) as u32
+        } else {
+            out_size.0.max(1) as u32
+        };
+        let output_ref_h = if passthrough_only {
+            shared.size.1.max(1) as u32
+        } else {
+            out_size.1.max(1) as u32
+        };
+
+        let result = if passthrough_only {
+            let identity = dml_vulkan_identity_shader();
+            vulkan_multipass::process_d3d12_nchw_to_gl(
+                luid,
+                identity.as_ref(),
+                shared.size.0.max(1) as u32,
+                shared.size.1.max(1) as u32,
+                output_ref_w,
+                output_ref_h,
+                shared.key,
+                shared.handle.0 as isize,
+                shared.byte_len,
+                shared.padded.0.max(1) as u32,
+                shared.padded.1.max(1) as u32,
+                shared.fp16,
+                gc,
+            )?
+        } else if sequence_shaders.len() == 1 {
+            vulkan_multipass::process_d3d12_nchw_to_gl(
+                luid,
+                sequence_shaders[0].as_ref(),
+                shared.size.0.max(1) as u32,
+                shared.size.1.max(1) as u32,
+                output_ref_w,
+                output_ref_h,
+                shared.key,
+                shared.handle.0 as isize,
+                shared.byte_len,
+                shared.padded.0.max(1) as u32,
+                shared.padded.1.max(1) as u32,
+                shared.fp16,
+                gc,
+            )?
+        } else {
+            let shader_refs = sequence_shaders
+                .iter()
+                .map(|shader| shader.as_ref())
+                .collect::<Vec<_>>();
+            vulkan_multipass::process_d3d12_nchw_sequence_to_gl(
+                luid,
+                &shader_refs,
+                shared.size.0.max(1) as u32,
+                shared.size.1.max(1) as u32,
+                output_ref_w,
+                output_ref_h,
+                shared.key,
+                shared.handle.0 as isize,
+                shared.byte_len,
+                shared.padded.0.max(1) as u32,
+                shared.padded.1.max(1) as u32,
+                shared.fp16,
+                gc,
+            )?
+        };
+        let Some(result) = result else {
+            return Ok(None);
+        };
+
+        let output_w = result.output_width as i32;
+        let output_h = result.output_height as i32;
+        let output = result.output;
+        let elapsed_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+
+        if !passthrough_only {
+            if let Some(p) = probe.as_deref_mut() {
+                let total_passes = pass_counts.iter().sum::<usize>().max(1);
+                for (offset, pass_count) in pass_counts.iter().enumerate() {
+                    let index = start_index + offset;
+                    p(
+                        &metric_labels[index],
+                        StageKind::Glsl,
+                        elapsed_ms * (*pass_count as f64 / total_passes as f64),
+                    );
+                }
+            }
+        }
+
+        if result.first_frame_active || self.dml_vulkan_resident_log_keys.insert(shared.key) {
+            let route = if passthrough_only {
+                "identity"
+            } else if sequence_shaders.len() == 1 {
+                "single-plan"
+            } else {
+                "sequence-plan"
+            };
+            let output_transfer = if result.output_external_buffer {
+                "d3d12-directml-to-vulkan-device-local-input-to-d3d12-external-rgba8-to-gl"
+            } else {
+                "d3d12-directml-to-vulkan-device-local-input-to-mapped-readback-to-gl"
+            };
+            let line = format!(
+                "dml-vulkan-resident-chain: result=active requested_luid={:016x} gpu='{}' shared_key={} allocation_bytes={} stages=[{}] stage_count={} passes={} input={}x{} padded={}x{} output={}x{} fp16={} plan={} transfer={} dml_to_vulkan_cpu_readback=0 dml_to_vulkan_cpu_upload=0 gl_input_readback=0 vulkan_to_gl_cpu_readback={} vulkan_to_gl_cpu_upload={} nchw_input_device_local=true intermediate_gpu_resident=true output_vec_copy=false output_external_buffer={} workgroup=16x8 external_sync_ms={:.3} vulkan_ms={:.3} gl_bridge_ms={:.3} total_ms={:.3} fallback=legacy-on-error",
+                luid,
+                result.gpu_name,
+                shared.key,
+                shared.heap_byte_len,
+                if passthrough_only {
+                    "<RIFE-output-handoff>".to_string()
+                } else {
+                    stage_names.join(", ")
+                },
+                stage_names.len(),
+                result.active_passes,
+                shared.size.0,
+                shared.size.1,
+                shared.padded.0,
+                shared.padded.1,
+                output_w,
+                output_h,
+                shared.fp16,
+                route,
+                output_transfer,
+                if result.output_external_buffer { 0 } else { 1 },
+                if result.output_external_buffer { 0 } else { 1 },
+                result.output_external_buffer,
+                result.external_sync_ms,
+                result.vulkan_ms,
+                result.gl_upload_ms,
+                elapsed_ms,
+            );
+            log::info!("{line}");
+            crate::render::vulkan_gpu::record_probe_result(&line);
+        }
+        Ok(Some(output))
     }
 
     /// Execute an exact, half-open section of the GUI chain. This is used to
@@ -1072,6 +1857,343 @@ impl FilterChain {
         // in-betweens each count as a frame, like mpv's own interpolation)
         crate::render::glsl_engine::advance_frame();
         let range_end = end_index.min(self.stages.len());
+
+        // v662: a second consecutive GLSL stage used to fall out of the
+        // conservative v648 resident-batch gate whenever the first shader was
+        // LUMA-based (FSRCNNX is the common case).  Each shader then executed
+        // through its own GL->CPU->Vulkan->CPU->GL bridge.  At 2560x1440 and
+        // especially 5120x2880 that staging cost dwarfs the actual Vulkan GPU
+        // work.  Build each shader's normal Vulkan plan independently and
+        // concatenate the *plans* instead of their raw passes, preserving
+        // LUMA->RGB stage boundaries while keeping all inter-stage images on
+        // Vulkan.  On any incompatibility, fall through to the proven v661
+        // per-stage path unchanged.
+        if let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() {
+            if vulkan_multipass::production_requested() && start_index < range_end {
+                let sequence_end = self
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .take(range_end)
+                    .skip(start_index)
+                    .take_while(|(_, stage)| {
+                        matches!(
+                            stage,
+                            Stage::Glsl { shader, .. }
+                                if !shader.is_post
+                                    && shader.name() != "NeoDeint.glsl"
+                                    && vulkan_multipass::production_shader_admitted(shader)
+                        )
+                    })
+                    .map(|(index, _)| index + 1)
+                    .last()
+                    .unwrap_or(start_index);
+                if sequence_end.saturating_sub(start_index) >= 2 {
+                    if cur.has_offset() {
+                        cur = crate::render::scaler::align_offset(gc, cur).context(
+                            "failed to align pending mpv shader OFFSET before Vulkan sequence chain",
+                        )?;
+                    }
+                    let unsupported_reason = if cur.comps() != 4 {
+                        Some(format!("input-components-{}", cur.comps()))
+                    } else if cur.has_offset() {
+                        Some("pending-mpv-offset".to_string())
+                    } else if !matches!(cur.key.dtype, Dtype::U8 | Dtype::F16) {
+                        Some(format!("input-dtype-{:?}", cur.key.dtype))
+                    } else {
+                        None
+                    };
+                    if unsupported_reason.is_none() {
+                        let sequence_shaders = self.stages[start_index..sequence_end]
+                            .iter()
+                            .filter_map(|stage| match stage {
+                                Stage::Glsl { shader, .. } => Some(Rc::clone(shader)),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if sequence_shaders.len() == sequence_end - start_index {
+                            let shader_refs = sequence_shaders
+                                .iter()
+                                .map(|shader| shader.as_ref())
+                                .collect::<Vec<_>>();
+                            let stage_started = std::time::Instant::now();
+                            let input_dtype = cur.key.dtype;
+                            let input_w = cur.w();
+                            let input_h = cur.h();
+                            let rgba = gc.download_rgba8(cur);
+                            match vulkan_multipass::process_rgba8_sequence_to_gl(
+                                luid,
+                                &shader_refs,
+                                input_w as u32,
+                                input_h as u32,
+                                out_size.0.max(1) as u32,
+                                out_size.1.max(1) as u32,
+                                &rgba,
+                                gc,
+                            ) {
+                                Ok(Some(result)) => {
+                                    let output_w = result.output_width as i32;
+                                    let output_h = result.output_height as i32;
+                                    let output = if input_dtype == Dtype::U8 {
+                                        result.output
+                                    } else {
+                                        // Preserve the established bridge's
+                                        // dtype contract for uncommon F16
+                                        // callers; production WGC/DML image
+                                        // chains are U8 here.
+                                        let rgba = gc.download_rgba8(result.output);
+                                        gc.recycle(result.output);
+                                        upload_vulkan_bridge_rgba8(
+                                            gc,
+                                            input_dtype,
+                                            output_w,
+                                            output_h,
+                                            &rgba,
+                                        )
+                                    };
+                                    let stage_elapsed_ms =
+                                        stage_started.elapsed().as_secs_f64() * 1000.0;
+                                    if let Some(p) = probe.as_deref_mut() {
+                                        let pass_counts = sequence_shaders
+                                            .iter()
+                                            .map(|shader| shader.passes.len().max(1))
+                                            .collect::<Vec<_>>();
+                                        let total_passes = pass_counts.iter().sum::<usize>().max(1);
+                                        for (offset, pass_count) in pass_counts.iter().enumerate() {
+                                            let index = start_index + offset;
+                                            let estimated_ms = stage_elapsed_ms
+                                                * (*pass_count as f64 / total_passes as f64);
+                                            p(&metric_labels[index], StageKind::Glsl, estimated_ms);
+                                        }
+                                    }
+                                    if result.first_frame_active {
+                                        let names = sequence_shaders
+                                            .iter()
+                                            .map(|shader| shader.name())
+                                            .collect::<Vec<_>>();
+                                        let output_transfer = if result.output_external_buffer {
+                                            "gl-to-cpu-to-vulkan-sequence-to-d3d12-external-rgba8-to-gl"
+                                        } else {
+                                            "gl-to-cpu-to-vulkan-sequence-mapped-readback-to-gl"
+                                        };
+                                        let line = format!(
+                                            "vulkan-sequence-chain: result=active requested_luid={:016x} gpu='{}' stages=[{}] stage_count={} passes={} input={}x{} output={}x{} input_dtype={:?} transfer={} input_cpu_readback=1 output_cpu_readback={} output_cpu_upload={} inter_stage_cpu_copies=0 intermediate_gpu_resident=true output_vec_copy=false output_external_buffer={} workgroup=16x8 external_sync_ms={:.3} vulkan_ms={:.3} gl_bridge_ms={:.3} chain_ms={:.3} fallback=per-stage-on-error",
+                                            luid,
+                                            result.gpu_name,
+                                            names.join(", "),
+                                            names.len(),
+                                            result.active_passes,
+                                            input_w,
+                                            input_h,
+                                            output_w,
+                                            output_h,
+                                            input_dtype,
+                                            output_transfer,
+                                            if result.output_external_buffer { 0 } else { 1 },
+                                            if result.output_external_buffer { 0 } else { 1 },
+                                            result.output_external_buffer,
+                                            result.external_sync_ms,
+                                            result.vulkan_ms,
+                                            result.gl_upload_ms,
+                                            stage_elapsed_ms,
+                                        );
+                                        log::info!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                    if sequence_end < range_end {
+                                        return self.process_range(
+                                            gc,
+                                            output,
+                                            out_size,
+                                            sequence_end,
+                                            range_end,
+                                            probe,
+                                        );
+                                    }
+                                    return Ok(output);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    let names = sequence_shaders
+                                        .iter()
+                                        .map(|shader| shader.name())
+                                        .collect::<Vec<_>>();
+                                    let line = format!(
+                                        "vulkan-sequence-chain: result=fallback requested_luid={luid:016x} stages=[{}] reason={:#} fallback=per-stage",
+                                        names.join(", "),
+                                        error,
+                                    );
+                                    vulkan_onepass::record_route_once(
+                                        format!(
+                                            "sequence-chain-runtime:{luid:016x}:{}:{}",
+                                            start_index, sequence_end
+                                        ),
+                                        &line,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // v648: keep a consecutive ordinary GLSL section resident on the
+        // explicitly selected Vulkan GPU. v647 crossed the bridge for every
+        // shader independently (GL -> CPU -> Vulkan -> CPU -> GL), which made
+        // staging dominate the actual Vulkan compute time. A prebuilt merged
+        // shader graph lets the complete section use one Vulkan runtime, one
+        // upload, and one final readback/upload while every intermediate pass
+        // remains a Vulkan image. If the conservative merge gate or runtime
+        // fails, fall through to the proven per-stage path unchanged.
+        if let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() {
+            if vulkan_multipass::production_requested() {
+                // v655 selected-GPU resident-prefix scheduler. The old gate
+                // required the resident batch to consume the *entire* requested
+                // range. In mixed chains that meant a valid GLSL prefix followed
+                // by ONNX/temporal work could miss the resident path and later
+                // execute piecemeal or fall back to presentation OpenGL. Consume
+                // the maximal compatible GLSL prefix (1+ stages) on the selected
+                // Vulkan GPU, then continue the remaining range from batch.end.
+                let prefix_end = self
+                    .stages
+                    .iter()
+                    .enumerate()
+                    .take(range_end)
+                    .skip(start_index)
+                    .take_while(|(_, stage)| {
+                        matches!(stage, Stage::Glsl { shader, .. } if vulkan_batch_shader_isolated(shader))
+                    })
+                    .map(|(index, _)| index + 1)
+                    .last()
+                    .unwrap_or(start_index);
+                let resident_batch = self
+                    .vulkan_resident_batches
+                    .iter()
+                    .filter(|batch| {
+                        batch.start == start_index
+                            && batch.end <= range_end
+                            && batch.end == prefix_end
+                    })
+                    .max_by_key(|batch| batch.end)
+                    .cloned()
+                    .or_else(|| {
+                        build_vulkan_resident_batch(&self.stages, start_index, prefix_end, 1)
+                    });
+                if let Some(batch) = resident_batch {
+                    if cur.has_offset() {
+                        cur = crate::render::scaler::align_offset(gc, cur).context(
+                            "failed to align pending mpv shader OFFSET before resident Vulkan GLSL chain",
+                        )?;
+                    }
+                    let unsupported_reason = if !matches!(cur.comps(), 3 | 4) {
+                        Some(format!("input-components-{}", cur.comps()))
+                    } else if cur.has_offset() {
+                        Some("pending-mpv-offset".to_string())
+                    } else if !matches!(cur.key.dtype, Dtype::U8 | Dtype::F16) {
+                        Some(format!("input-dtype-{:?}", cur.key.dtype))
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = unsupported_reason {
+                        let line = format!(
+                            "vulkan-resident-chain: result=fallback requested_luid={luid:016x} stages=[{}] reason={} fallback=per-stage",
+                            batch.stage_names.join(", "),
+                            reason,
+                        );
+                        vulkan_onepass::record_route_once(
+                            format!(
+                                "resident-chain-gate:{luid:016x}:{}:{}:{}",
+                                batch.start, batch.end, reason
+                            ),
+                            &line,
+                        );
+                    } else {
+                        let stage_started = std::time::Instant::now();
+                        let input_dtype = cur.key.dtype;
+                        let input_w = cur.w();
+                        let input_h = cur.h();
+                        let rgba = gc.download_rgba8(cur);
+                        match vulkan_multipass::process_rgba8(
+                            luid,
+                            &batch.shader,
+                            input_w as u32,
+                            input_h as u32,
+                            out_size.0.max(1) as u32,
+                            out_size.1.max(1) as u32,
+                            &rgba,
+                        ) {
+                            Ok(Some(result)) => {
+                                let output_w = result.output_width as i32;
+                                let output_h = result.output_height as i32;
+                                let output = upload_vulkan_bridge_rgba8(
+                                    gc,
+                                    input_dtype,
+                                    output_w,
+                                    output_h,
+                                    &result.output_rgba8,
+                                );
+                                let stage_elapsed_ms =
+                                    stage_started.elapsed().as_secs_f64() * 1000.0;
+                                if let Some(p) = probe.as_deref_mut() {
+                                    let total_passes =
+                                        batch.pass_counts.iter().sum::<usize>().max(1);
+                                    for (offset, pass_count) in batch.pass_counts.iter().enumerate()
+                                    {
+                                        let index = batch.start + offset;
+                                        let estimated_ms = stage_elapsed_ms
+                                            * (*pass_count as f64 / total_passes as f64);
+                                        p(&metric_labels[index], StageKind::Glsl, estimated_ms);
+                                    }
+                                }
+                                if result.first_frame_active {
+                                    let line = format!(
+                                        "vulkan-resident-chain: result=active requested_luid={:016x} gpu='{}' stages=[{}] stage_count={} passes={} input={}x{} output={}x{} input_dtype={:?} transfer=gl-to-cpu-to-vulkan-resident-chain-to-cpu-to-gl cpu_bridge_roundtrips=1 intermediate_gpu_resident=true vulkan_ms={:.3} chain_ms={:.3} metrics=pass-weighted-estimate fallback=per-stage-on-error",
+                                        luid,
+                                        result.gpu_name,
+                                        batch.stage_names.join(", "),
+                                        batch.stage_names.len(),
+                                        result.active_passes,
+                                        input_w,
+                                        input_h,
+                                        output_w,
+                                        output_h,
+                                        input_dtype,
+                                        result.elapsed_ms,
+                                        stage_elapsed_ms,
+                                    );
+                                    log::info!("{line}");
+                                    crate::render::vulkan_gpu::record_probe_result(&line);
+                                }
+                                if batch.end < range_end {
+                                    return self.process_range(
+                                        gc, output, out_size, batch.end, range_end, probe,
+                                    );
+                                }
+                                return Ok(output);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let line = format!(
+                                    "vulkan-resident-chain: result=fallback requested_luid={:016x} stages=[{}] reason={:#} fallback=per-stage",
+                                    luid,
+                                    batch.stage_names.join(", "),
+                                    error,
+                                );
+                                vulkan_onepass::record_route_once(
+                                    format!(
+                                        "resident-chain-runtime:{luid:016x}:{}:{}",
+                                        batch.start, batch.end
+                                    ),
+                                    &line,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // When the engine enters the chain after its interpolation stage, the
         // input texture is already a GPU-resident interpolated frame.  Preserve
         // that residency for following DirectML image models instead of forcing
@@ -1106,17 +2228,276 @@ impl FilterChain {
                     // final downscale, not here
                 }
                 Stage::Glsl { shader, .. } => {
-                    let timer = probe
-                        .is_some()
-                        .then(|| gc.begin_gpu_timer(&metric_labels[stage_index]))
-                        .flatten();
-                    let applied = GlslEngine::apply(gc, shader, cur, out_size);
-                    if let Some(query) = timer {
-                        gc.end_gpu_timer(query, metric_labels[stage_index].clone());
+                    // Consume mpv OFFSET before crossing the Vulkan bridge.
+                    // This keeps a preceding GLSL's phase correction intact
+                    // without forcing the following user filter back to OpenGL.
+                    if cur.has_offset()
+                        && crate::render::vulkan_gpu::production_selected_luid().is_some()
+                    {
+                        cur = crate::render::scaler::align_offset(gc, cur).context(
+                            "failed to align pending mpv shader OFFSET before Vulkan GLSL",
+                        )?;
                     }
-                    cur = applied.with_context(|| {
-                        format!("GLSL stage failed: {} ({})", shader.name(), shader.path)
-                    })?;
+                    // v636 selected-GPU chain routing. v635 could execute the
+                    // first GLSL stage through Vulkan before the frame entered
+                    // OpenGL, but GLSL after ONNX (and later GLSL stages) fell
+                    // back to the render GPU. Route every ordinary GLSL stage
+                    // through the selected Vulkan adapter when one is explicit.
+                    // The bridge is deliberately CPU-staged for correctness;
+                    // the Vulkan runtime cache keeps every active shader warm.
+                    let mut vulkan_applied = false;
+                    if vulkan_multipass::production_requested()
+                        && vulkan_multipass::production_shader_admitted(shader)
+                    {
+                        if let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() {
+                            let unsupported_reason = if cur.comps() != 4 {
+                                Some(format!("input-components-{}", cur.comps()))
+                            } else if cur.has_offset() {
+                                Some("pending-mpv-offset".to_string())
+                            } else if !matches!(cur.key.dtype, Dtype::U8 | Dtype::F16) {
+                                Some(format!("input-dtype-{:?}", cur.key.dtype))
+                            } else {
+                                None
+                            };
+                            if let Some(reason) = unsupported_reason {
+                                let line = format!(
+                                    "vulkan-multipass-glsl: result=fallback route=mixed-chain shader='{}' requested_luid={luid:016x} reason={} input_dtype={:?} comps={} offset={} fallback=OpenGL",
+                                    shader.name(),
+                                    reason,
+                                    cur.key.dtype,
+                                    cur.comps(),
+                                    cur.has_offset(),
+                                );
+                                vulkan_onepass::record_route_once(
+                                    format!(
+                                        "multipass-chain-gate:{luid:016x}:{}:{reason}",
+                                        shader.name()
+                                    ),
+                                    &line,
+                                );
+                            } else {
+                                let stage_started = std::time::Instant::now();
+                                let input_dtype = cur.key.dtype;
+                                let input_w = cur.w();
+                                let input_h = cur.h();
+                                let rgba = gc.download_rgba8(cur);
+                                match vulkan_multipass::process_rgba8(
+                                    luid,
+                                    shader,
+                                    input_w as u32,
+                                    input_h as u32,
+                                    out_size.0.max(1) as u32,
+                                    out_size.1.max(1) as u32,
+                                    &rgba,
+                                ) {
+                                    Ok(Some(result)) => {
+                                        let output_w = result.output_width as i32;
+                                        let output_h = result.output_height as i32;
+                                        let output = upload_vulkan_bridge_rgba8(
+                                            gc,
+                                            input_dtype,
+                                            output_w,
+                                            output_h,
+                                            &result.output_rgba8,
+                                        );
+                                        let stage_elapsed_ms =
+                                            stage_started.elapsed().as_secs_f64() * 1000.0;
+                                        if let Some(p) = probe.as_deref_mut() {
+                                            p(
+                                                &metric_labels[stage_index],
+                                                StageKind::Glsl,
+                                                stage_elapsed_ms,
+                                            );
+                                        }
+                                        if result.first_frame_active {
+                                            let line = format!(
+                                                "vulkan-multipass-glsl: result=active route=mixed-chain shader='{}' requested_luid={:016x} gpu='{}' input={}x{} output={}x{} passes={} input_dtype={:?} transfer=gl-to-cpu-to-vulkan-to-cpu-to-gl display=Vulkan-result vulkan_ms={:.3} stage_ms={:.3} runtime_cache=multi fallback=OpenGL-on-error",
+                                                shader.name(),
+                                                luid,
+                                                result.gpu_name,
+                                                input_w,
+                                                input_h,
+                                                output_w,
+                                                output_h,
+                                                result.active_passes,
+                                                input_dtype,
+                                                result.elapsed_ms,
+                                                stage_elapsed_ms,
+                                            );
+                                            log::info!("{line}");
+                                            crate::render::vulkan_gpu::record_probe_result(&line);
+                                        }
+                                        cur = output;
+                                        vulkan_applied = true;
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        let line = format!(
+                                            "vulkan-multipass-glsl: result=fallback route=mixed-chain shader='{}' requested_luid={:016x} reason={:#} fallback=OpenGL",
+                                            shader.name(),
+                                            luid,
+                                            error
+                                        );
+                                        log::warn!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Retain the older one-pass compatibility route as a
+                    // fallback for shaders the multi-pass path cannot execute.
+                    if !vulkan_applied
+                        && vulkan_onepass::production_one_pass_requested()
+                        && vulkan_onepass::production_shader_admitted(shader)
+                    {
+                        if let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() {
+                            let route_key = format!(
+                                "candidate:{luid:016x}:{}:{}x{}:{:?}:{}:{}",
+                                shader.name(),
+                                cur.w(),
+                                cur.h(),
+                                cur.key.dtype,
+                                cur.comps(),
+                                cur.has_offset(),
+                            );
+                            let candidate = format!(
+                                "vulkan-production-glsl: phase=candidate shader='{}' requested_luid={luid:016x} size={}x{} input_dtype={:?} comps={} offset={} transfer=cpu-staging",
+                                shader.name(),
+                                cur.w(),
+                                cur.h(),
+                                cur.key.dtype,
+                                cur.comps(),
+                                cur.has_offset(),
+                            );
+                            vulkan_onepass::record_route_once(route_key, &candidate);
+
+                            let unsupported_reason = if cur.comps() != 4 {
+                                Some(format!("input-components-{}", cur.comps()))
+                            } else if cur.has_offset() {
+                                Some("pending-mpv-offset".to_string())
+                            } else if !matches!(cur.key.dtype, Dtype::U8 | Dtype::F16) {
+                                Some(format!("input-dtype-{:?}", cur.key.dtype))
+                            } else {
+                                None
+                            };
+
+                            if let Some(reason) = unsupported_reason {
+                                let line = format!(
+                                    "vulkan-production-glsl: result=fallback shader='{}' requested_luid={luid:016x} reason={} input_dtype={:?} comps={} offset={} fallback=OpenGL",
+                                    shader.name(),
+                                    reason,
+                                    cur.key.dtype,
+                                    cur.comps(),
+                                    cur.has_offset(),
+                                );
+                                vulkan_onepass::record_route_once(
+                                    format!("gate:{luid:016x}:{}:{reason}", shader.name()),
+                                    &line,
+                                );
+                            } else {
+                                let production_started = std::time::Instant::now();
+                                let input_dtype = cur.key.dtype;
+                                let rgba = gc.download_rgba8(cur);
+                                match vulkan_onepass::process_rgba8(
+                                    luid,
+                                    shader,
+                                    cur.w() as u32,
+                                    cur.h() as u32,
+                                    &rgba,
+                                ) {
+                                    Ok(Some(result)) => {
+                                        // Preserve the OpenGL chain's storage type. GLSL
+                                        // intermediates are normally F16; uploading the
+                                        // Vulkan RGBA8 result back as F16 avoids changing
+                                        // downstream type expectations during this bridge test.
+                                        let output = upload_vulkan_bridge_rgba8(
+                                            gc,
+                                            input_dtype,
+                                            cur.w(),
+                                            cur.h(),
+                                            &result.output_rgba8,
+                                        );
+                                        let stage_elapsed_ms =
+                                            production_started.elapsed().as_secs_f64() * 1000.0;
+                                        if let Some(p) = probe.as_deref_mut() {
+                                            p(
+                                                &metric_labels[stage_index],
+                                                StageKind::Glsl,
+                                                stage_elapsed_ms,
+                                            );
+                                        }
+                                        if result.first_frame_verified {
+                                            let line = format!(
+                                                "vulkan-production-glsl: result=active shader='{}' requested_luid={:016x} gpu='{}' size={}x{} input_dtype={:?} output_dtype={:?} validation={} visual_check_required={} verified={}/{} tolerance={} transfer=cpu-staging persistent_runtime=true display=Vulkan-result vulkan_ms={:.3} stage_ms={:.3} fallback=OpenGL-on-error",
+                                                shader.name(),
+                                                luid,
+                                                result.gpu_name,
+                                                cur.w(),
+                                                cur.h(),
+                                                input_dtype,
+                                                input_dtype,
+                                                result.validation_mode,
+                                                result.visual_check_required,
+                                                result.verified_pixels,
+                                                (cur.w() as usize) * (cur.h() as usize),
+                                                result.tolerance,
+                                                result.elapsed_ms,
+                                                stage_elapsed_ms,
+                                            );
+                                            log::info!("{line}");
+                                            crate::render::vulkan_gpu::record_probe_result(&line);
+                                        }
+                                        cur = output;
+                                        vulkan_applied = true;
+                                    }
+                                    Ok(None) => {
+                                        let line = format!(
+                                            "vulkan-production-glsl: result=fallback shader='{}' requested_luid={luid:016x} reason=onepass-subset-not-admitted fallback=OpenGL",
+                                            shader.name(),
+                                        );
+                                        vulkan_onepass::record_route_once(
+                                            format!("not-admitted:{luid:016x}:{}", shader.name()),
+                                            &line,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let line = format!(
+                                            "vulkan-production-glsl: result=fallback shader='{}' requested_luid={:016x} reason={:#} fallback=OpenGL",
+                                            shader.name(),
+                                            luid,
+                                            error
+                                        );
+                                        log::warn!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                }
+                            }
+                        } else {
+                            let line = format!(
+                                "vulkan-production-glsl: result=fallback shader='{}' reason=explicit-luid-missing fallback=OpenGL",
+                                shader.name(),
+                            );
+                            vulkan_onepass::record_route_once(
+                                format!("luid-missing:{}", shader.name()),
+                                &line,
+                            );
+                        }
+                    }
+                    if !vulkan_applied {
+                        let timer = probe
+                            .is_some()
+                            .then(|| gc.begin_gpu_timer(&metric_labels[stage_index]))
+                            .flatten();
+                        let applied = GlslEngine::apply(gc, shader, cur, out_size);
+                        if let Some(query) = timer {
+                            gc.end_gpu_timer(query, metric_labels[stage_index].clone());
+                        }
+                        cur = applied.with_context(|| {
+                            format!("GLSL stage failed: {} ({})", shader.name(), shader.path)
+                        })?;
+                    }
                 }
                 Stage::Onnx {
                     is_interp: true, ..
@@ -1238,9 +2619,18 @@ mod tests {
 
     #[test]
     fn directml_temporal_height_limit_caps_only_above_1080() {
-        assert_eq!(directml_temporal_limited_size(2304, 1296), Some((1920, 1080)));
-        assert_eq!(directml_temporal_limited_size(3840, 2160), Some((1920, 1080)));
-        assert_eq!(directml_temporal_limited_size(2560, 1440), Some((1920, 1080)));
+        assert_eq!(
+            directml_temporal_limited_size(2304, 1296),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            directml_temporal_limited_size(3840, 2160),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            directml_temporal_limited_size(2560, 1440),
+            Some((1920, 1080))
+        );
         assert_eq!(directml_temporal_limited_size(1920, 1080), None);
         assert_eq!(directml_temporal_limited_size(1152, 648), None);
     }

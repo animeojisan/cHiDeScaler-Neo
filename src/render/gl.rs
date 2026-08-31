@@ -144,6 +144,13 @@ pub struct GlContext {
     /// OUTSIDE the tracked/pool lifecycle (their declared filter/wrap must
     /// survive; re-uploading megabytes per frame would be waste)
     persist: HashMap<String, GpuTex>,
+    /// Dedicated RGBA8 capture-upload rotation for fullscreen monitor-region
+    /// fallback. These textures intentionally live outside tracked/pool so the
+    /// generic frame recycler cannot hand a just-presented surface back to the
+    /// uploader on the next refresh. They are not shader //!TEXTUREs and thus
+    /// still participate in the normal LINEAR/NEAREST source-filter dance.
+    capture_upload_ring: Vec<GpuTex>,
+    capture_upload_ring_key: Option<TexKey>,
     external_neoflow_state: ExternalNeoFlowState,
     fbo: glow::Framebuffer,
     pub quad_vao: glow::VertexArray,
@@ -233,6 +240,8 @@ impl GlContext {
                 pool: HashMap::new(),
                 prog_cache: HashMap::new(),
                 persist: HashMap::new(),
+                capture_upload_ring: Vec::new(),
+                capture_upload_ring_key: None,
                 external_neoflow_state: ExternalNeoFlowState::default(),
                 fbo,
                 quad_vao: vao,
@@ -589,6 +598,70 @@ impl GlContext {
         Ok(dest)
     }
 
+    /// Convert a packed RGBA8 buffer imported through GL_EXT_memory_object into
+    /// a regular pooled RGBA8 texture without staging the frame through CPU memory.
+    /// The producer (Vulkan) is synchronized by its queue fence before this call;
+    /// the GL fence recorded here protects the shared buffer from being overwritten
+    /// until this compute read has retired.
+    pub fn external_rgba8_buffer_to_texture(
+        &mut self,
+        key: u64,
+        width: i32,
+        height: i32,
+    ) -> Result<GpuTex, String> {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "external RGBA8 size overflow".to_string())?;
+        let (buffer, byte_len) = self
+            .external_imports
+            .get(&key)
+            .map(|item| (item.buffer, item.byte_len))
+            .ok_or_else(|| "shared Vulkan RGBA8 buffer is not imported".to_string())?;
+        if byte_len < expected {
+            return Err(format!(
+                "shared Vulkan RGBA8 buffer is too small: {} < {}",
+                byte_len, expected
+            ));
+        }
+        let dest = self.make_tex(width, height, 4, Dtype::U8);
+        let program = self.compute_program(EXTERNAL_RGBA8_BUFFER_TO_TEXTURE)?;
+        unsafe {
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
+            self.gl.use_program(Some(program));
+            self.gl.bind_image_texture(
+                0,
+                Some(dest.tex),
+                0,
+                false,
+                0,
+                glow::WRITE_ONLY,
+                glow::RGBA8,
+            );
+            if let Some(loc) = self.gl.get_uniform_location(program, "width") {
+                self.gl.uniform_1_i32(Some(&loc), width);
+            }
+            if let Some(loc) = self.gl.get_uniform_location(program, "height") {
+                self.gl.uniform_1_i32(Some(&loc), height);
+            }
+            self.gl
+                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(8), 1);
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
+            let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+            if let Some(import) = self.external_imports.get_mut(&key) {
+                if let Some(old) = import.read_fence.replace(fence) {
+                    self.gl.delete_sync(old);
+                }
+            }
+        }
+        Ok(dest)
+    }
+
     pub fn external_nchw_f32_to_rgba8_crop(
         &mut self,
         key: u64,
@@ -918,9 +991,8 @@ impl GlContext {
             // copy the still-pending tail of the buffer, so only the lower
             // part of generated RIFE frames flickered while real/DRBA frames
             // remained correct. Keep this fence-free and GPU-resident.
-            self.gl.memory_barrier(
-                glow::SHADER_STORAGE_BARRIER_BIT | glow::BUFFER_UPDATE_BARRIER_BIT,
-            );
+            self.gl
+                .memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT | glow::BUFFER_UPDATE_BARRIER_BIT);
             self.gl.bind_texture(source.target(), None);
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, None);
@@ -1312,6 +1384,128 @@ impl GlContext {
             self.tracked.push(t);
             t
         }
+    }
+
+    /// Upload tightly packed RGBA8 into a fixed-size rotation that is owned by
+    /// the GL context rather than the transient pool. The first geometry seen
+    /// in a capture session owns the ring; if geometry changes unexpectedly,
+    /// return an error so the caller can fall back to the established pool
+    /// instead of deleting a texture that may still be the last presented
+    /// frame. clear_pool() resets the ring between capture sessions.
+    pub fn upload_rgba8_capture_ring(
+        &mut self,
+        slot: usize,
+        slots: usize,
+        w: i32,
+        h: i32,
+        data: &[u8],
+    ) -> Result<GpuTex, String> {
+        let expected = usize::try_from(w)
+            .ok()
+            .and_then(|w| usize::try_from(h).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "capture upload ring size overflow".to_string())?;
+        if w <= 0 || h <= 0 || data.len() != expected || slots < 2 {
+            return Err(format!(
+                "invalid capture upload ring frame: {}x{} bytes={} expected={} slots={}",
+                w,
+                h,
+                data.len(),
+                expected,
+                slots
+            ));
+        }
+
+        let key = TexKey {
+            w,
+            h,
+            d: 1,
+            comps: 4,
+            dtype: Dtype::U8,
+        };
+        if let Some(existing) = self.capture_upload_ring_key {
+            if existing != key || self.capture_upload_ring.len() != slots {
+                return Err(format!(
+                    "geometry changed from {}x{} to {}x{}",
+                    existing.w, existing.h, w, h
+                ));
+            }
+        } else {
+            let gl = &self.gl;
+            let mut ring: Vec<GpuTex> = Vec::with_capacity(slots);
+            let (internal, format, ty) = formats(4, Dtype::U8);
+            unsafe {
+                for _ in 0..slots {
+                    let tex = match gl.create_texture() {
+                        Ok(texture) => texture,
+                        Err(error) => {
+                            for allocated in ring.drain(..) {
+                                gl.delete_texture(allocated.tex);
+                            }
+                            return Err(error.to_string());
+                        }
+                    };
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        internal,
+                        w,
+                        h,
+                        0,
+                        format,
+                        ty,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::CLAMP_TO_EDGE as i32,
+                    );
+                    ring.push(GpuTex {
+                        tex,
+                        key,
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                    });
+                }
+            }
+            self.capture_upload_ring = ring;
+            self.capture_upload_ring_key = Some(key);
+        }
+
+        let texture = self.capture_upload_ring[slot % self.capture_upload_ring.len()];
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture.tex));
+            let (_, format, ty) = formats(4, Dtype::U8);
+            self.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                w,
+                h,
+                format,
+                ty,
+                glow::PixelUnpackData::Slice(Some(data)),
+            );
+        }
+        Ok(texture)
     }
 
     /// Upload raw uint8 pixels (RGBA, tightly packed) into a pooled RGBA8 tex.
@@ -1824,6 +2018,13 @@ impl GlContext {
 
     /// Return a kept texture (e.g. last frame's output) to the pool.
     pub fn recycle(&mut self, t: GpuTex) {
+        if self
+            .capture_upload_ring
+            .iter()
+            .any(|capture| capture.tex == t.tex)
+        {
+            return;
+        }
         // Kept outputs survive release_frame() in `tracked`. Remove the
         // survivor before pooling it so one GL texture cannot be handed out
         // twice through both lifecycle lists.
@@ -1943,6 +2144,10 @@ impl GlContext {
             for query in pending_timers {
                 gl.delete_query(query);
             }
+            for t in self.capture_upload_ring.drain(..) {
+                gl.delete_texture(t.tex);
+            }
+            self.capture_upload_ring_key = None;
             for t in self.tracked.drain(..) {
                 gl.delete_texture(t.tex);
             }
@@ -1973,7 +2178,9 @@ impl GlContext {
     }
 
     pub fn live_texture_count(&self) -> usize {
-        self.tracked.len() + self.pool.values().map(|v| v.len()).sum::<usize>()
+        self.capture_upload_ring.len()
+            + self.tracked.len()
+            + self.pool.values().map(|v| v.len()).sum::<usize>()
     }
 
     pub fn set_filter_linear(&self, t: GpuTex, linear: bool) {
@@ -2120,6 +2327,20 @@ impl GlContext {
         }
     }
 }
+
+const EXTERNAL_RGBA8_BUFFER_TO_TEXTURE: &str = r#"#version 430
+layout(local_size_x=16, local_size_y=8) in;
+layout(std430, binding=0) readonly buffer Source { uint pixels[]; };
+layout(rgba8, binding=0) uniform writeonly image2D dst;
+uniform int width;
+uniform int height;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= width || p.y >= height) return;
+    uint rgba_word = pixels[uint(p.y * width + p.x)];
+    imageStore(dst, p, unpackUnorm4x8(rgba_word));
+}
+"#;
 
 const EXTERNAL_NCHW_F16_TO_RGBA8: &str = r#"#version 430
 layout(local_size_x=16, local_size_y=16) in;

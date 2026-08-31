@@ -4,10 +4,13 @@ use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicIsize, Ordering},
 };
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_CAPTION_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TEXT_COLOR,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_CAPTION_COLOR, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT, DEVMODEW,
@@ -77,11 +80,18 @@ struct GuiTransitionSnapshotState {
 
 static GUI_TRANSITION_SNAPSHOT: OnceLock<Mutex<GuiTransitionSnapshotState>> = OnceLock::new();
 
+// Top-level Neo windows temporarily excluded from monitor capture while a
+// structural display-region fallback is active. The list exists only so Stop
+// can restore WDA_NONE deterministically even when individual helper HWNDs were
+// created after capture startup.
+static CAPTURE_EXCLUDED_WINDOWS: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+
 // Keep the native WNDPROC handoff installed for the lifetime of the eframe
 // window. Unlike the former Ctrl+Alt+G route, every message (including
 // SC_MINIMIZE) is forwarded unchanged so Windows owns minimize/restore.
 static MAIN_GUI_SUBCLASS_HWND: AtomicIsize = AtomicIsize::new(0);
 static MAIN_GUI_OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+static SINGLE_INSTANCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 unsafe extern "system" fn main_gui_caption_wndproc(
     hwnd: HWND,
@@ -89,6 +99,23 @@ unsafe extern "system" fn main_gui_caption_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Make application exit feel immediate without weakening shutdown safety.
+    // Hide only Neo's own root GUI as soon as Windows delivers WM_CLOSE, then
+    // forward the message unchanged so eframe/on_exit can continue the normal
+    // cursor/source/geometry/provider cleanup in the background. Never wait on
+    // DWM, the render thread, or any foreign HWND from this native callback.
+    if msg == WM_CLOSE {
+        // Arm only the janitor's post-quit grace clock. No cursor/source/input
+        // state is changed here; the ordinary close path gets its full stable
+        // shutdown opportunity first.
+        crate::input::notify_cursor_janitor_quit_requested("main-gui-close");
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        log::info!(
+            "main-gui-close-visual-hide: hwnd={:#x} cleanup=continue",
+            hwnd.0 as isize
+        );
+    }
+
     // Native minimization is a GUI-only presentation transition. The floating
     // panel has its own lifetime and must never be shown/hidden from this WNDPROC.
     // Only preserve the cursor fail-visible contract here.
@@ -148,7 +175,6 @@ pub fn wake_main_gui_for_panel_action(_restore_if_minimized: bool) {
         let _ = PostMessageW(Some(h), WM_NULL, WPARAM(0), LPARAM(0));
     }
 }
-
 
 fn gui_transition_snapshot_state() -> &'static Mutex<GuiTransitionSnapshotState> {
     GUI_TRANSITION_SNAPSHOT.get_or_init(|| Mutex::new(GuiTransitionSnapshotState::default()))
@@ -347,11 +373,7 @@ unsafe fn publish_panel_gdi_region(
         }
         let mem = raw_create_compatible_dc(hdc);
         let bitmap = if !mem.is_null() {
-            raw_create_compatible_bitmap(
-                hdc,
-                snapshot.width.max(1),
-                snapshot.height.max(1),
-            )
+            raw_create_compatible_bitmap(hdc, snapshot.width.max(1), snapshot.height.max(1))
         } else {
             core::ptr::null_mut()
         };
@@ -359,10 +381,7 @@ unsafe fn publish_panel_gdi_region(
         if !mem.is_null() && !bitmap.is_null() {
             let old = raw_select_object(mem, bitmap);
             if !old.is_null() {
-                paint_panel_gdi_mirror(
-                    windows::Win32::Graphics::Gdi::HDC(mem),
-                    snapshot,
-                );
+                paint_panel_gdi_mirror(windows::Win32::Graphics::Gdi::HDC(mem), snapshot);
                 published = raw_bit_blt(
                     hdc,
                     rect.left,
@@ -833,7 +852,7 @@ unsafe extern "system" fn gui_transition_snapshot_wndproc(
                 }
             }
             LRESULT(0)
-        },
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
@@ -1159,10 +1178,7 @@ unsafe extern "system" fn panel_gdi_mirror_wndproc(
                 if !mem.is_null() && !bitmap.is_null() {
                     let old = raw_select_object(mem, bitmap);
                     if !old.is_null() {
-                        paint_panel_gdi_mirror(
-                            windows::Win32::Graphics::Gdi::HDC(mem),
-                            &snapshot,
-                        );
+                        paint_panel_gdi_mirror(windows::Win32::Graphics::Gdi::HDC(mem), &snapshot);
                         published = raw_bit_blt(
                             hdc.0,
                             0,
@@ -1235,7 +1251,7 @@ unsafe extern "system" fn panel_gdi_host_wndproc(
                 }
             }
             LRESULT(0)
-        },
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
@@ -1280,7 +1296,9 @@ fn apply_panel_gdi_host_round_region(hwnd: isize, width: i32, height: i32) {
 }
 
 fn overload_gdi_font_face(text: &str) -> (&'static str, i32) {
-    let hangul = text.chars().any(|ch| matches!(ch as u32, 0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af));
+    let hangul = text
+        .chars()
+        .any(|ch| matches!(ch as u32, 0x1100..=0x11ff | 0x3130..=0x318f | 0xac00..=0xd7af));
     if hangul {
         return ("Malgun Gothic", 500);
     }
@@ -1297,7 +1315,10 @@ fn overload_gdi_font_face(text: &str) -> (&'static str, i32) {
     }
 }
 
-unsafe fn overload_gdi_make_font(text: &str, pixel_height: i32) -> windows::Win32::Graphics::Gdi::HFONT {
+unsafe fn overload_gdi_make_font(
+    text: &str,
+    pixel_height: i32,
+) -> windows::Win32::Graphics::Gdi::HFONT {
     unsafe {
         let (face, weight) = overload_gdi_font_face(text);
         let mut lf = LOGFONTW::default();
@@ -1367,13 +1388,23 @@ unsafe fn paint_overload_notice_gdi(
         // to keep artifact-free.
         panel_gdi_fill(
             hdc,
-            RECT { left: 0, top: 0, right: w, bottom: h },
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
             BG,
         );
         let radius = (h / 6).max(3);
         panel_gdi_round_frame(
             hdc,
-            RECT { left: 0, top: 0, right: w, bottom: h },
+            RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            },
             radius,
             1,
             BORDER,
@@ -1570,9 +1601,7 @@ pub fn show_overload_notice_gdi(
         return;
     }
 
-    let dpi = unsafe {
-        windows::Win32::UI::HiDpi::GetDpiForWindow(HWND(overlay_hwnd as *mut _))
-    };
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(HWND(overlay_hwnd as *mut _)) };
     let scale = ((dpi.max(72) as f32) / 96.0).clamp(0.75, 2.5);
     let height = ((38.0 * scale).round() as i32).clamp(28, ch.saturating_sub(4).max(28));
     let pad_x = ((14.0 * scale).round() as i32).max(8);
@@ -1585,7 +1614,8 @@ pub fn show_overload_notice_gdi(
     let mut text_w = overload_gdi_measure_text(text, font_px);
     let available_text = (max_width - pad_x * 2 - icon_w - gap).max(16);
     if text_w > available_text {
-        let fitted = ((font_px as f32) * (available_text as f32 / text_w.max(1) as f32)).floor() as i32;
+        let fitted =
+            ((font_px as f32) * (available_text as f32 / text_w.max(1) as f32)).floor() as i32;
         font_px = fitted.clamp(min_font, base_font);
         text_w = overload_gdi_measure_text(text, font_px);
     }
@@ -1674,7 +1704,11 @@ pub fn show_overload_notice_gdi(
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER,
+                    SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOACTIVATE
+                        | SWP_NOSENDCHANGING
+                        | SWP_NOOWNERZORDER,
                 );
             } else {
                 let _ = SetWindowPos(
@@ -1684,7 +1718,11 @@ pub fn show_overload_notice_gdi(
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER,
+                    SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOACTIVATE
+                        | SWP_NOSENDCHANGING
+                        | SWP_NOOWNERZORDER,
                 );
             }
         }
@@ -1983,13 +2021,12 @@ pub fn update_panel_gdi_mirror(
                 } else {
                     false
                 };
-                let full_published = if !partial_published
-                    && (geometry_changed || visibility_changed)
-                {
-                    publish_panel_gdi_region(child, &snapshot, full_rect)
-                } else {
-                    false
-                };
+                let full_published =
+                    if !partial_published && (geometry_changed || visibility_changed) {
+                        publish_panel_gdi_region(child, &snapshot, full_rect)
+                    } else {
+                        false
+                    };
                 if !partial_published && !full_published {
                     let _ = RedrawWindow(Some(child), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                 }
@@ -2079,7 +2116,11 @@ pub fn republish_panel_gdi_mirror_full(parent_hwnd: isize) -> bool {
             "panel-gdi-reveal-republish: child={child_hwnd:#x} parent={parent_hwnd:#x} size={}x{} result={}",
             snapshot.width,
             snapshot.height,
-            if published { "bitblt" } else { "redraw-fallback" }
+            if published {
+                "bitblt"
+            } else {
+                "redraw-fallback"
+            }
         );
     }
     true
@@ -2143,6 +2184,216 @@ pub fn promote_current_thread_for_gui() {
 // Hybrid-GPU selection is requested only through the executable exports
 // NvOptimusEnablement and AmdPowerXpressRequestHighPerformance in main.rs.
 // This portable app creates no persistent OS GPU preference.
+
+#[derive(Clone, Copy, Debug)]
+struct SourceCornerOverride {
+    hwnd: isize,
+    pid: u32,
+    original: i32,
+}
+
+fn source_corner_override_slot() -> &'static Mutex<Option<SourceCornerOverride>> {
+    static SLOT: OnceLock<Mutex<Option<SourceCornerOverride>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn window_corner_preference(hwnd: isize) -> Option<i32> {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return None;
+    }
+    let hwnd = HWND(hwnd as *mut _);
+    let mut preference = DWM_WINDOW_CORNER_PREFERENCE(0);
+    let result = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&mut preference as *mut DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+    };
+    result.ok().map(|_| preference.0)
+}
+
+fn set_window_corner_preference(hwnd: isize, preference: i32) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return false;
+    }
+    let hwnd = HWND(hwnd as *mut _);
+    let preference = DWM_WINDOW_CORNER_PREFERENCE(preference);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+        .is_ok()
+    }
+}
+
+/// Restore a captured DWM corner preference only if the HWND still belongs to
+/// the original source process. Used by the isolated post-exit janitor.
+pub fn restore_window_corner_preference_checked(
+    hwnd: isize,
+    expected_pid: u32,
+    preference: i32,
+) -> bool {
+    window_matches_pid(hwnd, expected_pid) && set_window_corner_preference(hwnd, preference)
+}
+
+/// Temporarily request square DWM corners for one verified capture target.
+/// Unsupported Windows versions and windows that manage their own shape are
+/// treated as a no-op. Only a change that is read back successfully is owned.
+pub fn suppress_source_rounded_corners(hwnd: isize, expected_pid: u32) -> bool {
+    if !window_matches_pid(hwnd, expected_pid) {
+        return false;
+    }
+
+    // A single Neo process owns at most one capture session. Give a stale
+    // retryable cleanup record one last chance before considering a new target.
+    let pending = *source_corner_override_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = pending {
+        let _ = restore_source_rounded_corners(previous.hwnd, previous.pid);
+        if source_corner_override_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            log::warn!(
+                "source-corners-suppress-skipped: hwnd={hwnd:#x} pid={expected_pid} reason=previous-override-pending"
+            );
+            return false;
+        }
+    }
+
+    let Some(original) = window_corner_preference(hwnd) else {
+        log::debug!(
+            "source-corners-suppress: hwnd={hwnd:#x} pid={expected_pid} result=unsupported-or-unavailable"
+        );
+        return false;
+    };
+
+    if original == DWMWCP_DONOTROUND.0 {
+        log::debug!(
+            "source-corners-suppress: hwnd={hwnd:#x} pid={expected_pid} result=already-square"
+        );
+        return false;
+    }
+
+    if !window_matches_pid(hwnd, expected_pid) {
+        return false;
+    }
+    if !set_window_corner_preference(hwnd, DWMWCP_DONOTROUND.0) {
+        log::debug!("source-corners-suppress: hwnd={hwnd:#x} pid={expected_pid} result=set-failed");
+        return false;
+    }
+
+    if !window_matches_pid(hwnd, expected_pid) {
+        return false;
+    }
+    if window_corner_preference(hwnd) != Some(DWMWCP_DONOTROUND.0) {
+        // We cannot prove ownership of the visible state, so immediately put
+        // back the exact value sampled before the change and keep capturing.
+        let _ = set_window_corner_preference(hwnd, original);
+        log::debug!(
+            "source-corners-suppress: hwnd={hwnd:#x} pid={expected_pid} result=verify-failed"
+        );
+        return false;
+    }
+
+    *source_corner_override_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SourceCornerOverride {
+        hwnd,
+        pid: expected_pid,
+        original,
+    });
+    log::info!(
+        "source-corners-suppress: hwnd={hwnd:#x} pid={expected_pid} original={original} active=true"
+    );
+    true
+}
+
+/// Restore only a corner preference that this Neo process actually changed.
+/// If the source changed the preference while capture was active, leave that
+/// newer value alone. A failed restore remains registered so a later cleanup
+/// path can retry without touching any unrelated HWND.
+pub fn restore_source_rounded_corners(hwnd: isize, expected_pid: u32) -> bool {
+    let owned = {
+        let mut slot = source_corner_override_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *slot {
+            Some(value) if value.hwnd == hwnd && value.pid == expected_pid => slot.take().unwrap(),
+            Some(_) => return false,
+            None => return true,
+        }
+    };
+
+    if !window_matches_pid(hwnd, expected_pid) {
+        log::warn!(
+            "source-corners-restore-skipped: hwnd={hwnd:#x} expected_pid={expected_pid} current_pid={} reason=identity-changed",
+            window_pid(hwnd)
+        );
+        return false;
+    }
+
+    for attempt in 1..=3 {
+        if !window_matches_pid(hwnd, expected_pid) {
+            log::warn!(
+                "source-corners-restore-skipped: hwnd={hwnd:#x} expected_pid={expected_pid} current_pid={} reason=identity-changed",
+                window_pid(hwnd)
+            );
+            return false;
+        }
+
+        let Some(current) = window_corner_preference(hwnd) else {
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            *source_corner_override_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owned);
+            log::debug!(
+                "source-corners-restore-deferred: hwnd={hwnd:#x} pid={expected_pid} reason=readback-unavailable"
+            );
+            return false;
+        };
+
+        if current != DWMWCP_DONOTROUND.0 {
+            log::info!(
+                "source-corners-restore-skipped: hwnd={hwnd:#x} pid={expected_pid} current={current} reason=source-changed-preference"
+            );
+            return true;
+        }
+
+        if set_window_corner_preference(hwnd, owned.original)
+            && window_corner_preference(hwnd) == Some(owned.original)
+        {
+            log::info!(
+                "source-corners-restored: hwnd={hwnd:#x} pid={expected_pid} preference={} verified=true attempt={attempt}",
+                owned.original
+            );
+            return true;
+        }
+
+        if attempt < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    *source_corner_override_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owned);
+    log::warn!(
+        "source-corners-restore-deferred: hwnd={hwnd:#x} pid={expected_pid} original={} reason=verify-failed",
+        owned.original
+    );
+    false
+}
 
 /// Use a neutral dark-gray native caption without replacing the standard
 /// Windows resize, minimize, maximize, or close behaviour.
@@ -2239,14 +2490,31 @@ pub fn acquire_single_instance() -> bool {
     unsafe {
         let handle = CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr()));
         let already = GetLastError() == ERROR_ALREADY_EXISTS;
-        // keep the handle alive for the process lifetime (leak on purpose)
         if let Ok(h) = handle {
-            // HANDLE is a Copy wrapper and has no Drop implementation. Leaving
-            // it unclosed intentionally keeps the named mutex for process life.
-            let _ = h;
+            if already {
+                let _ = CloseHandle(h);
+            } else {
+                SINGLE_INSTANCE_HANDLE.store(h.0 as isize, Ordering::Release);
+            }
         }
         !already
     }
+}
+
+/// Release the named single-instance mutex immediately before a deliberate
+/// same-EXE GPU-selection relaunch. Ordinary exits keep the historical
+/// process-lifetime ownership; this narrow handoff lets the replacement process
+/// start while the old, already-shut-down process waits only long enough to
+/// restore the user's temporary Windows GPU preference.
+pub fn release_single_instance() {
+    let raw = SINGLE_INSTANCE_HANDLE.swap(0, Ordering::AcqRel);
+    if raw == 0 {
+        return;
+    }
+    unsafe {
+        let _ = CloseHandle(windows::Win32::Foundation::HANDLE(raw as *mut _));
+    }
+    log::info!("single-instance: released for controlled relaunch");
 }
 
 /// Find the main window of ANOTHER instance (by exact title, any process that
@@ -2449,6 +2717,15 @@ pub fn set_window_input_passthrough(hwnd: isize, passthrough: bool) {
     }
 }
 
+/// Read WS_EX_LAYERED from a verified foreign/source window.
+/// Unlike `is_window_layered`, this is intentionally not limited to Neo-owned HWNDs.
+pub fn source_window_layered(hwnd: isize, expected_pid: u32) -> Option<bool> {
+    if !window_matches_pid(hwnd, expected_pid) {
+        return None;
+    }
+    Some(unsafe { GetWindowLongW(HWND(hwnd as *mut _), GWL_EXSTYLE) as u32 & WS_EX_LAYERED.0 != 0 })
+}
+
 pub fn is_window_layered(hwnd: isize) -> bool {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
@@ -2553,12 +2830,144 @@ fn rect_covers_monitor(
         && (window.3 - monitor.3).abs() <= tolerance
 }
 
-/// Restore an exact outer-window rectangle. A currently maximized window must
-/// first leave the maximized state or SetWindowPos only changes its hidden
-/// normal-placement rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowPlacementSnapshot {
+    flags: u32,
+    show_cmd: u32,
+    min_position: (i32, i32),
+    max_position: (i32, i32),
+    /// WINDOWPLACEMENT::rcNormalPosition stored as (left, top, right, bottom).
+    normal_rect: (i32, i32, i32, i32),
+}
+
+impl WindowPlacementSnapshot {
+    pub fn normal_rect_xywh(self) -> (i32, i32, i32, i32) {
+        (
+            self.normal_rect.0,
+            self.normal_rect.1,
+            self.normal_rect.2 - self.normal_rect.0,
+            self.normal_rect.3 - self.normal_rect.1,
+        )
+    }
+
+    pub fn janitor_raw_parts(self) -> (u32, u32, (i32, i32), (i32, i32), (i32, i32, i32, i32)) {
+        (
+            self.flags,
+            self.show_cmd,
+            self.min_position,
+            self.max_position,
+            self.normal_rect,
+        )
+    }
+
+    pub fn from_janitor_raw_parts(
+        flags: u32,
+        show_cmd: u32,
+        min_position: (i32, i32),
+        max_position: (i32, i32),
+        normal_rect: (i32, i32, i32, i32),
+    ) -> Self {
+        Self {
+            flags,
+            show_cmd,
+            min_position,
+            max_position,
+            normal_rect,
+        }
+    }
+}
+
+/// Snapshot the full Win32 placement record, including the hidden normal
+/// position retained while a window is maximized. GetWindowRect alone cannot
+/// preserve the size to which the application should return after the user
+/// later leaves the maximized state.
+pub fn window_placement_snapshot(hwnd: isize) -> Option<WindowPlacementSnapshot> {
+    if !is_window_valid(hwnd) {
+        return None;
+    }
+    unsafe {
+        let mut placement = WINDOWPLACEMENT::default();
+        placement.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(HWND(hwnd as *mut _), &mut placement).is_err() {
+            return None;
+        }
+        Some(WindowPlacementSnapshot {
+            flags: placement.flags.0,
+            show_cmd: placement.showCmd,
+            min_position: (placement.ptMinPosition.x, placement.ptMinPosition.y),
+            max_position: (placement.ptMaxPosition.x, placement.ptMaxPosition.y),
+            normal_rect: (
+                placement.rcNormalPosition.left,
+                placement.rcNormalPosition.top,
+                placement.rcNormalPosition.right,
+                placement.rcNormalPosition.bottom,
+            ),
+        })
+    }
+}
+
+/// Restore the exact Win32 placement record captured at Start. This is the
+/// authoritative path for a source that was already maximized: it restores
+/// rcNormalPosition without temporarily converting the maximized outer frame
+/// into the application's future normal-window bounds.
+pub fn restore_window_placement_snapshot(hwnd: isize, snapshot: WindowPlacementSnapshot) -> bool {
+    if !is_window_valid(hwnd) {
+        return false;
+    }
+    let placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        flags: WINDOWPLACEMENT_FLAGS(snapshot.flags),
+        showCmd: snapshot.show_cmd,
+        ptMinPosition: POINT {
+            x: snapshot.min_position.0,
+            y: snapshot.min_position.1,
+        },
+        ptMaxPosition: POINT {
+            x: snapshot.max_position.0,
+            y: snapshot.max_position.1,
+        },
+        rcNormalPosition: RECT {
+            left: snapshot.normal_rect.0,
+            top: snapshot.normal_rect.1,
+            right: snapshot.normal_rect.2,
+            bottom: snapshot.normal_rect.3,
+        },
+    };
+    let set_ok = unsafe { SetWindowPlacement(HWND(hwnd as *mut _), &placement).is_ok() };
+    if !set_ok {
+        return false;
+    }
+    window_placement_snapshot(hwnd).is_some_and(|after| after.normal_rect == snapshot.normal_rect)
+}
+
+/// Restore the immutable session origin. Maximized windows require their full
+/// WINDOWPLACEMENT snapshot so their pre-maximize restore size is preserved.
+pub fn restore_window_origin(
+    hwnd: isize,
+    rect: Option<(i32, i32, i32, i32)>,
+    was_maximized: bool,
+    placement: Option<WindowPlacementSnapshot>,
+) -> bool {
+    if was_maximized {
+        if let Some(snapshot) = placement {
+            return restore_window_placement_snapshot(hwnd, snapshot);
+        }
+    }
+    rect.is_some_and(|rect| restore_window_rect(hwnd, rect, was_maximized))
+}
+
+/// Restore an exact outer-window rectangle. This remains the normal-window
+/// path. Maximized session origins should use restore_window_origin() so the
+/// hidden pre-maximize WINDOWPLACEMENT is not overwritten.
 pub fn restore_window_rect(hwnd: isize, rect: (i32, i32, i32, i32), was_maximized: bool) -> bool {
     if !is_window_valid(hwnd) || rect.2 <= 0 || rect.3 <= 0 {
         return false;
+    }
+    // If placement metadata was unavailable, at least avoid damaging an
+    // already-correct maximized window by restoring it to its own maximized
+    // outer rectangle and thereby overwriting its hidden normal bounds.
+    if was_maximized && is_maximized(hwnd) && window_rect(hwnd) == Some(rect) {
+        return true;
     }
     unsafe {
         let h = HWND(hwnd as *mut _);
@@ -2572,7 +2981,7 @@ pub fn restore_window_rect(hwnd: isize, rect: (i32, i32, i32, i32), was_maximize
             let _ = ShowWindow(HWND(hwnd as *mut _), SW_MAXIMIZE);
         }
     }
-    window_rect(hwnd).is_some()
+    window_rect(hwnd) == Some(rect) && is_maximized(hwnd) == was_maximized
 }
 
 pub fn any_mouse_button_down() -> bool {
@@ -2980,6 +3389,153 @@ pub fn external_window_rects_above_overlay(
     }
 }
 
+/// Repair the global z-order boundary of Neo's magnified overlay.
+///
+/// `WS_EX_TOPMOST` is a style bit, not a sufficient proof that the HWND is
+/// currently above every ordinary foreign window in USER32's live z-list. A
+/// hidden/re-shown overlay or another top-level z-order transaction can leave
+/// the style intact while an ordinary window is physically ahead of it. The
+/// owned GUI/panel normalizer cannot detect that state because it intentionally
+/// compares only Neo siblings.
+///
+/// This helper is deliberately conditional: it scans the real top-level z-list
+/// and mutates nothing unless a visible, overlapping, non-TOPMOST foreign
+/// window is actually above the overlay. When repair is needed, the overlay is
+/// recommitted into the TOPMOST band and then placed immediately below the
+/// lowest meaningful TOPMOST window that was already above it. Thus genuine
+/// always-on-top windows remain above Neo, while ordinary applications cannot
+/// cover the magnified image. `source_hwnd` is excluded from the preserved
+/// anchor set because the selected source is intentionally kept below Neo.
+pub fn repair_overlay_zorder_boundary(overlay_hwnd: isize, source_hwnd: isize) -> bool {
+    if overlay_hwnd == 0
+        || !is_window_valid(overlay_hwnd)
+        || !is_own_window(overlay_hwnd)
+        || !is_window_visible(overlay_hwnd)
+    {
+        return false;
+    }
+
+    let Some((ox, oy, ow, oh)) = window_rect(overlay_hwnd) else {
+        return false;
+    };
+    if ow <= 1 || oh <= 1 {
+        return false;
+    }
+    let oright = ox.saturating_add(ow);
+    let obottom = oy.saturating_add(oh);
+
+    unsafe {
+        let own_pid = GetCurrentProcessId();
+        let mut lowest_topmost_anchor = 0isize;
+        let mut illegal_ordinary = 0isize;
+        let mut illegal_pid = 0u32;
+        let mut found_overlay = false;
+        let mut hwnd = GetTopWindow(None).unwrap_or_default();
+        let mut guard = 0usize;
+
+        while !hwnd.0.is_null() && guard < 4096 {
+            let raw = hwnd.0 as isize;
+            if raw == overlay_hwnd {
+                found_overlay = true;
+                break;
+            }
+
+            if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && !is_cloaked(raw) {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
+                    if width > 1 && height > 1 {
+                        if is_topmost(raw) {
+                            // Preserve every meaningful TOPMOST window already
+                            // above Neo, including Neo's own GUI/panel/cursor
+                            // and external always-on-top tools. The selected
+                            // source is the sole exception: its contract is to
+                            // remain immediately below the magnified overlay.
+                            if raw != source_hwnd {
+                                lowest_topmost_anchor = raw;
+                            }
+                        } else if illegal_ordinary == 0 {
+                            let pid = window_pid(raw);
+                            let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                            let interactive = ex_style & WS_EX_TRANSPARENT.0 == 0;
+                            let overlaps_overlay = rect.left < oright
+                                && rect.right > ox
+                                && rect.top < obottom
+                                && rect.bottom > oy;
+                            if pid != own_pid
+                                && interactive
+                                && overlaps_overlay
+                                && !is_system_window(raw)
+                            {
+                                illegal_ordinary = raw;
+                                illegal_pid = pid;
+                            }
+                        }
+                    }
+                }
+            }
+
+            hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+            guard += 1;
+        }
+
+        if !found_overlay || illegal_ordinary == 0 {
+            return false;
+        }
+
+        let flags =
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER;
+
+        // First force USER32 to recommit the HWND into the actual TOPMOST band.
+        // Do not trust the already-set WS_EX_TOPMOST style as proof of position.
+        let first_ok = SetWindowPos(
+            HWND(overlay_hwnd as *mut _),
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            flags,
+        )
+        .is_ok();
+
+        // Keep all meaningful TOPMOST windows which were already ahead of Neo
+        // ahead of it. No DwmFlush is issued between the two operations so DWM
+        // can consume the repair as one final stack rather than expose an
+        // intermediate overlay-at-absolute-front frame.
+        let anchor_ok = if lowest_topmost_anchor != 0
+            && lowest_topmost_anchor != overlay_hwnd
+            && is_window_valid(lowest_topmost_anchor)
+        {
+            SetWindowPos(
+                HWND(overlay_hwnd as *mut _),
+                Some(HWND(lowest_topmost_anchor as *mut _)),
+                0,
+                0,
+                0,
+                0,
+                flags,
+            )
+            .is_ok()
+        } else {
+            true
+        };
+
+        let boundary_ok = window_is_above(overlay_hwnd, illegal_ordinary);
+        if boundary_ok {
+            log::info!(
+                "overlay-zorder-boundary-repair: overlay={overlay_hwnd:#x} illegal={illegal_ordinary:#x} illegal_pid={illegal_pid} anchor={lowest_topmost_anchor:#x} action=topmost-recommit+preserve-anchor first_ok={first_ok} anchor_ok={anchor_ok}"
+            );
+        } else {
+            log::warn!(
+                "overlay-zorder-boundary-repair-incomplete: overlay={overlay_hwnd:#x} illegal={illegal_ordinary:#x} illegal_pid={illegal_pid} anchor={lowest_topmost_anchor:#x} first_ok={first_ok} anchor_ok={anchor_ok}"
+            );
+        }
+        true
+    }
+}
+
 /// Current QPC time converted to 100ns ticks, matching WinRT SystemRelativeTime.
 pub fn qpc_time_100ns() -> Option<i64> {
     let mut counter = 0i64;
@@ -3018,6 +3574,23 @@ pub fn window_title(hwnd: isize) -> String {
         let n = GetWindowTextW(h, &mut buf);
         String::from_utf16_lossy(&buf[..n.max(0) as usize])
     }
+}
+
+/// Width of the native minimize/maximize/close cluster in physical pixels.
+pub fn caption_system_button_cluster_width() -> i32 {
+    unsafe {
+        let single = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXSIZE,
+        )
+        .max(1);
+        single.saturating_mul(3)
+    }
+}
+
+/// HWND values can be recycled. Pair them with the process selected at Start
+/// before mutating any foreign window state.
+pub fn window_matches_pid(hwnd: isize, expected_pid: u32) -> bool {
+    expected_pid != 0 && is_window_valid(hwnd) && window_pid(hwnd) == expected_pid
 }
 
 pub fn window_pid(hwnd: isize) -> u32 {
@@ -3268,11 +3841,8 @@ pub fn recommit_overlay_below_helpers(panel_hwnd: isize, overlay_hwnd: isize) {
         return;
     }
     unsafe {
-        let flags = SWP_NOMOVE
-            | SWP_NOSIZE
-            | SWP_NOACTIVATE
-            | SWP_NOSENDCHANGING
-            | SWP_NOOWNERZORDER;
+        let flags =
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER;
         let _ = SetWindowPos(
             HWND(overlay_hwnd as *mut _),
             Some(HWND_TOPMOST),
@@ -3306,7 +3876,10 @@ pub fn visible_top_level_windows_for_pid(pid: u32, limit: usize) -> Vec<isize> {
         let mut guard = 0usize;
         while !hwnd.0.is_null() && guard < 4096 && out.len() < limit {
             let raw = hwnd.0 as isize;
-            if window_pid(raw) == pid && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+            if window_pid(raw) == pid
+                && IsWindowVisible(hwnd).as_bool()
+                && !IsIconic(hwnd).as_bool()
+            {
                 out.push(raw);
             }
             hwnd = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
@@ -3320,14 +3893,22 @@ fn z_prev(hwnd: isize) -> isize {
     if hwnd == 0 || !is_window_valid(hwnd) {
         return 0;
     }
-    unsafe { GetWindow(HWND(hwnd as *mut _), GW_HWNDPREV).unwrap_or_default().0 as isize }
+    unsafe {
+        GetWindow(HWND(hwnd as *mut _), GW_HWNDPREV)
+            .unwrap_or_default()
+            .0 as isize
+    }
 }
 
 fn z_next(hwnd: isize) -> isize {
     if hwnd == 0 || !is_window_valid(hwnd) {
         return 0;
     }
-    unsafe { GetWindow(HWND(hwnd as *mut _), GW_HWNDNEXT).unwrap_or_default().0 as isize }
+    unsafe {
+        GetWindow(HWND(hwnd as *mut _), GW_HWNDNEXT)
+            .unwrap_or_default()
+            .0 as isize
+    }
 }
 
 fn compact_window_diag(hwnd: isize) -> String {
@@ -3344,7 +3925,11 @@ fn compact_window_diag(hwnd: isize) -> String {
         hwnd,
         window_pid(hwnd),
         window_class(hwnd),
-        window_title(hwnd).replace('\n', " ").chars().take(80).collect::<String>(),
+        window_title(hwnd)
+            .replace('\n', " ")
+            .chars()
+            .take(80)
+            .collect::<String>(),
         is_window_visible(hwnd),
         is_minimized(hwnd),
         is_topmost(hwnd),
@@ -3465,9 +4050,8 @@ pub fn log_helper_physical_visibility(
     overlay_hwnd: isize,
     cursor_hwnd: isize,
 ) {
-    let panel_api_visible = panel_hwnd != 0
-        && is_window_valid(panel_hwnd)
-        && is_window_visible(panel_hwnd);
+    let panel_api_visible =
+        panel_hwnd != 0 && is_window_valid(panel_hwnd) && is_window_visible(panel_hwnd);
     let panel_probe = panel_screen_visibility_probe(panel_hwnd);
     let panel_state = panel_probe
         .map(|(m, n, _)| visibility_probe_state(m, n))
@@ -3574,6 +4158,397 @@ pub fn window_owner(hwnd: isize) -> isize {
     }
 }
 
+/// True when a foreign/source window already owns WS_EX_LAYERED presentation.
+/// Neo must never apply its alpha-hide trick on top of an application-owned
+/// layered window: WPF/per-pixel-alpha applications can lose their own backing
+/// composition state even after alpha is restored to 255.
+pub fn is_layered_window(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return false;
+    }
+    unsafe { (GetWindowLongW(HWND(hwnd as *mut _), GWL_EXSTYLE) as u32) & WS_EX_LAYERED.0 != 0 }
+}
+
+/// Visible same-process top-level secondary/owned windows whose presentation is
+/// geometrically part of `hwnd`. Windows Graphics Capture can include these via
+/// SetIncludeSecondaryWindows(true). This is intentionally structural rather
+/// than app-name/class-name based so WPF/EVR, Qt helper surfaces and similar
+/// multi-HWND render hosts can use the same safe path.
+pub fn wgc_visible_secondary_windows(hwnd: isize) -> Vec<isize> {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return Vec::new();
+    }
+    let pid = window_pid(hwnd);
+    let Some((tx, ty, tw, th)) = window_rect(hwnd) else {
+        return Vec::new();
+    };
+    if pid == 0 || tw <= 0 || th <= 0 {
+        return Vec::new();
+    }
+    let t_right = tx.saturating_add(tw);
+    let t_bottom = ty.saturating_add(th);
+    let target_area = i64::from(tw).saturating_mul(i64::from(th)).max(1);
+
+    struct Ctx {
+        pid: u32,
+        root: isize,
+        tx: i32,
+        ty: i32,
+        tr: i32,
+        tb: i32,
+        target_area: i64,
+        rows: Vec<(i64, isize)>,
+    }
+    unsafe extern "system" fn callback(candidate: HWND, lp: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let ctx = &mut *(lp.0 as *mut Ctx);
+            let raw = candidate.0 as isize;
+            if raw == ctx.root
+                || !IsWindowVisible(candidate).as_bool()
+                || IsIconic(candidate).as_bool()
+            {
+                return true.into();
+            }
+            let mut candidate_pid = 0u32;
+            GetWindowThreadProcessId(candidate, Some(&mut candidate_pid));
+            if candidate_pid != ctx.pid {
+                return true.into();
+            }
+
+            // Secondary windows are top-level owned/helper windows. Walk the
+            // owner chain instead of depending on application or class names.
+            let mut owned_by_root = false;
+            let mut owner = GetWindow(candidate, GW_OWNER).unwrap_or_default();
+            let mut guard = 0usize;
+            while !owner.0.is_null() && guard < 16 {
+                if owner.0 as isize == ctx.root {
+                    owned_by_root = true;
+                    break;
+                }
+                owner = GetWindow(owner, GW_OWNER).unwrap_or_default();
+                guard += 1;
+            }
+            if !owned_by_root && GetAncestor(candidate, GA_ROOTOWNER).0 as isize != ctx.root {
+                return true.into();
+            }
+
+            let Some((cx, cy, cw, ch)) = window_rect(raw) else {
+                return true.into();
+            };
+            if cw <= 0 || ch <= 0 {
+                return true.into();
+            }
+            let cr = cx.saturating_add(cw);
+            let cb = cy.saturating_add(ch);
+            let ix0 = ctx.tx.max(cx);
+            let iy0 = ctx.ty.max(cy);
+            let ix1 = ctx.tr.min(cr);
+            let iy1 = ctx.tb.min(cb);
+            if ix1 <= ix0 || iy1 <= iy0 {
+                return true.into();
+            }
+            let intersection = i64::from(ix1 - ix0).saturating_mul(i64::from(iy1 - iy0));
+            let candidate_area = i64::from(cw).saturating_mul(i64::from(ch)).max(1);
+            // Ignore tiny tooltips/menus. A persistent render helper normally
+            // occupies a meaningful fraction of its host or is mostly inside it.
+            let meaningful = intersection.saturating_mul(8) >= candidate_area.saturating_mul(5)
+                && (intersection.saturating_mul(20) >= ctx.target_area
+                    || candidate_area.saturating_mul(20) >= ctx.target_area);
+            if meaningful {
+                ctx.rows.push((candidate_area, raw));
+            }
+            true.into()
+        }
+    }
+
+    let mut ctx = Ctx {
+        pid,
+        root: hwnd,
+        tx,
+        ty,
+        tr: t_right,
+        tb: t_bottom,
+        target_area,
+        rows: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(callback), LPARAM(&mut ctx as *mut _ as isize));
+    }
+    ctx.rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+    ctx.rows.into_iter().map(|(_, hwnd)| hwnd).collect()
+}
+
+pub fn wgc_has_visible_secondary_windows(hwnd: isize) -> bool {
+    !wgc_visible_secondary_windows(hwnd).is_empty()
+}
+
+/// Resolve a meaningful owned/helper presentation surface back to its root
+/// owner before the GUI adopts it as the next capture target. This is purely
+/// structural: no executable name, title, class name, or application ID is
+/// consulted. Ordinary owned dialogs/popups remain selectable unless they are
+/// already part of the root's large in-window presentation set.
+pub fn normalize_capture_target(hwnd: isize) -> isize {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return hwnd;
+    }
+    let pid = window_pid(hwnd);
+    if pid == 0 {
+        return hwnd;
+    }
+    let root_owner = unsafe { GetAncestor(HWND(hwnd as *mut _), GA_ROOTOWNER).0 as isize };
+    if root_owner == 0
+        || root_owner == hwnd
+        || !is_window_valid(root_owner)
+        || window_pid(root_owner) != pid
+    {
+        return hwnd;
+    }
+    let Some(region_hwnd) = wgc_display_region_candidate(root_owner) else {
+        return hwnd;
+    };
+    let Some(region_rect) = window_rect(region_hwnd) else {
+        return hwnd;
+    };
+    let same_presentation_rect = window_rect(hwnd).is_some_and(|rect| {
+        (rect.0 - region_rect.0).abs() <= 2
+            && (rect.1 - region_rect.1).abs() <= 2
+            && (rect.2 - region_rect.2).abs() <= 2
+            && (rect.3 - region_rect.3).abs() <= 2
+    });
+    if same_presentation_rect && wgc_visible_secondary_windows(root_owner).contains(&hwnd) {
+        log::debug!(
+            "capture-target-normalized-secondary: selected={:#x} root={:#x} reason=paired-owned-presentation-region",
+            hwnd,
+            root_owner
+        );
+        root_owner
+    } else {
+        hwnd
+    }
+}
+
+/// Return a conservative display-region fallback candidate for a multi-HWND
+/// presentation host. The signature is deliberately narrow: the root itself
+/// already owns layered presentation, and two meaningful owned surfaces occupy
+/// essentially the same rectangle, with exactly one of them non-layered. This
+/// is characteristic of a compositor/helper pair without tying the behavior to
+/// any product, executable, title, class string, or vendor.
+pub fn wgc_display_region_candidate(hwnd: isize) -> Option<isize> {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_layered_window(hwnd) {
+        return None;
+    }
+    let rows = wgc_visible_secondary_windows(hwnd);
+    if rows.len() < 2 {
+        return None;
+    }
+    for &candidate in &rows {
+        if is_layered_window(candidate) {
+            continue;
+        }
+        let Some((cx, cy, cw, ch)) = window_rect(candidate) else {
+            continue;
+        };
+        if cw <= 0 || ch <= 0 {
+            continue;
+        }
+        for &partner in &rows {
+            if partner == candidate || !is_layered_window(partner) {
+                continue;
+            }
+            let Some((px, py, pw, ph)) = window_rect(partner) else {
+                continue;
+            };
+            let nearly_same_rect = (cx - px).abs() <= 2
+                && (cy - py).abs() <= 2
+                && (cw - pw).abs() <= 2
+                && (ch - ph).abs() <= 2;
+            if nearly_same_rect {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Exclude one Neo-owned top-level window from public capture APIs while it is
+/// still shown locally. Windows 10 2004+ removes WDA_EXCLUDEFROMCAPTURE windows
+/// entirely from supported captures, which prevents a monitor-region fallback
+/// from recursively capturing Neo's own fullscreen overlay.
+pub fn set_own_window_capture_excluded(hwnd: isize, excluded: bool) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    let affinity = if excluded {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
+    let ok = unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), affinity).is_ok() };
+    if !ok {
+        log::warn!(
+            "capture-exclusion-change-failed: hwnd={:#x} excluded={}",
+            hwnd,
+            excluded
+        );
+        return false;
+    }
+    let registry = CAPTURE_EXCLUDED_WINDOWS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut rows = registry.lock().unwrap();
+    if excluded {
+        if !rows.contains(&hwnd) {
+            rows.push(hwnd);
+        }
+    } else {
+        rows.retain(|h| *h != hwnd);
+    }
+    true
+}
+
+/// Restore WDA_NONE on every Neo helper that was excluded for a monitor-region
+/// capture. Safe to call unconditionally at Stop and before a new session.
+pub fn clear_own_window_capture_exclusions() {
+    let Some(registry) = CAPTURE_EXCLUDED_WINDOWS.get() else {
+        return;
+    };
+    let rows = {
+        let mut guard = registry.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+    for hwnd in rows {
+        if hwnd != 0 && is_window_valid(hwnd) && is_own_window(hwnd) {
+            unsafe {
+                let _ = SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_NONE);
+            }
+        }
+    }
+}
+
+/// Candidate host windows for WGC when the exact selected HWND cannot be
+/// converted to a GraphicsCaptureItem. This deliberately stays generic: child
+/// render surfaces, owned video popups, and helper presentation windows may be
+/// uncapturable even though their same-process top-level host is capturable.
+///
+/// Ordering is conservative: direct ancestors/owners first, then visible
+/// same-process top-level windows that geometrically contain/overlap the
+/// selected surface. The selected HWND itself is never returned here.
+pub fn wgc_fallback_host_candidates(hwnd: isize) -> Vec<isize> {
+    if hwnd == 0 || !is_window_valid(hwnd) {
+        return Vec::new();
+    }
+    let pid = window_pid(hwnd);
+    let target_rect = window_rect(hwnd);
+    let mut out = Vec::<isize>::new();
+    let mut push_unique = |candidate: isize| {
+        if candidate != 0
+            && candidate != hwnd
+            && is_window_valid(candidate)
+            && window_pid(candidate) == pid
+            && !out.contains(&candidate)
+        {
+            out.push(candidate);
+        }
+    };
+
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        push_unique(GetAncestor(h, GA_ROOT).0 as isize);
+        push_unique(GetAncestor(h, GA_ROOTOWNER).0 as isize);
+        let mut owner = GetWindow(h, GW_OWNER).unwrap_or_default();
+        let mut guard = 0usize;
+        while !owner.0.is_null() && guard < 16 {
+            push_unique(owner.0 as isize);
+            push_unique(GetAncestor(owner, GA_ROOT).0 as isize);
+            owner = GetWindow(owner, GW_OWNER).unwrap_or_default();
+            guard += 1;
+        }
+    }
+
+    struct EnumCtx {
+        pid: u32,
+        selected: isize,
+        target_rect: Option<(i32, i32, i32, i32)>,
+        rows: Vec<(u8, i64, isize)>,
+    }
+    unsafe extern "system" fn callback(hwnd: HWND, lp: LPARAM) -> windows::core::BOOL {
+        unsafe {
+            let ctx = &mut *(lp.0 as *mut EnumCtx);
+            let raw = hwnd.0 as isize;
+            if raw == ctx.selected || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return true.into();
+            }
+            let mut candidate_pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut candidate_pid));
+            if candidate_pid != ctx.pid {
+                return true.into();
+            }
+            let Some((cx, cy, cw, ch)) = window_rect(raw) else {
+                return true.into();
+            };
+            if cw <= 0 || ch <= 0 {
+                return true.into();
+            }
+            let Some((tx, ty, tw, th)) = ctx.target_rect else {
+                return true.into();
+            };
+            if tw <= 0 || th <= 0 {
+                return true.into();
+            }
+            let t_right = tx.saturating_add(tw);
+            let t_bottom = ty.saturating_add(th);
+            let c_right = cx.saturating_add(cw);
+            let c_bottom = cy.saturating_add(ch);
+            let center_x = tx.saturating_add(tw / 2);
+            let center_y = ty.saturating_add(th / 2);
+            let contains_center =
+                center_x >= cx && center_x < c_right && center_y >= cy && center_y < c_bottom;
+            let fully_contains = tx >= cx && ty >= cy && t_right <= c_right && t_bottom <= c_bottom;
+            let ix0 = tx.max(cx);
+            let iy0 = ty.max(cy);
+            let ix1 = t_right.min(c_right);
+            let iy1 = t_bottom.min(c_bottom);
+            let intersection_area = if ix1 > ix0 && iy1 > iy0 {
+                i64::from(ix1 - ix0).saturating_mul(i64::from(iy1 - iy0))
+            } else {
+                0
+            };
+            let target_area = i64::from(tw).saturating_mul(i64::from(th)).max(1);
+            let area = i64::from(cw).saturating_mul(i64::from(ch));
+            // Same-process windows can include tooltips/menus over the selected
+            // surface. Never prefer one of those tiny overlaps as a capture
+            // host. A useful host contains the whole target, or at minimum its
+            // center with comparable area / a strong geometric overlap.
+            let rank = if fully_contains {
+                0
+            } else if contains_center && area >= target_area {
+                1
+            } else if intersection_area.saturating_mul(10) >= target_area.saturating_mul(8) {
+                2
+            } else {
+                return true.into();
+            };
+            ctx.rows.push((rank, area, raw));
+            true.into()
+        }
+    }
+
+    if pid != 0 && target_rect.is_some() {
+        let mut ctx = EnumCtx {
+            pid,
+            selected: hwnd,
+            target_rect,
+            rows: Vec::new(),
+        };
+        unsafe {
+            let _ = EnumWindows(Some(callback), LPARAM(&mut ctx as *mut _ as isize));
+        }
+        ctx.rows.sort_by_key(|row| (row.0, row.1));
+        for (_, _, candidate) in ctx.rows {
+            push_unique(candidate);
+        }
+    }
+    out
+}
+
 /// Change the owner of one of Neo's top-level popup helper windows.
 ///
 /// For a top-level WS_POPUP, GWLP_HWNDPARENT changes the owner (not the
@@ -3593,11 +4568,7 @@ pub fn set_owned_popup_owner(popup_hwnd: isize, owner_hwnd: isize) {
         return;
     }
     unsafe {
-        let _ = SetWindowLongPtrW(
-            HWND(popup_hwnd as *mut _),
-            GWLP_HWNDPARENT,
-            owner_hwnd,
-        );
+        let _ = SetWindowLongPtrW(HWND(popup_hwnd as *mut _), GWLP_HWNDPARENT, owner_hwnd);
     }
 }
 
@@ -3666,7 +4637,11 @@ pub fn normalize_panel_overlay_stack(panel_hwnd: isize, overlay_hwnd: isize) {
         hwnd != 0 && is_window_valid(hwnd) && is_own_window(hwnd) && is_window_visible(hwnd)
     };
     let panel = if own_live(panel_hwnd) { panel_hwnd } else { 0 };
-    let overlay = if own_live(overlay_hwnd) { overlay_hwnd } else { 0 };
+    let overlay = if own_live(overlay_hwnd) {
+        overlay_hwnd
+    } else {
+        0
+    };
     if overlay == 0 {
         return;
     }
@@ -3698,7 +4673,11 @@ pub fn normalize_neo_topmost_stack(
     };
     let panel_valid = panel_hwnd != 0 && is_window_valid(panel_hwnd) && is_own_window(panel_hwnd);
     let panel = if own_live(panel_hwnd) { panel_hwnd } else { 0 };
-    let overlay = if own_live(overlay_hwnd) { overlay_hwnd } else { 0 };
+    let overlay = if own_live(overlay_hwnd) {
+        overlay_hwnd
+    } else {
+        0
+    };
 
     // v235 never coupled panel/cursor lifetime to the overlay through GW_OWNER.
     // Always clean up a stale owner relationship before doing ordinary TOPMOST
@@ -3899,7 +4878,7 @@ fn reset_settings_folder_explorer_state() {
     *lock_settings_folder_explorer_state() = SettingsFolderExplorerState::Idle;
 }
 
-fn monitor_work_area_of(hwnd: isize) -> (i32, i32, i32, i32) {
+pub fn monitor_work_area_of(hwnd: isize) -> (i32, i32, i32, i32) {
     unsafe {
         let mon = MonitorFromWindow(HWND(hwnd as *mut _), MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {

@@ -103,6 +103,14 @@ fn disable_diagnostic_file_logging_after_io_error(error: &std::io::Error, path: 
 impl log::Log for TeeLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         if self.diagnostics_enabled.load(Ordering::Relaxed) {
+            // Naga's parser/validator emits extremely verbose per-expression
+            // DEBUG traces. A single Vulkan shader compile can otherwise add
+            // tens of thousands of lines to Neo's diagnostic log. Keep Naga
+            // INFO/WARN/ERROR (including compile failures), but suppress only
+            // its internal DEBUG stream. Neo/wgpu diagnostics remain unchanged.
+            if metadata.level() == log::Level::Debug && metadata.target().starts_with("naga") {
+                return false;
+            }
             metadata.level() <= log::Level::Debug
         } else {
             metadata.level() <= log::Level::Info

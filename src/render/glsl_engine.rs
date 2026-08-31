@@ -59,6 +59,51 @@ impl GlslEngine {
         }
     }
 
+    /// Run an OUTPUT/SCALED shader with the pre-scale MAIN texture still
+    /// available as a normal mpv bind. This mirrors mpv's ability to bind
+    /// earlier intermediate textures from a later hook without introducing
+    /// any shader-specific names or syntax.
+    pub fn run_post_with_main(
+        gc: &mut GlContext,
+        shader: &UserShader,
+        main: GpuTex,
+        output: GpuTex,
+    ) -> Result<GpuTex> {
+        let mut textures = HashMap::from([
+            ("MAIN".to_string(), main),
+            ("RGB".to_string(), main),
+            ("NATIVE".to_string(), main),
+            ("MAINPRESUB".to_string(), main),
+            ("OUTPUT".to_string(), output),
+            ("SCALED".to_string(), output),
+            ("PREKERNEL".to_string(), output),
+            ("POSTKERNEL".to_string(), output),
+        ]);
+        let mut comps = HashMap::from([
+            ("MAIN".to_string(), 4u8),
+            ("RGB".to_string(), 4u8),
+            ("NATIVE".to_string(), 4u8),
+            ("MAINPRESUB".to_string(), 4u8),
+            ("OUTPUT".to_string(), 4u8),
+            ("SCALED".to_string(), 4u8),
+            ("PREKERNEL".to_string(), 4u8),
+            ("POSTKERNEL".to_string(), 4u8),
+        ]);
+        let mut sizes = Self::base_sizes(main.w(), main.h(), (output.w(), output.h()));
+        for k in ["SCALED", "PREKERNEL", "POSTKERNEL"] {
+            sizes.insert(k.into(), (output.w() as f64, output.h() as f64));
+        }
+        Self::run_passes(gc, shader, &mut textures, &mut comps, &mut sizes, None)?;
+        for k in ["OUTPUT", "SCALED", "PREKERNEL", "POSTKERNEL"] {
+            if let Some(t) = textures.get(k) {
+                if t.tex != output.tex {
+                    return Ok(*t);
+                }
+            }
+        }
+        Ok(output)
+    }
+
     /// OUTPUT/SCALED-hook shaders (sharpeners etc.): run on the final
     /// display-size image; all size refs equal the image size.
     pub fn run_post(gc: &mut GlContext, shader: &UserShader, img: GpuTex) -> Result<GpuTex> {
@@ -1151,7 +1196,7 @@ fn compute_src(
 /// the shader does not already contain a real function body with that name.
 /// A shader-provided implementation therefore wins unchanged; shaders that
 /// merely call the helper keep the existing Neo fallback behavior.
-fn append_mpv_transfer_helpers(prelude: &mut String, body: &str) {
+pub(crate) fn append_mpv_transfer_helpers(prelude: &mut String, body: &str) {
     if !body_defines_function(body, "linearize") {
         prelude.push_str(
             "vec4 linearize(vec4 c){ return vec4(pow(max(c.rgb, vec3(0.0)), vec3(2.2)), c.a); }\n",
@@ -1520,11 +1565,19 @@ pub fn advance_frame() {
     FRAME_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Undo a speculative frame advance when a pre-presentation alternate backend
+/// fails before producing a usable frame. This is deliberately paired only
+/// with v661's synchronous DirectML -> Vulkan attempt; no rendered frame can
+/// observe the temporary value because the attempt completes on this thread.
+pub fn rewind_frame() {
+    FRAME_INDEX.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn current_frame() -> i32 {
     FRAME_INDEX.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn compat_shader_code(p: &Pass, binds_comps: &[(String, u8, bool)]) -> String {
+pub(crate) fn compat_shader_code(p: &Pass, binds_comps: &[(String, u8, bool)]) -> String {
     let names: Vec<&str> = binds_comps
         .iter()
         .filter_map(|(name, comps, _)| (*comps == 1).then_some(name.as_str()))
@@ -1682,13 +1735,7 @@ vec4 delinearize(vec4 color) {
 #endif
 vec4 hook(){ return delinearize(linearize(HOOKED_tex(HOOKED_pos))); }
 "#;
-        let src = fragment_src(
-            code,
-            "MAIN",
-            &[("HOOKED".into(), 4, false)],
-            &[],
-            &[],
-        );
+        let src = fragment_src(code, "MAIN", &[("HOOKED".into(), 4, false)], &[], &[]);
         assert_eq!(src.matches("vec4 linearize(vec4").count(), 1);
         assert_eq!(src.matches("vec4 delinearize(vec4").count(), 1);
         assert!(src.contains("vec3(2.4)"));

@@ -174,9 +174,15 @@ impl OverlayWindow {
             let _ = DwmFlush();
             let native_visible = IsWindowVisible(self.win.hwnd).as_bool();
             if native_visible {
-                log::error!("overlay-stop-hide-postcondition-failed: hwnd={:#x} native_visible=true", self.win.hwnd.0 as isize);
+                log::error!(
+                    "overlay-stop-hide-postcondition-failed: hwnd={:#x} native_visible=true",
+                    self.win.hwnd.0 as isize
+                );
             } else {
-                log::info!("overlay-stop-hide-complete: hwnd={:#x} native_visible=false rect=(-32000,-32000 1x1)", self.win.hwnd.0 as isize);
+                log::info!(
+                    "overlay-stop-hide-complete: hwnd={:#x} native_visible=false rect=(-32000,-32000 1x1)",
+                    self.win.hwnd.0 as isize
+                );
             }
         }
         self.width = 1;

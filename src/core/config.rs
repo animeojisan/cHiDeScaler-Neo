@@ -121,6 +121,114 @@ pub struct CaptureResolution {
     pub h: u32,
 }
 
+/// How the final display-only aspect correction is derived. Manual preserves
+/// the v576 width/height controls. Auto modes recompute from the current
+/// pre-correction presentation aspect whenever that aspect changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AspectCorrectionMode {
+    #[default]
+    #[serde(rename = "manual")]
+    Manual,
+    #[serde(rename = "auto_4_3")]
+    Auto4x3,
+    #[serde(rename = "auto_16_9")]
+    Auto16x9,
+}
+
+/// User crop relative to Neo's already-established capture image (after the
+/// existing optional client/title-bar crop). Values are pixels removed from
+/// each edge. Runtime code clamps them against the actual frame so malformed
+/// or stale presets can never produce an empty image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureCrop {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub left: u32,
+    #[serde(default)]
+    pub top: u32,
+    #[serde(default)]
+    pub right: u32,
+    #[serde(default)]
+    pub bottom: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedCaptureCrop {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    /// Exact source pixels retained before Neo's existing even-size edge pad.
+    pub content_w: u32,
+    pub content_h: u32,
+    /// Processing size after right/bottom edge replication for odd dimensions.
+    pub output_w: u32,
+    pub output_h: u32,
+}
+
+impl CaptureCrop {
+    pub fn applied_to(self, width: u32, height: u32) -> AppliedCaptureCrop {
+        let width = width.max(1);
+        let height = height.max(1);
+        // Absolute compatibility rule: when user crop is OFF, this helper is
+        // geometry-transparent. v576 already owns any WGC right/bottom even
+        // padding, so the new feature must not introduce a second implicit
+        // size/aspect adjustment merely because an odd Win32 rect is observed.
+        if !self.enabled {
+            return AppliedCaptureCrop {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+                content_w: width,
+                content_h: height,
+                output_w: width,
+                output_h: height,
+            };
+        }
+        let left = self.left.min(width.saturating_sub(1));
+        let right = self.right.min(width.saturating_sub(left).saturating_sub(1));
+        let top = self.top.min(height.saturating_sub(1));
+        let bottom = self
+            .bottom
+            .min(height.saturating_sub(top).saturating_sub(1));
+        let content_w = width.saturating_sub(left + right).max(1);
+        let content_h = height.saturating_sub(top + bottom).max(1);
+        let output_w = if content_w & 1 == 0 {
+            content_w
+        } else {
+            content_w + 1
+        };
+        let output_h = if content_h & 1 == 0 {
+            content_h
+        } else {
+            content_h + 1
+        };
+        AppliedCaptureCrop {
+            left,
+            top,
+            right,
+            bottom,
+            content_w,
+            content_h,
+            output_w,
+            output_h,
+        }
+    }
+}
+
+pub const ASPECT_CORRECTION_SCALE_MIN: f32 = 0.50;
+pub const ASPECT_CORRECTION_SCALE_MAX: f32 = 2.00;
+
+pub fn sanitize_aspect_correction_scale(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(ASPECT_CORRECTION_SCALE_MIN, ASPECT_CORRECTION_SCALE_MAX)
+    } else {
+        1.0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_ui_mode")]
@@ -208,9 +316,19 @@ pub struct Settings {
     /// Legacy saved value; retained for compatibility and ignored by the fixed Low400 mapper.
     #[serde(default)]
     pub hdr_sdr_mode: HdrSdrMode,
-    /// Stable DXGI adapter LUID for DirectML. None = automatic high performance.
+    /// Stable DXGI adapter LUID selected by the user. None = Auto.
+    /// Neo first asks Windows/driver to place WGPU/WGL on this adapter. If an
+    /// explicit request cannot move the render GPU, ONNX still uses the
+    /// selected adapter and falls back to the existing cross-GPU/CPU transfer
+    /// paths rather than silently running AI inference on the iGPU.
     #[serde(default)]
     pub gpu_adapter_luid: Option<u64>,
+    /// Force compatible GLSL stages through Vulkan on the explicitly selected
+    /// GPU even when that adapter already owns the OpenGL presentation context.
+    /// False keeps the normal same-GPU OpenGL fast path; cross-GPU explicit
+    /// selection still uses Vulkan automatically so GLSL stays on the selected GPU.
+    #[serde(default)]
+    pub gpu_force_vulkan: bool,
     /// Global ONNX backend preference. Presets intentionally remain backend
     /// agnostic; unavailable TensorRT installations resolve to DirectML.
     #[serde(default)]
@@ -218,6 +336,20 @@ pub struct Settings {
     /// Source-window client resize before/while capturing. None = auto/no resize.
     #[serde(default)]
     pub capture_resolution: Option<CaptureResolution>,
+    /// Display-only non-uniform aspect correction. Capture/WGC and all
+    /// filter-processing geometry remain unchanged; only the final
+    /// presentation aspect is adjusted when enabled.
+    #[serde(default)]
+    pub aspect_correction: bool,
+    #[serde(default)]
+    pub aspect_correction_mode: AspectCorrectionMode,
+    #[serde(default = "default_aspect_scale")]
+    pub aspect_width_scale: f32,
+    #[serde(default = "default_aspect_scale")]
+    pub aspect_height_scale: f32,
+    /// Optional user crop applied before GLSL/ONNX processing.
+    #[serde(default)]
+    pub capture_crop: CaptureCrop,
 }
 
 fn default_downscaler() -> String {
@@ -255,6 +387,9 @@ fn default_mode() -> ScaleMode {
 }
 fn default_ratio() -> f32 {
     2.0
+}
+fn default_aspect_scale() -> f32 {
+    1.0
 }
 fn default_hotkey() -> String {
     "Ctrl+Alt+Z".into()
@@ -295,8 +430,14 @@ impl Default for Settings {
             hdr_capture: false,
             hdr_sdr_mode: HdrSdrMode::Low400,
             gpu_adapter_luid: None,
+            gpu_force_vulkan: false,
             onnx_backend: OnnxBackendPreference::DirectML,
             capture_resolution: None,
+            aspect_correction: false,
+            aspect_correction_mode: AspectCorrectionMode::Manual,
+            aspect_width_scale: 1.0,
+            aspect_height_scale: 1.0,
+            capture_crop: CaptureCrop::default(),
         }
     }
 }

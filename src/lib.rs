@@ -32,4 +32,7 @@ pub mod render {
     pub mod onnx_backend;
     pub mod onnx_stage;
     pub mod scaler;
+    pub mod vulkan_gpu;
+    pub mod vulkan_multipass;
+    pub mod vulkan_onepass;
 }

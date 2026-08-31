@@ -15,15 +15,22 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, INPUT, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, SendInput, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, mouse_event,
+    GetAsyncKeyState, INPUT, INPUT_MOUSE, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+    MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, RegisterHotKey, SendInput,
+    UnregisterHotKey, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, mouse_event,
 };
 use windows::Win32::UI::Magnification::{MagInitialize, MagShowSystemCursor, MagUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::PCWSTR;
 
 const ENTER_MARGIN_PX: i32 = 8;
 // Native UI routing is exact. Invisible click margins and post-hover grace
@@ -154,7 +161,62 @@ static SOURCE_CLIENT_DRAG_OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
 /// and even past the physical monitor edge, so they remain a usable visual
 /// drag authority after Windows/Chromium stops moving the hidden source HWND.
 static SOURCE_CLIENT_DRAG_RAW_ORIGIN: AtomicI64 = AtomicI64::new(0);
+
 static SOURCE_CLIENT_DRAG_RAW_CURRENT: AtomicI64 = AtomicI64::new(0);
+
+// v643: safe deferred routing for the one case where a physical source-space
+// button edge must not reach another top-level window that covers the hidden
+// source coordinate.
+//
+// IMPORTANT SAFETY CONTRACT:
+// - WH_MOUSE_LL does ONLY atomic reads/writes here.
+// - No WindowFromPoint, PostMessage, SetCursorPos, cursor visibility, Z-order,
+//   logging, or State mutex work is performed by this guard.
+// - Win32 delivery to the source is drained later from configure(), on the
+//   normal engine/Magnification owner thread.
+//
+// v642 violated this contract by doing window queries/message delivery/sprite
+// manipulation directly inside WH_MOUSE_LL and could destabilize DWM.  Keep
+// this path deliberately small and bounded.
+const DEFERRED_SOURCE_EVENT_CAP: usize = 16;
+const DEFERRED_OCCLUSION_CAP: usize = 8;
+static DEFERRED_SOURCE_ENGAGED: AtomicBool = AtomicBool::new(false);
+static DEFERRED_SOURCE_CLIENT_ONLY: AtomicBool = AtomicBool::new(false);
+static DEFERRED_SOURCE_HWND: AtomicIsize = AtomicIsize::new(0);
+// Seqlock-published geometry used by the atomic-only LL-hook gate.  The hook
+// maps the visible Neo sprite to its intended source-screen target without
+// touching State or calling Win32.
+static DEFERRED_GEOMETRY_SEQ: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_CONTENT_XY: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_CONTENT_WH: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_SOURCE_XY: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_SOURCE_WH: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_SOURCE_LAST_TARGET: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_OCCLUSION_COUNT: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static DEFERRED_OCCLUSION_X: [AtomicI32; DEFERRED_OCCLUSION_CAP] =
+    [const { AtomicI32::new(0) }; DEFERRED_OCCLUSION_CAP];
+static DEFERRED_OCCLUSION_Y: [AtomicI32; DEFERRED_OCCLUSION_CAP] =
+    [const { AtomicI32::new(0) }; DEFERRED_OCCLUSION_CAP];
+static DEFERRED_OCCLUSION_W: [AtomicI32; DEFERRED_OCCLUSION_CAP] =
+    [const { AtomicI32::new(0) }; DEFERRED_OCCLUSION_CAP];
+static DEFERRED_OCCLUSION_H: [AtomicI32; DEFERRED_OCCLUSION_CAP] =
+    [const { AtomicI32::new(0) }; DEFERRED_OCCLUSION_CAP];
+
+static DEFERRED_EVENT_WRITE: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_EVENT_READ: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_EVENT_MSG: [std::sync::atomic::AtomicU32; DEFERRED_SOURCE_EVENT_CAP] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; DEFERRED_SOURCE_EVENT_CAP];
+static DEFERRED_EVENT_POS: [AtomicI64; DEFERRED_SOURCE_EVENT_CAP] =
+    [const { AtomicI64::new(0) }; DEFERRED_SOURCE_EVENT_CAP];
+static DEFERRED_EVENT_VISUAL: [AtomicI64; DEFERRED_SOURCE_EVENT_CAP] =
+    [const { AtomicI64::new(0) }; DEFERRED_SOURCE_EVENT_CAP];
+static DEFERRED_SOURCE_HELD_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static DEFERRED_SOURCE_OVERFLOW: AtomicBool = AtomicBool::new(false);
+static DEFERRED_SOURCE_MOVE_POS: AtomicI64 = AtomicI64::new(0);
+static DEFERRED_SOURCE_MOVE_SEQ: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_SOURCE_MOVE_DRAINED_SEQ: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_SOURCE_QUEUED_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Lock-free provenance check used by the render/geometry thread.  A client
 /// drag is valid only when its LEFT-down began while Neo actually owned source
@@ -419,7 +481,11 @@ pub fn record_gui_minimize_cursor() {
     }
     GUI_MINIMIZE_CURSOR.store(pack_drag_pair(pos.0, pos.1), Ordering::Release);
     GUI_MINIMIZE_CURSOR_AT_MS.store(route_clock_ms(), Ordering::Release);
-    log::info!("gui-native-minimize-cursor-saved: pos=({},{})", pos.0, pos.1);
+    log::info!(
+        "gui-native-minimize-cursor-saved: pos=({},{})",
+        pos.0,
+        pos.1
+    );
 }
 
 /// Fail-visible handoff for native root-GUI minimization during capture.
@@ -1410,11 +1476,17 @@ fn clip_rect(src: Rect) -> RECT {
 /// Injecting an unconditional RIGHTUP here can be interpreted by Explorer as
 /// a completed right-click and opened its context menu before Neo appeared.
 pub fn startup_recover_input_state() {
+    start_input_failsafe_worker();
+    // PID values are reusable. Never inherit a stale recovery snapshot from an
+    // older crashed process that happened to own the same numeric PID.
+    clear_janitor_source_recovery();
+    INPUT_FAILSAFE_LATCHED.store(false, Ordering::Release);
+    CAPTURE_SESSION_ACTIVE.store(false, Ordering::Release);
     SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     // ask the render-engine thread (Mag owner) to reveal the cursor if it is
-    // still alive; also do a best-effort local reveal for the standalone rescue
-    // exe (where no engine thread exists — the OS restores the cursor on the
-    // hidden process's exit anyway, so a residual no-op here is harmless).
+    // still alive. Independent fail-safe/janitor recovery covers the case where
+    // that owner thread is unavailable, so startup never relies on an implicit
+    // OS cursor-visibility reset.
     WANT_CURSOR_HIDDEN.store(false, Ordering::Relaxed);
     CURSOR_HIDE_APPLIED.store(false, Ordering::Release);
     DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
@@ -1627,6 +1699,18 @@ struct State {
     /// Buttons whose hardware UP must be swallowed because their DOWN was
     /// redirected to the panel as a synthetic full click (bit per button).
     swallow_up: u8,
+    /// Physical source-button gestures that had to be forwarded directly to
+    /// the source HWND because the hidden source point was occluded by another
+    /// top-most window (or the in-hook cursor warp could not be verified).
+    /// While a bit is set, matching move/up messages are also routed directly
+    /// so an occluding Task Manager/browser window can never steal half of the
+    /// gesture.
+    source_direct_bits: u8,
+    /// Coalesces WM_MOUSEMOVE only while Neo owns a directly-forwarded source
+    /// button gesture. Ordinary hover/movement always stays on the established
+    /// native v636 path; this field must never make occlusion alone change cursor
+    /// ownership.
+    last_source_direct_post: Option<(isize, (i32, i32), u8, std::time::Instant)>,
     /// Buttons currently handed to a real GUI/control-panel window. While set,
     /// the magnifier must not re-engage: the user is dragging/clicking UI.
     ui_hold_bits: u8,
@@ -2075,7 +2159,9 @@ fn gui_caption_band(
     // horizontal non-client caption band so the left icon/system-menu side does
     // not silently take a different cursor path. The SOURCE classifier above
     // remains conservative because it has geometry side effects.
-    let inside = px >= wx && px < wx.saturating_add(ww) && py >= wy && py < cy;
+    let system_buttons = crate::platform::win32::caption_system_button_cluster_width();
+    let button_cluster_left = wx.saturating_add(ww).saturating_sub(system_buttons);
+    let inside = px >= wx && px < button_cluster_left && py >= wy && py < cy;
     Some((window, client, inside))
 }
 
@@ -2117,7 +2203,11 @@ fn begin_native_gui_caption_drag(hwnd: isize, px: i32, py: i32) -> bool {
         "native-gui-caption-drag-begin: hwnd={hwnd:#x} cursor=({px},{py}) window=({wx},{wy}) anchor=({},{}) visual_owner={} raw-authority=true",
         anchor.0,
         anchor.1,
-        if external_native_cursor_owner(hwnd) { "native" } else { "neo-sprite" }
+        if external_native_cursor_owner(hwnd) {
+            "native"
+        } else {
+            "neo-sprite"
+        }
     );
     true
 }
@@ -2670,7 +2760,10 @@ pub fn cursor_sprite_screen_probe() -> (bool, bool, usize, usize, u32) {
     let Some((sx, sy, sw, sh)) = crate::platform::win32::window_rect(raw_hwnd) else {
         return (requested, api_visible, 0, 0, 0);
     };
-    let size = SPRITE_SIZE_PX.load(Ordering::Relaxed).max(1).min(sw.max(sh).max(1));
+    let size = SPRITE_SIZE_PX
+        .load(Ordering::Relaxed)
+        .max(1)
+        .min(sw.max(sh).max(1));
     let expected = arrow_pixels(size);
     let mut opaque = Vec::new();
     for (idx, pixel) in expected.iter().copied().enumerate() {
@@ -2802,6 +2895,255 @@ fn button_transition(msg: u32) -> Option<(u8, bool)> {
     }
 }
 
+fn publish_deferred_source_engaged(committed: bool) {
+    DEFERRED_SOURCE_ENGAGED.store(committed, Ordering::Release);
+}
+
+fn clear_deferred_source_queue() {
+    let w = DEFERRED_EVENT_WRITE.load(Ordering::Acquire);
+    DEFERRED_EVENT_READ.store(w, Ordering::Release);
+    DEFERRED_SOURCE_HELD_BITS.store(0, Ordering::Release);
+    DEFERRED_SOURCE_LAST_TARGET.store(0, Ordering::Release);
+    DEFERRED_SOURCE_OVERFLOW.store(false, Ordering::Release);
+    let move_seq = DEFERRED_SOURCE_MOVE_SEQ.load(Ordering::Acquire);
+    DEFERRED_SOURCE_MOVE_DRAINED_SEQ.store(move_seq, Ordering::Release);
+}
+
+fn publish_deferred_source_geometry(
+    active: bool,
+    client_only: bool,
+    src_hwnd: isize,
+    content: Rect,
+    src: Rect,
+    no_engage: &[NoEngageRect],
+) {
+    DEFERRED_SOURCE_CLIENT_ONLY.store(active && client_only, Ordering::Release);
+    DEFERRED_SOURCE_HWND.store(if active { src_hwnd } else { 0 }, Ordering::Release);
+
+    // Odd sequence = writer in progress, even = coherent snapshot.  There is
+    // only one configure/geometry publisher, but the LL hook may sample at any
+    // instruction boundary.
+    DEFERRED_GEOMETRY_SEQ.fetch_add(1, Ordering::AcqRel);
+    let (content_xy, content_wh, source_xy, source_wh) = if active {
+        (
+            pack_drag_pair(content.x, content.y),
+            pack_drag_pair(content.w, content.h),
+            pack_drag_pair(src.x, src.y),
+            pack_drag_pair(src.w, src.h),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    DEFERRED_CONTENT_XY.store(content_xy, Ordering::Relaxed);
+    DEFERRED_CONTENT_WH.store(content_wh, Ordering::Relaxed);
+    DEFERRED_SOURCE_XY.store(source_xy, Ordering::Relaxed);
+    DEFERRED_SOURCE_WH.store(source_wh, Ordering::Relaxed);
+
+    let mut n = 0usize;
+    if active {
+        for hit in no_engage {
+            if n >= DEFERRED_OCCLUSION_CAP {
+                break;
+            }
+            if hit.hwnd == 0
+                || hit.panel
+                || crate::platform::win32::is_own_window(hit.hwnd)
+                || hit.land.w <= 0
+                || hit.land.h <= 0
+            {
+                continue;
+            }
+            DEFERRED_OCCLUSION_X[n].store(hit.land.x, Ordering::Relaxed);
+            DEFERRED_OCCLUSION_Y[n].store(hit.land.y, Ordering::Relaxed);
+            DEFERRED_OCCLUSION_W[n].store(hit.land.w, Ordering::Relaxed);
+            DEFERRED_OCCLUSION_H[n].store(hit.land.h, Ordering::Relaxed);
+            n += 1;
+        }
+    }
+    DEFERRED_OCCLUSION_COUNT.store(n as u32, Ordering::Relaxed);
+    DEFERRED_GEOMETRY_SEQ.fetch_add(1, Ordering::Release);
+    if !active || src_hwnd == 0 {
+        publish_deferred_source_engaged(false);
+    }
+}
+
+fn deferred_source_target_from_visual_lockfree(visual_x: i32, visual_y: i32) -> Option<(i32, i32)> {
+    // Bounded seqlock read: never wait/spin in WH_MOUSE_LL.  A concurrent
+    // geometry update merely lets this one edge use the ordinary safe fallback.
+    for _ in 0..2 {
+        let seq_before = DEFERRED_GEOMETRY_SEQ.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            continue;
+        }
+        let (cx, cy) = unpack_drag_pair(DEFERRED_CONTENT_XY.load(Ordering::Relaxed));
+        let (cw, ch) = unpack_drag_pair(DEFERRED_CONTENT_WH.load(Ordering::Relaxed));
+        let (sx, sy) = unpack_drag_pair(DEFERRED_SOURCE_XY.load(Ordering::Relaxed));
+        let (sw, sh) = unpack_drag_pair(DEFERRED_SOURCE_WH.load(Ordering::Relaxed));
+        let seq_after = DEFERRED_GEOMETRY_SEQ.load(Ordering::Acquire);
+        if seq_before != seq_after || seq_after & 1 != 0 {
+            continue;
+        }
+        if cw <= 1 || ch <= 1 || sw <= 1 || sh <= 1 {
+            return None;
+        }
+        // Same pixel-centre mapping as map_content_to_source(), kept local so
+        // the hook performs arithmetic + atomics only.
+        let fx = ((visual_x as f64 - cx as f64 + 0.5) / cw as f64).clamp(0.0, 1.0);
+        let fy = ((visual_y as f64 - cy as f64 + 0.5) / ch as f64).clamp(0.0, 1.0);
+        let tx = (sx as f64 + fx * sw as f64 - 0.5).round() as i32;
+        let ty = (sy as f64 + fy * sh as f64 - 0.5).round() as i32;
+        return Some((
+            tx.clamp(sx, sx.saturating_add(sw).saturating_sub(1)),
+            ty.clamp(sy, sy.saturating_add(sh).saturating_sub(1)),
+        ));
+    }
+    None
+}
+
+fn deferred_source_occluded_target_from_visual_lockfree(
+    visual_x: i32,
+    visual_y: i32,
+) -> Option<(i32, i32)> {
+    // Read geometry + external-window rectangles under one bounded seqlock
+    // snapshot.  This avoids classifying a target with a rectangle list from a
+    // different configure tick while keeping WH_MOUSE_LL strictly atomic-only.
+    for _ in 0..2 {
+        let seq_before = DEFERRED_GEOMETRY_SEQ.load(Ordering::Acquire);
+        if seq_before & 1 != 0 {
+            continue;
+        }
+        let (cx, cy) = unpack_drag_pair(DEFERRED_CONTENT_XY.load(Ordering::Relaxed));
+        let (cw, ch) = unpack_drag_pair(DEFERRED_CONTENT_WH.load(Ordering::Relaxed));
+        let (sx, sy) = unpack_drag_pair(DEFERRED_SOURCE_XY.load(Ordering::Relaxed));
+        let (sw, sh) = unpack_drag_pair(DEFERRED_SOURCE_WH.load(Ordering::Relaxed));
+        if cw <= 1 || ch <= 1 || sw <= 1 || sh <= 1 {
+            return None;
+        }
+        let fx = ((visual_x as f64 - cx as f64 + 0.5) / cw as f64).clamp(0.0, 1.0);
+        let fy = ((visual_y as f64 - cy as f64 + 0.5) / ch as f64).clamp(0.0, 1.0);
+        let target_x = ((sx as f64 + fx * sw as f64 - 0.5).round() as i32)
+            .clamp(sx, sx.saturating_add(sw).saturating_sub(1));
+        let target_y = ((sy as f64 + fy * sh as f64 - 0.5).round() as i32)
+            .clamp(sy, sy.saturating_add(sh).saturating_sub(1));
+
+        let count =
+            (DEFERRED_OCCLUSION_COUNT.load(Ordering::Relaxed) as usize).min(DEFERRED_OCCLUSION_CAP);
+        let mut occluded = false;
+        for i in 0..count {
+            let x = DEFERRED_OCCLUSION_X[i].load(Ordering::Relaxed);
+            let y = DEFERRED_OCCLUSION_Y[i].load(Ordering::Relaxed);
+            let w = DEFERRED_OCCLUSION_W[i].load(Ordering::Relaxed);
+            let h = DEFERRED_OCCLUSION_H[i].load(Ordering::Relaxed);
+            if w <= 0 || h <= 0 {
+                continue;
+            }
+            let target_inside = target_x >= x
+                && target_x < x.saturating_add(w)
+                && target_y >= y
+                && target_y < y.saturating_add(h);
+            if !target_inside {
+                continue;
+            }
+            let visual_inside = visual_x >= x
+                && visual_x < x.saturating_add(w)
+                && visual_y >= y
+                && visual_y < y.saturating_add(h);
+            if !visual_inside {
+                occluded = true;
+                break;
+            }
+        }
+        let seq_after = DEFERRED_GEOMETRY_SEQ.load(Ordering::Acquire);
+        if seq_before != seq_after || seq_after & 1 != 0 {
+            continue;
+        }
+        return occluded.then_some((target_x, target_y));
+    }
+    None
+}
+
+fn enqueue_deferred_source_event(msg: u32, px: i32, py: i32, vx: i32, vy: i32) -> bool {
+    let write = DEFERRED_EVENT_WRITE.load(Ordering::Relaxed);
+    let read = DEFERRED_EVENT_READ.load(Ordering::Acquire);
+    if write.saturating_sub(read) >= DEFERRED_SOURCE_EVENT_CAP as u64 {
+        DEFERRED_SOURCE_OVERFLOW.store(true, Ordering::Release);
+        return false;
+    }
+    let slot = (write as usize) % DEFERRED_SOURCE_EVENT_CAP;
+    DEFERRED_EVENT_POS[slot].store(pack_drag_pair(px, py), Ordering::Relaxed);
+    DEFERRED_EVENT_VISUAL[slot].store(pack_drag_pair(vx, vy), Ordering::Relaxed);
+    DEFERRED_EVENT_MSG[slot].store(msg, Ordering::Relaxed);
+    DEFERRED_EVENT_WRITE.store(write.wrapping_add(1), Ordering::Release);
+    DEFERRED_SOURCE_QUEUED_COUNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// LL-hook safety gate for source-space button edges. This function is
+/// intentionally atomic-only; it must stay safe even when the main State mutex
+/// is busy or the render thread is stalled.
+fn queue_occluded_source_button_edge_lockfree(msg: u32, _px: i32, _py: i32) -> bool {
+    let Some((bit, down)) = button_transition(msg) else {
+        return false;
+    };
+    let held = DEFERRED_SOURCE_HELD_BITS.load(Ordering::Acquire);
+    let visual = unpack_drag_pair(SPRITE_TARGET.load(Ordering::Acquire));
+
+    // Once a DOWN was swallowed by this gate, its matching UP belongs to the
+    // same deferred source gesture regardless of any ownership transition in
+    // between.  Re-map the CURRENT visual point; if geometry is being published
+    // at this exact instant, fall back to the last coherent target from the
+    // gesture instead of leaking the UP elsewhere.
+    if !down && held & bit != 0 {
+        let target = deferred_source_target_from_visual_lockfree(visual.0, visual.1)
+            .unwrap_or_else(|| {
+                unpack_drag_pair(DEFERRED_SOURCE_LAST_TARGET.load(Ordering::Acquire))
+            });
+        let queued = enqueue_deferred_source_event(msg, target.0, target.1, visual.0, visual.1);
+        DEFERRED_SOURCE_HELD_BITS.fetch_and(!bit, Ordering::AcqRel);
+        if !queued {
+            DEFERRED_SOURCE_OVERFLOW.store(true, Ordering::Release);
+        }
+        return true;
+    }
+
+    if !down
+        || !DEFERRED_SOURCE_ENGAGED.load(Ordering::Acquire)
+        || !DEFERRED_SOURCE_CLIENT_ONLY.load(Ordering::Acquire)
+        || DEFERRED_SOURCE_HWND.load(Ordering::Acquire) == 0
+        || NATIVE_GUI_OWNER.load(Ordering::Acquire) != 0
+    {
+        return false;
+    }
+
+    let Some(target) = deferred_source_occluded_target_from_visual_lockfree(visual.0, visual.1)
+    else {
+        return false;
+    };
+
+    DEFERRED_SOURCE_LAST_TARGET.store(pack_drag_pair(target.0, target.1), Ordering::Release);
+    let queued = enqueue_deferred_source_event(msg, target.0, target.1, visual.0, visual.1);
+    DEFERRED_SOURCE_HELD_BITS.fetch_or(bit, Ordering::AcqRel);
+    if !queued {
+        DEFERRED_SOURCE_OVERFLOW.store(true, Ordering::Release);
+    }
+    // Safety-first: even queue overflow must not leak this physical DOWN to the
+    // covering window. The engine-side overflow recovery releases bookkeeping.
+    true
+}
+
+fn note_deferred_source_drag_move_lockfree(_px: i32, _py: i32) {
+    if DEFERRED_SOURCE_HELD_BITS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let visual = unpack_drag_pair(SPRITE_TARGET.load(Ordering::Acquire));
+    let Some(target) = deferred_source_target_from_visual_lockfree(visual.0, visual.1) else {
+        return;
+    };
+    DEFERRED_SOURCE_LAST_TARGET.store(pack_drag_pair(target.0, target.1), Ordering::Release);
+    DEFERRED_SOURCE_MOVE_POS.store(pack_drag_pair(target.0, target.1), Ordering::Relaxed);
+    DEFERRED_SOURCE_MOVE_SEQ.fetch_add(1, Ordering::Release);
+}
+
 fn physical_button_bits() -> u8 {
     let mut bits = 0;
     unsafe {
@@ -2819,6 +3161,11 @@ fn physical_button_bits() -> u8 {
 }
 
 const STALE_BUTTON_WATCHDOG_MS: u64 = 180;
+/// During the rare directly-forwarded source drag, cap posted WM_MOUSEMOVE
+/// traffic so a 1000/8000Hz mouse cannot flood the source queue. Occlusion by
+/// itself never enables synthetic movement; ordinary cursor motion remains on
+/// the stable native path used before v637.
+const SOURCE_DIRECT_MOVE_MIN_MS: u64 = 4;
 
 fn reconcile_stale_buttons(g: &mut State, now: std::time::Instant) -> u8 {
     reconcile_stale_buttons_with_physical(g, now, physical_button_bits())
@@ -2829,7 +3176,13 @@ fn reconcile_stale_buttons_with_physical(
     now: std::time::Instant,
     physical: u8,
 ) -> u8 {
-    let tracked = g.buttons_down | g.ui_hold_bits | g.native_ui_hold_bits;
+    // A directly-forwarded source DOWN is intentionally swallowed in the LL hook.
+    // On Windows that can leave GetAsyncKeyState() reporting the button as UP
+    // even though the matching physical LL-hook UP has not arrived yet. Never let
+    // the generic watchdog synthesize an early UP for those owned gestures; the
+    // matching hook UP (or release_locked() on Stop/transition) closes them.
+    let direct_owned = g.source_direct_bits;
+    let tracked = (g.buttons_down & !direct_owned) | g.ui_hold_bits | g.native_ui_hold_bits;
     if tracked == 0
         || g.last_button_event.is_some_and(|edge| {
             now.saturating_duration_since(edge)
@@ -3127,6 +3480,7 @@ fn begin_ui_hold(g: &mut State, hover: UiHover, bit: u8) -> bool {
         return false;
     };
     g.engaged = false;
+    publish_deferred_source_engaged(false);
     g.edge_out_accum = 0.0;
     g.last_engage_at = None;
     g.teleport_guard_until = None;
@@ -3176,6 +3530,7 @@ fn handoff_to_gui(g: &mut State, hover: UiHover, _now: std::time::Instant) -> bo
         return false;
     };
     g.engaged = false;
+    publish_deferred_source_engaged(false);
     g.edge_out_accum = 0.0;
     g.last_engage_at = None;
     g.teleport_guard_until = None;
@@ -3715,6 +4070,9 @@ fn try_panel_redirect(msg: u32, px: i32, py: i32) -> bool {
 unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code >= 0 {
+            if INPUT_FAILSAFE_LATCHED.load(Ordering::Acquire) {
+                return CallNextHookEx(None, code, wp, lp);
+            }
             let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
             // Hardware events only. The native desktop regression harness can
             // opt in to one private SendInput tag so it exercises this exact
@@ -3748,6 +4106,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let msg = wp.0 as u32;
                 match msg {
                     WM_MOUSEMOVE => {
+                        note_deferred_source_drag_move_lockfree(info.pt.x, info.pt.y);
                         // SetCursorPos during engagement moves the real cursor into the
                         // source rect. Do not let the original hardware move continue
                         // afterwards and overwrite that new position with its old point.
@@ -3807,10 +4166,22 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if try_panel_redirect(msg, info.pt.x, info.pt.y) {
                             return LRESULT(1);
                         }
+                        // v643: when only the hidden mapped source cursor is
+                        // covered by an external window, swallow this edge
+                        // without taking State and defer ALL Win32/source work
+                        // to the normal engine thread. This atomic-only guard
+                        // replaces v642's unsafe in-hook window/message route.
+                        if queue_occluded_source_button_edge_lockfree(msg, info.pt.x, info.pt.y) {
+                            return LRESULT(1);
+                        }
                         track_button_state(msg, info.pt.x, info.pt.y);
-                        align_engaged_cursor_for_input(info.pt.x, info.pt.y);
+                        let source_edge_consumed =
+                            align_engaged_cursor_for_input(msg, info.pt.x, info.pt.y);
                         if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
                             diagnose_click(info.pt.x, info.pt.y);
+                        }
+                        if source_edge_consumed {
+                            return LRESULT(1);
                         }
                     }
                     WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
@@ -3820,7 +4191,9 @@ unsafe extern "system" fn mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
                         if pending_engage_active() {
                             return LRESULT(1);
                         }
-                        align_engaged_cursor_for_input(info.pt.x, info.pt.y);
+                        if align_engaged_cursor_for_input(msg, info.pt.x, info.pt.y) {
+                            return LRESULT(1);
+                        }
                     }
                     _ => {}
                 }
@@ -3859,6 +4232,261 @@ fn post_mouse_button(msg: u32, tx: i32, ty: i32, src_hwnd: isize) -> bool {
         };
         let lp = ((client.y as u32 & 0xFFFF) << 16) | (client.x as u32 & 0xFFFF);
         PostMessageW(Some(hit), msg, WPARAM(down_wparam), LPARAM(lp as isize)).is_ok()
+    }
+}
+
+/// Post directly to the known source root instead of WindowFromPoint. This is
+/// only a fallback for an engaged source gesture whose physical source point is
+/// covered by another top-most window. Normal unoccluded input still follows
+/// the native hardware path, preserving browser/raw-input compatibility.
+fn post_mouse_button_to_source(msg: u32, tx: i32, ty: i32, src_hwnd: isize) -> bool {
+    if src_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let target = HWND(src_hwnd as *mut _);
+        let mut client = POINT { x: tx, y: ty };
+        let _ = ScreenToClient(target, &mut client);
+        let wparam = match msg {
+            WM_LBUTTONDOWN => 0x0001usize,
+            WM_RBUTTONDOWN => 0x0002usize,
+            WM_MBUTTONDOWN => 0x0010usize,
+            _ => 0usize,
+        };
+        let lp = ((client.y as u32 & 0xFFFF) << 16) | (client.x as u32 & 0xFFFF);
+        PostMessageW(Some(target), msg, WPARAM(wparam), LPARAM(lp as isize)).is_ok()
+    }
+}
+
+fn post_mouse_move_to_source(tx: i32, ty: i32, src_hwnd: isize, buttons: u8) -> bool {
+    if src_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let target = HWND(src_hwnd as *mut _);
+        let mut client = POINT { x: tx, y: ty };
+        let _ = ScreenToClient(target, &mut client);
+        let mut wparam = 0usize;
+        if buttons & BTN_LEFT != 0 {
+            wparam |= 0x0001;
+        }
+        if buttons & BTN_RIGHT != 0 {
+            wparam |= 0x0002;
+        }
+        if buttons & BTN_MIDDLE != 0 {
+            wparam |= 0x0010;
+        }
+        let lp = ((client.y as u32 & 0xFFFF) << 16) | (client.x as u32 & 0xFFFF);
+        PostMessageW(
+            Some(target),
+            WM_MOUSEMOVE,
+            WPARAM(wparam),
+            LPARAM(lp as isize),
+        )
+        .is_ok()
+    }
+}
+
+fn clamp_deferred_source_point(g: &State, px: i32, py: i32) -> (i32, i32) {
+    if g.src.w <= 1 || g.src.h <= 1 {
+        return g.last_set;
+    }
+    (
+        px.clamp(g.src.x, g.src.x.saturating_add(g.src.w).saturating_sub(1)),
+        py.clamp(g.src.y, g.src.y.saturating_add(g.src.h).saturating_sub(1)),
+    )
+}
+
+fn drain_deferred_source_input(g: &mut State) {
+    let src_hwnd = DEFERRED_SOURCE_HWND.load(Ordering::Acquire);
+    if DEFERRED_SOURCE_OVERFLOW.swap(false, Ordering::AcqRel) {
+        // A full queue means the hook deliberately swallowed at least one edge
+        // rather than leaking it into the covering window. Recover source-side
+        // bookkeeping here and keep the capture usable; do not escalate into
+        // cursor/DWM manipulation from the hook.
+        let held = g.source_direct_bits | DEFERRED_SOURCE_HELD_BITS.swap(0, Ordering::AcqRel);
+        if held != 0 && g.src_hwnd != 0 {
+            let target = if g.src.w > 1 && g.src.h > 1 && g.content.w > 1 && g.content.h > 1 {
+                map_content_to_source(g.content, g.src, g.virt.0, g.virt.1)
+            } else {
+                g.last_set
+            };
+            for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+                if held & bit == 0 {
+                    continue;
+                }
+                let msg = match bit {
+                    BTN_LEFT => WM_LBUTTONUP,
+                    BTN_RIGHT => WM_RBUTTONUP,
+                    BTN_MIDDLE => WM_MBUTTONUP,
+                    _ => continue,
+                };
+                let _ = post_mouse_button_to_source(msg, target.0, target.1, g.src_hwnd);
+            }
+        }
+        g.buttons_down &= !held;
+        g.source_direct_bits &= !held;
+        g.last_source_direct_post = None;
+        SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+        let write = DEFERRED_EVENT_WRITE.load(Ordering::Acquire);
+        DEFERRED_EVENT_READ.store(write, Ordering::Release);
+        log::error!(
+            "deferred-source-input overflow recovered: swallowed_edge=true held={held:#04x} action=release-and-drop"
+        );
+    }
+
+    let mut read = DEFERRED_EVENT_READ.load(Ordering::Relaxed);
+    let write = DEFERRED_EVENT_WRITE.load(Ordering::Acquire);
+    while read != write {
+        let slot = (read as usize) % DEFERRED_SOURCE_EVENT_CAP;
+        let msg = DEFERRED_EVENT_MSG[slot].load(Ordering::Relaxed);
+        let (px, py) = unpack_drag_pair(DEFERRED_EVENT_POS[slot].load(Ordering::Relaxed));
+        let (vx, vy) = unpack_drag_pair(DEFERRED_EVENT_VISUAL[slot].load(Ordering::Relaxed));
+        read = read.wrapping_add(1);
+        DEFERRED_EVENT_READ.store(read, Ordering::Release);
+
+        let Some((bit, down)) = button_transition(msg) else {
+            continue;
+        };
+        if src_hwnd == 0 || g.src_hwnd == 0 || g.src_hwnd != src_hwnd || !g.active {
+            g.buttons_down &= !bit;
+            g.source_direct_bits &= !bit;
+            if bit == BTN_LEFT {
+                SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+            }
+            continue;
+        }
+
+        let now = std::time::Instant::now();
+        g.last_button_event = Some(now);
+        g.last_move = Some(now);
+        g.hidden_by_idle = false;
+        // The queued position is the intended source-screen target mapped
+        // lock-free from the visible Neo cursor. Clamp only to the committed
+        // source client rect in case geometry changed before this drain.
+        let (tx, ty) = clamp_deferred_source_point(g, px, py);
+
+        if down {
+            let move_buttons = g.buttons_down & !bit;
+            let move_forwarded = post_mouse_move_to_source(tx, ty, src_hwnd, move_buttons);
+            let forwarded = post_mouse_button_to_source(msg, tx, ty, src_hwnd);
+            g.buttons_down |= bit;
+            g.source_direct_bits |= bit;
+
+            // Deferred delivery is virtual: no SetCursorPos is performed here.
+            // Keep hardware bookkeeping anchored to the REAL hidden cursor so
+            // the next LL move cannot turn the source target delta into a huge
+            // synthetic cursor jump.
+            let physical = read_cursor_pos_or(g.last_hw, "deferred source down physical preserve");
+            g.last_set = physical;
+            g.last_hw = physical;
+
+            // Do not arm the native source-window drag provenance for a
+            // synthetic client gesture (seek-bar/button drag). That owner is
+            // consumed by overlay-follow code and expects raw hardware screen
+            // coordinates, while this route intentionally carries mapped
+            // source targets.
+            if bit == BTN_LEFT {
+                SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+            }
+            request_cursor_hidden(true);
+            sprite_move_now(vx, vy, true);
+            keep_cursor_sprite_on_top();
+            log::warn!(
+                "source-button-deferred-occlusion: edge=down msg={msg:#x} source=({tx},{ty}) visual=({vx},{vy}) physical=({},{}) hwnd={src_hwnd:#x} move_forwarded={move_forwarded} forwarded={forwarded} hook_win32_calls=0 swallowed=true",
+                physical.0,
+                physical.1
+            );
+        } else {
+            let move_forwarded = post_mouse_move_to_source(tx, ty, src_hwnd, g.source_direct_bits);
+            let forwarded = post_mouse_button_to_source(msg, tx, ty, src_hwnd);
+            g.buttons_down &= !bit;
+            g.source_direct_bits &= !bit;
+            if g.source_direct_bits == 0 {
+                g.last_source_direct_post = None;
+            }
+            if bit == BTN_LEFT {
+                SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+            }
+            let physical = read_cursor_pos_or(g.last_hw, "deferred source up physical preserve");
+            g.last_set = physical;
+            g.last_hw = physical;
+            request_cursor_hidden(true);
+            sprite_move_now(vx, vy, true);
+            keep_cursor_sprite_on_top();
+            log::info!(
+                "source-button-deferred-occlusion: edge=up msg={msg:#x} source=({tx},{ty}) visual=({vx},{vy}) physical=({},{}) hwnd={src_hwnd:#x} move_forwarded={move_forwarded} forwarded={forwarded} hook_win32_calls=0 swallowed=true",
+                physical.0,
+                physical.1
+            );
+        }
+    }
+
+    // While a deferred DOWN is held, preserve source drag hover even if the
+    // mutex-backed move path misses a high-rate sample. Latest-only is enough;
+    // source_direct_bits continues to own ordinary mapped move forwarding too.
+    if g.source_direct_bits != 0 && g.src_hwnd == src_hwnd && src_hwnd != 0 {
+        let seq = DEFERRED_SOURCE_MOVE_SEQ.load(Ordering::Acquire);
+        let drained = DEFERRED_SOURCE_MOVE_DRAINED_SEQ.load(Ordering::Relaxed);
+        if seq != drained {
+            let (px, py) = unpack_drag_pair(DEFERRED_SOURCE_MOVE_POS.load(Ordering::Acquire));
+            let (tx, ty) = clamp_deferred_source_point(g, px, py);
+            let _ = post_mouse_move_to_source(tx, ty, src_hwnd, g.source_direct_bits);
+            DEFERRED_SOURCE_MOVE_DRAINED_SEQ.store(seq, Ordering::Release);
+        }
+    }
+}
+
+/// A directly-forwarded source gesture is still logically owned by the
+/// magnified source, even though the hidden physical cursor cannot be placed on
+/// the mapped point because another top-most window covers it. Keep the active
+/// capture's sprite/native-hide contract authoritative for the whole gesture;
+/// otherwise an unrelated foreground window (Task Manager is the common case)
+/// can become visual cursor owner between the synthetic DOWN and UP.
+fn maintain_direct_source_cursor_contract(g: &mut State) {
+    g.native_gui_owner_hwnd = 0;
+    NATIVE_GUI_OWNER.store(0, Ordering::Release);
+    g.native_gui_settle = None;
+    g.ui_hover_active = false;
+    g.last_ui_hover = None;
+    g.last_ui_post = None;
+    g.hidden_by_idle = false;
+    g.cursor_hidden = true;
+    DESKTOP_REVEAL_BRIDGE_ACTIVE.store(false, Ordering::Release);
+    request_cursor_hidden(true);
+    let vx = g.virt.0.round() as i32;
+    let vy = g.virt.1.round() as i32;
+    sprite_move_now(vx, vy, true);
+    keep_cursor_sprite_on_top();
+}
+
+fn source_root_owns_screen_point(src_hwnd: isize, x: i32, y: i32) -> bool {
+    if src_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let hit = WindowFromPoint(POINT { x, y });
+        if hit.0.is_null() {
+            return false;
+        }
+        let root = GetAncestor(hit, GA_ROOT).0 as isize;
+        if root == src_hwnd {
+            return true;
+        }
+        // Menus/tooltips/owned popups can have their own top-level HWND even
+        // though they are still part of the source interaction. Treat the
+        // source's root-owner and same-process popup family as native source
+        // ownership so the occlusion fallback never steals input from a real
+        // source menu (mpv's #32768 context menu is one concrete example).
+        let root_owner = GetAncestor(hit, GA_ROOTOWNER).0 as isize;
+        if root_owner == src_hwnd {
+            return true;
+        }
+        let mut src_pid = 0u32;
+        let mut hit_pid = 0u32;
+        let _ = GetWindowThreadProcessId(HWND(src_hwnd as *mut _), Some(&mut src_pid));
+        let _ = GetWindowThreadProcessId(hit, Some(&mut hit_pid));
+        src_pid != 0 && hit_pid == src_pid
     }
 }
 
@@ -3939,18 +4567,58 @@ fn forward_engaged_button(msg: u32) -> bool {
     send_mouse_button(flag, msg, tx, ty, src_hwnd)
 }
 
-fn align_engaged_cursor_for_input(_px: i32, _py: i32) {
+/// Align a button/wheel edge to the mapped source. Returns true when the
+/// physical event must be swallowed because Neo forwarded it directly to the
+/// source (or safely dropped it) instead of allowing it to hit an unrelated
+/// desktop/top-most window.
+fn align_engaged_cursor_for_input(msg: u32, _px: i32, _py: i32) -> bool {
     let st = state();
     let mut g = match st.try_lock() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return false,
     };
+
+    let transition = button_transition(msg);
+    // A directly-forwarded DOWN owns its matching UP even if source ownership
+    // changed between the two edges. This prevents a half gesture from leaking
+    // to the desktop while the source remains logically pressed.
+    if let Some((bit, down)) = transition {
+        if !down && g.source_direct_bits & bit != 0 {
+            let src_hwnd = g.src_hwnd;
+            let (tx, ty) = if g.src.w > 1 && g.src.h > 1 && g.content.w > 1 && g.content.h > 1 {
+                map_content_to_source(g.content, g.src, g.virt.0, g.virt.1)
+            } else {
+                g.last_set
+            };
+            // Keep the direct gesture visually/source-owned until the matching
+            // UP is delivered. Do not attempt to steal foreground from an
+            // unrelated top-most window; Windows can legitimately reject that
+            // request. The synthetic source transaction is self-contained.
+            maintain_direct_source_cursor_contract(&mut g);
+            let now = std::time::Instant::now();
+            g.last_move = Some(now);
+            g.hidden_by_idle = false;
+            let move_forwarded = post_mouse_move_to_source(tx, ty, src_hwnd, g.source_direct_bits);
+            let forwarded = post_mouse_button_to_source(msg, tx, ty, src_hwnd);
+            g.source_direct_bits &= !bit;
+            if g.source_direct_bits == 0 {
+                g.last_source_direct_post = None;
+            }
+            SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+            maintain_direct_source_cursor_contract(&mut g);
+            log::info!(
+                "source-button-direct-forward: edge=up msg={msg:#x} source=({tx},{ty}) hwnd={src_hwnd:#x} move_forwarded={move_forwarded} activation=skipped forwarded={forwarded} reason=matching-direct-down"
+            );
+            return true;
+        }
+    }
+
     if !g.active || !g.engaged || g.pending_engage.is_some() {
-        return;
+        return false;
     }
     let s = g.src;
     if s.w <= 1 || s.h <= 1 {
-        return;
+        return false;
     }
     let vx = g.virt.0.round() as i32;
     let vy = g.virt.1.round() as i32;
@@ -3962,26 +4630,74 @@ fn align_engaged_cursor_for_input(_px: i32, _py: i32) {
             disengage_state(&mut g, now);
             g.cooldown_until = Some(reenter_cooldown(now, g.oscillations));
         }
-        return;
+        return false;
     }
-    // Keep the visible cursor authoritative. Rebuilding it from GetCursorPos()
-    // would use the clipped source-edge cursor and visibly pull the pointer
-    // inward exactly when the user is working at the magnified edge.
+
+    // Keep the visible cursor authoritative. First ask who owns the mapped
+    // source point BEFORE touching the physical cursor. If Task Manager or
+    // another top-most window covers that point, SetCursorPos cannot make the
+    // physical click safely land on the source and repeated in-hook warp attempts
+    // visibly destabilize the cursor. In that case we skip warping completely
+    // and use the direct source route below. For an unoccluded point, retain the
+    // established v636 warp-then-clip path.
     let (tx, ty) = map_content_to_source(g.content, s, g.virt.0, g.virt.1);
-    // A click over the panel is handled earlier by try_panel_redirect (which
-    // swallows it); here we only ever align a click destined for the SOURCE,
-    // so keep the cursor confined and let the real click pass through to it.
-    let (aligned, actual) = warp_then_clip_source((tx, ty), s);
+    let source_point_unoccluded = source_root_owns_screen_point(g.src_hwnd, tx, ty);
+    let (aligned, actual) = if source_point_unoccluded {
+        warp_then_clip_source((tx, ty), s)
+    } else {
+        (
+            false,
+            read_cursor_pos_or(g.last_set, "engaged input occlusion bypass"),
+        )
+    };
     if aligned {
         g.last_set = actual;
         g.last_hw = actual;
-    } else {
-        log::warn!(
-            "engaged input alignment rejected: target=({tx},{ty}) actual=({},{})",
-            actual.0,
-            actual.1
-        );
     }
+
+    // Wheel input keeps the established native path when alignment succeeds.
+    // If it fails we simply swallow this one edge; posting synthetic wheel
+    // messages here would change high-resolution wheel semantics.
+    if transition.is_none() {
+        if !aligned {
+            log::warn!(
+                "engaged wheel alignment failed: target=({tx},{ty}) actual=({},{}) action=swallow",
+                actual.0,
+                actual.1
+            );
+            return true;
+        }
+        return false;
+    }
+
+    let (bit, down) = transition.unwrap();
+    let source_owns_point = aligned && source_point_unoccluded;
+    if source_owns_point {
+        return false;
+    }
+
+    // v643 safety rollback: occluded client-source button delivery is handled
+    // by the atomic-only hook gate + engine-thread deferred queue above.
+    // If that gate did not classify this edge (for example because the external
+    // geometry snapshot changed between engine ticks), do NOT resurrect the
+    // v640/v641 in-hook realign/PostMessage experiment. Swallow this edge here;
+    // losing one click is safer than touching another process/DWM from the
+    // low-level hook.
+    let src_hwnd = g.src_hwnd;
+
+    // Never allow an engaged source click with failed/occluded alignment to
+    // fall through to Program Manager or an unrelated top-most window.
+    if down {
+        g.swallow_up |= bit;
+    }
+    log::warn!(
+        "engaged source button swallowed: edge={} msg={msg:#x} target=({tx},{ty}) actual=({},{}) aligned={aligned} source_owns_point={source_owns_point} window_frame_input={} hwnd={src_hwnd:#x}",
+        if down { "down" } else { "up" },
+        actual.0,
+        actual.1,
+        g.window_frame_input
+    );
+    true
 }
 
 /// Log exactly where a click will land while engaged — the key diagnostic for
@@ -4073,16 +4789,492 @@ fn system_cursor_showing() -> bool {
 // messages), with the LL-hook on a separate arithmetic-only thread. So we do the
 // same: the hook thread only RECORDS the desired visibility here; the
 // render-engine thread (which owns the overlay window + pumps it) APPLIES it via
-// pump_cursor_visibility(). Bonus: a Mag hide is auto-restored by the OS on
-// process exit, so a crash never leaves the desktop cursor-less. Do not add a
-// SetSystemCursor fallback here: it changes global desktop state and survives
-// TerminateProcess/Task Manager.
+// pump_cursor_visibility(). Do not assume process exit will repair every global
+// cursor/clip state. v583 keeps a separate post-exit/explicit-emergency janitor,
+// but no automatic worker is allowed to mutate ordinary capture state. Do not add a
+// SetSystemCursor fallback here because it permanently replaces global cursor
+// resources rather than simply changing visibility.
 static WANT_CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// True only after the Magnification owner thread successfully applied hide.
 /// The sprite is gated by this flag, preventing a native+sprite double cursor.
 static CURSOR_HIDE_APPLIED: AtomicBool = AtomicBool::new(false);
 /// Cross-thread request; consumed only by the render-engine/Mag owner thread.
 static MAG_REINIT_REQUESTED: AtomicBool = AtomicBool::new(true);
+// Manual-only lock-free input rescue. Normal cursor ownership belongs to the
+// render/Magnification thread. This latch is not armed by ordinary Start/Stop;
+// it is reserved for exceptional direct recovery paths.
+static INPUT_FAILSAFE_LATCHED: AtomicBool = AtomicBool::new(false);
+static CAPTURE_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CURSOR_OWNER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+static HOOK_THREAD_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+static HOOK_HEARTBEAT_ENABLED: AtomicBool = AtomicBool::new(false);
+const INPUT_HOOK_HEARTBEAT_TIMER_ID: usize = 0x4348_5346;
+const INPUT_JANITOR_HOTKEY_ID: i32 = 0x4348;
+const INPUT_JANITOR_REASSERT_MS: u64 = 4_000;
+const INPUT_JANITOR_QUIT_GRACE_MS: u64 = 3_000;
+static JANITOR_QUIT_EVENT_HANDLE: OnceLock<isize> = OnceLock::new();
+
+fn start_input_failsafe_worker() {
+    // v583: intentionally dormant. Automatic watchdog recovery must never
+    // mutate cursor/input/source state during ordinary Neo operation. The
+    // separate janitor process is the last-resort boundary after application
+    // exit/quit-timeout, and Ctrl+Alt+Shift+Q remains an explicit user rescue.
+}
+
+pub fn capture_session_active() -> bool {
+    CAPTURE_SESSION_ACTIVE.load(Ordering::Acquire)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JanitorSourceRecovery {
+    hwnd: isize,
+    pid: u32,
+    rect: Option<(i32, i32, i32, i32)>,
+    placement: Option<crate::platform::win32::WindowPlacementSnapshot>,
+    was_maximized: bool,
+    was_topmost: bool,
+    was_layered: bool,
+    corner_preference: Option<i32>,
+}
+
+fn janitor_recovery_path(parent_pid: u32) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("cHiDeScaler-Neo-recovery-{parent_pid}.txt"))
+}
+
+fn parse_i32_list<const N: usize>(value: &str) -> Option<[i32; N]> {
+    let parsed = value
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<i32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    parsed.try_into().ok()
+}
+
+fn read_janitor_source_recovery(parent_pid: u32) -> Option<JanitorSourceRecovery> {
+    let text = std::fs::read_to_string(janitor_recovery_path(parent_pid)).ok()?;
+    let mut values = std::collections::HashMap::<&str, &str>::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        values.insert(key.trim(), value.trim());
+    }
+    if values.get("version").copied() != Some("1") {
+        return None;
+    }
+    let hwnd = values.get("hwnd")?.parse::<i64>().ok()? as isize;
+    let pid = values.get("pid")?.parse::<u32>().ok()?;
+    let rect = values
+        .get("rect")
+        .and_then(|value| parse_i32_list::<4>(value))
+        .map(|v| (v[0], v[1], v[2], v[3]));
+    let placement = values.get("placement").and_then(|value| {
+        let parts = value.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 10 {
+            return None;
+        }
+        let flags = parts[0].parse::<u32>().ok()?;
+        let show_cmd = parts[1].parse::<u32>().ok()?;
+        let nums = parts[2..]
+            .iter()
+            .map(|part| part.parse::<i32>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        Some(
+            crate::platform::win32::WindowPlacementSnapshot::from_janitor_raw_parts(
+                flags,
+                show_cmd,
+                (nums[0], nums[1]),
+                (nums[2], nums[3]),
+                (nums[4], nums[5], nums[6], nums[7]),
+            ),
+        )
+    });
+    Some(JanitorSourceRecovery {
+        hwnd,
+        pid,
+        rect,
+        placement,
+        was_maximized: values.get("maximized").copied() == Some("1"),
+        was_topmost: values.get("topmost").copied() == Some("1"),
+        was_layered: values.get("layered").copied() == Some("1"),
+        corner_preference: values.get("corner").and_then(|value| {
+            if *value == "none" {
+                None
+            } else {
+                value.parse::<i32>().ok()
+            }
+        }),
+    })
+}
+
+/// Publish only the source state Neo may temporarily mutate. The record lives
+/// in the user's temp directory and is consumed solely by the isolated janitor
+/// if Neo exits/crashes while a capture session still owns the source.
+pub fn publish_janitor_source_recovery(
+    hwnd: isize,
+    pid: u32,
+    rect: Option<(i32, i32, i32, i32)>,
+    placement: Option<crate::platform::win32::WindowPlacementSnapshot>,
+    was_maximized: bool,
+    was_topmost: bool,
+    was_layered: bool,
+    corner_preference: Option<i32>,
+) {
+    if hwnd == 0 || pid == 0 || !crate::platform::win32::window_matches_pid(hwnd, pid) {
+        return;
+    }
+    let rect_text = rect
+        .map(|r| format!("{},{},{},{}", r.0, r.1, r.2, r.3))
+        .unwrap_or_default();
+    let placement_text = placement
+        .map(|snapshot| {
+            let (flags, show_cmd, min, max, normal) = snapshot.janitor_raw_parts();
+            format!(
+                "{flags},{show_cmd},{},{},{},{},{},{},{},{}",
+                min.0, min.1, max.0, max.1, normal.0, normal.1, normal.2, normal.3
+            )
+        })
+        .unwrap_or_default();
+    let corner_text = corner_preference
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let text = format!(
+        "version=1\nhwnd={}\npid={}\nrect={}\nplacement={}\nmaximized={}\ntopmost={}\nlayered={}\ncorner={}\n",
+        hwnd as i64,
+        pid,
+        rect_text,
+        placement_text,
+        u8::from(was_maximized),
+        u8::from(was_topmost),
+        u8::from(was_layered),
+        corner_text,
+    );
+    let path = janitor_recovery_path(std::process::id());
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// A completed ordinary Stop no longer needs post-exit source recovery. Clear
+/// the record only after the engine has reached a confirmed idle state.
+pub fn clear_janitor_source_recovery() {
+    let _ = std::fs::remove_file(janitor_recovery_path(std::process::id()));
+}
+
+fn janitor_restore_source(parent_pid: u32) {
+    let Some(recovery) = read_janitor_source_recovery(parent_pid) else {
+        return;
+    };
+    if !crate::platform::win32::window_matches_pid(recovery.hwnd, recovery.pid) {
+        return;
+    }
+    // Mirror the proven v578 order: visual opacity/style first, then DWM corner
+    // preference, z-order, and finally the immutable start geometry.
+    crate::platform::win32::show_window_visual(recovery.hwnd, recovery.was_layered);
+    if let Some(preference) = recovery.corner_preference {
+        let _ = crate::platform::win32::restore_window_corner_preference_checked(
+            recovery.hwnd,
+            recovery.pid,
+            preference,
+        );
+    }
+    if crate::platform::win32::window_matches_pid(recovery.hwnd, recovery.pid) {
+        crate::platform::win32::set_topmost(recovery.hwnd, recovery.was_topmost);
+    }
+    if crate::platform::win32::window_matches_pid(recovery.hwnd, recovery.pid) {
+        let _ = crate::platform::win32::restore_window_origin(
+            recovery.hwnd,
+            recovery.rect,
+            recovery.was_maximized,
+            recovery.placement,
+        );
+    }
+}
+
+fn janitor_quit_event_name(parent_pid: u32) -> Vec<u16> {
+    format!("Local\\cHiDeScalerNeoQuit-{parent_pid}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn create_janitor_quit_event(parent_pid: u32) -> Option<HANDLE> {
+    let name = janitor_quit_event_name(parent_pid);
+    unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())).ok() }
+}
+
+/// Start the janitor's existing stable-exit grace clock. This does not touch
+/// cursor, ClipCursor, source windows, providers, or Neo's input state.
+pub fn notify_cursor_janitor_quit_requested(reason: &str) {
+    let raw = if let Some(raw) = JANITOR_QUIT_EVENT_HANDLE.get().copied() {
+        raw
+    } else {
+        let Some(handle) = create_janitor_quit_event(std::process::id()) else {
+            log::warn!("cursor-janitor-quit-signal-unavailable: reason={reason}");
+            return;
+        };
+        let raw = handle.0 as isize;
+        let _ = JANITOR_QUIT_EVENT_HANDLE.set(raw);
+        raw
+    };
+    let result = unsafe { SetEvent(HANDLE(raw as *mut _)) };
+    if result.is_ok() {
+        log::info!(
+            "cursor-janitor-quit-grace-armed: reason={reason} grace_ms={INPUT_JANITOR_QUIT_GRACE_MS}"
+        );
+    } else {
+        log::warn!("cursor-janitor-quit-signal-failed: reason={reason} error={result:?}");
+    }
+}
+
+fn janitor_restore_cursor(mag_initialized: &mut bool) {
+    unsafe {
+        let _ = ClipCursor(None);
+        if !*mag_initialized {
+            *mag_initialized = MagInitialize().as_bool();
+        }
+        // Reassert more than once because a dying parent can still have one
+        // queued hide transition while its threads are unwinding.
+        for _ in 0..4 {
+            let _ = MagShowSystemCursor(true);
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+    }
+}
+
+/// One-shot isolated recovery helper retained for explicit diagnostics. It is
+/// not launched by ordinary capture or by an automatic watchdog in v583.
+pub fn run_cursor_rescue_once() {
+    let mut mag_initialized = unsafe { MagInitialize() }.as_bool();
+    janitor_restore_cursor(&mut mag_initialized);
+    if mag_initialized {
+        unsafe {
+            let _ = MagUninitialize();
+        }
+    }
+}
+
+/// Run the no-GUI companion mode. It never participates in ordinary capture
+/// Start/Stop. It wakes only when Neo exits, when Ctrl+Alt+Q / GUI-X arms the
+/// post-quit grace (the normal 2 s shutdown window plus margin), or when the user explicitly presses the independent
+/// Ctrl+Alt+Shift+Q emergency rescue key.
+fn record_production_janitor_breadcrumb(line: &str) {
+    let enabled = std::env::var("NEO_VULKAN_PRODUCTION_1PASS")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let Ok(path) = std::env::var("NEO_VULKAN_PROBE_RESULT") else {
+        return;
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+pub fn run_cursor_janitor(parent_pid: u32) {
+    record_production_janitor_breadcrumb(&format!(
+        "vulkan-production-glsl: role=cursor-janitor phase=start pid={} parent_pid={parent_pid}",
+        std::process::id()
+    ));
+    // The janitor never initializes Neo's GUI/GPU/capture stack. It waits on
+    // the parent process plus one named quit-grace event and a manual emergency
+    // hotkey message queue. Ordinary capture Stop never signals this process.
+    let Ok(parent) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }) else {
+        let mut mag_initialized = unsafe { MagInitialize() }.as_bool();
+        janitor_restore_cursor(&mut mag_initialized);
+        janitor_restore_source(parent_pid);
+        let _ = std::fs::remove_file(janitor_recovery_path(parent_pid));
+        if mag_initialized {
+            unsafe {
+                let _ = MagUninitialize();
+            }
+        }
+        record_production_janitor_breadcrumb(&format!(
+            "vulkan-production-glsl: role=cursor-janitor phase=exit-complete pid={} parent_pid={parent_pid} reason=parent-open-failed",
+            std::process::id()
+        ));
+        return;
+    };
+
+    let quit_event = create_janitor_quit_event(parent_pid);
+    let quit_event_present = quit_event.is_some();
+    let mut handles = vec![parent];
+    if let Some(event) = quit_event {
+        handles.push(event);
+    }
+
+    let mut rescue_until = 0u64;
+    let mut quit_deadline = 0u64;
+    let mut mag_initialized = false;
+    unsafe {
+        let _ = RegisterHotKey(
+            None,
+            INPUT_JANITOR_HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            b'Q' as u32,
+        );
+    }
+
+    loop {
+        let now = route_clock_ms();
+        if quit_deadline != 0 && now >= quit_deadline {
+            // Ctrl+Alt+Q / GUI-X had its normal shutdown grace but the Neo
+            // process is still alive. Recover only external/native state; do
+            // not terminate Neo or the source process.
+            janitor_restore_cursor(&mut mag_initialized);
+            janitor_restore_source(parent_pid);
+            // One-shot post-grace recovery: once the pre-capture source state
+            // has been restored, forget it so a later delayed parent exit cannot
+            // rewind legitimate user changes made after recovery.
+            let _ = std::fs::remove_file(janitor_recovery_path(parent_pid));
+            quit_deadline = 0;
+            // v622 production-test safety: after GUI close was explicitly
+            // requested and this helper has already restored every external
+            // state it owns, keeping the janitor resident provides no further
+            // recovery value if the parent itself is stuck. Exit the helper so
+            // Task Manager never shows an orphaned Neo test process. Ordinary
+            // product launches keep the established parent-lifetime contract.
+            if std::env::var("NEO_VULKAN_PRODUCTION_1PASS")
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                record_production_janitor_breadcrumb(&format!(
+                    "vulkan-production-glsl: role=cursor-janitor phase=quit-grace-expired pid={} parent_pid={parent_pid} action=exit-after-recovery",
+                    std::process::id()
+                ));
+                break;
+            }
+        }
+
+        let rescue_active = rescue_until != 0 && now < rescue_until;
+        let mut timeout = if rescue_active { 100 } else { INFINITE };
+        if quit_deadline != 0 {
+            let remaining = quit_deadline.saturating_sub(now).max(1);
+            timeout = timeout.min(remaining.min(u32::MAX as u64) as u32);
+        }
+
+        let wait = unsafe {
+            MsgWaitForMultipleObjectsEx(
+                Some(handles.as_slice()),
+                timeout,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            )
+        };
+        if wait == WAIT_OBJECT_0 {
+            record_production_janitor_breadcrumb(&format!(
+                "vulkan-production-glsl: role=cursor-janitor phase=parent-terminated pid={} parent_pid={parent_pid}",
+                std::process::id()
+            ));
+            break; // parent terminated: final one-shot cleanup below
+        }
+
+        if quit_event_present && wait.0 == WAIT_OBJECT_0.0 + 1 {
+            // Do not recover immediately. Preserve the established 2 s stable shutdown opportunity plus
+            // the janitor-only safety margin first.
+            quit_deadline = route_clock_ms().saturating_add(INPUT_JANITOR_QUIT_GRACE_MS);
+            continue;
+        }
+
+        let message_index = WAIT_OBJECT_0.0 + handles.len() as u32;
+        if wait.0 == message_index {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == INPUT_JANITOR_HOTKEY_ID {
+                        rescue_until = route_clock_ms().saturating_add(INPUT_JANITOR_REASSERT_MS);
+                        // Explicit emergency key: the user asked for the last
+                        // resort now, so cursor + captured source state may be
+                        // restored even while the parent remains alive.
+                        janitor_restore_cursor(&mut mag_initialized);
+                        janitor_restore_source(parent_pid);
+                    }
+                }
+            }
+        }
+        if rescue_until != 0 && route_clock_ms() < rescue_until {
+            janitor_restore_cursor(&mut mag_initialized);
+        }
+    }
+
+    // Normal close, crash and Task-Manager termination all converge here.
+    // Reapply only Neo-owned external state once, then forget the snapshot.
+    janitor_restore_cursor(&mut mag_initialized);
+    janitor_restore_source(parent_pid);
+    let _ = std::fs::remove_file(janitor_recovery_path(parent_pid));
+    unsafe {
+        let _ = UnregisterHotKey(None, INPUT_JANITOR_HOTKEY_ID);
+        for handle in handles {
+            let _ = CloseHandle(handle);
+        }
+        if mag_initialized {
+            let _ = MagUninitialize();
+        }
+    }
+    record_production_janitor_breadcrumb(&format!(
+        "vulkan-production-glsl: role=cursor-janitor phase=exit-complete pid={} parent_pid={parent_pid}",
+        std::process::id()
+    ));
+}
+
+/// Spawn the companion as the same portable executable. No extra binary or
+/// installed service is required; the child exits as soon as this process does.
+pub fn spawn_cursor_janitor() {
+    let Ok(exe) = std::env::current_exe() else {
+        log::warn!("cursor-janitor-spawn-skipped: current_exe unavailable");
+        return;
+    };
+    let parent_pid = std::process::id();
+    // Create the named auto-reset event before launching the helper so a very
+    // early Ctrl+Alt+Q / WM_CLOSE cannot race janitor initialization.
+    if let Some(event) = create_janitor_quit_event(parent_pid) {
+        let raw = event.0 as isize;
+        if JANITOR_QUIT_EVENT_HANDLE.set(raw).is_err() {
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+        }
+    } else {
+        log::warn!("cursor-janitor-quit-event-create-failed");
+    }
+    let arg = format!("--cursor-janitor={parent_pid}");
+    match std::process::Command::new(exe).arg(arg).spawn() {
+        Ok(child) => {
+            log::info!("cursor-janitor-started: pid={}", child.id());
+            record_production_janitor_breadcrumb(&format!(
+                "vulkan-production-glsl: role=main phase=janitor-spawned pid={} janitor_pid={}",
+                std::process::id(),
+                child.id()
+            ));
+        }
+        Err(error) => log::warn!("cursor-janitor-spawn-failed: {error}"),
+    }
+}
 
 /// Clamp a point to the inclusive pixel bounds of a monitor rectangle.
 /// Kept pure so the exact 1920x1080 regression can be unit-tested without Win32.
@@ -4383,6 +5575,13 @@ thread_local! {
 /// high frame rate does not spam MagShowSystemCursor. Re-asserts on a ~40ms
 /// heartbeat because a game/other app can reset the hide on a cursor-shape change.
 pub fn pump_cursor_visibility() {
+    CURSOR_OWNER_HEARTBEAT_MS.store(route_clock_ms(), Ordering::Release);
+    // A latched rescue always wins over ordinary cursor ownership until a new
+    // capture session explicitly rearms it. This prevents a recovered render
+    // thread from immediately hiding the cursor again after the watchdog fired.
+    if INPUT_FAILSAFE_LATCHED.load(Ordering::Acquire) {
+        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+    }
     // Initialize and repair Magnification only on its owning engine thread.
     let reinit_requested = MAG_REINIT_REQUESTED.swap(false, Ordering::AcqRel);
     MAG_ON_THIS_THREAD.with(|f| {
@@ -4408,7 +5607,10 @@ pub fn pump_cursor_visibility() {
     let capture_sprite_mode = capture_sprite_active();
     let external_native_owner = external_native_cursor_owner(native_gui_owner);
     let mut want_hidden = WANT_CURSOR_HIDDEN.load(Ordering::Relaxed);
-    if capture_sprite_mode && !external_native_owner {
+    if INPUT_FAILSAFE_LATCHED.load(Ordering::Acquire) {
+        want_hidden = false;
+        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+    } else if capture_sprite_mode && !external_native_owner {
         want_hidden = true;
         WANT_CURSOR_HIDDEN.store(true, Ordering::Release);
     }
@@ -4776,6 +5978,7 @@ pub fn pump_cursor_engage_commit() {
         );
         g.pending_engage = None;
         g.engaged = false;
+        publish_deferred_source_engaged(false);
         g.expect_teleport = None;
         g.teleport_guard_until = None;
         g.cursor_hidden = false;
@@ -4801,6 +6004,7 @@ pub fn pump_cursor_engage_commit() {
             warp_unclipped_verified(pending.origin, "engage abort native restore");
         g.pending_engage = None;
         g.engaged = false;
+        publish_deferred_source_engaged(false);
         g.expect_teleport = None;
         g.teleport_guard_until = None;
         g.cursor_hidden = false;
@@ -4993,6 +6197,9 @@ enum MovePlan {
 }
 
 fn mark_engage_committed(g: &mut State, target: (i32, i32), now: std::time::Instant) {
+    publish_deferred_source_engaged(
+        g.active && !g.window_frame_input && g.src_hwnd != 0 && g.pending_engage.is_none(),
+    );
     g.native_gui_owner_hwnd = 0;
     NATIVE_GUI_OWNER.store(0, Ordering::Release);
     // The engage is not real until the owner thread has hidden the native
@@ -5555,6 +6762,7 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
         );
         g.pending_engage = None;
         g.engaged = false;
+        publish_deferred_source_engaged(false);
         g.expect_teleport = None;
         g.teleport_guard_until = None;
         g.cursor_hidden = false;
@@ -5786,6 +6994,43 @@ fn on_hardware_move(px: i32, py: i32) -> bool {
                 } else {
                     sprite_move(sx, sy, true);
                 }
+            }
+            // v639 regression rollback: v638 mirrored ordinary WM_MOUSEMOVE to
+            // the source whenever the mapped source point was occluded. That made
+            // occlusion itself alter the input route and raced the long-standing
+            // native-GUI ownership/ghost-route repair logic. The v638 log showed
+            // `source-direct-motion` immediately followed by `gui-ghost-route
+            // repaired` and a native GUI handoff. Restore the stable pre-v637
+            // movement path: synthetic movement is allowed ONLY while Neo owns a
+            // directly-forwarded button gesture. Never swallow the physical MOVE.
+            if g.source_direct_bits != 0 && g.engaged && !g.window_frame_input && g.src_hwnd != 0 {
+                let (tx, ty) = map_content_to_source(g.content, g.src, g.virt.0, g.virt.1);
+                let buttons = g.buttons_down | g.source_direct_bits;
+                let should_post =
+                    g.last_source_direct_post
+                        .map_or(true, |(hwnd, pos, old_buttons, at)| {
+                            hwnd != g.src_hwnd
+                                || (pos != (tx, ty)
+                                    && now.saturating_duration_since(at)
+                                        >= std::time::Duration::from_millis(
+                                            SOURCE_DIRECT_MOVE_MIN_MS,
+                                        ))
+                                || old_buttons != buttons
+                        });
+                if should_post {
+                    let forwarded = post_mouse_move_to_source(tx, ty, g.src_hwnd, buttons);
+                    if forwarded {
+                        g.last_source_direct_post = Some((g.src_hwnd, (tx, ty), buttons, now));
+                    }
+                    if GHOST_ROUTE_SAMPLE_COUNT.fetch_add(1, Ordering::Relaxed) % 128 == 0 {
+                        log::debug!(
+                            "source-direct-drag-move: source=({tx},{ty}) hwnd={:#x} buttons={buttons:#04x} forwarded={forwarded}",
+                            g.src_hwnd
+                        );
+                    }
+                }
+            } else if g.source_direct_bits == 0 {
+                g.last_source_direct_post = None;
             }
             let gui_handoff_applied = if g.engaged && !g.hidden_by_idle && g.buttons_down == 0 {
                 post_ui_hover_from_state(&mut g, now)
@@ -6019,7 +7264,14 @@ fn plan_engage_impl(
             return None;
         }
     }
-    let inside_visible_content = if !g.fullscreen && g.window_frame_input {
+    // Fullscreen ownership cannot escape through the display edge (see the
+    // engaged edge path below), so an entry dead-band there only creates a
+    // non-interactive strip. This was visible with 4:3 Auto: MPC-HC's seek bar
+    // at the bottom could not be the first source interaction, but worked after
+    // a click higher in the image had already engaged source ownership. Keep
+    // the proven dead-band only for windowed client-space re-entry. Window-frame
+    // input already uses an exact boundary as before.
+    let inside_visible_content = if g.fullscreen || g.window_frame_input {
         g.content.contains(px, py)
     } else {
         contains_for_engage(g.content, px, py)
@@ -6046,7 +7298,8 @@ fn plan_engage_impl(
     // windowed edge cannot oscillate / pull the cursor back. Skipped for a
     // source too small to hold the band.
     let m = ENGAGE_SRC_MARGIN_PX;
-    if !(g.window_frame_input && !g.fullscreen)
+    if !g.fullscreen
+        && !g.window_frame_input
         && s.w > 2 * m
         && s.h > 2 * m
         && (tx < s.x + m || tx >= s.x + s.w - m || ty < s.y + m || ty >= s.y + s.h - m)
@@ -6205,6 +7458,7 @@ fn release_windows_to_native_at(
 
 /// Pure state transition for a disengage (no Windows calls).
 fn disengage_state(g: &mut State, now: std::time::Instant) {
+    publish_deferred_source_engaged(false);
     SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     mark_disengage(g, now);
     g.engaged = false;
@@ -6213,6 +7467,8 @@ fn disengage_state(g: &mut State, now: std::time::Instant) {
     g.teleport_guard_until = None;
     g.edge_release_settle_until = None;
     g.swallow_up = 0;
+    g.source_direct_bits = 0;
+    g.last_source_direct_post = None;
     g.ui_hold_bits = 0;
     g.native_ui_hold_bits = 0;
     g.last_button_event = None;
@@ -6224,6 +7480,8 @@ fn disengage_state(g: &mut State, now: std::time::Instant) {
 }
 
 fn release_locked(g: &mut State) {
+    publish_deferred_source_engaged(false);
+    clear_deferred_source_queue();
     SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
     // begin_ui_hold injects a DOWN at the native GUI so dragging behaves like
     // an ordinary window. A focus transition can occasionally lose the
@@ -6239,6 +7497,29 @@ fn release_locked(g: &mut State) {
         log::warn!("release cleared outstanding GUI mouse hold bits={held:#04x}");
     }
     if g.src_hwnd != 0 {
+        if g.source_direct_bits != 0 {
+            let (tx, ty) = if g.src.w > 1 && g.src.h > 1 && g.content.w > 1 && g.content.h > 1 {
+                map_content_to_source(g.content, g.src, g.virt.0, g.virt.1)
+            } else {
+                g.last_set
+            };
+            for bit in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+                if g.source_direct_bits & bit != 0 {
+                    let msg = match bit {
+                        BTN_LEFT => WM_LBUTTONUP,
+                        BTN_RIGHT => WM_RBUTTONUP,
+                        BTN_MIDDLE => WM_MBUTTONUP,
+                        _ => continue,
+                    };
+                    let _ = post_mouse_button_to_source(msg, tx, ty, g.src_hwnd);
+                }
+            }
+            log::info!(
+                "release closed direct source hold bits={:#04x} hwnd={:#x}",
+                g.source_direct_bits,
+                g.src_hwnd
+            );
+        }
         unsafe {
             // Tell the source to abandon any native move/resize/drag modal
             // loop entered while Neo owned the mapped cursor. This is needed
@@ -6263,6 +7544,8 @@ fn release_locked(g: &mut State) {
     g.teleport_guard_until = None;
     g.edge_release_settle_until = None;
     g.swallow_up = 0;
+    g.source_direct_bits = 0;
+    g.last_source_direct_post = None;
     g.ui_hold_bits = 0;
     g.native_ui_hold_bits = 0;
     g.last_button_event = None;
@@ -6314,6 +7597,7 @@ impl InputSystem {
     pub fn start() -> Self {
         // Startup recovery must never inject mouse-button UP events.
         startup_recover_input_state();
+        start_input_failsafe_worker();
         let (tx, rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::Builder::new()
@@ -6347,9 +7631,25 @@ impl InputSystem {
                 let tid = windows::Win32::System::Threading::GetCurrentThreadId();
                 let _ = tx.send(tid);
                 HOOK_RUNNING.store(true, Ordering::Release);
+                HOOK_THREAD_HEARTBEAT_MS.store(route_clock_ms(), Ordering::Release);
+                let heartbeat_timer = SetTimer(None, INPUT_HOOK_HEARTBEAT_TIMER_ID, 250, None);
+                HOOK_HEARTBEAT_ENABLED.store(heartbeat_timer != 0, Ordering::Release);
+                if heartbeat_timer == 0 {
+                    log::warn!(
+                        "mouse-hook heartbeat timer unavailable; hook-stall watchdog disabled"
+                    );
+                }
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    if msg.message == WM_TIMER && msg.wParam.0 == heartbeat_timer {
+                        HOOK_THREAD_HEARTBEAT_MS.store(route_clock_ms(), Ordering::Release);
+                        continue;
+                    }
                     DispatchMessageW(&msg);
+                }
+                HOOK_HEARTBEAT_ENABLED.store(false, Ordering::Release);
+                if heartbeat_timer != 0 {
+                    let _ = KillTimer(None, heartbeat_timer);
                 }
                 if let Ok(h) = hook {
                     let _ = UnhookWindowsHookEx(h);
@@ -6430,11 +7730,43 @@ impl InputSystem {
         g.last_configure_at = Some(std::time::Instant::now());
         if suspended {
             clear_capture_sprite_contract(&mut g);
-            release_locked(&mut g);
+            let mapping_was_live = g.active
+                || g.engaged
+                || g.pending_engage.is_some()
+                || g.src_hwnd != 0
+                || g.cursor_hidden;
+            if mapping_was_live {
+                release_locked(&mut g);
+            } else {
+                // At initial capture startup there is no source mapping to
+                // release yet. `virt` is still its default (0,0); routing that
+                // through release_locked() teleports the user's native cursor
+                // to monitor origin before the first filtered frame. Preserve
+                // the actual desktop point instead.
+                let actual = read_cursor_pos_or(
+                    (g.virt.0.round() as i32, g.virt.1.round() as i32),
+                    "provider-transition inactive preserve",
+                );
+                unsafe {
+                    let _ = ClipCursor(None);
+                }
+                g.virt = (actual.0 as f64, actual.1 as f64);
+                g.last_set = actual;
+                g.last_hw = actual;
+                g.source_direct_bits = 0;
+                request_cursor_hidden(false);
+                sprite_hide();
+                log::debug!(
+                    "provider-transition inactive cursor preserved: actual=({},{})",
+                    actual.0,
+                    actual.1
+                );
+            }
             g.active = false;
             g.src_hwnd = 0;
             g.buttons_down = 0;
             g.native_ui_hold_bits = 0;
+            g.source_direct_bits = 0;
             g.last_gui_sprite_sync_at = None;
             log::info!("input mapping suspended during provider transition");
             drop(g);
@@ -6495,8 +7827,39 @@ impl InputSystem {
             0
         };
         ACTIVE_PANEL_HWND.store(active_panel, Ordering::Release);
+        publish_deferred_source_geometry(
+            active,
+            !window_frame_input,
+            src_hwnd,
+            content,
+            src,
+            &no_engage,
+        );
 
+        let was_session_active = CAPTURE_SESSION_ACTIVE.load(Ordering::Acquire);
         let mut g = state().lock().unwrap();
+        // Do not publish inactive until Windows ownership has actually been
+        // released below. If this configure call stalls on teardown, the
+        // watchdog must remain armed rather than assuming the cursor is safe.
+        if active {
+            CAPTURE_SESSION_ACTIVE.store(true, Ordering::Release);
+        }
+        if active && !was_session_active {
+            // Only a genuine inactive -> active capture-session edge may rearm
+            // cursor ownership after a fail-safe latch. A stalled session that
+            // resumes still sees was_session_active=true and remains pass-through.
+            INPUT_FAILSAFE_LATCHED.store(false, Ordering::Release);
+            CURSOR_OWNER_HEARTBEAT_MS.store(route_clock_ms(), Ordering::Release);
+            HOOK_THREAD_HEARTBEAT_MS.store(route_clock_ms(), Ordering::Release);
+            log::info!("input-failsafe-rearmed: reason=new-capture-session");
+        }
+        if INPUT_FAILSAFE_LATCHED.load(Ordering::Acquire)
+            && (g.engaged || g.cursor_hidden || g.pending_engage.is_some())
+        {
+            release_locked(&mut g);
+            g.buttons_down = 0;
+            g.native_ui_hold_bits = 0;
+        }
         g.last_configure_at = Some(std::time::Instant::now());
         g.fullscreen = fullscreen;
         let caption_drag_diag = g.buttons_down != 0 && source_caption_drag_active();
@@ -6555,6 +7918,7 @@ impl InputSystem {
             );
             release_windows(&mut g);
             g.engaged = false;
+            publish_deferred_source_engaged(false);
             g.expect_teleport = None;
             g.teleport_guard_until = None;
         }
@@ -6624,8 +7988,10 @@ impl InputSystem {
                 sprite_move(g.virt.0.round() as i32, g.virt.1.round() as i32, true);
             }
         }
-        let effective_active =
-            active && !g.transition_suspended && !tensorrt_build_native_cursor_guard();
+        let effective_active = active
+            && !g.transition_suspended
+            && !tensorrt_build_native_cursor_guard()
+            && !INPUT_FAILSAFE_LATCHED.load(Ordering::Acquire);
         g.active = effective_active;
         CAPTURE_SPRITE_ACTIVE.store(effective_active, Ordering::Release);
         if !effective_active {
@@ -6639,6 +8005,7 @@ impl InputSystem {
             g.no_engage_moved_at = Some(std::time::Instant::now());
         }
         g.no_engage = no_engage;
+        drain_deferred_source_input(&mut g);
         if no_engage_changed {
             // Full/Basic/Mini changes keep the same GUI HWND while replacing
             // its rectangle. `native_gui_owner_hwnd` is deliberately not
@@ -6687,6 +8054,17 @@ impl InputSystem {
         }
         if !effective_active {
             g.src_hwnd = 0;
+            publish_deferred_source_geometry(
+                false,
+                false,
+                0,
+                Rect::default(),
+                Rect::default(),
+                &[],
+            );
+            clear_deferred_source_queue();
+        } else if g.engaged && g.pending_engage.is_none() {
+            publish_deferred_source_engaged(!g.window_frame_input && g.src_hwnd != 0);
         }
         // The topmost GUI rect can arrive one GUI tick after the first filtered
         // overlay frame. If the stationary virtual cursor is already inside it,
@@ -6728,6 +8106,9 @@ impl InputSystem {
         if should_hide_cursor_for_idle(&g, std::time::Instant::now()) {
             g.hidden_by_idle = true;
             sprite_hide();
+        }
+        if !active {
+            CAPTURE_SESSION_ACTIVE.store(false, Ordering::Release);
         }
     }
 
@@ -6800,18 +8181,35 @@ impl InputSystem {
         g.native_ui_hold_bits = 0;
         g.oscillations = 0;
         drop(g);
+        // A completed Stop is the only point that rearms the next capture.
+        // Emergency release itself intentionally keeps this true while a wedged
+        // session may still be alive, preventing that same session from silently
+        // reclaiming the cursor after the fail-safe fired.
+        CAPTURE_SESSION_ACTIVE.store(false, Ordering::Release);
     }
 
     pub fn stop(&mut self) {
         // Application close must never wait indefinitely for the WH_MOUSE_LL
-        // thread. The visible/clip/button state is released synchronously
-        // first, then WM_QUIT asks the hook thread to unwind. A hook callback
-        // can occasionally be delayed by Windows during window destruction;
-        // waiting on JoinHandle there was the exact ~2 s X-button stall seen
-        // when the outer render-engine shutdown cannot complete promptly.
-        self.release();
-        emergency_release_all();
+        // thread *or* for the normal input-state mutex. Ordinary capture Stop
+        // still uses release(), preserving the stable v578-style route. App
+        // shutdown is different: revoke ownership lock-free and ask the hook
+        // thread to unwind with a bounded wait. The full visible/input recovery
+        // has already been requested by the application-close path.
+        CAPTURE_SESSION_ACTIVE.store(false, Ordering::Release);
+        CAPTURE_SPRITE_ACTIVE.store(false, Ordering::Release);
+        SOURCE_CLIENT_DRAG_OWNER_HWND.store(0, Ordering::Release);
+        cancel_source_caption_drag_contract();
+        // Cmd::Shutdown is reached only after the application-close visible
+        // recovery has already requested cursor/input release. Do not run the
+        // full emergency recovery a second time from InputSystem::stop(): that
+        // path touches foreign/system cursor presentation and was observed to
+        // consume the entire 2.5 s outer shutdown budget. The hook shutdown
+        // itself must be strictly bounded and lock-free.
+        WANT_CURSOR_HIDDEN.store(false, Ordering::Release);
+        NATIVE_GUI_OWNER.store(0, Ordering::Release);
+        ACTIVE_OVERLAY_HWND.store(0, Ordering::Release);
         unsafe {
+            let _ = ClipCursor(None);
             let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
         if let Some(h) = self.handle.take() {
@@ -6824,10 +8222,11 @@ impl InputSystem {
                     log::debug!("mouse-hook shutdown complete");
                 }
                 Err(_) => {
-                    // Dropping a JoinHandle detaches the thread. This is safe
-                    // on process exit: emergency_release_all() already restored
-                    // cursor/input state, and Windows removes the LL hook when
-                    // the process terminates. Never hold the GUI close for it.
+                    // Dropping a JoinHandle detaches the thread. The visible
+                    // recovery path has already released input best-effort, and
+                    // the external janitor is the final cursor/clip safety net if
+                    // this process exits before the hook thread unwinds. Never
+                    // hold the GUI close for it.
                     log::warn!("mouse-hook shutdown deferred: elapsed_ms=50 action=detach");
                     drop(h);
                 }
@@ -7170,10 +8569,7 @@ mod tests {
             panel_action_for_relative_x(135, 15, 10),
             Some(PANEL_ACTION_STOP)
         );
-        assert_eq!(
-            panel_action_for_relative_x(540, 60, 240),
-            None
-        );
+        assert_eq!(panel_action_for_relative_x(540, 60, 240), None);
     }
 
     #[test]
@@ -8747,6 +10143,51 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_can_engage_exact_bottom_edge_without_prior_source_click() {
+        let now = std::time::Instant::now();
+        let content = Rect {
+            x: 240,
+            y: 0,
+            w: 1440,
+            h: 1080,
+        };
+        let src = Rect {
+            x: 1316,
+            y: 117,
+            w: 571,
+            h: 344,
+        };
+        let mut g = State {
+            active: true,
+            fullscreen: true,
+            content,
+            src,
+            src_hwnd: 0x1234,
+            ..Default::default()
+        };
+        let plan = plan_engage(
+            &g,
+            content.x + content.w / 2,
+            content.y + content.h - 1,
+            now,
+        )
+        .expect("fullscreen bottom edge must be immediately engageable");
+        assert_eq!(plan.ty, src.y + src.h - 1);
+
+        // The same exact edge remains guarded in ordinary windowed client mode.
+        g.fullscreen = false;
+        assert!(
+            plan_engage(
+                &g,
+                content.x + content.w / 2,
+                content.y + content.h - 1,
+                now
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn windowed_edge_exit_is_smooth_single_transition() {
         let (c, s) = win();
         let mut sim = Sim::new(c, s, &[], (c.x + c.w / 2, c.y + c.h / 2));
@@ -9388,6 +10829,26 @@ mod tests {
     }
 
     #[test]
+    fn direct_source_hold_is_not_released_by_async_key_watchdog() {
+        let now = std::time::Instant::now();
+        let mut g = State {
+            active: true,
+            buttons_down: BTN_LEFT,
+            source_direct_bits: BTN_LEFT,
+            last_button_event: Some(
+                now - std::time::Duration::from_millis(STALE_BUTTON_WATCHDOG_MS + 50),
+            ),
+            ..Default::default()
+        };
+        // A swallowed LL-hook DOWN may be invisible to GetAsyncKeyState. The
+        // matching LL-hook UP, not this watchdog, owns the direct gesture.
+        let stale = reconcile_stale_buttons_with_physical(&mut g, now, 0);
+        assert_eq!(stale, 0);
+        assert_eq!(g.buttons_down, BTN_LEFT);
+        assert_eq!(g.source_direct_bits, BTN_LEFT);
+    }
+
+    #[test]
     fn panel_over_gui_overlap_stays_engaged_no_churn() {
         // panel and GUI both no-engage AND overlapping: sweeping the overlap and
         // either side must never disengage / oscillate (stays confined; clicks
@@ -9685,6 +11146,67 @@ mod tests {
             let expected = if top == 0x1111 { gui } else { panel };
             assert_eq!(tracked_ui_for_top_hwnd(&zones, top), Some(expected));
         }
+    }
+
+    #[test]
+    fn v579_fullscreen_button_hook_reentry_is_not_present() {
+        let source = include_str!("input.rs");
+        let production_input_route = source
+            .split("fn diagnose_click")
+            .nth(1)
+            .expect("input diagnostic boundary")
+            .split("fn set_system_cursor_visible")
+            .next()
+            .expect("cursor visibility boundary");
+        assert!(!production_input_route.contains("try_fullscreen_first_button_engage"));
+        assert!(!production_input_route.contains("fullscreen first-button engage-forward"));
+    }
+
+    #[test]
+    fn ordinary_release_does_not_arm_janitor_or_manual_failsafe() {
+        let source = include_str!("input.rs");
+        let start = source
+            .find("pub fn emergency_release_all()")
+            .expect("release");
+        let tail = &source[start..];
+        let end = tail.find("struct PendingEngage").expect("boundary");
+        let body = &tail[..end];
+        assert!(!body.contains("request_emergency_input_release"));
+        assert!(!body.contains("spawn_cursor_janitor"));
+        assert!(!body.contains("run_cursor_rescue_once"));
+    }
+
+    #[test]
+    fn automatic_failsafe_worker_is_dormant_during_normal_operation() {
+        let source = include_str!("input.rs");
+        let start = source
+            .find("fn start_input_failsafe_worker")
+            .expect("failsafe worker");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub fn capture_session_active")
+            .expect("capture session boundary");
+        let body = &tail[..end];
+        assert!(!body.contains("std::thread::Builder"));
+        assert!(!body.contains("MagInitialize"));
+        assert!(!body.contains("request_emergency_input_release"));
+    }
+
+    #[test]
+    fn janitor_waits_for_parent_or_quit_event_and_preserves_normal_stop_isolation() {
+        let source = include_str!("input.rs");
+        let start = source.find("pub fn run_cursor_janitor").expect("janitor");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub fn spawn_cursor_janitor")
+            .expect("janitor spawn");
+        let body = &tail[..end];
+        assert_eq!(body.matches("OpenProcess(").count(), 1);
+        assert!(body.contains("MsgWaitForMultipleObjectsEx"));
+        assert!(body.contains("INPUT_JANITOR_QUIT_GRACE_MS"));
+        assert!(body.contains("janitor_restore_source(parent_pid)"));
+        assert!(!body.contains("TerminateProcess"));
+        assert!(!body.contains("request_emergency_input_release"));
     }
 
     #[test]

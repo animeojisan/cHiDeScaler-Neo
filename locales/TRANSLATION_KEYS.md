@@ -12,6 +12,8 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `admin.restart_failed` | Could not restart as administrator. Allow the Windows confirmation prompt and try again. |
 | `admin.restart_instruction` | Restart cHiDeScaler-Neo as administrator, then select the window again. |
 | `admin.target_elevated` | The selected window is running with administrator permission. |
+| `aspect.help` | Adjust only the final displayed aspect ratio. Capture resolution and ONNX/GLSL processing remain unchanged. 1.00 / 1.00 keeps the original aspect. Changes apply immediately while scaling. |
+| `aspect.next_start` | Applies immediately |
 | `capture.click_target` | (Click the window to magnify) |
 | `capture.client_help` | Capture only the window contents; applies next start |
 | `capture.client_forced_help` | Capture resolution forces client-area-only capture until Auto is selected |
@@ -54,6 +56,8 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `filter.empty_help` | No filters in this chain. Use + Add Filter to add one. |
 | `filter.more_errors` | more filter errors |
 | `filter.none` | (No filters found) |
+| `gpu.select_help` | Select the processing GPU; normal same-GPU entries keep OpenGL when possible, `[Vulkan]` forces compatible GLSL through Vulkan, cross-GPU selection uses Vulkan automatically, TensorRT maps to selected NVIDIA GPU |
+| `gpu.stop_to_change` | Stop scaling before changing the GPU |
 | `filter.reorder_help` | (Hold and drag to reorder) |
 | `filter.toggle` | Enable/Disable |
 | `glsl_overload.auto_stop` | Insufficient performance. Scaling will stop. |
@@ -94,6 +98,9 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `resize.range` | 0.25–4.00 (default 0.75) |
 | `resize.scale` | Scale |
 | `resize.title` | Resize scale |
+| `settings.aspect_correction` | Aspect correction |
+| `settings.aspect_width` | Width scale: |
+| `settings.aspect_height` | Height scale: |
 | `settings.client_only` | Client area only |
 | `settings.cursor_autohide` | Auto-hide cursor |
 | `settings.cursor_speed` | Natural cursor speed |
@@ -127,3 +134,6 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `tensorrt.preparing_label` | TensorRT (preparing) |
 | `tensorrt.unavailable_help` | The TensorRT backend is currently unavailable. Check cHiDeScaler-Neo.log for details. |
 | `vsync.help` | Synchronizes presentation to the monitor refresh to reduce tearing or split-frame artifacts; scrolling may feel less smooth on some systems. |
+
+- `source_occlusion.notice_title` — short title for the source-overlap safety-stop notice.
+- `source_occlusion.notice` — short explanation shown for 3 seconds after the source-overlap safety stop.

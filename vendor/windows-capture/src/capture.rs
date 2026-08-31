@@ -3,6 +3,7 @@ use std::os::windows::prelude::AsRawHandle;
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use windows::Win32::Foundation::{HANDLE, LPARAM, WPARAM};
@@ -190,6 +191,9 @@ pub enum GraphicsCaptureApiError<E> {
     /// Joining the worker thread failed (panic or OS-level join error).
     #[error("Failed to join thread")]
     FailedToJoinThread,
+    /// The capture worker did not finish startup within the bounded wait.
+    #[error("Capture startup timed out")]
+    StartupTimedOut,
     /// Failed to initialize the Windows Runtime for multithreaded apartment.
     ///
     /// Occurs when `RoInitialize(RO_INIT_MULTITHREADED)` returns an error other than `S_FALSE`.
@@ -370,6 +374,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
     {
         let (halt_sender, halt_receiver) = mpsc::channel::<Arc<AtomicBool>>();
         let (callback_sender, callback_receiver) = mpsc::channel::<Arc<Mutex<Self>>>();
+        let startup_cancel = Arc::new(AtomicBool::new(false));
+        let startup_cancel_worker = startup_cancel.clone();
 
         let thread_handle = thread::spawn(
             move || -> Result<(), GraphicsCaptureApiError<Self::Error>> {
@@ -393,6 +399,9 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
                 // Create direct3d device and context
                 let (d3d_device, d3d_device_context) = create_d3d_device()?;
+                if startup_cancel_worker.load(atomic::Ordering::Acquire) {
+                    return Err(GraphicsCaptureApiError::StartupTimedOut);
+                }
 
                 // Start capture
                 let result = Arc::new(Mutex::new(None));
@@ -426,16 +435,22 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 )
                 .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
+                if startup_cancel_worker.load(atomic::Ordering::Acquire) {
+                    return Err(GraphicsCaptureApiError::StartupTimedOut);
+                }
                 capture
                     .start_capture()
                     .map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
-                // Send halt handle
+                // Publish startup handles only while the caller is still waiting.
                 let halt_handle = capture.halt_handle();
-                halt_sender.send(halt_handle).unwrap();
-
-                // Send callback
-                callback_sender.send(callback).unwrap();
+                if startup_cancel_worker.load(atomic::Ordering::Acquire)
+                    || halt_sender.send(halt_handle).is_err()
+                    || callback_sender.send(callback).is_err()
+                {
+                    capture.stop_capture();
+                    return Err(GraphicsCaptureApiError::StartupTimedOut);
+                }
 
                 // Message loop
                 let mut message = MSG::default();
@@ -484,22 +499,39 @@ pub trait GraphicsCaptureApiHandler: Sized {
             },
         );
 
-        let Ok(halt_handle) = halt_receiver.recv() else {
-            match thread_handle.join() {
-                Ok(result) => return Err(result.err().unwrap()),
-                Err(_) => {
-                    return Err(GraphicsCaptureApiError::FailedToJoinThread);
-                }
+        const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+        let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
+        let halt_handle = match halt_receiver.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(handle) => handle,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                startup_cancel.store(true, atomic::Ordering::Release);
+                return Err(GraphicsCaptureApiError::StartupTimedOut);
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => match thread_handle.join() {
+                Ok(result) => {
+                    return Err(result
+                        .err()
+                        .unwrap_or(GraphicsCaptureApiError::FailedToJoinThread));
+                }
+                Err(_) => return Err(GraphicsCaptureApiError::FailedToJoinThread),
+            },
         };
 
-        let Ok(callback) = callback_receiver.recv() else {
-            match thread_handle.join() {
-                Ok(result) => return Err(result.err().unwrap()),
-                Err(_) => {
-                    return Err(GraphicsCaptureApiError::FailedToJoinThread);
-                }
+        let callback_wait = startup_deadline.saturating_duration_since(Instant::now());
+        let callback = match callback_receiver.recv_timeout(callback_wait) {
+            Ok(callback) => callback,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                startup_cancel.store(true, atomic::Ordering::Release);
+                return Err(GraphicsCaptureApiError::StartupTimedOut);
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => match thread_handle.join() {
+                Ok(result) => {
+                    return Err(result
+                        .err()
+                        .unwrap_or(GraphicsCaptureApiError::FailedToJoinThread));
+                }
+                Err(_) => return Err(GraphicsCaptureApiError::FailedToJoinThread),
+            },
         };
 
         Ok(CaptureControl::new(thread_handle, halt_handle, callback))

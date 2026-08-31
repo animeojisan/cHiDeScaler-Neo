@@ -1,6 +1,9 @@
 //! Named filter-chain presets + portable JSON persistence (atomic save).
 
-use super::config::{Settings, StageKind, StageSpec, UiLanguage, UiLanguageMode};
+use super::config::{
+    AspectCorrectionMode, CaptureCrop, CaptureResolution, Settings, StageKind, StageSpec,
+    UiLanguage, UiLanguageMode, sanitize_aspect_correction_scale,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -33,10 +36,89 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> std:
     std::fs::rename(source, destination)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PresetAspectCorrection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: AspectCorrectionMode,
+    #[serde(default = "default_preset_aspect_scale")]
+    pub width_scale: f32,
+    #[serde(default = "default_preset_aspect_scale")]
+    pub height_scale: f32,
+}
+
+fn default_preset_aspect_scale() -> f32 {
+    1.0
+}
+
+impl Default for PresetAspectCorrection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: AspectCorrectionMode::Manual,
+            width_scale: 1.0,
+            height_scale: 1.0,
+        }
+    }
+}
+
+impl PresetAspectCorrection {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            enabled: settings.aspect_correction,
+            mode: settings.aspect_correction_mode,
+            width_scale: sanitize_aspect_correction_scale(settings.aspect_width_scale),
+            height_scale: sanitize_aspect_correction_scale(settings.aspect_height_scale),
+        }
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            mode: self.mode,
+            width_scale: sanitize_aspect_correction_scale(self.width_scale),
+            height_scale: sanitize_aspect_correction_scale(self.height_scale),
+        }
+    }
+
+    pub fn apply_to_settings(self, settings: &mut Settings) {
+        let value = self.sanitized();
+        settings.aspect_correction = value.enabled;
+        settings.aspect_correction_mode = value.mode;
+        settings.aspect_width_scale = value.width_scale;
+        settings.aspect_height_scale = value.height_scale;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,
     pub chain: Vec<StageSpec>,
+    /// Optional for backwards compatibility with v0.99.0/v557 presets.
+    /// Missing means the preset predates aspect metadata and therefore uses
+    /// Neo's safe no-op presentation default (OFF, 1.00 x 1.00).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_correction: Option<PresetAspectCorrection>,
+    /// Optional for backwards compatibility. Missing crop metadata is a safe
+    /// no-op (OFF / all edges 0) when the preset is explicitly selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<CaptureCrop>,
+    /// Optional fixed client capture size owned by this preset. From v672,
+    /// missing means "inherit the current GUI capture resolution" when selected,
+    /// which also keeps every pre-v671 preset naturally compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_resolution: Option<CaptureResolution>,
+}
+
+impl Preset {
+    pub fn effective_aspect_correction(&self) -> PresetAspectCorrection {
+        self.aspect_correction.unwrap_or_default().sanitized()
+    }
+
+    pub fn effective_crop(&self) -> CaptureCrop {
+        self.crop.unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -133,6 +215,9 @@ impl PresetStore {
         &mut self,
         requested_name: &str,
         chain: &[StageSpec],
+        aspect_correction: PresetAspectCorrection,
+        crop: CaptureCrop,
+        capture_resolution: Option<CaptureResolution>,
     ) -> Result<String, PresetEditError> {
         let name = requested_name.trim();
         if name.is_empty() {
@@ -155,6 +240,9 @@ impl PresetStore {
             .ok_or(PresetEditError::ActivePresetMissing)?;
         preset.name = name.to_string();
         preset.chain = chain.to_vec();
+        preset.aspect_correction = Some(aspect_correction.sanitized());
+        preset.crop = Some(crop);
+        preset.capture_resolution = capture_resolution;
         self.data.active = name.to_string();
         Ok(name.to_string())
     }
@@ -165,6 +253,9 @@ impl PresetStore {
         &mut self,
         requested_name: &str,
         chain: &[StageSpec],
+        aspect_correction: PresetAspectCorrection,
+        crop: CaptureCrop,
+        capture_resolution: Option<CaptureResolution>,
     ) -> Result<String, PresetEditError> {
         let requested_name = requested_name.trim();
         if requested_name.is_empty() {
@@ -185,16 +276,28 @@ impl PresetStore {
         self.data.presets.push(Preset {
             name: name.clone(),
             chain: chain.to_vec(),
+            aspect_correction: Some(aspect_correction.sanitized()),
+            crop: Some(crop),
+            capture_resolution,
         });
         self.data.active = name.clone();
         Ok(name)
     }
 
-    pub fn create_blank(&mut self, base_name: &str) -> String {
+    pub fn create_blank(
+        &mut self,
+        base_name: &str,
+        aspect_correction: PresetAspectCorrection,
+        crop: CaptureCrop,
+        capture_resolution: Option<CaptureResolution>,
+    ) -> String {
         let name = self.unique_name(base_name);
         self.data.presets.push(Preset {
             name: name.clone(),
             chain: Vec::new(),
+            aspect_correction: Some(aspect_correction.sanitized()),
+            crop: Some(crop),
+            capture_resolution,
         });
         self.data.active = name.clone();
         name
@@ -408,6 +511,9 @@ mod tests {
             presets: vec![Preset {
                 name: "Only Mine".into(),
                 chain: vec![],
+                aspect_correction: None,
+                crop: None,
+                capture_resolution: None,
             }],
         };
         std::fs::write(
@@ -549,10 +655,16 @@ mod tests {
                     Preset {
                         name: "A".into(),
                         chain: vec![sample_stage("old.glsl")],
+                        aspect_correction: None,
+                        crop: None,
+                        capture_resolution: None,
                     },
                     Preset {
                         name: "B".into(),
                         chain: vec![],
+                        aspect_correction: None,
+                        crop: None,
+                        capture_resolution: None,
                     },
                 ],
             },
@@ -564,7 +676,13 @@ mod tests {
         let mut store = test_store();
         let chain = vec![sample_stage("new.glsl")];
         assert_eq!(
-            store.overwrite_active_as("Renamed", &chain),
+            store.overwrite_active_as(
+                "Renamed",
+                &chain,
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                None,
+            ),
             Ok("Renamed".into())
         );
         assert_eq!(store.data.presets.len(), 2);
@@ -576,7 +694,13 @@ mod tests {
     fn overwrite_rejects_another_preset_name() {
         let mut store = test_store();
         assert_eq!(
-            store.overwrite_active_as("B", &[]),
+            store.overwrite_active_as(
+                "B",
+                &[],
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                None,
+            ),
             Err(PresetEditError::NameInUse)
         );
         assert_eq!(store.data.active, "A");
@@ -585,7 +709,16 @@ mod tests {
     #[test]
     fn save_as_current_name_creates_numbered_copy() {
         let mut store = test_store();
-        assert_eq!(store.save_as_new("A", &[]), Ok("A (2)".into()));
+        assert_eq!(
+            store.save_as_new(
+                "A",
+                &[],
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                None,
+            ),
+            Ok("A (2)".into())
+        );
         assert_eq!(store.data.active, "A (2)");
         assert_eq!(store.data.presets.len(), 3);
     }
@@ -593,9 +726,152 @@ mod tests {
     #[test]
     fn new_preset_starts_with_an_empty_chain() {
         let mut store = test_store();
-        let name = store.create_blank("New Preset");
+        let name = store.create_blank(
+            "New Preset",
+            PresetAspectCorrection::default(),
+            CaptureCrop::default(),
+            None,
+        );
         assert_eq!(name, "New Preset");
         assert!(store.active().unwrap().chain.is_empty());
+    }
+
+    #[test]
+    fn legacy_preset_without_aspect_metadata_defaults_to_safe_noop() {
+        let preset: Preset = serde_json::from_str(r#"{"name":"Legacy","chain":[]}"#).unwrap();
+        assert!(preset.aspect_correction.is_none());
+        assert_eq!(
+            preset.effective_aspect_correction(),
+            PresetAspectCorrection::default()
+        );
+    }
+
+    #[test]
+    fn legacy_aspect_metadata_without_mode_defaults_to_manual() {
+        let preset: Preset = serde_json::from_str(
+            r#"{"name":"LegacyAspect","chain":[],"aspect_correction":{"enabled":true,"width_scale":0.75,"height_scale":1.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            preset.effective_aspect_correction().mode,
+            AspectCorrectionMode::Manual
+        );
+    }
+
+    #[test]
+    fn auto_aspect_mode_serializes_with_stable_preset_name() {
+        let aspect = PresetAspectCorrection {
+            enabled: true,
+            mode: AspectCorrectionMode::Auto4x3,
+            width_scale: 1.0,
+            height_scale: 1.0,
+        };
+        let value = serde_json::to_value(aspect).unwrap();
+        assert_eq!(value["mode"], "auto_4_3");
+    }
+
+    #[test]
+    fn save_as_records_current_aspect_without_touching_legacy_entries() {
+        let mut store = test_store();
+        let aspect = PresetAspectCorrection {
+            enabled: true,
+            mode: AspectCorrectionMode::Manual,
+            width_scale: 0.78,
+            height_scale: 1.0,
+        };
+        assert_eq!(
+            store.save_as_new("CPS2", &[], aspect, CaptureCrop::default(), None),
+            Ok("CPS2".into())
+        );
+        assert_eq!(store.active().unwrap().aspect_correction, Some(aspect));
+        assert!(store.data.presets[0].aspect_correction.is_none());
+
+        let value = serde_json::to_value(&store.data).unwrap();
+        assert!(value["presets"][0].get("aspect_correction").is_none());
+        assert_eq!(value["presets"][2]["aspect_correction"]["enabled"], true);
+    }
+
+    #[test]
+    fn overwrite_records_aspect_off_state_explicitly() {
+        let mut store = test_store();
+        let aspect = PresetAspectCorrection {
+            enabled: false,
+            mode: AspectCorrectionMode::Manual,
+            width_scale: 0.78,
+            height_scale: 1.0,
+        };
+        assert_eq!(
+            store.overwrite_active_as("A", &[], aspect, CaptureCrop::default(), None),
+            Ok("A".into())
+        );
+        assert_eq!(store.active().unwrap().aspect_correction, Some(aspect));
+    }
+
+    #[test]
+    fn legacy_preset_without_crop_metadata_defaults_to_disabled_zero_crop() {
+        let preset: Preset = serde_json::from_str(r#"{"name":"Legacy","chain":[]}"#).unwrap();
+        assert!(preset.crop.is_none());
+        assert_eq!(preset.effective_crop(), CaptureCrop::default());
+    }
+
+    #[test]
+    fn save_as_records_crop_state_and_values() {
+        let mut store = test_store();
+        let crop = CaptureCrop {
+            enabled: true,
+            left: 12,
+            top: 34,
+            right: 56,
+            bottom: 78,
+        };
+        assert_eq!(
+            store.save_as_new(
+                "Cropped",
+                &[],
+                PresetAspectCorrection::default(),
+                crop,
+                None
+            ),
+            Ok("Cropped".into())
+        );
+        assert_eq!(store.active().unwrap().crop, Some(crop));
+    }
+
+    #[test]
+    fn legacy_preset_without_capture_resolution_is_unspecified() {
+        let preset: Preset = serde_json::from_str(r#"{"name":"Legacy","chain":[]}"#).unwrap();
+        assert_eq!(preset.capture_resolution, None);
+    }
+
+    #[test]
+    fn fixed_capture_resolution_serializes_but_unspecified_is_omitted() {
+        let mut store = test_store();
+        let fixed = CaptureResolution { w: 1280, h: 720 };
+        assert_eq!(
+            store.save_as_new(
+                "Fixed",
+                &[],
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                Some(fixed),
+            ),
+            Ok("Fixed".into())
+        );
+        assert_eq!(
+            store.save_as_new(
+                "Auto",
+                &[],
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                None,
+            ),
+            Ok("Auto".into())
+        );
+        let value = serde_json::to_value(&store.data).unwrap();
+        assert!(value["presets"][0].get("capture_resolution").is_none());
+        assert_eq!(value["presets"][2]["capture_resolution"]["w"], 1280);
+        assert_eq!(value["presets"][2]["capture_resolution"]["h"], 720);
+        assert!(value["presets"][3].get("capture_resolution").is_none());
     }
 
     #[test]

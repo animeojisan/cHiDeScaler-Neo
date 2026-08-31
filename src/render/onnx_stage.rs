@@ -606,6 +606,10 @@ pub struct OnnxStage {
     /// metadata to reuse B's already-packed planes as the next first input.
     pack_frame_key: Option<(usize, usize, usize, usize, usize)>,
     pack_second_ptr: Option<usize>,
+    /// v655: log once when the conservative cross-GPU RIFE pack path disables
+    /// pointer-only previous-frame reuse. This avoids treating allocator pointer
+    /// reuse as frame identity on slow/asynchronous secondary-GPU sessions.
+    cross_gpu_rife_full_repack_logged: bool,
     last_interp_profile: Option<InterpProfile>,
     last_upscale_profile: Option<UpscaleProfile>,
     last_upscale_input_size: Option<(i32, i32)>,
@@ -618,6 +622,11 @@ pub struct OnnxStage {
     tensorrt_temporal_bridge: Option<TensorRtTemporalGpuBridge>,
     tensorrt_interp_bridge: Option<TensorRtInterpGpuBridge>,
     dml_interp_bridge: Option<DmlInterpGpuBridge>,
+    /// Cross-GPU fallback: CPU-packed RIFE input still enters DirectML normally,
+    /// but completed outputs stay in app-owned shareable D3D12 buffers so the
+    /// same selected GPU can hand them directly to Vulkan without a CPU readback.
+    dml_cpu_interp_shared_outputs: [Vec<DmlDirectOutput>; 2],
+    dml_cpu_interp_shared_disabled: bool,
     interp_gpu_path_disabled: bool,
     tensorrt_gpu_path_disabled: bool,
     tensorrt_gpu_unsupported_logged: bool,
@@ -700,6 +709,36 @@ pub(crate) struct PreparedInterpGpuOutput {
     /// upscaler can turn tiny provider-specific errors into visible
     /// checkerboard/nearest-neighbour-like blocks.
     pub(crate) preserve_float: bool,
+}
+
+/// One completed DirectML interpolation slot exported as its app-owned
+/// shareable D3D12 committed buffer. The Win32 handle is a fresh NT handle
+/// created for this export and remains owned by this wrapper; Vulkan import
+/// does not take ownership of Win32 handles.
+pub(crate) struct PreparedDmlSharedOutput {
+    pub(crate) key: u64,
+    pub(crate) handle: HANDLE,
+    pub(crate) byte_len: usize,
+    pub(crate) heap_byte_len: u64,
+    pub(crate) luid: [u8; 8],
+    pub(crate) size: (i32, i32),
+    pub(crate) padded: (i32, i32),
+    pub(crate) fp16: bool,
+}
+
+// Moving an owned Win32 handle between the interpolation worker and render
+// thread is safe; the underlying DirectML resource remains owned by OnnxStage.
+unsafe impl Send for PreparedDmlSharedOutput {}
+
+impl Drop for PreparedDmlSharedOutput {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+            self.handle = HANDLE::default();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1107,6 +1146,7 @@ impl OnnxStage {
             pack_t_cached: None,
             pack_frame_key: None,
             pack_second_ptr: None,
+            cross_gpu_rife_full_repack_logged: false,
             last_interp_profile: None,
             last_upscale_profile: None,
             last_upscale_input_size: None,
@@ -1119,6 +1159,8 @@ impl OnnxStage {
             tensorrt_temporal_bridge: None,
             tensorrt_interp_bridge: None,
             dml_interp_bridge: None,
+            dml_cpu_interp_shared_outputs: [Vec::new(), Vec::new()],
+            dml_cpu_interp_shared_disabled: false,
             interp_gpu_path_disabled: false,
             tensorrt_gpu_path_disabled: false,
             tensorrt_gpu_unsupported_logged: false,
@@ -1447,12 +1489,17 @@ impl OnnxStage {
         self.pack_t_cached = None;
         self.pack_frame_key = None;
         self.pack_second_ptr = None;
+        self.cross_gpu_rife_full_repack_logged = false;
         self.last_interp_profile = None;
         self.last_upscale_profile = None;
         self.last_upscale_input_size = None;
         self.temporal_history.clear();
         self.temporal_size = None;
         self.direct_output_disabled = false;
+        for bank in &mut self.dml_cpu_interp_shared_outputs {
+            bank.clear();
+        }
+        self.dml_cpu_interp_shared_disabled = false;
         self.tensorrt_gpu_path_disabled = false;
         self.tensorrt_gpu_unsupported_logged = false;
     }
@@ -1468,6 +1515,16 @@ impl OnnxStage {
     pub fn reset_interp_pack_cache(&mut self) {
         self.pack_frame_key = None;
         self.pack_second_ptr = None;
+    }
+
+    pub(crate) fn disable_dml_cpu_interp_shared(&mut self, reason: &str) {
+        if !self.dml_cpu_interp_shared_disabled {
+            log::warn!(
+                "dml-vulkan-resident-handoff: action=disable reason={} fallback=cpu-visible-interpolation",
+                reason
+            );
+        }
+        self.dml_cpu_interp_shared_disabled = true;
     }
 
     /// How many input frames the interpolation model consumes (1 = not an
@@ -1575,6 +1632,44 @@ impl OnnxStage {
         if !self.supports_interp_gpu() || timesteps.is_empty() {
             return Ok(None);
         }
+
+        // v653: DirectML interpolation cannot use the OpenGL external-memory
+        // bridge when presentation GL and the explicitly selected compute GPU
+        // are different adapters. v652 still entered bridge construction first
+        // and only discovered the LUID mismatch while importing the shared
+        // buffers. That transaction is unnecessary and, on some drivers, can
+        // leave the first RIFE session observing partially-visible/invalid
+        // shared contents before the CPU-visible fallback takes over.
+        //
+        // Bypass that impossible route *before allocating/importing anything*.
+        // The established CPU-packed DirectML path remains available, and when
+        // compatible Vulkan GLSL follows RIFE the separate DML->Vulkan shared
+        // output handoff can still keep the expensive output boundary resident
+        // on the selected GPU.
+        if self.provider == OnnxProvider::DirectML {
+            if let (Some(gl_luid), Some(selected_luid)) = (
+                gc.external_device_luid(),
+                crate::render::vulkan_gpu::production_selected_luid(),
+            ) {
+                let gl_luid_u64 = u64::from_le_bytes(gl_luid);
+                if gl_luid_u64 != selected_luid {
+                    self.interp_gpu_path_disabled = true;
+                    self.reset_interp_pack_cache();
+                    log::info!(
+                        "interp-gpu-path-bypass: backend=DirectML model={} reason=cross-gpu-gl-luid-mismatch selected_luid={:016x} gl_luid={:016x} route=cpu-input-directml{}",
+                        self.name,
+                        selected_luid,
+                        gl_luid_u64,
+                        if stable_post_handoff {
+                            "->d3d12-vulkan-output-when-compatible"
+                        } else {
+                            "->cpu-visible-output"
+                        }
+                    );
+                    return Ok(None);
+                }
+            }
+        }
         let required = self.interp_frames();
         anyhow::ensure!(
             frames.len() >= required,
@@ -1619,6 +1714,10 @@ impl OnnxStage {
             Err(error) => {
                 self.retire_interp_gpu_bridges(gc);
                 self.interp_gpu_path_disabled = true;
+                // Do not carry input-pack identity/cache state across a failed
+                // shared-resource transaction. The fallback must rebuild the
+                // next RIFE invocation exactly like a clean CPU-visible session.
+                self.reset_interp_pack_cache();
                 if matches!(
                     std::env::var("CHIDESCALER_INTERP_GPU").ok().as_deref(),
                     Some("require")
@@ -1871,6 +1970,58 @@ impl OnnxStage {
                     && matches!(self.provider, OnnxProvider::DirectML),
             })
             .collect())
+    }
+
+    /// Export the persistent app-owned DirectML output buffer for a completed
+    /// interpolation slot. Cross-GPU selected-compute handoff uses this, and
+    /// v661 also uses it to skip a redundant DML -> OpenGL -> CPU -> Vulkan
+    /// loop when DirectML and a forced Vulkan post-chain share the same GPU.
+    /// DirectML and Vulkan must resolve to the same selected-GPU LUID.
+    /// TensorRT/other providers return None and continue through their existing
+    /// OpenGL handoff unchanged.
+    pub(crate) fn export_prepared_interp_dml_shared_output(
+        &self,
+        output: PreparedInterpGpuOutput,
+    ) -> Result<Option<PreparedDmlSharedOutput>> {
+        if !matches!(self.provider, OnnxProvider::DirectML) {
+            return Ok(None);
+        }
+        let direct = if let Some(invocation) = self.dml_interp_bridge.as_ref().and_then(|bridge| {
+            bridge
+                .invocations
+                .iter()
+                .find(|invocation| invocation.output.key == output.key)
+        }) {
+            &invocation.output
+        } else if let Some(slot) = self
+            .dml_cpu_interp_shared_outputs
+            .iter()
+            .flat_map(|bank| bank.iter())
+            .find(|slot| slot.key == output.key)
+        {
+            slot
+        } else {
+            anyhow::bail!(
+                "DirectML interpolation output slot {} is no longer available",
+                output.key
+            );
+        };
+        anyhow::ensure!(
+            direct.input_size == output.padded,
+            "DirectML shared output geometry changed: {:?} != {:?}",
+            direct.input_size,
+            output.padded
+        );
+        Ok(Some(PreparedDmlSharedOutput {
+            key: direct.key,
+            handle: direct.shared_handle()?,
+            byte_len: direct.byte_len,
+            heap_byte_len: direct.heap_byte_len,
+            luid: direct.luid,
+            size: output.size,
+            padded: output.padded,
+            fp16: output.fp16,
+        }))
     }
 
     pub(crate) fn finish_prepared_interp_gpu_output(
@@ -2131,6 +2282,216 @@ impl OnnxStage {
         ts.iter()
             .map(|t| self.process_interp_rgba8(w, h, frames, *t))
             .collect()
+    }
+
+    /// Cross-GPU DirectML -> Vulkan handoff for RIFE. Input packing intentionally
+    /// remains CPU-visible because the capture/OpenGL GPU may be a different
+    /// adapter. Only the expensive provider output boundary is made resident:
+    /// DirectML writes on the selected GPU, a D3D12 GPU copy moves the provider
+    /// tensor into an app-owned shareable buffer, and Vulkan imports that buffer
+    /// on the same LUID. No DirectML output readback or Vulkan re-upload occurs.
+    pub(crate) fn process_interp_many_rgba8_dml_shared(
+        &mut self,
+        w: i32,
+        h: i32,
+        frames: &[&[u8]],
+        ts: &[f32],
+        output_bank: usize,
+    ) -> Result<Option<Vec<PreparedInterpGpuOutput>>> {
+        if self.provider != OnnxProvider::DirectML
+            || self.dml_cpu_interp_shared_disabled
+            || ts.is_empty()
+        {
+            return Ok(None);
+        }
+        let InterpKind::RifeV1 { channels } = self.interp.clone() else {
+            return Ok(None);
+        };
+        let output_bank = output_bank % 2;
+        let attempt = (|| -> Result<Vec<PreparedInterpGpuOutput>> {
+            anyhow::ensure!(!frames.is_empty(), "no frames");
+            anyhow::ensure!(channels >= 3 * frames.len() + 1, "model wants more frames");
+            let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+            anyhow::ensure!(wu > 0 && hu > 0, "empty frame");
+            let pw = wu.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE;
+            let ph = hu.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE;
+            let pn = pw * ph;
+            let aux = 3 * frames.len();
+            let padded = (i32::try_from(pw)?, i32::try_from(ph)?);
+            if self
+                .dml_cpu_interp_shared_outputs
+                .iter()
+                .flat_map(|bank| bank.iter())
+                .any(|slot| slot.input_size != padded)
+            {
+                for bank in &mut self.dml_cpu_interp_shared_outputs {
+                    bank.clear();
+                }
+            }
+
+            let pack_started = Instant::now();
+            let mut total_run_ms = 0.0f64;
+            let mut total_copy_ms = 0.0f64;
+            let mut prepared = Vec::with_capacity(ts.len());
+            let shape = vec![1i64, channels as i64, ph as i64, pw as i64];
+
+            if self.fp16 {
+                prepare_len_f16(&mut self.scratch_f16, pn * channels);
+                let x = self.scratch_f16.as_mut_slice();
+                fill_padded_rgb_planes_f16(x, frames, frames.len(), wu, hu, pw, ph, pn, 4);
+                if channels >= aux + 3 {
+                    let row: Vec<f16> = (0..pw)
+                        .map(|j| f16::from_f32(2.0 * j as f32 / (pw - 1) as f32 - 1.0))
+                        .collect();
+                    use rayon::prelude::*;
+                    x[(aux + 1) * pn..(aux + 2) * pn]
+                        .par_chunks_mut(pw)
+                        .for_each(|dst| dst.copy_from_slice(&row));
+                    x[(aux + 2) * pn..(aux + 3) * pn]
+                        .par_chunks_mut(pw)
+                        .enumerate()
+                        .for_each(|(i, row)| {
+                            row.fill(f16::from_f32(2.0 * i as f32 / (ph - 1) as f32 - 1.0));
+                        });
+                }
+                if channels >= aux + 5 {
+                    x[(aux + 3) * pn..(aux + 4) * pn].fill(f16::from_f32(2.0 / (pw - 1) as f32));
+                    x[(aux + 4) * pn..(aux + 5) * pn].fill(f16::from_f32(2.0 / (ph - 1) as f32));
+                }
+                for (index, timestep) in ts.iter().copied().enumerate() {
+                    x[aux * pn..(aux + 1) * pn].fill(f16::from_f32(timestep.clamp(0.0, 1.0)));
+                    let tin = TensorRef::from_array_view((shape.clone(), &*x)).map_err(oerr)?;
+                    if self.dml_cpu_interp_shared_outputs[output_bank].len() <= index {
+                        let output = create_direct_output(
+                            &mut self.session,
+                            &self.run_options,
+                            &self.in_name,
+                            &self.out_name,
+                            &tin,
+                            padded,
+                        )?;
+                        self.dml_cpu_interp_shared_outputs[output_bank].push(output);
+                    }
+                    let output = &mut self.dml_cpu_interp_shared_outputs[output_bank][index];
+                    anyhow::ensure!(
+                        output.dims.len() == 4
+                            && output.dims[0] == 1
+                            && output.dims[1] >= 3
+                            && output.dims[2] == ph as i64
+                            && output.dims[3] == pw as i64,
+                        "DirectML shared RIFE output shape {:?} does not match padded {}x{}",
+                        output.dims,
+                        pw,
+                        ph
+                    );
+                    let (run_ms, copy_ms) = run_cpu_tensor_to_dml_shared_output(
+                        &mut self.session,
+                        &self.run_options,
+                        &self.in_name,
+                        &self.out_name,
+                        &tin,
+                        output,
+                    )?;
+                    total_run_ms += run_ms;
+                    total_copy_ms += copy_ms;
+                    prepared.push(PreparedInterpGpuOutput {
+                        key: output.key,
+                        size: (w, h),
+                        padded,
+                        fp16: true,
+                        preserve_float: true,
+                    });
+                }
+            } else {
+                prepare_len_f32(&mut self.scratch_f32, pn * channels);
+                let x = self.scratch_f32.as_mut_slice();
+                fill_padded_rgb_planes_f32(x, frames, frames.len(), wu, hu, pw, ph, pn, 4);
+                if channels >= aux + 3 {
+                    let row: Vec<f32> = (0..pw)
+                        .map(|j| 2.0 * j as f32 / (pw - 1) as f32 - 1.0)
+                        .collect();
+                    use rayon::prelude::*;
+                    x[(aux + 1) * pn..(aux + 2) * pn]
+                        .par_chunks_mut(pw)
+                        .for_each(|dst| dst.copy_from_slice(&row));
+                    x[(aux + 2) * pn..(aux + 3) * pn]
+                        .par_chunks_mut(pw)
+                        .enumerate()
+                        .for_each(|(i, row)| row.fill(2.0 * i as f32 / (ph - 1) as f32 - 1.0));
+                }
+                if channels >= aux + 5 {
+                    x[(aux + 3) * pn..(aux + 4) * pn].fill(2.0 / (pw - 1) as f32);
+                    x[(aux + 4) * pn..(aux + 5) * pn].fill(2.0 / (ph - 1) as f32);
+                }
+                for (index, timestep) in ts.iter().copied().enumerate() {
+                    x[aux * pn..(aux + 1) * pn].fill(timestep.clamp(0.0, 1.0));
+                    let tin = TensorRef::from_array_view((shape.clone(), &*x)).map_err(oerr)?;
+                    if self.dml_cpu_interp_shared_outputs[output_bank].len() <= index {
+                        let output = create_direct_output(
+                            &mut self.session,
+                            &self.run_options,
+                            &self.in_name,
+                            &self.out_name,
+                            &tin,
+                            padded,
+                        )?;
+                        self.dml_cpu_interp_shared_outputs[output_bank].push(output);
+                    }
+                    let output = &mut self.dml_cpu_interp_shared_outputs[output_bank][index];
+                    anyhow::ensure!(
+                        output.dims.len() == 4
+                            && output.dims[0] == 1
+                            && output.dims[1] >= 3
+                            && output.dims[2] == ph as i64
+                            && output.dims[3] == pw as i64,
+                        "DirectML shared RIFE output shape {:?} does not match padded {}x{}",
+                        output.dims,
+                        pw,
+                        ph
+                    );
+                    let (run_ms, copy_ms) = run_cpu_tensor_to_dml_shared_output(
+                        &mut self.session,
+                        &self.run_options,
+                        &self.in_name,
+                        &self.out_name,
+                        &tin,
+                        output,
+                    )?;
+                    total_run_ms += run_ms;
+                    total_copy_ms += copy_ms;
+                    prepared.push(PreparedInterpGpuOutput {
+                        key: output.key,
+                        size: (w, h),
+                        padded,
+                        fp16: false,
+                        preserve_float: true,
+                    });
+                }
+            }
+            self.last_interp_profile = Some(InterpProfile {
+                pack_ms: pack_started.elapsed().as_secs_f64() * 1000.0
+                    - total_run_ms
+                    - total_copy_ms,
+                run_ms: total_run_ms,
+                out_ms: total_copy_ms,
+                padded_size: (pw, ph),
+            });
+            Ok(prepared)
+        })();
+
+        match attempt {
+            Ok(prepared) => Ok(Some(prepared)),
+            Err(error) => {
+                self.dml_cpu_interp_shared_disabled = true;
+                for bank in &mut self.dml_cpu_interp_shared_outputs {
+                    bank.clear();
+                }
+                log::warn!(
+                    "dml-vulkan-resident-handoff: action=disable reason={error:#} fallback=cpu-visible-interpolation"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn complete_successful_tensorrt_shape(&self, w: i32, h: i32) {
@@ -4249,6 +4610,122 @@ impl OnnxStage {
         }
     }
 
+    /// v652 cross-GPU ordinary-image handoff. Run the first ordinary FP16
+    /// DirectML model into the same app-owned shareable D3D12 output buffer
+    /// used by the proven interop code, but do not import it into OpenGL.
+    /// The caller may hand this resource directly to Vulkan when DirectML and
+    /// Vulkan share the selected GPU while presentation OpenGL lives on a
+    /// different adapter. Any unsupported model returns None and preserves the
+    /// established CPU/OpenGL path.
+    pub(crate) fn process_rgba8_dml_shared_output(
+        &mut self,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> Result<Option<(PreparedDmlSharedOutput, f64)>> {
+        if self.provider != OnnxProvider::DirectML
+            || !self.fp16
+            || self.interp != InterpKind::None
+            || self.temporal_frames.is_some()
+        {
+            return Ok(None);
+        }
+        let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+        let n = wu
+            .checked_mul(hu)
+            .ok_or_else(|| anyhow!("DirectML shared output input size overflow"))?;
+        anyhow::ensure!(rgba.len() >= n * 4, "RGBA input buffer too small");
+        if self
+            .direct_output
+            .as_ref()
+            .is_some_and(|state| state.input_size != (w, h))
+        {
+            log::info!(
+                "ONNX DML->Vulkan shared resize: model='{}' {:?} -> {}x{}; retiring old shared output",
+                self.name,
+                self.direct_output.as_ref().map(|state| state.input_size),
+                w,
+                h
+            );
+            self.direct_output = None;
+        }
+
+        let started = Instant::now();
+        let pack_start = Instant::now();
+        prepare_len_f16(&mut self.scratch_f16, n * 3);
+        let lut = u8_to_f16_lut();
+        use rayon::prelude::*;
+        self.scratch_f16
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(channel, plane)| {
+                for i in 0..n {
+                    plane[i] = lut[rgba[i * 4 + channel] as usize];
+                }
+            });
+        let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
+        let input_shape = Shape::new([1i64, 3, h as i64, w as i64]);
+        let input = TensorRef::from_array_view((input_shape, &*self.scratch_f16)).map_err(oerr)?;
+
+        let created = self.direct_output.is_none();
+        if created {
+            self.direct_output = Some(create_direct_output(
+                &mut self.session,
+                &self.run_options,
+                &self.in_name,
+                &self.out_name,
+                &input,
+                (w, h),
+            )?);
+        }
+
+        let state = self
+            .direct_output
+            .as_mut()
+            .ok_or_else(|| anyhow!("DirectML shared output state disappeared"))?;
+        let (run_ms, copy_ms) = run_cpu_tensor_to_dml_shared_output(
+            &mut self.session,
+            &self.run_options,
+            &self.in_name,
+            &self.out_name,
+            &input,
+            state,
+        )?;
+        let ow = i32::try_from(state.dims[3])?;
+        let oh = i32::try_from(state.dims[2])?;
+        let shared = PreparedDmlSharedOutput {
+            key: state.key,
+            handle: state.shared_handle()?,
+            byte_len: state.byte_len,
+            heap_byte_len: state.heap_byte_len,
+            luid: state.luid,
+            size: (ow, oh),
+            padded: (ow, oh),
+            fp16: true,
+        };
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms,
+            run_ms,
+            out_ms: copy_ms,
+            output_size: (usize::try_from(ow)?, usize::try_from(oh)?),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if created {
+            log::info!(
+                "ONNX DML->Vulkan shared output ready: model='{}' shape={:?} bytes={} LUID={:02x?} pack_ms={:.3} run_ms={:.3} gpu_copy_ms={:.3}",
+                self.name,
+                state.dims,
+                state.byte_len,
+                state.luid,
+                pack_ms,
+                run_ms,
+                copy_ms,
+            );
+        }
+        Ok(Some((shared, total_ms)))
+    }
+
     fn process_rgba8_gpu_output_inner(
         &mut self,
         gc: &mut GlContext,
@@ -5484,6 +5961,79 @@ fn create_direct_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
     })
 }
 
+fn run_cpu_tensor_to_dml_shared_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
+    session: &mut Session,
+    run_options: &CancelableRunOptions,
+    input_name: &str,
+    output_name: &str,
+    input: &TensorRef<'_, T>,
+    output: &mut DmlDirectOutput,
+) -> Result<(f64, f64)> {
+    let memory = MemoryInfo::new(
+        AllocationDevice::DIRECTML,
+        0,
+        AllocatorType::Device,
+        MemoryType::Default,
+    )?;
+    let input_c = CString::new(input_name.as_bytes())?;
+    ort_status(unsafe {
+        (ort::api().BindInput)(
+            output.binding.ptr().cast_mut(),
+            input_c.as_ptr(),
+            input.ptr(),
+        )
+    })?;
+    output
+        .binding
+        .bind_output_to_device(output_name.to_string(), &memory)
+        .map_err(oerr)?;
+
+    let run_started = Instant::now();
+    let result = (|| -> Result<(f64, f64)> {
+        let mut provider_outputs = session
+            .run_binding_with_options(&output.binding, run_options.armed()?)
+            .map_err(oerr)?;
+        output.binding.synchronize_outputs().map_err(oerr)?;
+        let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+        let copy_started = Instant::now();
+        let provider = provider_outputs
+            .remove(output_name)
+            .ok_or_else(|| anyhow!("DirectML interpolation provider output missing"))?
+            .downcast::<TensorValueType<T>>()?;
+        anyhow::ensure!(
+            provider.memory_info().allocation_device().as_str() == "DML",
+            "DirectML interpolation output silently fell back to CPU"
+        );
+        let provider_dims: Vec<i64> = provider.shape().iter().copied().collect();
+        anyhow::ensure!(
+            provider_dims == output.dims,
+            "DirectML interpolation provider output shape changed: {:?} != {:?}",
+            provider_dims,
+            output.dims
+        );
+        let api = dml_api()?;
+        let mut raw_resource = std::ptr::null_mut();
+        ort_status(unsafe {
+            (api.GetD3D12ResourceFromAllocation)(
+                output.dml_allocator.ptr().cast_mut(),
+                provider.data_ptr().cast_mut(),
+                &mut raw_resource,
+            )
+        })?;
+        let borrowed = unsafe { ID3D12Resource::from_raw_borrowed(&raw_resource) }
+            .ok_or_else(|| anyhow!("DirectML interpolation provider output resource is null"))?;
+        let provider_resource = borrowed.clone();
+        let _ = output
+            .copy
+            .copy_and_wait(&provider_resource, &output.resource, output.byte_len)?;
+        drop(provider);
+        drop(provider_outputs);
+        Ok((run_ms, copy_started.elapsed().as_secs_f64() * 1000.0))
+    })();
+    output.binding.clear();
+    result
+}
+
 fn dml_interp_interop_mode(
     _gc: &GlContext,
     _stable_post_handoff: bool,
@@ -5599,7 +6149,28 @@ impl OnnxStage {
         let frame_key = (w, h, pw, ph, stride);
         let const_ok = self.pack_const_key == Some(const_key);
         let t_ok = const_ok && self.pack_t_cached == Some(t.clamp(0.0, 1.0));
-        let reuse_prev = nf == 2
+        // v655 correctness guard for explicit cross-GPU compute. The historical
+        // pack optimization identified the overlapping frame in consecutive
+        // RIFE pairs by Vec data pointer alone: (A,B) -> (B,C). On a slower
+        // asynchronous secondary GPU, allocator reuse can give a different new
+        // frame the same address after the previous Arc/Vec is released. That
+        // makes stale B planes become the next A planes and can corrupt only the
+        // generated midpoint while real frames remain correct.
+        //
+        // production_selected_luid() is set only when explicit compute differs
+        // from the presentation OpenGL adapter, so the known-good same-GPU RTX
+        // DirectML path retains the fast reuse optimization unchanged.
+        let cross_gpu_directml = self.provider == OnnxProvider::DirectML
+            && crate::render::vulkan_gpu::production_selected_luid().is_some();
+        if cross_gpu_directml && !self.cross_gpu_rife_full_repack_logged {
+            log::info!(
+                "rife-pack-safety: backend=DirectML route=cross-gpu-full-repack model={} reason=pointer-identity-not-sufficient same-gpu-fast-reuse=preserved",
+                self.name
+            );
+            self.cross_gpu_rife_full_repack_logged = true;
+        }
+        let reuse_prev = !cross_gpu_directml
+            && nf == 2
             && self.pack_frame_key == Some(frame_key)
             && self.pack_second_ptr == Some(frames[0].as_ptr() as usize);
         let (outputs, pack_ms, run_ms) = if self.fp16 {

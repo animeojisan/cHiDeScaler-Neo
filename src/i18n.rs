@@ -511,6 +511,7 @@ mod tests {
     #[test]
     fn option_and_panel_tooltips_are_translated_in_every_bundled_catalog() {
         let keys = [
+            "aspect.help",
             "smooth.help",
             "interpolation.factor_help",
             "panel.gui_topmost_enable_help",

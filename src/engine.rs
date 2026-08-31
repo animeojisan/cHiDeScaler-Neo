@@ -5,13 +5,17 @@
 //! capture, the filter chain, and overlay visibility.
 
 use crate::capture::wgc::{FrameBuf, WgcSource};
-use crate::core::config::{HdrSdrMode, OnnxBackendPreference, ScaleMode, StageKind, StageSpec};
+use crate::core::config::{
+    AspectCorrectionMode, CaptureCrop, HdrSdrMode, OnnxBackendPreference, ScaleMode, StageKind,
+    StageSpec, sanitize_aspect_correction_scale,
+};
 use crate::core::metrics::Metrics;
 use crate::overlay::window::OverlayWindow;
 use crate::platform::win32;
-use crate::render::chain::{FilterChain, StageFactory};
+use crate::render::chain::{FilterChain, Stage, StageFactory};
 use crate::render::gl::{GlContext, GpuTex};
-use crate::render::onnx_stage::PreparedInterpGpuOutput;
+use crate::render::onnx_stage::{PreparedDmlSharedOutput, PreparedInterpGpuOutput};
+use crate::render::vulkan_gpu::{self, GlslBackendRoute};
 use anyhow::Result;
 use glow::HasContext;
 use half::f16;
@@ -97,7 +101,13 @@ const GLSL_GUARD_CHAIN_CONFIRM: Duration = Duration::from_millis(300);
 // geometry-independent fast-reconfirm, and the ordinary guard thresholds.
 const GLSL_GUARD_RESOLUTION_RECHECK_SETTLE: Duration = Duration::from_millis(1000);
 const GLSL_GUARD_RESOLUTION_RECHECK_TIMEOUT: Duration = Duration::from_secs(8);
-// Once the existing overload detector has *proven* the current GLSL
+// Monitor/display-region fallback captures an application-owned presentation
+// child from the monitor rather than the selected root HWND itself. Resizing
+// the root can make that child relayout through several transient sizes before
+// it settles. Never rebuild shape-specialized ONNX state from those intermediate
+// surfaces; wait for one real display-region capture size to remain stable.
+const DISPLAY_REGION_CAPTURE_RESOLUTION_SETTLE: Duration = Duration::from_millis(500);
+// v555: once the existing overload detector has *proven* the current GLSL
 // workload is beyond the machine, give the user a readable warning interval
 // and then use the ordinary Stop route. While that grace period is active,
 // non-interpolation GLSL chains hold the last complete filtered frame instead
@@ -231,19 +241,38 @@ fn hdr_tonemap_pool() -> &'static rayon::ThreadPool {
 pub enum Cmd {
     Start {
         hwnd: isize,
+        source_pid: u32,
+        source_was_topmost: bool,
         specs: Vec<StageSpec>,
         mode: ScaleMode,
         ratio: f32,
+        /// Display-only non-uniform scaling applied after the filter chain.
+        /// Capture/WGC and filter-processing geometry remain unchanged.
+        aspect_correction: bool,
+        aspect_correction_mode: AspectCorrectionMode,
+        aspect_width_scale: f32,
+        aspect_height_scale: f32,
+        capture_crop: CaptureCrop,
         fps_cap: Option<u32>,
         hide_source: bool,
         client_only: bool,
         hdr: bool,
         hdr_sdr_mode: HdrSdrMode,
         gpu_adapter: Option<i32>,
+        /// Exact explicit DXGI LUID selected by the user. None is Auto and is
+        /// the hard compatibility contract for the untouched OpenGL path.
+        explicit_gpu_luid: Option<u64>,
+        /// User selected the duplicate "[Vulkan]" entry for this adapter.
+        /// This affects compatible GLSL routing only; ONNX/TensorRT still use
+        /// the same physical GPU selected by explicit_gpu_luid.
+        force_vulkan_glsl: bool,
         source_restore_rect: Option<(i32, i32, i32, i32)>,
+        source_restore_placement: Option<win32::WindowPlacementSnapshot>,
         source_was_maximized: bool,
-        /// ((requested w/h), (aspect-safe applied w/h)); performed only after
-        /// the first filtered frame covers the source.
+        /// ((requested retained-content w/h), (source-client w/h)); performed
+        /// only after the first filtered frame covers the source. The source
+        /// client may be odd when crop margins are odd; WGC frame matching uses
+        /// its even-padded equivalent without changing the foreign HWND size.
         deferred_capture_resolution: Option<((u32, u32), (u32, u32))>,
         capture_canvas: Option<(u32, u32)>,
     },
@@ -254,12 +283,45 @@ pub enum Cmd {
     WakeForStop,
     /// Save the most recently presented, fully filtered frame.
     SaveScreenshot(std::path::PathBuf),
-    ApplyChain(Vec<StageSpec>),
+    ApplyChain {
+        specs: Vec<StageSpec>,
+        aspect_correction: bool,
+        aspect_correction_mode: AspectCorrectionMode,
+        aspect_width_scale: f32,
+        aspect_height_scale: f32,
+        capture_crop: CaptureCrop,
+    },
+    /// Latest-only display aspect update. This changes presentation geometry
+    /// only; WGC/capture size and filter processing geometry stay untouched.
+    SetAspectCorrection {
+        enabled: bool,
+        mode: AspectCorrectionMode,
+        width_scale: f32,
+        height_scale: f32,
+    },
+    /// Latest-only user crop update. The next frame is cropped before any
+    /// GLSL/ONNX stage, while source-window geometry remains unchanged.
+    SetCaptureCrop {
+        crop: CaptureCrop,
+    },
     SwitchOnnxBackend {
         backend: OnnxBackendPreference,
         trt_device_id: Option<i32>,
         cache_root: std::path::PathBuf,
         specs: Vec<StageSpec>,
+    },
+    /// Change the selected compute adapter without rebuilding Neo's WGL/WGPU
+    /// presentation devices. The Full-mode selector is disabled while capture
+    /// is active, so this normally commits while idle. If a start races the
+    /// GUI command, only future factory state is changed; the active session
+    /// keeps its original GPU contract until the next Start.
+    SetGpuSelection {
+        gpu_adapter: Option<i32>,
+        explicit_gpu_luid: Option<u64>,
+        force_vulkan_glsl: bool,
+        backend: OnnxBackendPreference,
+        trt_device_id: Option<i32>,
+        cache_root: std::path::PathBuf,
     },
     SetMode {
         mode: ScaleMode,
@@ -272,6 +334,9 @@ pub enum Cmd {
     SetCaptureGeometry {
         requested: (u32, u32),
         applied: (u32, u32),
+        /// Current GUI crop committed atomically with this source resize. This
+        /// prevents TensorRT from compiling an intermediate pre-resize shape.
+        capture_crop: CaptureCrop,
     },
     /// Return a running session to native WGC geometry (Capture size = Auto).
     /// This also clears any capture-resolution reservation that was suspended
@@ -329,6 +394,10 @@ pub struct Status {
     pub target_title: String,
     pub last_error: Option<String>,
     pub warning: Option<String>,
+    /// Monotonic notification sequence for the windowed-source occlusion safety stop.
+    /// The GUI uses this to show a short, non-blocking topmost explanation after
+    /// the proven Stop path has already restored the source/cursor/overlay state.
+    pub source_occlusion_notice_seq: u64,
     /// Live monitor-covering fullscreen state of the selected source. This may
     /// change after Start when an application uses its own fullscreen button.
     pub source_live_fullscreen: bool,
@@ -352,7 +421,7 @@ pub struct Status {
     /// cleared by an actual chain change/Stop, or after a live capture-resolution
     /// change is measured stably healthy and a full-chain verification frame passes.
     pub glsl_overload_notice_latched: bool,
-    /// Deadline armed only after the existing overload detector has
+    /// v554: deadline armed only after the existing overload detector has
     /// latched the user-facing warning. The GUI dispatches the same ordinary
     /// Cmd::Stop route when this expires; None means no automatic Stop pending.
     pub glsl_overload_auto_stop_deadline: Option<Instant>,
@@ -364,11 +433,18 @@ pub struct Status {
     pub overlay_hwnd: isize,
     /// (hwnd, was_layered) of a visually-hidden source — insurance so the GUI
     /// can restore it even if the engine thread died.
-    pub hidden_src: Option<(isize, bool)>,
+    pub hidden_src: Option<(isize, u32, bool)>,
     /// Full source recovery record kept outside Session so a render-thread
     /// error/panic can restore a hidden or moved PIP even after stack unwind.
-    /// (hwnd, original window rect, was_maximized, was_topmost)
-    pub source_recovery: Option<(isize, Option<(i32, i32, i32, i32)>, bool, bool)>,
+    /// (hwnd, pid, original outer rect, original WINDOWPLACEMENT, was_maximized, was_topmost)
+    pub source_recovery: Option<(
+        isize,
+        u32,
+        Option<(i32, i32, i32, i32)>,
+        Option<win32::WindowPlacementSnapshot>,
+        bool,
+        bool,
+    )>,
     pub onnx_backend: OnnxBackendPreference,
     pub onnx_backend_switching: bool,
     pub onnx_backend_error: Option<String>,
@@ -376,6 +452,12 @@ pub struct Status {
     pub onnx_tensorrt_stages: usize,
     pub onnx_cuda_stages: usize,
     pub onnx_directml_fallbacks: usize,
+    /// Render-worker OpenGL device identity. `render_gpu_ready` becomes true
+    /// immediately after the persistent WGL context has been created, even on
+    /// drivers that cannot expose GL_DEVICE_LUID_EXT.
+    pub render_gpu_ready: bool,
+    pub render_gpu_luid: Option<u64>,
+    pub render_gpu_name: String,
 }
 
 /// Compute the control panel's physical desktop position. Both the GUI
@@ -428,9 +510,110 @@ impl PendingNoEngage {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AspectCorrectionState {
+    enabled: bool,
+    mode: AspectCorrectionMode,
+    width_scale: f32,
+    height_scale: f32,
+}
+
+impl AspectCorrectionState {
+    fn sanitized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            mode: self.mode,
+            width_scale: sanitize_aspect_correction_scale(self.width_scale),
+            height_scale: sanitize_aspect_correction_scale(self.height_scale),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingLiveUpdate {
+    chain: Option<Vec<StageSpec>>,
+    aspect: Option<AspectCorrectionState>,
+    crop: Option<CaptureCrop>,
+    chain_overwritten: u64,
+    aspect_overwritten: u64,
+    crop_overwritten: u64,
+}
+
+impl PendingLiveUpdate {
+    fn publish_chain(
+        &mut self,
+        specs: Vec<StageSpec>,
+        aspect: AspectCorrectionState,
+        crop: CaptureCrop,
+    ) {
+        if self.chain.replace(specs).is_some() {
+            self.chain_overwritten = self.chain_overwritten.saturating_add(1);
+        }
+        // A preset/filter-chain snapshot and its aspect metadata are one
+        // semantic edit. Publish them under the same lock so the render thread
+        // can never observe a new preset with stale aspect settings.
+        self.publish_aspect(aspect);
+        self.publish_crop(crop);
+    }
+
+    fn publish_crop(&mut self, crop: CaptureCrop) {
+        if self.crop.replace(crop).is_some() {
+            self.crop_overwritten = self.crop_overwritten.saturating_add(1);
+        }
+    }
+
+    fn publish_aspect(&mut self, aspect: AspectCorrectionState) {
+        if self.aspect.replace(aspect.sanitized()).is_some() {
+            self.aspect_overwritten = self.aspect_overwritten.saturating_add(1);
+        }
+    }
+
+    fn take_latest(
+        &mut self,
+    ) -> (
+        Option<Vec<StageSpec>>,
+        Option<AspectCorrectionState>,
+        Option<CaptureCrop>,
+        u64,
+        u64,
+        u64,
+    ) {
+        (
+            self.chain.take(),
+            self.aspect.take(),
+            self.crop.take(),
+            std::mem::take(&mut self.chain_overwritten),
+            std::mem::take(&mut self.aspect_overwritten),
+            std::mem::take(&mut self.crop_overwritten),
+        )
+    }
+
+    fn clear_all(&mut self) {
+        self.chain = None;
+        self.aspect = None;
+        self.crop = None;
+        self.chain_overwritten = 0;
+        self.aspect_overwritten = 0;
+        self.crop_overwritten = 0;
+    }
+
+    fn clear_chain(&mut self) {
+        self.chain = None;
+        self.chain_overwritten = 0;
+    }
+}
+
+// Normal application exit gets a small bounded grace period for the render
+// thread/provider stack to unwind. Keep this below the independent janitor's
+// 3000 ms quit-grace so the external last-resort cleanup can never race the
+// normal in-process shutdown path. v585 diagnostics showed that a warmed
+// TensorRT provider cache can spend ~1.9 s in teardown, so v586 releases native
+// input before entering that slow provider cleanup while keeping this bound.
+const ENGINE_SHUTDOWN_GRACE_MS: u64 = 2_500;
+
 pub struct EngineHandle {
     tx: Sender<Cmd>,
-    pending_chain: Arc<Mutex<Option<Vec<StageSpec>>>>,
+    pending_live: Arc<Mutex<PendingLiveUpdate>>,
     // GUI geometry is state, not an ordered command stream. Language, DPI,
     // mode changes and dragging can publish many rectangles while a heavy GPU
     // frame owns the render thread; retaining only the newest measurement
@@ -447,7 +630,7 @@ pub struct EngineHandle {
 #[derive(Clone)]
 pub struct EngineStopHandle {
     tx: Sender<Cmd>,
-    pending_chain: Arc<Mutex<Option<Vec<StageSpec>>>>,
+    pending_live: Arc<Mutex<PendingLiveUpdate>>,
     pending_no_engage: Arc<Mutex<PendingNoEngage>>,
     stop_requested: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
@@ -465,7 +648,7 @@ impl EngineStopHandle {
         if !active {
             return;
         }
-        *self.pending_chain.lock().unwrap() = None;
+        self.pending_live.lock().unwrap().clear_all();
         self.pending_no_engage.lock().unwrap().publish(Vec::new());
         self.stop_requested.store(true, Ordering::Release);
         let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -480,6 +663,30 @@ impl Drop for EngineThreadDone {
     fn drop(&mut self) {
         let _ = self.0.send(());
     }
+}
+
+fn restore_source_topmost_verified(hwnd: isize, source_pid: u32, topmost: bool) -> bool {
+    for attempt in 1..=3 {
+        if !win32::window_matches_pid(hwnd, source_pid) {
+            log::warn!(
+                "source-zorder-restore-aborted: hwnd={hwnd:#x} expected_pid={source_pid} current_pid={} reason=identity-changed",
+                win32::window_pid(hwnd)
+            );
+            return false;
+        }
+        win32::set_topmost(hwnd, topmost);
+        if win32::is_topmost(hwnd) == topmost {
+            log::debug!(
+                "source-zorder-verified: hwnd={hwnd:#x} pid={source_pid} topmost={topmost} attempt={attempt}"
+            );
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    log::warn!(
+        "source-zorder-verify-failed: hwnd={hwnd:#x} pid={source_pid} requested_topmost={topmost}"
+    );
+    false
 }
 
 fn emergency_recover_engine_state(
@@ -510,27 +717,35 @@ fn emergency_recover_engine_state(
         (state.hidden_src.take(), state.source_recovery.take())
     };
 
-    if let Some((hwnd, was_layered)) = hidden {
-        if win32::is_window_valid(hwnd) {
+    if let Some((hwnd, pid, was_layered)) = hidden {
+        if win32::window_matches_pid(hwnd, pid) {
             win32::show_window_visual(hwnd, was_layered);
         }
     }
-    if let Some((hwnd, restore_rect, was_maximized, was_topmost)) = recovery {
-        if win32::is_window_valid(hwnd) {
-            if let Some((hidden_hwnd, was_layered)) = hidden {
-                if hidden_hwnd == hwnd {
+    if let Some((hwnd, pid, restore_rect, restore_placement, was_maximized, was_topmost)) = recovery
+    {
+        // Always release our bookkeeping. The helper itself refuses to mutate
+        // an HWND whose PID no longer matches the captured source.
+        let _ = win32::restore_source_rounded_corners(hwnd, pid);
+        if win32::window_matches_pid(hwnd, pid) {
+            if let Some((hidden_hwnd, hidden_pid, was_layered)) = hidden {
+                if hidden_hwnd == hwnd && hidden_pid == pid {
                     win32::show_window_visual(hwnd, was_layered);
                 }
             }
-            if let Some(rect) = restore_rect {
-                let ok = win32::restore_window_rect(hwnd, rect, was_maximized);
-                log::warn!(
-                    "engine-failure-source-geometry-restored: reason={reason} hwnd={hwnd:#x} rect={rect:?} maximized={was_maximized} ok={ok}"
-                );
-            }
+            // Restore z-order before geometry. Some foreign windows react to
+            // TOPMOST changes asynchronously; doing this after SetWindowPos can
+            // move/resize the source again after we have already declared the
+            // geometry restored.
             if !was_topmost {
-                win32::set_topmost(hwnd, false);
+                restore_source_topmost_verified(hwnd, pid, false);
             }
+            let ok =
+                win32::restore_window_origin(hwnd, restore_rect, was_maximized, restore_placement);
+            log::warn!(
+                "engine-failure-source-geometry-restored: reason={reason} hwnd={hwnd:#x} rect={restore_rect:?} normal_rect={:?} maximized={was_maximized} ok={ok}",
+                restore_placement.map(|p| p.normal_rect_xywh())
+            );
         }
     }
     crate::input::emergency_release_all();
@@ -576,22 +791,29 @@ fn recover_visible_capture_state_now(status: &Arc<Mutex<Status>>, reason: &str) 
         win32::set_window_alpha(overlay_hwnd, 0);
     }
 
-    if let Some((hwnd, was_layered)) = hidden {
-        if win32::is_window_valid(hwnd) {
+    if let Some((hwnd, pid, was_layered)) = hidden {
+        if win32::window_matches_pid(hwnd, pid) {
             win32::show_window_visual(hwnd, was_layered);
         }
     }
-    if let Some((hwnd, restore_rect, was_maximized, was_topmost)) = recovery {
-        if win32::is_window_valid(hwnd) {
-            if let Some(rect) = restore_rect {
-                let ok = win32::restore_window_rect(hwnd, rect, was_maximized);
-                log::info!(
-                    "stop-immediate-source-geometry-restored: reason={reason} hwnd={hwnd:#x} rect={rect:?} maximized={was_maximized} ok={ok}"
-                );
-            }
+    if let Some((hwnd, pid, restore_rect, restore_placement, was_maximized, was_topmost)) = recovery
+    {
+        // Release the temporary DWM preference even if the original HWND has
+        // disappeared; identity mismatch only clears our record and touches no window.
+        let _ = win32::restore_source_rounded_corners(hwnd, pid);
+        if win32::window_matches_pid(hwnd, pid) {
+            // Restore z-order first, then commit the exact start geometry.
+            // This prevents a delayed response to HWND_NOTOPMOST from
+            // invalidating the just-restored rectangle.
             if !was_topmost {
-                win32::set_topmost(hwnd, false);
+                restore_source_topmost_verified(hwnd, pid, false);
             }
+            let ok =
+                win32::restore_window_origin(hwnd, restore_rect, was_maximized, restore_placement);
+            log::info!(
+                "stop-immediate-source-geometry-restored: reason={reason} hwnd={hwnd:#x} rect={restore_rect:?} normal_rect={:?} maximized={was_maximized} ok={ok}",
+                restore_placement.map(|p| p.normal_rect_xywh())
+            );
         }
     }
 
@@ -603,7 +825,7 @@ impl EngineHandle {
     pub fn stop_handle(&self) -> EngineStopHandle {
         EngineStopHandle {
             tx: self.tx.clone(),
-            pending_chain: self.pending_chain.clone(),
+            pending_live: self.pending_live.clone(),
             pending_no_engage: self.pending_no_engage.clone(),
             stop_requested: self.stop_requested.clone(),
             status: self.status.clone(),
@@ -623,7 +845,7 @@ impl EngineHandle {
         PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
         let (tx, rx) = channel();
         let (done_tx, done_rx) = channel();
-        let pending_chain = Arc::new(Mutex::new(None));
+        let pending_live = Arc::new(Mutex::new(PendingLiveUpdate::default()));
         let pending_no_engage = Arc::new(Mutex::new(PendingNoEngage::default()));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let metrics = Metrics::default();
@@ -633,7 +855,7 @@ impl EngineHandle {
         }));
         let m2 = metrics.clone();
         let s2 = status.clone();
-        let pending_chain2 = pending_chain.clone();
+        let pending_live2 = pending_live.clone();
         let pending_no_engage2 = pending_no_engage.clone();
         let stop_requested2 = stop_requested.clone();
         // The render thread also needs a sender for the native floating-panel
@@ -649,7 +871,7 @@ impl EngineHandle {
                     engine_main(
                         rx,
                         control_tx,
-                        pending_chain2,
+                        pending_live2,
                         pending_no_engage2,
                         stop_requested2,
                         m2,
@@ -683,7 +905,7 @@ impl EngineHandle {
             .expect("spawn engine");
         Self {
             tx,
-            pending_chain,
+            pending_live,
             pending_no_engage,
             stop_requested,
             metrics,
@@ -701,7 +923,7 @@ impl EngineHandle {
                 // DirectML/TensorRT Session::Run may currently own that thread.
                 // RunOptions::terminate is cooperative and returns immediately,
                 // allowing the blocked call to unwind and read Cmd::Stop.
-                *self.pending_chain.lock().unwrap() = None;
+                self.pending_live.lock().unwrap().clear_all();
                 self.pending_no_engage.lock().unwrap().publish(Vec::new());
                 self.stop_requested.store(true, Ordering::Release);
                 let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -716,7 +938,7 @@ impl EngineHandle {
             }
             Cmd::Shutdown => {
                 PANEL_LURK_RESTORE_GEOMETRY_GUARD.store(false, Ordering::Release);
-                *self.pending_chain.lock().unwrap() = None;
+                self.pending_live.lock().unwrap().clear_all();
                 self.pending_no_engage.lock().unwrap().publish(Vec::new());
                 self.stop_requested.store(true, Ordering::Release);
                 let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -726,7 +948,10 @@ impl EngineHandle {
             }
             start @ Cmd::Start {
                 hwnd,
+                source_pid,
+                source_was_topmost,
                 source_restore_rect,
+                source_restore_placement,
                 source_was_maximized,
                 ..
             } => {
@@ -747,12 +972,14 @@ impl EngineHandle {
                     state.source_live_fullscreen = fullscreen_origin;
                     state.source_recovery = Some((
                         hwnd,
+                        source_pid,
                         source_restore_rect,
+                        source_restore_placement,
                         source_was_maximized,
                         // Fullscreen pixel-lock sessions deliberately never
                         // promote the foreign source HWND, so recovery must
                         // not issue a matching NOTOPMOST mutation either.
-                        win32::is_topmost(hwnd) || fullscreen_origin,
+                        source_was_topmost || fullscreen_origin,
                     ));
                 }
                 self.stop_requested.store(false, Ordering::Release);
@@ -766,11 +993,51 @@ impl EngineHandle {
                     state.source_recovery = None;
                 }
             }
-            Cmd::ApplyChain(specs) => {
+            Cmd::ApplyChain {
+                specs,
+                aspect_correction,
+                aspect_correction_mode,
+                aspect_width_scale,
+                aspect_height_scale,
+                capture_crop,
+            } => {
                 // Live editing can produce several changes in one GUI gesture.
-                // Keep the newest complete chain instead of queueing stale rebuilds
-                // behind frame interpolation work.
-                *self.pending_chain.lock().unwrap() = Some(specs);
+                // Keep only the newest complete chain and its matching aspect
+                // snapshot instead of replaying stale intermediate presets.
+                self.pending_live.lock().unwrap().publish_chain(
+                    specs,
+                    AspectCorrectionState {
+                        enabled: aspect_correction,
+                        mode: aspect_correction_mode,
+                        width_scale: aspect_width_scale,
+                        height_scale: aspect_height_scale,
+                    },
+                    capture_crop,
+                );
+            }
+            Cmd::SetAspectCorrection {
+                enabled,
+                mode,
+                width_scale,
+                height_scale,
+            } => {
+                // DragValue can publish many values while a heavy GPU frame is
+                // in flight. Treat aspect as latest-only presentation state so
+                // stale values can never replay after the user has moved on.
+                self.pending_live
+                    .lock()
+                    .unwrap()
+                    .publish_aspect(AspectCorrectionState {
+                        enabled,
+                        mode,
+                        width_scale,
+                        height_scale,
+                    });
+            }
+            Cmd::SetCaptureCrop { crop } => {
+                // Pixel DragValues can emit many edits while rendering a heavy
+                // chain. Keep only the newest complete crop rectangle.
+                self.pending_live.lock().unwrap().publish_crop(crop);
             }
             Cmd::SetNoEngage(rects) => {
                 // GUI geometry is latest-only state. Never put position/size
@@ -783,7 +1050,7 @@ impl EngineHandle {
             switch @ Cmd::SwitchOnnxBackend { .. } => {
                 // The switch carries the newest complete specs. Discard a
                 // queued edit so it cannot rebuild the old backend afterward.
-                *self.pending_chain.lock().unwrap() = None;
+                self.pending_live.lock().unwrap().clear_chain();
                 let _ = self.tx.send(switch);
             }
             other => {
@@ -793,7 +1060,7 @@ impl EngineHandle {
     }
 
     pub fn shutdown(&mut self) {
-        *self.pending_chain.lock().unwrap() = None;
+        self.pending_live.lock().unwrap().clear_all();
         self.pending_no_engage.lock().unwrap().publish(Vec::new());
         self.stop_requested.store(true, Ordering::Release);
         let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -801,10 +1068,17 @@ impl EngineHandle {
         recover_visible_capture_state_now(&self.status, "application-drop");
         let _ = self.tx.send(Cmd::Shutdown);
         if let Some(t) = self.thread.take() {
-            if self.done_rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+            if self
+                .done_rx
+                .recv_timeout(Duration::from_millis(ENGINE_SHUTDOWN_GRACE_MS))
+                .is_ok()
+            {
                 let _ = t.join();
             } else {
-                log::error!("render-engine-shutdown-timeout: elapsed_ms=2000 action=detach");
+                log::error!(
+                    "render-engine-shutdown-timeout: elapsed_ms={} action=detach",
+                    ENGINE_SHUTDOWN_GRACE_MS
+                );
                 emergency_recover_engine_state(
                     &self.status,
                     "shutdown-timeout",
@@ -824,7 +1098,7 @@ impl EngineHandle {
     /// Waiting here caused the root eframe viewport to remain visible for the
     /// outer 2 s render-engine timeout even with no active filters.
     pub fn shutdown_for_app_exit(&mut self) {
-        *self.pending_chain.lock().unwrap() = None;
+        self.pending_live.lock().unwrap().clear_all();
         self.pending_no_engage.lock().unwrap().publish(Vec::new());
         self.stop_requested.store(true, Ordering::Release);
         let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -1148,6 +1422,68 @@ struct FrameSignature {
     luma: Vec<u8>,
 }
 
+const VULKAN_CAPTURE_SAMPLE_SIDE: usize = 8;
+const VULKAN_CAPTURE_SAMPLE_BYTES: usize =
+    VULKAN_CAPTURE_SAMPLE_SIDE * VULKAN_CAPTURE_SAMPLE_SIDE * 4;
+
+/// Copy only the centre 8x8 pixels from one real accepted RGBA8 WGC frame.
+/// Keeping the render-thread work to 256 bytes makes the opt-in Vulkan shadow
+/// validation effectively invisible to pacing while still proving real capture
+/// pixel layout and content survive the selected-GPU Vulkan image path.
+fn vulkan_capture_sample_rgba8(
+    frame: &FrameBuf,
+) -> Option<([u8; VULKAN_CAPTURE_SAMPLE_BYTES], i32, i32)> {
+    if frame.hdr
+        || frame.w < VULKAN_CAPTURE_SAMPLE_SIDE as i32
+        || frame.h < VULKAN_CAPTURE_SAMPLE_SIDE as i32
+    {
+        return None;
+    }
+    let w = frame.w as usize;
+    let h = frame.h as usize;
+    let expected = w.checked_mul(h)?.checked_mul(4)?;
+    if frame.data.len() < expected {
+        return None;
+    }
+    let x = (w - VULKAN_CAPTURE_SAMPLE_SIDE) / 2;
+    let y = (h - VULKAN_CAPTURE_SAMPLE_SIDE) / 2;
+    let mut sample = [0u8; VULKAN_CAPTURE_SAMPLE_BYTES];
+    for row in 0..VULKAN_CAPTURE_SAMPLE_SIDE {
+        let src_start = ((y + row) * w + x) * 4;
+        let src_end = src_start + VULKAN_CAPTURE_SAMPLE_SIDE * 4;
+        let dst_start = row * VULKAN_CAPTURE_SAMPLE_SIDE * 4;
+        sample[dst_start..dst_start + VULKAN_CAPTURE_SAMPLE_SIDE * 4]
+            .copy_from_slice(&frame.data[src_start..src_end]);
+    }
+    Some((sample, x as i32, y as i32))
+}
+
+/// Copy the centre 64x64 pixels from one real accepted RGBA8 WGC frame for
+/// the v612 shadow tile probe. This is a one-shot 16 KiB copy and is only
+/// reachable when an explicit GPU is selected and the dedicated probe is on.
+fn vulkan_capture_tile_rgba8(frame: &FrameBuf) -> Option<(Vec<u8>, i32, i32)> {
+    let side = vulkan_gpu::FRAME_TILE_PROBE_WIDTH as usize;
+    if frame.hdr || frame.w < side as i32 || frame.h < side as i32 {
+        return None;
+    }
+    let w = frame.w as usize;
+    let h = frame.h as usize;
+    let expected = w.checked_mul(h)?.checked_mul(4)?;
+    if frame.data.len() < expected {
+        return None;
+    }
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    let mut tile = vec![0u8; vulkan_gpu::FRAME_TILE_PROBE_BYTE_COUNT];
+    for row in 0..side {
+        let src_start = ((y + row) * w + x) * 4;
+        let src_end = src_start + side * 4;
+        let dst_start = row * side * 4;
+        tile[dst_start..dst_start + side * 4].copy_from_slice(&frame.data[src_start..src_end]);
+    }
+    Some((tile, x as i32, y as i32))
+}
+
 /// Conservative perceptual signature for duplicate animation frames. Four
 /// samples per 64x36 cell suppress codec grain, while the strict maximum
 /// delta guard prevents a small moving object or subtitle from being missed.
@@ -1469,8 +1805,34 @@ fn source_input_reference_rect(
 /// Position changes do not alter the WGC surface.  Keep the fullscreen/resize
 /// watchdog strictly size-based so ordinary title-bar dragging can never arm
 /// a capture restart.
+
+/// Coordinate reference for the pixels actually delivered by the capture
+/// source. Ordinary sessions keep the established HWND/client/DWM mapping;
+/// the conservative monitor-region fallback maps only to its owned
+/// presentation rectangle while the logical source remains the root host.
+fn session_source_input_reference_rect(
+    s: &Session,
+    frame_size: (i32, i32),
+) -> Option<((i32, i32, i32, i32), bool, &'static str)> {
+    if let Some(rect) = s.source.display_region_rect() {
+        return Some((rect, false, "display-region"));
+    }
+    source_input_reference_rect(s.hwnd, s.capture_client_only, frame_size)
+}
+
 fn rect_size_changed(previous: (i32, i32, i32, i32), next: (i32, i32, i32, i32)) -> bool {
     previous.2 != next.2 || previous.3 != next.3
+}
+
+fn rect_intersection(
+    a: (i32, i32, i32, i32),
+    b: (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let left = a.0.max(b.0);
+    let top = a.1.max(b.1);
+    let right = a.0.saturating_add(a.2).min(b.0.saturating_add(b.2));
+    let bottom = a.1.saturating_add(a.3).min(b.1.saturating_add(b.3));
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
 }
 
 /// Compare a delivered WGC frame with the native rectangle that actually
@@ -1538,8 +1900,50 @@ fn should_enter_live_fullscreen(
     !neo_owned_monitor_canvas
 }
 
+#[derive(Debug)]
+struct ScreenshotBurst {
+    /// Base path supplied by the existing screenshot button, without extension.
+    base: std::path::PathBuf,
+    next_index: u8,
+    remaining: u8,
+}
+
+impl ScreenshotBurst {
+    fn new(path: std::path::PathBuf, frames: u8) -> Self {
+        let mut base = path;
+        base.set_extension("");
+        Self {
+            base,
+            next_index: 0,
+            remaining: frames.max(1),
+        }
+    }
+
+    fn next_path(&mut self, kind: &str) -> std::path::PathBuf {
+        let parent = self
+            .base
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let stem = self
+            .base
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("cHiDeScaler-Neo");
+        let path = parent.join(format!("{stem}_burst_{:02}_{kind}.png", self.next_index));
+        self.next_index = self.next_index.saturating_add(1);
+        self.remaining = self.remaining.saturating_sub(1);
+        path
+    }
+
+    fn finished(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 struct Session {
     hwnd: isize,
+    source_pid: u32,
     /// Immutable session-origin monitor coverage. Fullscreen source hiding must
     /// happen only after the opaque overlay has been committed, otherwise the
     /// desktop is exposed between the two DWM updates.
@@ -1563,10 +1967,47 @@ struct Session {
     chain: FilterChain,
     mode: ScaleMode,
     ratio: f32,
+    aspect_correction: bool,
+    aspect_correction_mode: AspectCorrectionMode,
+    aspect_width_scale: f32,
+    aspect_height_scale: f32,
+    capture_crop: CaptureCrop,
+    /// Raw WGC/client geometry before the user crop. Filter processing keeps
+    /// using `in_size`, which is the cropped/padded geometry.
+    capture_in_size: (i32, i32),
+    /// Keep input mapping released until a frame produced with the newest crop
+    /// has actually been presented.
+    crop_transition_pending: bool,
+    /// Hold the current overlay geometry until a frame rendered with the new
+    /// presentation aspect is ready. This prevents the previous texture from
+    /// being stretched through an intermediate aspect while live-editing.
+    aspect_transition_pending: bool,
     fps_cap: Option<u32>,
     capture_client_only: bool,
     capture_hdr: bool,
     hdr_sdr_mode: HdrSdrMode,
+    /// Exact specs that produced `chain`. Keeping these lets the explicit-GPU
+    /// live interpolation handoff fully drop the old provider generation before
+    /// constructing the new one, while still allowing a safe rebuild of the old
+    /// chain if the requested replacement is invalid.
+    chain_specs: Vec<StageSpec>,
+    /// True when the user explicitly selected a compute GPU instead of Auto.
+    /// This is intentionally vendor-neutral: explicit selection is the escape
+    /// hatch for systems where Windows/driver auto-selection lands on an iGPU.
+    /// Live interpolation preset replacement therefore uses a stronger
+    /// generation handoff on every explicitly selected GPU, even when the
+    /// selected adapter also owns the OpenGL presentation context.
+    explicit_gpu_selection: bool,
+    /// v611 routing contract. Auto is LegacyOpenGl; only an explicit GPU LUID
+    /// may target Vulkan. Production presentation remains OpenGL until the
+    /// shadow validation stages are complete.
+    glsl_backend_route: GlslBackendRoute,
+    /// One-shot guard for the opt-in real-capture Vulkan shadow validation.
+    vulkan_capture_probe_started: bool,
+    /// v612 one-shot guard for the larger 64x64 real-frame tile validation.
+    vulkan_frame_probe_started: bool,
+    /// One-shot guard for the v613 real Neo user-GLSL Vulkan shadow runner.
+    vulkan_user_glsl_probe_started: bool,
     /// Logged after the first successful lightweight RGBA8 highlight pass.
     hdr_sdr_preprocess_logged: bool,
     /// Avoid flooding the log if a malformed fallback frame is received.
@@ -1588,8 +2029,9 @@ struct Session {
     /// static PIP does not emit another WGC frame.
     chain_reprocess_pending: bool,
     in_size: (i32, i32),
-    /// Display aspect captured when magnification starts. Processing follows
-    /// later source resolutions, but the picture must not become anamorphic.
+    /// Base display aspect tracked independently from the live correction.
+    /// Processing follows source/capture geometry while presentation may apply
+    /// a non-uniform correction without changing those processing dimensions.
     display_aspect: (i32, i32),
     pending_resize_size: Option<(i32, i32)>,
     /// A real source-size transition invalidates shape-specialized ONNX/EP
@@ -1610,6 +2052,8 @@ struct Session {
     /// Immutable outer-window rectangle captured before any Neo-initiated
     /// capture-resolution resize. Never rebase this during the session.
     source_restore_rect: Option<(i32, i32, i32, i32)>,
+    /// Full placement snapshot keeps the pre-maximize normal bounds intact.
+    source_restore_placement: Option<win32::WindowPlacementSnapshot>,
     /// Maximized state paired with the immutable session-origin rectangle.
     source_was_maximized: bool,
     deferred_capture_resolution: Option<((u32, u32), (u32, u32))>,
@@ -1627,6 +2071,12 @@ struct Session {
     /// case reveal a freshly filtered native-size cache (never resampled to
     /// the requested capture size) while continuing to wait for the real frame.
     capture_resolution_native_fallback: bool,
+    /// During a live capture-resolution change, monitor/display-region fallback
+    /// does not produce a WGC frame equal to the selected root client's size.
+    /// Coalesce the application's child-presentation relayout and commit only
+    /// the final stable real capture geometry.
+    capture_resolution_region_candidate: Option<(i32, i32)>,
+    capture_resolution_region_candidate_since: Option<Instant>,
     /// Suppress duplicate diagnostics while ONNX waits for the real requested
     /// WGC geometry. Reset after the target frame arrives or the request ends.
     onnx_geometry_deferred_logged: bool,
@@ -1762,6 +2212,25 @@ struct Session {
     /// DirectML RIFE has a fixed safety/performance input-height cap. Keep the
     /// diagnostic one-shot per source/limited geometry and chain position.
     dml_rife_limit_log_key: Option<(i32, i32, i32, i32, usize)>,
+    /// Existing screenshot button becomes a short render-thread burst while
+    /// interpolation is active. This captures alternating REAL/MID frames that
+    /// external desktop screenshots can systematically miss.
+    screenshot_burst: Option<ScreenshotBurst>,
+    /// v656 cross-GPU RIFE correctness probe. Validate each live interpolation
+    /// stage once by comparing the exact DML->Vulkan midpoint against an
+    /// independent CPU-visible DirectML run from the same source pair/timestep.
+    /// The stage identity avoids carrying a verdict across a live model swap.
+    dml_vulkan_rife_validation_stage: Option<usize>,
+    /// If the one-shot validation finds a material mismatch, all already queued
+    /// shared payloads for that exact stage are re-run through the established
+    /// CPU-visible path. The OnnxStage is also latched to stop creating new
+    /// shared outputs for the remainder of that stage lifetime.
+    dml_vulkan_rife_force_cpu_stage: Option<usize>,
+    /// v661 same-selected-GPU DirectML -> Vulkan post-chain optimization.
+    /// A failed shared import/runtime attempt disables only this shortcut for
+    /// the current live chain generation; the established DML -> OpenGL ->
+    /// Vulkan bridge remains the correctness fallback.
+    gpu_interp_dml_vulkan_post_disabled: bool,
     /// source client rect as of the previous tick (geometry-change detection)
     last_client_rect: Option<(i32, i32, i32, i32)>,
     last_process_ms: f64,
@@ -1775,6 +2244,13 @@ struct Session {
     /// separating user-chain submission, the internal display resampler,
     /// OUTPUT/SCALED post passes, pacing wait and the final present call.
     last_upload_submit_ms: f64,
+    /// Monitor-region capture uses a deeper GL upload rotation so DWM capture
+    /// exclusion/scanout cannot force immediate reuse of a texture
+    /// that was just presented. This is storage rotation only; frame timing and
+    /// ordering remain unchanged.
+    display_region_upload_slot: usize,
+    display_region_upload_ring_logged: bool,
+    display_region_upload_ring_fallback_logged: bool,
     last_chain_submit_ms: f64,
     last_resample_submit_ms: f64,
     last_post_submit_ms: f64,
@@ -2577,6 +3053,22 @@ impl CadenceEstimator {
         self.forced_period_s = None;
     }
 
+    /// Live filter edits can insert a one-off timestamp/sequence discontinuity
+    /// even though the source cadence itself did not change.  Keep the rolling
+    /// cadence history and only break the transition anchor.  The history is
+    /// source-timestamp state, not workload state: discarding it after a heavy
+    /// chain caused the fresh estimator to learn the temporarily throttled WGC
+    /// delivery rate (for example ~20.8fps instead of a previously stable 24p)
+    /// until Stop -> Start rebuilt the estimator.  Genuine source-rate changes
+    /// still replace the preserved history naturally through the normal
+    /// 120-sample rolling window.
+    fn reset_transition_anchor_preserve_history(&mut self) -> usize {
+        let preserved = self.intervals.len();
+        self.prev_t = None;
+        self.prev_seq = None;
+        preserved
+    }
+
     fn force_period(&mut self, period_s: f64) {
         self.forced_period_s = Some(period_s);
     }
@@ -2677,9 +3169,7 @@ fn refresh_limited_output_ratio(
 /// This predicate is the hard boundary for ONNX x3's 60fps adaptation. No
 /// fractional x3 state is allowed to leak into any other refresh rate.
 fn onnx_x3_60hz_mode(refresh_hz: Option<f64>) -> bool {
-    refresh_hz.is_some_and(|refresh| {
-        refresh.is_finite() && (refresh - 60.0).abs() <= 0.75
-    })
+    refresh_hz.is_some_and(|refresh| refresh.is_finite() && (refresh - 60.0).abs() <= 0.75)
 }
 
 /// ONNX x3 has two explicitly separated contracts.
@@ -2692,11 +3182,7 @@ fn onnx_x3_60hz_mode(refresh_hz: Option<f64>) -> bool {
 ///
 /// The explicit refresh predicate prevents startup/source-cadence noise from
 /// accidentally selecting the 60 Hz path on 75/120/144/165/240 Hz displays.
-fn onnx_output_ratio(
-    requested: u32,
-    source_period_s: Option<f64>,
-    refresh_hz: Option<f64>,
-) -> f64 {
+fn onnx_output_ratio(requested: u32, source_period_s: Option<f64>, refresh_hz: Option<f64>) -> f64 {
     if requested == 3 {
         if onnx_x3_60hz_mode(refresh_hz) {
             refresh_limited_output_ratio(requested, source_period_s, refresh_hz)
@@ -3156,6 +3642,21 @@ impl SmoothPacer {
         self.long_interval_streak = 0;
         self.last_present_block_s = 0.0;
     }
+
+    /// A live filter-chain edit changes the processing cost immediately.
+    /// Keep ordinary timing resets lightweight, but discard the old chain's
+    /// measured processing budget at this explicit workload boundary. Without
+    /// this, up to 30 heavy-frame samples survive an ON/OFF edit and can keep
+    /// SmoothPacer scheduling as though the removed GLSL stages still existed
+    /// until the rolling history ages out. Stop -> Start naturally clears this
+    /// state; live edits should get the same pacing recovery without destroying
+    /// warm ONNX/TensorRT/Vulkan sessions.
+    fn reset_workload_history(&mut self) -> usize {
+        let cleared = self.process_samples_s.len();
+        self.reset();
+        self.process_samples_s.clear();
+        cleared
+    }
 }
 
 fn wait_until_with_pump(overlay: &mut OverlayWindow, deadline: Instant) {
@@ -3238,6 +3739,38 @@ fn pace_processing_start(s: &mut Session, overlay: &mut OverlayWindow) -> Instan
         s.paced_present_deadline = None;
     }
     Instant::now()
+}
+
+fn source_identity_matches(s: &Session) -> bool {
+    win32::window_matches_pid(s.hwnd, s.source_pid)
+}
+
+fn source_hide_window_visual(s: &Session) -> Option<bool> {
+    source_identity_matches(s)
+        .then(|| win32::hide_window_visual(s.hwnd))
+        .flatten()
+}
+
+fn source_resize_client_area(s: &Session, w: u32, h: u32) -> bool {
+    source_identity_matches(s) && win32::resize_client_area(s.hwnd, w, h)
+}
+
+fn source_request_window_repaint(s: &Session) {
+    if source_identity_matches(s) {
+        win32::request_window_repaint(s.hwnd);
+    }
+}
+
+fn source_keep_window_reachable(s: &Session) -> Option<(i32, i32)> {
+    source_identity_matches(s)
+        .then(|| keep_source_window_reachable(s.hwnd))
+        .flatten()
+}
+
+fn source_place_below(s: &Session, above: isize) {
+    if source_identity_matches(s) {
+        win32::place_below(s.hwnd, above);
+    }
 }
 
 #[derive(Clone)]
@@ -3375,11 +3908,27 @@ struct InterpJob {
     frames: Vec<Arc<Vec<u8>>>,
     ts: Vec<f32>,
     rgba: bool,
+    prefer_dml_vulkan_shared: bool,
+}
+
+struct DmlSharedFallback {
+    w: i32,
+    h: i32,
+    frames: Vec<Arc<Vec<u8>>>,
+    t: f32,
+}
+
+enum InterpPayload {
+    Cpu(i32, i32, Vec<u8>),
+    DmlShared {
+        shared: PreparedDmlSharedOutput,
+        fallback: DmlSharedFallback,
+    },
 }
 
 struct InterpResult {
     idx: usize,
-    r: Result<(i32, i32, Vec<u8>)>,
+    r: Result<InterpPayload>,
     /// (pack_ms, run_ms, out_ms)
     profile: Option<(f64, f64, f64)>,
 }
@@ -3394,12 +3943,96 @@ impl InterpWorker {
             .name("interp-worker".into())
             .spawn(move || {
                 let _done = InterpWorkerDone(done_tx);
+                let mut dml_shared_bank = 0usize;
                 while let Ok(job) = job_rx.recv() {
                     let frames: Vec<&[u8]> =
                         job.frames.iter().map(|frame| frame.as_slice()).collect();
                     if job.rgba {
                         let mut st = stage.lock().unwrap();
-                        let results = st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts);
+                        let results: Result<Vec<InterpPayload>> = if job.prefer_dml_vulkan_shared {
+                            match st.process_interp_many_rgba8_dml_shared(
+                                job.w,
+                                job.h,
+                                &frames,
+                                &job.ts,
+                                dml_shared_bank,
+                            ) {
+                                Ok(Some(prepared)) => {
+                                    let mut shared = Vec::with_capacity(prepared.len());
+                                    let mut export_error = None;
+                                    for (output, timestep) in
+                                        prepared.into_iter().zip(job.ts.iter().copied())
+                                    {
+                                        match st.export_prepared_interp_dml_shared_output(output) {
+                                            Ok(Some(output)) => shared.push(InterpPayload::DmlShared {
+                                                shared: output,
+                                                fallback: DmlSharedFallback {
+                                                    w: job.w,
+                                                    h: job.h,
+                                                    frames: job.frames.clone(),
+                                                    t: timestep,
+                                                },
+                                            }),
+                                            Ok(None) => {
+                                                export_error = Some(anyhow::anyhow!(
+                                                    "DirectML shared output export unavailable"
+                                                ));
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                export_error = Some(error);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if let Some(error) = export_error {
+                                        st.disable_dml_cpu_interp_shared(&format!(
+                                            "DirectML shared output export failed: {error:#}"
+                                        ));
+                                        st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                            .map(|results| {
+                                                results
+                                                    .into_iter()
+                                                    .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
+                                                    .collect()
+                                            })
+                                    } else {
+                                        Ok(shared)
+                                    }
+                                },
+                                Ok(None) => st
+                                    .process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                    .map(|results| {
+                                        results
+                                            .into_iter()
+                                            .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
+                                            .collect()
+                                    }),
+                                Err(error) => {
+                                    log::warn!(
+                                        "dml-vulkan-resident-handoff: worker setup failed: {error:#}; fallback=cpu-visible-interpolation"
+                                    );
+                                    st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                        .map(|results| {
+                                            results
+                                                .into_iter()
+                                                .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
+                                                .collect()
+                                        })
+                                }
+                            }
+                        } else {
+                            st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                .map(|results| {
+                                    results
+                                        .into_iter()
+                                        .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
+                                        .collect()
+                                })
+                        };
+                        if job.prefer_dml_vulkan_shared {
+                            dml_shared_bank ^= 1;
+                        }
                         let profile = st
                             .last_interp_profile()
                             .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
@@ -3425,7 +4058,9 @@ impl InterpWorker {
                     } else {
                         for (idx, t) in job.ts.iter().enumerate() {
                             let mut st = stage.lock().unwrap();
-                            let r = st.process_interp(job.w, job.h, &frames, *t);
+                            let r = st
+                                .process_interp(job.w, job.h, &frames, *t)
+                                .map(|(w, h, data)| InterpPayload::Cpu(w, h, data));
                             let profile = st
                                 .last_interp_profile()
                                 .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
@@ -3508,6 +4143,19 @@ struct GpuInterpResult {
     result: std::result::Result<(), String>,
 }
 
+#[derive(Clone, Copy)]
+struct ReadyGpuInterpOutput {
+    tex: GpuTex,
+    /// First chain stage that still needs to run when this texture is
+    /// presented. v661 can execute the complete DirectML -> Vulkan post range
+    /// before the texture reaches OpenGL, in which case this equals stage_count.
+    chain_start: usize,
+    /// Diagnostic-only wall time spent in the direct shared post handoff. It is
+    /// restored into path_ms(chain=...) after the no-op presentation chain so
+    /// Vulkan statistics do not become artificially optimistic.
+    preprocessed_chain_ms: f64,
+}
+
 struct PendingGpuInterp {
     generation: u64,
     pair_id: u64,
@@ -3531,7 +4179,7 @@ struct PendingGpuInterp {
     history_keep: Vec<GpuTex>,
     timesteps: Vec<f32>,
     output_slots: Vec<PreparedInterpGpuOutput>,
-    ready_outputs: Vec<Option<GpuTex>>,
+    ready_outputs: Vec<Option<ReadyGpuInterpOutput>>,
     next_output_index: usize,
     completed_outputs: usize,
     run_ms_total: f64,
@@ -3856,6 +4504,125 @@ fn apply_chain_update(
         .chain
         .interpolation_plan()
         .map(|(pre, _interp, _post)| pre);
+    // A Vulkan shared-post failure is scoped to one live chain
+    // generation. A preset/filter edit gets a fresh opportunity after its
+    // stages and runtime cache have been rebuilt.
+    s.gpu_interp_dml_vulkan_post_disabled = false;
+
+    // Explicit GPU selection exists specifically for machines where automatic
+    // adapter choice is unreliable (often selecting an iGPU).  On that route
+    // never create the replacement interpolation Session while the previous
+    // interpolation worker can still be executing on the explicitly selected
+    // adapter.  Some drivers tolerate overlapping old/new DirectML providers;
+    // others leave the newly selected preset producing corrupted midpoints
+    // until Stop -> Start performs a full generation retirement.
+    //
+    // Keep Auto's proven transactional/fast path unchanged.  For Explicit,
+    // snapshot the last valid visible frame, stop both interpolation workers,
+    // drain every pending result/output, retire shared bridges, and evict only
+    // DirectML factory Sessions BEFORE FilterChain::from_specs can construct a
+    // replacement. TensorRT Sessions remain warm; their workers/bridges are
+    // still synchronously retired here.
+    let explicit_interp_hard_handoff = s.explicit_gpu_selection && old_interp.is_some();
+    let mut explicit_rollback_specs: Option<Vec<StageSpec>> = None;
+    if explicit_interp_hard_handoff {
+        log::info!(
+            "explicit-gpu-interp-live-handoff: phase=begin old={old_interp:?} policy=stop-drain-retire-before-new-session vendor_neutral=true"
+        );
+        s.source.set_queue_enabled(false);
+        s.interp_pending = None;
+        s.interp_worker = None;
+        s.interp_post_warm = false;
+        if let Some(pack) = s.gpu_interp_pack_pending.take() {
+            gc.cancel_commands_fence(pack.fence);
+        }
+        if let Some(mut pending) = s.gpu_interp_pending.take() {
+            recycle_pending_gpu_outputs(gc, &mut pending);
+        }
+        if let Some(mut worker) = s.gpu_interp_worker.take() {
+            let clean = worker.shutdown();
+            if !clean {
+                log::error!(
+                    "explicit-gpu-interp-live-handoff: phase=worker-stop result=timeout action=continue-conservative-retirement"
+                );
+            }
+        }
+        while let Some(frame) = s.gpu_interp_hist.pop_front() {
+            gc.recycle(frame.tex);
+        }
+        s.gpu_interp_result_stash.clear();
+        s.gpu_interp_permit_after_post_submit = None;
+        s.interp_generation = s.interp_generation.saturating_add(1);
+        s.gpu_interp_active_logged = false;
+        // v656 validation/fallback state is keyed by Arc address. A freshly
+        // allocated replacement stage can legally reuse the same address, so
+        // never let a previous interpolation generation's diagnostic decision
+        // suppress validation or force a route in the new generation.
+        s.dml_vulkan_rife_validation_stage = None;
+        s.dml_vulkan_rife_force_cpu_stage = None;
+        s.gpu_interp_dml_vulkan_post_disabled = false;
+
+        // Preserve the last known-good image in CPU memory while the old
+        // provider generation is destroyed. The actual GL texture is released
+        // with the rest of the old pool below, then recreated as an ordinary
+        // owned RGBA8 texture before the new provider is built.
+        let stable_snapshot = s
+            .last_tex
+            .take()
+            .map(|texture| (texture.w(), texture.h(), gc.download_rgba8(texture)));
+        explicit_rollback_specs = Some(s.chain_specs.clone());
+
+        // Stop/Start is known-good because the old FilterChain (and therefore
+        // its ORT DirectML Session) is DROPPED before the replacement Session is
+        // created. v658 retired bridges and factory cache entries but still kept
+        // s.chain alive during FilterChain::from_specs(), so old/new DirectML
+        // Sessions overlapped on the explicitly selected adapter.
+        s.chain.prepare_gpu_transition(gc);
+        s.chain.reset_backend_runtime_state();
+        let retired_chain = std::mem::replace(&mut s.chain, FilterChain::empty());
+        drop(retired_chain);
+
+        // No texture/history from the old interpolation generation may survive
+        // this provider boundary. This mirrors the GPU-owned part of
+        // stop_session() without stopping WGC, unhiding the source, or
+        // recreating the overlay.
+        if let Some(texture) = s.prev_tex.take() {
+            gc.recycle(texture);
+        }
+        if let Some(texture) = s.prev2_tex.take() {
+            gc.recycle(texture);
+        }
+        s.prev_tex_seq = 0;
+        s.prev_tex_source_time_100ns = None;
+        s.hist.clear();
+        s.frame = FrameBuf::default();
+        s.chain_reprocess_pending = false;
+        gc.clear_temporal_shader_storage();
+        crate::render::vulkan_multipass::reset_session_runtime();
+
+        let dropped_dml = factory.drop_directml_sessions();
+        gc.clear_pool();
+        if let Some((width, height, rgba)) = stable_snapshot {
+            s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
+        }
+
+        let dml = crate::render::onnx_stage::dml_shared_stats();
+        log::info!(
+            "explicit-gpu-interp-live-handoff: phase=retired generation={} directml_sessions_dropped={} old_chain_dropped=true gl_pool_cleared=true dml_active_allocations={} dml_active_mb={:.1} last_frame_preserved={} next=new-session",
+            s.interp_generation,
+            dropped_dml,
+            dml.active_allocations,
+            dml.active_bytes as f64 / (1024.0 * 1024.0),
+            s.last_tex.is_some()
+        );
+        if dml.active_allocations != 0 {
+            log::warn!(
+                "explicit-gpu-interp-live-handoff: phase=retired result=shared-allocation-still-active count={} action=continue-with-fresh-session-no-old-chain",
+                dml.active_allocations
+            );
+        }
+    }
+
     let (mut chain, errs) = FilterChain::from_specs(factory, specs);
     // A warm TensorRT Session may be reused from StageFactory. Per-capture
     // temporal/packing state must never cross the session boundary even though
@@ -3864,40 +4631,65 @@ fn apply_chain_update(
     let requested = specs.iter().filter(|spec| spec.enabled).count();
     if requested > 0 && chain.stages.is_empty() {
         log::error!(
-            "chain-apply rejected: all {requested} enabled filters failed; keeping previous chain: {}",
+            "chain-apply rejected: all {requested} enabled filters failed: {}",
             errs.join(" | ")
         );
         status.lock().unwrap().chain_errors = errs;
+        if explicit_interp_hard_handoff {
+            // The old provider was deliberately destroyed before candidate
+            // construction. Rebuild the last known-good specs only after that
+            // destruction so rollback cannot restore overlapping DirectML
+            // Session generations.
+            if let Some(old_specs) = explicit_rollback_specs.as_ref() {
+                let (mut rollback, rollback_errs) = FilterChain::from_specs(factory, old_specs);
+                rollback.reset_backend_runtime_state();
+                if !rollback.stages.is_empty() || old_specs.iter().all(|spec| !spec.enabled) {
+                    s.chain = rollback;
+                    s.chain_specs = old_specs.clone();
+                    s.source.set_queue_enabled(s.chain.has_interp());
+                    source_request_window_repaint(s);
+                    log::warn!(
+                        "explicit-gpu-interp-live-handoff: phase=rollback reason=replacement-chain-invalid old_chain_rebuilt=true rollback_errors={} history=fresh-source-only",
+                        rollback_errs.len()
+                    );
+                } else {
+                    log::error!(
+                        "explicit-gpu-interp-live-handoff: phase=rollback result=failed old_chain_rebuilt=false errors={}",
+                        rollback_errs.join(" | ")
+                    );
+                }
+            }
+        }
         return;
     }
-    if s.interp_worker.is_some() {
-        log::info!(
-            "chain-apply: stopping previous interpolation worker after replacement validation"
-        );
-        s.interp_pending = None;
-        s.interp_worker = None;
-        s.interp_post_warm = false;
+    if !explicit_interp_hard_handoff {
+        if s.interp_worker.is_some() {
+            log::info!(
+                "chain-apply: stopping previous interpolation worker after replacement validation"
+            );
+            s.interp_pending = None;
+            s.interp_worker = None;
+            s.interp_post_warm = false;
+        }
+        if let Some(pack) = s.gpu_interp_pack_pending.take() {
+            gc.cancel_commands_fence(pack.fence);
+        }
+        if let Some(mut pending) = s.gpu_interp_pending.take() {
+            recycle_pending_gpu_outputs(gc, &mut pending);
+        }
+        if let Some(mut worker) = s.gpu_interp_worker.take() {
+            let _ = worker.shutdown();
+        }
+        while let Some(frame) = s.gpu_interp_hist.pop_front() {
+            gc.recycle(frame.tex);
+        }
+        s.gpu_interp_result_stash.clear();
+        s.gpu_interp_permit_after_post_submit = None;
+        s.interp_generation = s.interp_generation.saturating_add(1);
+        s.gpu_interp_active_logged = false;
     }
-    if let Some(pack) = s.gpu_interp_pack_pending.take() {
-        gc.cancel_commands_fence(pack.fence);
-    }
-    if let Some(mut pending) = s.gpu_interp_pending.take() {
-        recycle_pending_gpu_outputs(gc, &mut pending);
-    }
-    if let Some(mut worker) = s.gpu_interp_worker.take() {
-        let _ = worker.shutdown();
-    }
-    while let Some(frame) = s.gpu_interp_hist.pop_front() {
-        gc.recycle(frame.tex);
-    }
-    s.gpu_interp_result_stash.clear();
-    s.gpu_interp_permit_after_post_submit = None;
-    s.interp_generation = s.interp_generation.saturating_add(1);
-    s.gpu_interp_active_logged = false;
     let new_interp = chain.interp_key();
-    let new_interp_pre = chain
-        .interpolation_plan()
-        .map(|(pre, _interp, _post)| pre);
+    let new_interp_pre = chain.interpolation_plan().map(|(pre, _interp, _post)| pre);
     let directml_interp_pre_route_changed = old_interp.is_some()
         && old_interp.as_ref() == new_interp.as_ref()
         && chain.interp_provider() == Some(crate::render::onnx_stage::OnnxProvider::DirectML)
@@ -3935,16 +4727,22 @@ fn apply_chain_update(
     // made the retained image sample the replacement allocation with the old
     // dimensions (the brief giant crop seen when switching ONNX on static
     // PIP). Preserve it as an ordinary owned GL texture before teardown.
-    let transition_snapshot = s.last_tex.map(|texture| {
-        (
-            texture,
-            texture.w(),
-            texture.h(),
-            gc.download_rgba8(texture),
-        )
-    });
-    s.chain.prepare_gpu_transition(gc);
-    if directml_interp_pre_route_changed {
+    let transition_snapshot = if explicit_interp_hard_handoff {
+        None
+    } else {
+        s.last_tex.map(|texture| {
+            (
+                texture,
+                texture.w(),
+                texture.h(),
+                gc.download_rgba8(texture),
+            )
+        })
+    };
+    if !explicit_interp_hard_handoff {
+        s.chain.prepare_gpu_transition(gc);
+    }
+    if directml_interp_pre_route_changed && !explicit_interp_hard_handoff {
         // The candidate chain was intentionally validated before touching the
         // running chain, so its DirectML interpolator may still share the warm
         // StageFactory session with the old route. Retire the old bridge first,
@@ -3977,6 +4775,58 @@ fn apply_chain_update(
             .iter()
             .any(|known| known == &next_glsl_key);
     s.chain = chain;
+    s.chain_specs = specs.to_vec();
+
+    // v668: changing the live chain is a workload boundary even when no frame
+    // interpolator is involved.  Discard processing-budget/deadline history,
+    // but preserve the rolling source-cadence samples.  v663-v667 also cleared
+    // those cadence samples; after a heavy chain was disabled the fresh
+    // estimator could learn the temporarily throttled WGC delivery rate
+    // (~20-21fps) instead of the already-known 24p source, so FPS did not fully
+    // recover until Stop -> Start.  Breaking only the timestamp/sequence anchor
+    // avoids the transition discontinuity while keeping the valid source lock.
+    // Capture and expensive provider/runtime caches remain live.
+    if filter_chain_changed {
+        let process_samples_cleared = s.smooth_pacer.reset_workload_history();
+        let cadence_samples_preserved = s.cadence.reset_transition_anchor_preserve_history();
+        s.paced_present_deadline = None;
+        s.present_cadence = PresentCadence::default();
+        s.arrival_interval = 0.0;
+        s.last_arrival = Instant::now();
+        s.last_process_ms = 0.0;
+        s.last_compute_ms = 0.0;
+        s.last_pacer_wait_ms = 0.0;
+        s.last_present_call_ms = 0.0;
+        s.last_present_block_ms = 0.0;
+        log::info!(
+            "live-chain-pacing-reset: reason=filter-chain-changed process_samples_cleared={} cadence_samples_preserved={} source_period_preserved_ms={:.3} forced_source_period_preserved={} old_stages={:?} new_stages={:?}",
+            process_samples_cleared,
+            cadence_samples_preserved,
+            s.cadence.period_s().unwrap_or(0.0) * 1000.0,
+            s.cadence.forced_period_s.is_some(),
+            previous_glsl_key
+                .split('\u{1f}')
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>(),
+            next_glsl_key
+                .split('\u{1f}')
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    if explicit_interp_hard_handoff {
+        // The pre-switch WGC queue and cached s.frame were discarded above.
+        // Ask static/paused sources for one repaint and let the replacement
+        // interpolator build history only from frames acquired after its
+        // provider generation exists.
+        source_request_window_repaint(s);
+        log::info!(
+            "explicit-gpu-interp-live-handoff: phase=commit new={:?} generation={} history=fresh-source-only old-provider-overlap=false",
+            s.chain.interp_key(),
+            s.interp_generation
+        );
+    }
     // A newly-selected chain gets a clean live admission state. A bounded
     // same-session history survives only as a one-frame re-check hint; it never
     // directly throttles a replacement chain.
@@ -3996,9 +4846,7 @@ fn apply_chain_update(
                 log::info!("glsl-overload-notice: latched=false reason=filter-chain-changed");
             }
             if state.glsl_overload_auto_stop_deadline.take().is_some() {
-                log::info!(
-                    "glsl-overload-auto-stop: cancelled reason=filter-chain-changed"
-                );
+                log::info!("glsl-overload-auto-stop: cancelled reason=filter-chain-changed");
             }
         }
     }
@@ -4323,6 +5171,7 @@ fn switch_onnx_backend(
         s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
     }
     s.chain = candidate_chain;
+    s.chain_specs = specs.to_vec();
     *factory = candidate_factory;
     s.chain_reprocess_pending = !s.frame.data.is_empty();
     s.smooth_content_signature = None;
@@ -4363,8 +5212,8 @@ fn switch_onnx_backend(
 
 fn recycle_pending_gpu_outputs(gc: &mut GlContext, pending: &mut PendingGpuInterp) {
     for output in &mut pending.ready_outputs {
-        if let Some(texture) = output.take() {
-            gc.recycle(texture);
+        if let Some(ready) = output.take() {
+            gc.recycle(ready.tex);
         }
     }
 }
@@ -4432,9 +5281,7 @@ fn gpu_interp_present_lead_s(
     (compute_s + gpu_tail_s + submit_margin_s).clamp(0.0, output_period_s * 0.90)
 }
 
-fn provider_uses_gpu_x3_mid_detach(
-    provider: crate::render::onnx_stage::OnnxProvider,
-) -> bool {
+fn provider_uses_gpu_x3_mid_detach(provider: crate::render::onnx_stage::OnnxProvider) -> bool {
     matches!(
         provider,
         crate::render::onnx_stage::OnnxProvider::DirectML
@@ -4467,11 +5314,7 @@ fn should_detach_gpu_x3_midpoint(
     // final content size.
     let desired_overlay = overlay_geometry(s, overlay);
     let (vw, vh) = (desired_overlay.2, desired_overlay.3);
-    let display_aspect = if s.display_aspect.0 > 0 && s.display_aspect.1 > 0 {
-        s.display_aspect
-    } else {
-        (mid.w(), mid.h())
-    };
+    let display_aspect = session_presentation_aspect(s, (mid.w(), mid.h()));
     let (dw, dh) = fit_aspect_inside(display_aspect, (vw, vh));
     mid.w() == dw && mid.h() == dh
 }
@@ -4535,15 +5378,133 @@ fn drain_gpu_interp_stream(
             ));
             break;
         };
-        match crate::render::onnx_stage::OnnxStage::finish_prepared_interp_gpu_output(gc, slot) {
-            Ok(texture) => {
-                if let Some(existing) = pending.ready_outputs[done.index].replace(texture) {
-                    gc.recycle(existing);
+        // v661: when DirectML and forced Vulkan are on the same selected GPU,
+        // do not convert the completed DML midpoint into OpenGL only to read it
+        // straight back to the CPU and upload it into Vulkan. Export the
+        // already app-owned D3D12 output and let the existing Vulkan resident
+        // post-chain import it directly. The final Vulkan -> OpenGL boundary is
+        // intentionally unchanged for now. Any import/runtime failure falls
+        // back immediately to the established OpenGL handoff and disables only
+        // this shortcut for the remainder of the live chain generation.
+        let stage_count = s.chain.stage_count();
+        let dml_direct_candidate = !s.gpu_interp_dml_vulkan_post_disabled
+            && pending.post_chain_start < stage_count
+            && s.chain
+                .can_process_range_from_dml_shared(pending.post_chain_start, stage_count)
+            && matches!(
+                pending.stage.lock().unwrap().provider,
+                crate::render::onnx_stage::OnnxProvider::DirectML
+            );
+
+        let mut ready: Option<ReadyGpuInterpOutput> = None;
+        if dml_direct_candidate {
+            let direct_started = Instant::now();
+            let shared = {
+                let stage = pending.stage.lock().unwrap();
+                stage.export_prepared_interp_dml_shared_output(slot)
+            };
+            match shared {
+                Ok(Some(shared)) => {
+                    let detailed = metrics.detailed_enabled() && pending.frame.seq % 30 == 0;
+                    let m = metrics.clone();
+                    let mut probe_fn = |name: &str, kind: StageKind, ms: f64| {
+                        m.probe(
+                            name,
+                            if kind == StageKind::Glsl {
+                                "glsl"
+                            } else {
+                                "onnx"
+                            },
+                            ms,
+                        );
+                    };
+                    // The ordinary FilterChain path advances mpv's `frame`
+                    // builtin before executing GLSL. This direct path skips
+                    // FilterChain::process_range at presentation time, so
+                    // advance it here exactly once before Vulkan evaluates the
+                    // post shaders.
+                    crate::render::glsl_engine::advance_frame();
+                    match s.chain.process_range_from_dml_shared(
+                        gc,
+                        &shared,
+                        pending.out_size,
+                        pending.post_chain_start,
+                        stage_count,
+                        if detailed { Some(&mut probe_fn) } else { None },
+                    ) {
+                        Ok(Some(texture)) => {
+                            let direct_ms = direct_started.elapsed().as_secs_f64() * 1000.0;
+                            if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                                log::info!(
+                                    "interp-dml-vulkan-direct-post: result=active pair={} generation={} slot={}/{} post_stages={} route=d3d12-directml-to-vulkan gl_roundtrip_before_vulkan=false final_vulkan_to_gl_bridge=cpu-staging direct_ms={:.3}",
+                                    pending.pair_id,
+                                    pending.generation,
+                                    done.index + 1,
+                                    pending.timesteps.len(),
+                                    stage_count.saturating_sub(pending.post_chain_start),
+                                    direct_ms,
+                                );
+                            }
+                            ready = Some(ReadyGpuInterpOutput {
+                                tex: texture,
+                                chain_start: stage_count,
+                                preprocessed_chain_ms: direct_ms,
+                            });
+                        }
+                        Ok(None) => {
+                            crate::render::glsl_engine::rewind_frame();
+                            s.gpu_interp_dml_vulkan_post_disabled = true;
+                            log::warn!(
+                                "interp-dml-vulkan-direct-post: result=fallback reason=shared-post-range-unavailable action=use-established-opengl-bridge generation={}",
+                                pending.generation
+                            );
+                        }
+                        Err(error) => {
+                            crate::render::glsl_engine::rewind_frame();
+                            s.gpu_interp_dml_vulkan_post_disabled = true;
+                            log::warn!(
+                                "interp-dml-vulkan-direct-post: result=fallback reason={error:#} action=use-established-opengl-bridge generation={}",
+                                pending.generation
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    s.gpu_interp_dml_vulkan_post_disabled = true;
+                    log::warn!(
+                        "interp-dml-vulkan-direct-post: result=fallback reason=directml-shared-export-unavailable action=use-established-opengl-bridge generation={}",
+                        pending.generation
+                    );
+                }
+                Err(error) => {
+                    s.gpu_interp_dml_vulkan_post_disabled = true;
+                    log::warn!(
+                        "interp-dml-vulkan-direct-post: result=fallback reason={error:#} action=use-established-opengl-bridge generation={}",
+                        pending.generation
+                    );
                 }
             }
-            Err(error) => {
-                failure = Some(format!("{error:#}"));
-                break;
+        }
+
+        if ready.is_none() {
+            match crate::render::onnx_stage::OnnxStage::finish_prepared_interp_gpu_output(gc, slot)
+            {
+                Ok(texture) => {
+                    ready = Some(ReadyGpuInterpOutput {
+                        tex: texture,
+                        chain_start: pending.post_chain_start,
+                        preprocessed_chain_ms: 0.0,
+                    });
+                }
+                Err(error) => {
+                    failure = Some(format!("{error:#}"));
+                    break;
+                }
+            }
+        }
+        if let Some(ready) = ready {
+            if let Some(existing) = pending.ready_outputs[done.index].replace(ready) {
+                gc.recycle(existing.tex);
             }
         }
     }
@@ -4584,7 +5545,10 @@ fn drain_gpu_interp_stream(
 
     if pending.next_output_index < pending.timesteps.len() {
         let index = pending.next_output_index;
-        if let Some(mut mid) = pending.ready_outputs[index].take() {
+        if let Some(ready) = pending.ready_outputs[index].take() {
+            let mut mid = ready.tex;
+            let mid_chain_start = ready.chain_start;
+            let preprocessed_chain_ms = ready.preprocessed_chain_ms;
             let lead_s = gpu_interp_present_lead_s(
                 s.last_compute_ms,
                 s.last_present_block_ms,
@@ -4647,7 +5611,13 @@ fn drain_gpu_interp_stream(
                 now,
             );
             let mut keep = pending.history_keep.clone();
-            keep.extend(pending.ready_outputs.iter().flatten().copied());
+            keep.extend(
+                pending
+                    .ready_outputs
+                    .iter()
+                    .flatten()
+                    .map(|ready| ready.tex),
+            );
             if pending.permit_next_after_post_submit
                 && pending.cooperative_slots
                 && index + 1 < pending.timesteps.len()
@@ -4659,22 +5629,43 @@ fn drain_gpu_interp_stream(
                 s.gpu_interp_permit_after_post_submit = Some((pending.generation, pending.pair_id));
             }
             let presented_before = status.lock().unwrap().presented;
-            process_and_present_from(
-                gc,
-                overlay,
-                s,
-                metrics,
-                status,
-                mid,
-                pending.out_size,
-                metrics.detailed_enabled() && pending.frame.seq % 30 == 0,
-                now,
-                0,
-                Some(timing),
-                &keep,
-                downscaler,
-                pending.post_chain_start,
-            );
+            if preprocessed_chain_ms > 0.0 {
+                process_and_present_from_impl(
+                    gc,
+                    overlay,
+                    s,
+                    metrics,
+                    status,
+                    mid,
+                    pending.out_size,
+                    metrics.detailed_enabled() && pending.frame.seq % 30 == 0,
+                    now,
+                    0,
+                    Some(timing),
+                    &keep,
+                    downscaler,
+                    mid_chain_start,
+                    true,
+                    preprocessed_chain_ms,
+                );
+            } else {
+                process_and_present_from(
+                    gc,
+                    overlay,
+                    s,
+                    metrics,
+                    status,
+                    mid,
+                    pending.out_size,
+                    metrics.detailed_enabled() && pending.frame.seq % 30 == 0,
+                    now,
+                    0,
+                    Some(timing),
+                    &keep,
+                    downscaler,
+                    mid_chain_start,
+                );
+            }
             let last_present = s.last_present;
             let last_present_block_s = s.last_present_block_ms / 1000.0;
             let phase_corrected = s.smooth_pacing
@@ -5157,10 +6148,175 @@ fn resume_provider_transition_after_interpolated_present(
     );
 }
 
+fn apply_live_crop_update(
+    input: &crate::input::InputSystem,
+    s: &mut Session,
+    crop: CaptureCrop,
+    reason: &'static str,
+    status: &Arc<Mutex<Status>>,
+) -> bool {
+    if s.capture_crop == crop {
+        return false;
+    }
+    // Values stored behind an OFF checkbox are preset/UI state only. Preserve
+    // them without disturbing WGC, input ownership, or presentation until the
+    // crop is actually enabled.
+    if !s.capture_crop.enabled && !crop.enabled {
+        s.capture_crop = crop;
+        return false;
+    }
+    input.release();
+
+    // v598: a live Crop edit changes the effective ONNX/GLSL processing
+    // geometry.  The first frame after that change may include DirectML/ONNX
+    // session rebuild, texture-pool trim and shader-cache work and can be tens
+    // of milliseconds slower than steady state.  Do not feed that transition
+    // frame into the GLSL overload auto-stop guard.  This mirrors the existing
+    // chain/capture-resolution settle policy, but is deliberately scoped to
+    // active Crop geometry changes.  Re-arming on every live edit naturally
+    // means the guard starts evaluating again only after the final Crop value
+    // has remained stable for the normal settle window.
+    if glsl_guard_eligible(s) {
+        let guard_arm = Instant::now();
+        s.glsl_guard.reset();
+        s.glsl_overload_hint = false;
+        s.glsl_chain_settle_until = Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE);
+        s.glsl_chain_immediate_until =
+            Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE + GLSL_GUARD_CHAIN_CONFIRM);
+        clear_glsl_resolution_recheck(s);
+
+        // Overload history is geometry-specific.  A Crop transition must not
+        // preserve a hint learned from a different input shape (or from the
+        // rebuild frame itself), otherwise the next stable frame can be
+        // fast-reconfirmed incorrectly.
+        let history_entries = s.glsl_overload_history.len();
+        s.glsl_overload_history.clear();
+
+        let mut state = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.glsl_interactive_pause = false;
+        let notice_was_latched = state.glsl_overload_notice_latched;
+        state.glsl_overload_notice_latched = false;
+        let deadline_cancelled = state.glsl_overload_auto_stop_deadline.take().is_some();
+        drop(state);
+
+        log::debug!(
+            "glsl-responsiveness-crop-settle: reason={} duration_ms={} confirm_ms={} history_cleared={} notice_cleared={} auto_stop_cancelled={}",
+            reason,
+            GLSL_GUARD_CHAIN_SETTLE.as_millis(),
+            GLSL_GUARD_CHAIN_CONFIRM.as_millis(),
+            history_entries,
+            notice_was_latched,
+            deadline_cancelled
+        );
+    }
+
+    s.capture_crop = crop;
+    s.source.set_user_crop(crop);
+    // WGC is change-driven. Ask static browser/PIP sources for one repaint so
+    // queued interpolation paths also receive a raw frame for the new crop.
+    source_request_window_repaint(s);
+    s.crop_transition_pending = true;
+    s.paced_present_deadline = None;
+    s.interp_present_deadline = None;
+    log::info!(
+        "crop-live-state-updated: reason={reason} enabled={} edges=({}, {}, {}, {}) transition=pending",
+        crop.enabled,
+        crop.left,
+        crop.top,
+        crop.right,
+        crop.bottom
+    );
+    true
+}
+
+fn apply_live_aspect_update(
+    input: &crate::input::InputSystem,
+    s: &mut Session,
+    update: AspectCorrectionState,
+    reason: &'static str,
+) -> bool {
+    let update = update.sanitized();
+    let previous = AspectCorrectionState {
+        enabled: s.aspect_correction,
+        mode: s.aspect_correction_mode,
+        width_scale: s.aspect_width_scale,
+        height_scale: s.aspect_height_scale,
+    };
+    let width_changed = (previous.width_scale - update.width_scale).abs() > 0.0005;
+    let height_changed = (previous.height_scale - update.height_scale).abs() > 0.0005;
+    let correction_active = previous.enabled || update.enabled;
+    let manual_scale_changed = (previous.mode == AspectCorrectionMode::Manual
+        || update.mode == AspectCorrectionMode::Manual)
+        && (width_changed || height_changed);
+    let presentation_changed = previous.enabled != update.enabled
+        || (correction_active && (previous.mode != update.mode || manual_scale_changed));
+
+    // Always store the latest sanitized values, even when correction is OFF.
+    // This keeps preset/settings state exact without forcing a visual refresh
+    // for scale values that are currently inactive.
+    s.aspect_correction = update.enabled;
+    s.aspect_correction_mode = update.mode;
+    s.aspect_width_scale = update.width_scale;
+    s.aspect_height_scale = update.height_scale;
+
+    if !presentation_changed {
+        if width_changed || height_changed {
+            log::debug!(
+                "aspect-live-state-updated: reason={reason} enabled=false scale={:.2}x{:.2} visual_change=false",
+                update.width_scale,
+                update.height_scale
+            );
+        }
+        return false;
+    }
+
+    // Presentation-only transition: do not rebuild capture/WGC geometry and do
+    // not reset interpolation history/cadence. Release mapped input while the
+    // visible content rect changes, then force one cached-frame semantic
+    // refresh so a paused/static source updates immediately.
+    input.release();
+    s.paced_present_deadline = None;
+    s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+    s.source_drag_active = false;
+    s.source_client_drag_active = false;
+    s.source_client_unowned_rebase_pending = false;
+    s.source_client_drag_raw_origin = None;
+    s.source_client_drag_overlay_origin = None;
+    s.aspect_transition_pending = true;
+    s.chain_reprocess_pending = !s.frame.data.is_empty();
+
+    // A presentation semantic change must win over duplicate-frame reuse. No
+    // provider/filter state is discarded; these are only lightweight content
+    // signatures used to decide whether the old completed frame can be held.
+    s.duplicate_signature = None;
+    s.smooth_content_signature = None;
+    s.smooth_content_seq = 0;
+    s.smooth_content_unique_since_duplicate = 4;
+    s.smooth_content_last_candidate_seq = None;
+    s.smooth_content_last_candidate_time = None;
+    s.smooth_content_pattern_hits = 0;
+    s.smooth_content_candidate_gaps.clear();
+    s.smooth_content_24p_detected = false;
+
+    log::info!(
+        "aspect-live-transition-armed: reason={reason} enabled={} scale={:.2}x{:.2} previous_enabled={} previous_scale={:.2}x{:.2} cached_reprocess={} input=released reenable_ms=120 capture_geometry=preserved interp_history=preserved",
+        update.enabled,
+        update.width_scale,
+        update.height_scale,
+        previous.enabled,
+        previous.width_scale,
+        previous.height_scale,
+        s.chain_reprocess_pending
+    );
+    true
+}
+
 fn engine_main(
     rx: Receiver<Cmd>,
     control_tx: Sender<Cmd>,
-    pending_chain: Arc<Mutex<Option<Vec<StageSpec>>>>,
+    pending_live: Arc<Mutex<PendingLiveUpdate>>,
     pending_no_engage: Arc<Mutex<PendingNoEngage>>,
     stop_requested: Arc<AtomicBool>,
     metrics: Metrics,
@@ -5183,13 +6339,30 @@ fn engine_main(
             log::info!("DirectML/OpenGL GPU bridge unavailable; using stable CPU transfer: {error}")
         }
     }
-    unsafe {
-        log::info!(
-            "OpenGL renderer: vendor='{}' renderer='{}' version='{}'",
+    let (gl_vendor, gl_renderer, gl_version) = unsafe {
+        (
             gc.gl.get_parameter_string(glow::VENDOR),
             gc.gl.get_parameter_string(glow::RENDERER),
-            gc.gl.get_parameter_string(glow::VERSION)
-        );
+            gc.gl.get_parameter_string(glow::VERSION),
+        )
+    };
+    let gl_luid = gc.external_device_luid().map(u64::from_le_bytes);
+    log::info!(
+        "OpenGL renderer: vendor='{}' renderer='{}' version='{}' luid={}",
+        gl_vendor,
+        gl_renderer,
+        gl_version,
+        gl_luid
+            .map(|luid| format!("{luid:016x}"))
+            .unwrap_or_else(|| "unavailable".to_string())
+    );
+    {
+        let mut state = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.render_gpu_ready = true;
+        state.render_gpu_luid = gl_luid;
+        state.render_gpu_name = gl_renderer.clone();
     }
     let mut factory = StageFactory::new(base_dir);
     factory.set_onnx_backend(
@@ -5219,7 +6392,18 @@ fn engine_main(
     let mut duplicate_frame_reduction_on = false;
     let mut panel_chipped = false;
     let mut last_panel_raise_check = Instant::now() - Duration::from_secs(1);
+    // Global overlay-vs-ordinary-window boundary validation is intentionally
+    // separate from panel housekeeping. The first check runs immediately after
+    // a hidden overlay is staged back into USER32; steady state is read-only
+    // unless a real z-order escape is observed.
+    let mut last_overlay_boundary_check = Instant::now() - Duration::from_secs(1);
     let mut last_helper_compositor_diag = Instant::now() - Duration::from_secs(3);
+    // Periodic helper/z-order diagnostics enumerate USER32 state and can take
+    // tens of milliseconds on some compositor-heavy desktops. Keep rare
+    // source-window-set changes synchronous for exact event correlation, but
+    // move steady-state snapshots off the render thread. One in-flight guard
+    // prevents diagnostic work from piling up if USER32 is temporarily slow.
+    let helper_compositor_diag_inflight = Arc::new(AtomicBool::new(false));
     let mut last_source_window_poll = Instant::now() - Duration::from_millis(250);
     let mut last_source_visible_windows: Vec<isize> = Vec::new();
     let mut gui_priority_hwnd: isize = 0;
@@ -5236,7 +6420,7 @@ fn engine_main(
     loop {
         if crate::input::take_panel_stop_action() {
             log::info!("panel-priority-direct-dispatch: action=stop");
-            *pending_chain.lock().unwrap() = None;
+            pending_live.lock().unwrap().clear_all();
             pending_no_engage.lock().unwrap().publish(Vec::new());
             stop_requested.store(true, Ordering::Release);
             let _ = crate::render::onnx_stage::request_onnx_cancel();
@@ -5265,7 +6449,7 @@ fn engine_main(
         if stop_requested.swap(false, Ordering::AcqRel) {
             deferred_backend_switch = None;
             deferred_interp_factor = None;
-            *pending_chain.lock().unwrap() = None;
+            pending_live.lock().unwrap().clear_all();
             input.set_transition_suspended(false);
             input.release();
             stop_drag_follower(&mut drag_follower);
@@ -5307,18 +6491,45 @@ fn engine_main(
             }
             no_engage_rects = rects;
         }
-        if let Some(specs) = pending_chain.lock().unwrap().take() {
-            if deferred_backend_switch.take().is_some() {
-                let mut state = status.lock().unwrap();
-                state.onnx_backend_switching = false;
-                state.onnx_backend_error = None;
-                state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
-                log::info!("onnx-backend-switch-cancelled: reason=coalesced-chain-replaced");
-            }
-            if let Some(s) = session.as_mut() {
+        let (
+            latest_chain,
+            latest_aspect,
+            latest_crop,
+            chain_coalesced,
+            aspect_coalesced,
+            crop_coalesced,
+        ) = {
+            let mut pending = pending_live.lock().unwrap();
+            pending.take_latest()
+        };
+        if latest_chain.is_some() && deferred_backend_switch.take().is_some() {
+            let mut state = status.lock().unwrap();
+            state.onnx_backend_switching = false;
+            state.onnx_backend_error = None;
+            state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
+            log::info!("onnx-backend-switch-cancelled: reason=coalesced-chain-replaced");
+        }
+        if chain_coalesced > 0 || aspect_coalesced > 0 || crop_coalesced > 0 {
+            log::debug!(
+                "live-update-coalesced: chain={} aspect={} crop={}",
+                chain_coalesced,
+                aspect_coalesced,
+                crop_coalesced
+            );
+        }
+        if let Some(s) = session.as_mut() {
+            if latest_chain.is_some() {
                 input.set_transition_suspended(true);
                 s.provider_transition_input_suspended = true;
                 s.provider_transition_input_suspended_since = Some(Instant::now());
+            }
+            if let Some(aspect) = latest_aspect {
+                apply_live_aspect_update(&input, s, aspect, "latest-only");
+            }
+            if let Some(crop) = latest_crop {
+                apply_live_crop_update(&input, s, crop, "latest-only", &status);
+            }
+            if let Some(specs) = latest_chain {
                 apply_chain_update(s, &mut gc, &mut factory, &specs, &metrics, &status);
                 let wait_for_first_interp = matches!(
                     s.chain.interp_stage(),
@@ -5348,13 +6559,24 @@ fn engine_main(
                     log::debug!("render-engine shutdown begin");
                     input.set_transition_suspended(false);
                     stop_session(&mut session, &mut overlay, &mut gc, &status);
-                    factory.clear_onnx_cache();
+                    // Native input ownership is the only shutdown state that can
+                    // affect the desktop outside Neo. Release and stop it before
+                    // destroying ONNX/TensorRT provider caches, which can take
+                    // ~2 seconds after a TensorRT session. This keeps cursor and
+                    // ClipCursor safety independent from slow provider teardown.
                     let input_t0 = Instant::now();
+                    log::debug!("render-engine shutdown stage: input-stop begin");
                     input.stop();
+                    log::debug!("render-engine shutdown stage: input-stop complete");
+                    let provider_t0 = Instant::now();
+                    log::debug!("render-engine shutdown stage: provider-cache-clear begin");
+                    factory.clear_onnx_cache();
+                    log::debug!("render-engine shutdown stage: provider-cache-clear complete");
                     log::debug!(
-                        "render-engine shutdown complete: total_ms={:.1} input_stop_ms={:.1}",
+                        "render-engine shutdown complete: total_ms={:.1} input_stop_ms={:.1} provider_cache_ms={:.1}",
                         shutdown_t0.elapsed().as_secs_f64() * 1000.0,
-                        input_t0.elapsed().as_secs_f64() * 1000.0
+                        input_t0.elapsed().as_secs_f64() * 1000.0,
+                        provider_t0.elapsed().as_secs_f64() * 1000.0
                     );
                     return Ok(());
                 }
@@ -5376,7 +6598,7 @@ fn engine_main(
                     if stop_requested.swap(false, Ordering::AcqRel) {
                         deferred_backend_switch = None;
                         deferred_interp_factor = None;
-                        *pending_chain.lock().unwrap() = None;
+                        pending_live.lock().unwrap().clear_all();
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
@@ -5399,8 +6621,20 @@ fn engine_main(
                     log::info!("stop-queue-boundary-complete");
                 }
                 Cmd::SaveScreenshot(path) => {
-                    if let Some(s) = session.as_ref() {
-                        if let Some(tex) = s.last_tex {
+                    if let Some(s) = session.as_mut() {
+                        if s.chain.has_interp() {
+                            // A single desktop/overlay screenshot can repeatedly land on
+                            // the REAL half of an x2 cadence and completely miss a corrupt
+                            // RIFE midpoint. Arm a render-thread burst instead. Each PNG is
+                            // captured from the exact final texture submitted to the overlay.
+                            const INTERP_SCREENSHOT_BURST_FRAMES: u8 = 8;
+                            s.screenshot_burst =
+                                Some(ScreenshotBurst::new(path, INTERP_SCREENSHOT_BURST_FRAMES));
+                            log::info!(
+                                "screenshot-interp-burst: action=armed frames={} semantics=final-presented-texture labels=real-or-midpoint",
+                                INTERP_SCREENSHOT_BURST_FRAMES
+                            );
+                        } else if let Some(tex) = s.last_tex {
                             // Readback already matches PNG's top-left pixel order.
                             // Any row/column correction mirrors the saved image.
                             let rgba = gc.download_rgba8(tex);
@@ -5416,16 +6650,26 @@ fn engine_main(
                 }
                 Cmd::Start {
                     hwnd,
+                    source_pid,
+                    source_was_topmost,
                     specs,
                     mode,
                     ratio,
+                    aspect_correction,
+                    aspect_correction_mode,
+                    aspect_width_scale,
+                    aspect_height_scale,
+                    capture_crop,
                     fps_cap,
                     hide_source,
                     client_only,
                     hdr,
                     hdr_sdr_mode,
                     gpu_adapter,
+                    explicit_gpu_luid,
+                    force_vulkan_glsl,
                     source_restore_rect,
+                    source_restore_placement,
                     source_was_maximized,
                     deferred_capture_resolution,
                     capture_canvas,
@@ -5453,12 +6697,14 @@ fn engine_main(
                             .unwrap_or_else(|| win32::is_monitor_fullscreen(hwnd));
                         state.source_recovery = Some((
                             hwnd,
+                            source_pid,
                             source_restore_rect,
+                            source_restore_placement,
                             source_was_maximized,
                             // Fullscreen pixel-lock sessions deliberately never
                             // promote the foreign source HWND, so recovery must
                             // not issue a matching NOTOPMOST mutation either.
-                            win32::is_topmost(hwnd) || fullscreen_origin,
+                            source_was_topmost || fullscreen_origin,
                         ));
                     }
                     factory.set_gpu_adapter(gpu_adapter);
@@ -5468,15 +6714,26 @@ fn engine_main(
                     factory.retain_tensorrt_sessions_for_capture_restart();
                     match start_session(
                         hwnd,
+                        source_pid,
+                        source_was_topmost,
                         &specs,
                         mode,
                         ratio,
+                        aspect_correction,
+                        aspect_correction_mode,
+                        aspect_width_scale,
+                        aspect_height_scale,
+                        capture_crop,
                         fps_cap,
                         hide_source,
                         client_only,
                         hdr,
                         hdr_sdr_mode,
+                        explicit_gpu_luid,
+                        force_vulkan_glsl,
+                        gl_luid,
                         source_restore_rect,
+                        source_restore_placement,
                         source_was_maximized,
                         deferred_capture_resolution,
                         capture_canvas,
@@ -5495,6 +6752,55 @@ fn engine_main(
                                 stop_session(&mut session, &mut overlay, &mut gc, &status);
                                 continue;
                             }
+                            if s.source.uses_display_region_fallback() {
+                                // Monitor capture must never see Neo's own
+                                // fullscreen output or helpers. Exclude only
+                                // our top-level windows, and only for this
+                                // structural fallback session. WDA_NONE is
+                                // restored unconditionally by stop_session.
+                                let overlay_hwnd = overlay.hwnd().0 as isize;
+                                let overlay_excluded =
+                                    win32::set_own_window_capture_excluded(overlay_hwnd, true);
+                                if gui_priority_hwnd != 0 {
+                                    let _ = win32::set_own_window_capture_excluded(
+                                        gui_priority_hwnd,
+                                        true,
+                                    );
+                                }
+                                if panel_hwnd != 0 {
+                                    let _ =
+                                        win32::set_own_window_capture_excluded(panel_hwnd, true);
+                                }
+                                let cursor_hwnd = crate::input::cursor_sprite_hwnd();
+                                if cursor_hwnd != 0 {
+                                    let _ =
+                                        win32::set_own_window_capture_excluded(cursor_hwnd, true);
+                                }
+                                if !overlay_excluded {
+                                    log::error!(
+                                        "wgc-display-region-abort: overlay capture exclusion unavailable; refusing recursive monitor capture"
+                                    );
+                                    status.lock().unwrap().last_error = Some(
+                                        "モニター領域キャプチャの安全な初期化に失敗しました。通常のウィンドウキャプチャ経路は変更していません。"
+                                            .to_string(),
+                                    );
+                                    session = Some(s);
+                                    stop_session(&mut session, &mut overlay, &mut gc, &status);
+                                    continue;
+                                }
+                                // Frames can arrive on the WGC callback before
+                                // the affinity change is committed. Skip those
+                                // startup frames and reveal only a post-exclusion
+                                // monitor crop.
+                                s.source.discard_pending_frames();
+                                log::info!(
+                                    "wgc-display-region-capture-exclusion-ready: overlay={:#x} gui={:#x} panel={:#x} cursor={:#x}",
+                                    overlay_hwnd,
+                                    gui_priority_hwnd,
+                                    panel_hwnd,
+                                    cursor_hwnd
+                                );
+                            }
                             let usage = s.chain.onnx_backend_usage();
                             if matches!(
                                 s.chain.interp_stage(),
@@ -5506,7 +6812,12 @@ fn engine_main(
                             }
                             let rect = overlay_geometry(&s, &overlay);
                             reposition_overlay_for_gui_mode(
-                                &mut overlay, rect.0, rect.1, rect.2, rect.3, gui_priority_topmost,
+                                &mut overlay,
+                                rect.0,
+                                rect.1,
+                                rect.2,
+                                rect.3,
+                                gui_priority_topmost,
                             );
                             log::info!("overlay reveal deferred until first valid filtered frame");
                             enforce_gui_priority(
@@ -5515,13 +6826,23 @@ fn engine_main(
                                 panel_hwnd,
                                 overlay.hwnd().0 as isize,
                             );
-                            let source_rect = if client_only {
-                                win32::client_rect_on_screen(hwnd)
-                            } else {
-                                win32::window_rect(hwnd)
-                            };
+                            let source_rect = s.source.display_region_rect().or_else(|| {
+                                if client_only {
+                                    win32::client_rect_on_screen(hwnd)
+                                } else {
+                                    win32::window_rect(hwnd)
+                                }
+                            });
                             let initial_content = source_rect
+                                .map(|source_rect| crop_source_rect(source_rect, s.capture_crop))
                                 .map(|(_, _, w, h)| {
+                                    let (presentation_w, presentation_h) = if s.aspect_correction {
+                                        session_presentation_aspect(&s, (w, h))
+                                    } else {
+                                        // Preserve the established v555 startup mapping exactly
+                                        // when the new option is off.
+                                        (w, h)
+                                    };
                                     crate::input::content_rect(
                                         crate::input::Rect {
                                             x: rect.0,
@@ -5529,8 +6850,8 @@ fn engine_main(
                                             w: rect.2,
                                             h: rect.3,
                                         },
-                                        w,
-                                        h,
+                                        presentation_w,
+                                        presentation_h,
                                     )
                                 })
                                 .unwrap_or(crate::input::Rect {
@@ -5561,10 +6882,12 @@ fn engine_main(
                             g.source_live_fullscreen = s.source_live_fullscreen;
                             g.presented = 0;
                             g.overlay_hwnd = overlay.hwnd().0 as isize;
-                            g.hidden_src = s.hid_source.map(|wl| (s.hwnd, wl));
+                            g.hidden_src = s.hid_source.map(|wl| (s.hwnd, s.source_pid, wl));
                             g.source_recovery = Some((
                                 s.hwnd,
+                                s.source_pid,
                                 s.source_restore_rect,
+                                s.source_restore_placement,
                                 s.source_was_maximized,
                                 // `true` here means recovery must leave the
                                 // z-order alone. Fullscreen sessions were not
@@ -5596,13 +6919,28 @@ fn engine_main(
                                     state.stopping = false;
                                 }
                             }
-                            if let Some(rect) = source_restore_rect {
-                                let restored =
-                                    win32::restore_window_rect(hwnd, rect, source_was_maximized);
+                            let _ = win32::restore_source_rounded_corners(hwnd, source_pid);
+                            let restored = if win32::window_matches_pid(hwnd, source_pid) {
+                                if !source_was_topmost {
+                                    restore_source_topmost_verified(hwnd, source_pid, false);
+                                }
+                                win32::restore_window_origin(
+                                    hwnd,
+                                    source_restore_rect,
+                                    source_was_maximized,
+                                    source_restore_placement,
+                                )
+                            } else {
                                 log::warn!(
-                                    "capture start failed; source geometry rollback: hwnd={hwnd:#x} rect={rect:?} maximized={source_was_maximized} ok={restored}"
+                                    "capture start rollback skipped: hwnd={hwnd:#x} expected_pid={source_pid} current_pid={} reason=identity-changed",
+                                    win32::window_pid(hwnd)
                                 );
-                            }
+                                false
+                            };
+                            log::warn!(
+                                "capture start failed; source geometry rollback: hwnd={hwnd:#x} rect={source_restore_rect:?} normal_rect={:?} maximized={source_was_maximized} ok={restored}",
+                                source_restore_placement.map(|p| p.normal_rect_xywh())
+                            );
                             let message = format!("{e:#}");
                             if cancelled {
                                 log::info!(
@@ -5615,7 +6953,14 @@ fn engine_main(
                         }
                     }
                 }
-                Cmd::ApplyChain(specs) => {
+                Cmd::ApplyChain {
+                    specs,
+                    aspect_correction,
+                    aspect_correction_mode,
+                    aspect_width_scale,
+                    aspect_height_scale,
+                    capture_crop,
+                } => {
                     if crate::render::onnx_stage::onnx_cancel_requested() {
                         log::info!("filter-chain-update-skipped: Stop is pending");
                         input.set_transition_suspended(false);
@@ -5632,6 +6977,18 @@ fn engine_main(
                         input.set_transition_suspended(true);
                         s.provider_transition_input_suspended = true;
                         s.provider_transition_input_suspended_since = Some(Instant::now());
+                        apply_live_aspect_update(
+                            &input,
+                            s,
+                            AspectCorrectionState {
+                                enabled: aspect_correction,
+                                mode: aspect_correction_mode,
+                                width_scale: aspect_width_scale,
+                                height_scale: aspect_height_scale,
+                            },
+                            "queued-chain",
+                        );
+                        apply_live_crop_update(&input, s, capture_crop, "queued-chain", &status);
                         apply_chain_update(s, &mut gc, &mut factory, &specs, &metrics, &status);
                         let wait_for_first_interp = matches!(
                             s.chain.interp_stage(),
@@ -5644,6 +7001,83 @@ fn engine_main(
                         }
                     } else {
                         input.set_transition_suspended(false);
+                    }
+                }
+                Cmd::SetAspectCorrection {
+                    enabled,
+                    mode,
+                    width_scale,
+                    height_scale,
+                } => {
+                    if let Some(s) = session.as_mut() {
+                        apply_live_aspect_update(
+                            &input,
+                            s,
+                            AspectCorrectionState {
+                                enabled,
+                                mode,
+                                width_scale,
+                                height_scale,
+                            },
+                            "queued-direct",
+                        );
+                    }
+                }
+                Cmd::SetCaptureCrop { crop } => {
+                    if let Some(s) = session.as_mut() {
+                        apply_live_crop_update(&input, s, crop, "queued-direct", &status);
+                    }
+                }
+                Cmd::SetGpuSelection {
+                    gpu_adapter,
+                    explicit_gpu_luid,
+                    force_vulkan_glsl,
+                    backend,
+                    trt_device_id,
+                    cache_root,
+                } => {
+                    // Rebind future ONNX sessions immediately. Existing stages
+                    // own their provider sessions, so clearing the factory cache
+                    // cannot migrate a running frame halfway through a chain.
+                    factory.set_gpu_adapter(gpu_adapter);
+                    factory.set_onnx_backend(backend, trt_device_id, cache_root);
+                    if session.is_none() {
+                        let mut state = status.lock().unwrap();
+                        let vulkan_compute_luid = if force_vulkan_glsl {
+                            explicit_gpu_luid
+                        } else {
+                            explicit_gpu_luid.filter(|selected| {
+                                state
+                                    .render_gpu_luid
+                                    .map(|render| render != *selected)
+                                    .unwrap_or(true)
+                            })
+                        };
+                        crate::render::vulkan_gpu::set_production_selected_luid(
+                            vulkan_compute_luid,
+                        );
+                        state.onnx_backend = backend;
+                        state.onnx_backend_error = None;
+                        state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
+                        log::info!(
+                            "gpu-selection-live-commit: explicit_luid={} force_vulkan={} dml_device={:?} onnx_backend={backend:?} trt_device={:?} relaunch=false presentation_gpu=unchanged",
+                            explicit_gpu_luid
+                                .map(|luid| format!("{luid:016x}"))
+                                .unwrap_or_else(|| "Auto".to_string()),
+                            force_vulkan_glsl,
+                            gpu_adapter,
+                            trt_device_id,
+                        );
+                    } else {
+                        log::warn!(
+                            "gpu-selection-live-deferred: explicit_luid={} force_vulkan={} dml_device={:?} onnx_backend={backend:?} trt_device={:?} reason=session-raced-selector next_start=true",
+                            explicit_gpu_luid
+                                .map(|luid| format!("{luid:016x}"))
+                                .unwrap_or_else(|| "Auto".to_string()),
+                            force_vulkan_glsl,
+                            gpu_adapter,
+                            trt_device_id,
+                        );
                     }
                 }
                 Cmd::SwitchOnnxBackend {
@@ -5733,7 +7167,7 @@ fn engine_main(
                             s.source_client_drag_raw_origin = None;
                             s.source_client_drag_overlay_origin = None;
                             if mode == ScaleMode::Fixed {
-                                s.last_src_pos = keep_source_window_reachable(s.hwnd);
+                                s.last_src_pos = source_keep_window_reachable(s);
                             } else {
                                 s.last_src_pos =
                                     win32::client_rect_on_screen(s.hwnd).map(|(x, y, _, _)| (x, y));
@@ -5752,30 +7186,56 @@ fn engine_main(
                         s.ratio = ratio;
                     }
                 }
-                Cmd::SetCaptureGeometry { requested, applied } => {
+                Cmd::SetCaptureGeometry {
+                    requested,
+                    applied,
+                    capture_crop,
+                } => {
                     status
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .capture_resolution_resize_intent = None;
                     if let Some(s) = session.as_mut() {
-                        let normalized_applied = normalize_capture_client_size(applied);
-                        if normalized_applied != applied {
+                        if s.capture_crop != capture_crop {
+                            s.capture_crop = capture_crop;
+                            s.source.set_user_crop(capture_crop);
+                            s.crop_transition_pending = true;
                             log::info!(
-                                "capture-geometry-even-normalize: requested={}x{} applied={}x{} normalized={}x{} reason=wgc-even-frame-contract",
-                                requested.0,
-                                requested.1,
-                                applied.0,
-                                applied.1,
-                                normalized_applied.0,
-                                normalized_applied.1
+                                "capture-geometry crop-transaction-commit: enabled={} edges=({}, {}, {}, {})",
+                                capture_crop.enabled,
+                                capture_crop.left,
+                                capture_crop.top,
+                                capture_crop.right,
+                                capture_crop.bottom
                             );
                         }
-                        let applied = normalized_applied;
-                        let target = (applied.0 as i32, applied.1 as i32);
+                        let frame_target = normalize_capture_client_size(applied);
+                        let source_client_target = if s.capture_crop.enabled {
+                            applied
+                        } else {
+                            // Absolute v583 compatibility when Crop is OFF:
+                            // fixed capture sizes keep the established even
+                            // source-client contract.
+                            frame_target
+                        };
+                        if frame_target != applied {
+                            log::info!(
+                                "capture-geometry-even-normalize: requested={}x{} client={}x{} frame_target={}x{} crop_enabled={} reason=wgc-even-frame-contract",
+                                requested.0,
+                                requested.1,
+                                source_client_target.0,
+                                source_client_target.1,
+                                frame_target.0,
+                                frame_target.1,
+                                s.capture_crop.enabled
+                            );
+                        }
+                        let applied = source_client_target;
+                        let target = (frame_target.0 as i32, frame_target.1 as i32);
                         s.capture_canvas_suspended_for_fullscreen = false;
                         s.capture_resolution_reapply_pending = false;
                         s.fullscreen_exit_candidate_since = None;
-                        let previous = s.in_size;
+                        let previous = s.capture_in_size;
                         let overload_notice_latched = status
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -5839,18 +7299,24 @@ fn engine_main(
                         // this loop. If automatic detection already committed
                         // and rebuilt this same shape, a second reset only
                         // destroys a warm provider and causes another blackout.
-                        if previous == target
+                        if !s.source.uses_display_region_fallback()
+                            && previous == target
                             && s.pending_resize_size.is_none()
                             && !s.onnx_geometry_rebuild_pending
                         {
                             s.capture_canvas = Some(target);
-                            s.display_aspect = target;
+                            s.display_aspect = capture_crop_output_size(
+                                (applied.0 as i32, applied.1 as i32),
+                                s.capture_crop,
+                            );
                             s.deferred_capture_resolution = None;
                             s.capture_resolution_applied = false;
                             s.capture_resolution_wait_started = None;
                             s.capture_resolution_repaint_last = None;
                             s.capture_resolution_nudge_done = false;
                             s.capture_resolution_native_fallback = false;
+                            s.capture_resolution_region_candidate = None;
+                            s.capture_resolution_region_candidate_since = None;
                             s.onnx_geometry_deferred_logged = false;
                             log::info!(
                                 "capture-geometry-transition-deduplicated: current={}x{} requested={}x{} applied={}x{} action=metadata-only onnx_rebuild=false",
@@ -5880,6 +7346,8 @@ fn engine_main(
                         s.capture_resolution_repaint_last = None;
                         s.capture_resolution_nudge_done = false;
                         s.capture_resolution_native_fallback = false;
+                        s.capture_resolution_region_candidate = None;
+                        s.capture_resolution_region_candidate_since = None;
                         s.onnx_geometry_deferred_logged = false;
                         s.capture_canvas = Some(target);
                         // Preserve the currently presented geometry while the
@@ -5919,7 +7387,9 @@ fn engine_main(
                         s.source.set_queue_enabled(s.chain.has_interp());
                         s.onnx_geometry_rebuild_pending = s.chain.has_onnx();
                         metrics.reset();
-                        win32::request_window_repaint(s.hwnd);
+                        if !s.source.uses_display_region_fallback() {
+                            source_request_window_repaint(s);
+                        }
                         log::info!(
                             "capture-geometry-transition-armed: previous={}x{} requested={}x{} applied={}x{} overlay_shield={} input=released queue=flushed onnx_rebuild={} display_aspect={}x{}",
                             previous.0,
@@ -5949,11 +7419,14 @@ fn engine_main(
                         s.capture_resolution_repaint_last = None;
                         s.capture_resolution_nudge_done = false;
                         s.capture_resolution_native_fallback = false;
+                        s.capture_resolution_region_candidate = None;
+                        s.capture_resolution_region_candidate_since = None;
                         s.capture_canvas_suspended_for_fullscreen = false;
                         s.capture_resolution_reapply_pending = false;
                         s.fullscreen_exit_candidate_since = None;
                         if s.in_size.0 > 0 && s.in_size.1 > 0 {
-                            s.display_aspect = s.in_size;
+                            let next_display_aspect = committed_display_aspect(s, s.in_size);
+                            s.display_aspect = next_display_aspect;
                         }
                         s.pending_resize_size = None;
                         s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
@@ -6003,6 +7476,13 @@ fn engine_main(
                     panel_hwnd = hwnd;
                     panel_bar = bar;
                     panel_chip = chip;
+                    if panel_hwnd != 0
+                        && session
+                            .as_ref()
+                            .is_some_and(|s| s.source.uses_display_region_fallback())
+                    {
+                        let _ = win32::set_own_window_capture_excluded(panel_hwnd, true);
+                    }
                     if panel_hwnd != 0 && panel_visible {
                         // The egui thread owns visibility and layered alpha.
                         // Cross-thread ShowWindow here blocked AMD presentation
@@ -6018,6 +7498,13 @@ fn engine_main(
                 Cmd::SetGuiPriority { hwnd, topmost } => {
                     gui_priority_hwnd = hwnd;
                     gui_priority_topmost = topmost;
+                    if gui_priority_hwnd != 0
+                        && session
+                            .as_ref()
+                            .is_some_and(|s| s.source.uses_display_region_fallback())
+                    {
+                        let _ = win32::set_own_window_capture_excluded(gui_priority_hwnd, true);
+                    }
                     enforce_gui_priority(
                         gui_priority_hwnd,
                         gui_priority_topmost,
@@ -6172,11 +7659,13 @@ fn engine_main(
         // A fullscreen/orientation toggle can retire only the WGC session while
         // preserving the source HWND. Reconnect in place so the overlay, filter
         // chain, cursor mapping, and saved restore geometry survive the change.
-        if !win32::is_window_valid(s.hwnd) || win32::is_minimized(s.hwnd) {
+        if !win32::window_matches_pid(s.hwnd, s.source_pid) || win32::is_minimized(s.hwnd) {
             log::warn!(
-                "capture source unavailable: hwnd={:#x} valid={} minimized={}; stopping session",
+                "capture source unavailable: hwnd={:#x} identity_ok={} expected_pid={} current_pid={} minimized={}; stopping session",
                 s.hwnd,
-                win32::is_window_valid(s.hwnd),
+                win32::window_matches_pid(s.hwnd, s.source_pid),
+                s.source_pid,
+                win32::window_pid(s.hwnd),
                 win32::is_minimized(s.hwnd)
             );
             stop_session(&mut session, &mut overlay, &mut gc, &status);
@@ -6212,6 +7701,19 @@ fn engine_main(
                     pixel_exact_raw_hint,
                 ) {
                     Ok(new_source) => {
+                        new_source.set_user_crop(s.capture_crop);
+                        if !source_identity_matches(s) {
+                            drop(new_source);
+                            log::warn!(
+                                "WGC reconnect discarded: hwnd={:#x} expected_pid={} current_pid={} reason=identity-changed",
+                                s.hwnd,
+                                s.source_pid,
+                                win32::window_pid(s.hwnd)
+                            );
+                            stop_session(&mut session, &mut overlay, &mut gc, &status);
+                            input.release();
+                            continue;
+                        }
                         s.source.stop();
                         s.source = new_source;
                         s.source.set_queue_enabled(s.chain.has_interp());
@@ -6226,7 +7728,15 @@ fn engine_main(
                         s.source_restart_since = None;
                         if s.in_size != (0, 0) {
                             let stable_size = s.in_size;
-                            reset_for_source_resize(&mut gc, s, &metrics, stable_size, stable_size);
+                            let stable_capture_size = s.capture_in_size;
+                            reset_for_source_resize(
+                                &mut gc,
+                                s,
+                                &metrics,
+                                stable_size,
+                                stable_size,
+                                (stable_capture_size != (0, 0)).then_some(stable_capture_size),
+                            );
                         }
                         log::info!(
                             "WGC in-place reconnect succeeded: hwnd={:#x} elapsed_ms={:.1}; filter chain and overlay preserved",
@@ -6303,14 +7813,14 @@ fn engine_main(
             s.last_client_rect = Some(rect);
         }
 
+        let stale_capture_size = s.frame.capture_size();
         let stale_reference = if !s.frame.data.is_empty() {
-            source_input_reference_rect(s.hwnd, s.capture_client_only, (s.frame.w, s.frame.h))
+            session_source_input_reference_rect(s, stale_capture_size)
         } else {
             None
         };
-        let stale_surface_mismatch = stale_reference.is_some_and(|(rect, _, _)| {
-            frame_size_mismatches_reference((s.frame.w, s.frame.h), rect)
-        });
+        let stale_surface_mismatch = stale_reference
+            .is_some_and(|(rect, _, _)| frame_size_mismatches_reference(stale_capture_size, rect));
 
         // If WGC has already converged to the new native size, the geometry
         // transition is complete.  Disarm immediately; otherwise a static
@@ -6320,8 +7830,8 @@ fn engine_main(
                 log::debug!(
                     "source-geometry-watchdog-satisfied: hwnd={:#x} frame={}x{} expected={}x{} reference={} action=disarm",
                     s.hwnd,
-                    s.frame.w,
-                    s.frame.h,
+                    stale_capture_size.0,
+                    stale_capture_size.1,
                     rect.2,
                     rect.3,
                     reference
@@ -6343,14 +7853,21 @@ fn engine_main(
             log::warn!(
                 "source geometry changed but WGC retained stale surface: hwnd={:#x} frame={}x{} expected={}x{} reference={} client_only={} pointer_down=false; restarting WGC in place",
                 s.hwnd,
-                s.frame.w,
-                s.frame.h,
+                stale_capture_size.0,
+                stale_capture_size.1,
                 rect.2,
                 rect.3,
                 reference,
                 s.capture_client_only
             );
-            s.display_aspect = (rect.2, rect.3);
+            s.display_aspect = if s.source.uses_display_region_fallback() {
+                s.source
+                    .display_region_rect()
+                    .map(|(_, _, w, h)| capture_crop_content_size((w, h), s.capture_crop))
+                    .unwrap_or_else(|| capture_crop_output_size((rect.2, rect.3), s.capture_crop))
+            } else {
+                capture_crop_output_size((rect.2, rect.3), s.capture_crop)
+            };
             s.last_geom_change = None;
             s.source.stop();
             overlay.win.pump_messages();
@@ -6367,8 +7884,8 @@ fn engine_main(
                 log::debug!(
                     "source-geometry-restart-deferred: hwnd={:#x} frame={}x{} expected={}x{} reference={} reason=pointer-gesture-active",
                     s.hwnd,
-                    s.frame.w,
-                    s.frame.h,
+                    stale_capture_size.0,
+                    stale_capture_size.1,
                     rect.2,
                     rect.3,
                     reference
@@ -6430,7 +7947,7 @@ fn engine_main(
         // clicks must always land on it, but the GUI/panel float above
         let overlay_hwnd = overlay.hwnd().0 as isize;
         if !win32::window_is_above(overlay_hwnd, s.hwnd) {
-            win32::place_below(s.hwnd, overlay_hwnd);
+            source_place_below(s, overlay_hwnd);
         }
         let phase_zorder_finished = Instant::now();
 
@@ -6487,7 +8004,7 @@ fn engine_main(
                     stop_drag_follower(&mut drag_follower);
                     drag_session_epoch = None;
                     let before = win32::window_rect(s.hwnd);
-                    let rebased = keep_source_window_reachable(s.hwnd);
+                    let rebased = source_keep_window_reachable(s);
                     let after_client = win32::client_rect_on_screen(s.hwnd)
                         .map(|(x, y, _, _)| (x, y))
                         .or(rebased)
@@ -6497,13 +8014,12 @@ fn engine_main(
                         "source-drag-session-end: owner=anchored-high-rate-source-follower rebase_once=true before={before:?} client_after={after_client:?}"
                     );
                 } else {
-                    let drag_reference =
-                        if caption_drag {
-                            source_input_reference_rect(s.hwnd, false, s.display_aspect)
-                                .unwrap_or((client_rect, true, "client-fallback"))
-                        } else {
-                            (client_rect, false, "client")
-                        };
+                    let drag_reference = if caption_drag {
+                        source_input_reference_rect(s.hwnd, false, source_input_frame_hint(s))
+                            .unwrap_or((client_rect, true, "client-fallback"))
+                    } else {
+                        (client_rect, false, "client")
+                    };
                     let ((sx, sy, sw, sh), _window_frame, reference_kind) = drag_reference;
 
                     if caption_drag && !s.source_drag_active {
@@ -6665,7 +8181,12 @@ fn engine_main(
                                             let ny = before.1.saturating_add(dy);
                                             if (nx, ny) != (before.0, before.1) {
                                                 reposition_overlay_for_gui_mode(
-                                                    &mut overlay, nx, ny, before.2, before.3, gui_priority_topmost,
+                                                    &mut overlay,
+                                                    nx,
+                                                    ny,
+                                                    before.2,
+                                                    before.3,
+                                                    gui_priority_topmost,
                                                 );
                                             }
                                             log::warn!(
@@ -6750,7 +8271,12 @@ fn engine_main(
                                     let before = overlay.current_rect();
                                     if (nx, ny) != (before.0, before.1) {
                                         reposition_overlay_for_gui_mode(
-                                            &mut overlay, nx, ny, before.2, before.3, gui_priority_topmost,
+                                            &mut overlay,
+                                            nx,
+                                            ny,
+                                            before.2,
+                                            before.3,
+                                            gui_priority_topmost,
                                         );
                                         let after = overlay.current_rect();
                                         log::debug!(
@@ -6792,7 +8318,7 @@ fn engine_main(
                             "unowned-offscreen-move-end"
                         };
                         let before = win32::window_rect(s.hwnd);
-                        let rebased = keep_source_window_reachable(s.hwnd);
+                        let rebased = source_keep_window_reachable(s);
                         let after_client = win32::client_rect_on_screen(s.hwnd)
                             .map(|(x, y, _, _)| (x, y))
                             .or(rebased)
@@ -6823,11 +8349,23 @@ fn engine_main(
 
         // follow source geometry (windowed mode: user may have moved the
         // overlay -> keep its position, only track size)
-        let rect = overlay_geometry(s, &overlay);
         let cur = overlay.current_rect();
+        let rect = if s.aspect_transition_pending {
+            // Keep the last complete frame at its current geometry until a
+            // frame rendered with the newest aspect is ready. The commit path
+            // below resizes immediately before SwapBuffers.
+            cur
+        } else {
+            overlay_geometry(s, &overlay)
+        };
         if rect != cur {
             reposition_overlay_for_gui_mode(
-                &mut overlay, rect.0, rect.1, rect.2, rect.3, gui_priority_topmost,
+                &mut overlay,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                gui_priority_topmost,
             );
             enforce_gui_priority(
                 gui_priority_hwnd,
@@ -6841,8 +8379,46 @@ fn engine_main(
         // as soon as the next session has restored the correct geometry. This
         // gives DWM the same pre-existing transparent overlay tree that v235
         // used, instead of introducing a fullscreen surface only at reveal.
+        let overlay_was_native_hidden = !win32::is_window_visible(overlay.hwnd().0 as isize);
         if !overlay.is_visible() {
             overlay.prepare_hidden_for_reveal();
+        }
+        if overlay_was_native_hidden {
+            // A hard Stop removed this HWND from USER32's visible z-list. Force
+            // the boundary check to run on the same tick that it is reinserted,
+            // even when Stop -> Start happens faster than the steady 200ms poll.
+            last_overlay_boundary_check = Instant::now() - Duration::from_secs(1);
+        }
+
+        // WS_EX_TOPMOST can remain set even when a hide/show or another native
+        // z-order transaction leaves the overlay physically below an ordinary
+        // foreign window. Validate the real USER32 list after the alpha=0 stage
+        // and then at a low fixed cadence. The helper is a no-op unless an
+        // overlapping non-TOPMOST foreign HWND is genuinely ahead of the
+        // overlay, so normal presentation does not churn SetWindowPos.
+        if last_overlay_boundary_check.elapsed() >= Duration::from_millis(200) {
+            let overlay_hwnd = overlay.hwnd().0 as isize;
+            if win32::repair_overlay_zorder_boundary(overlay_hwnd, s.hwnd) {
+                // The boundary repair deliberately preserves external TOPMOST
+                // windows. Re-assert only Neo's established internal hierarchy
+                // afterwards so GUI/panel/cursor remain above the magnified view.
+                if gui_priority_topmost {
+                    enforce_gui_priority(gui_priority_hwnd, true, panel_hwnd, overlay_hwnd);
+                } else if panel_visible && panel_hwnd != 0 && win32::is_window_valid(panel_hwnd) {
+                    win32::normalize_panel_overlay_stack(panel_hwnd, overlay_hwnd);
+                    crate::input::keep_cursor_sprite_on_top();
+                } else {
+                    crate::input::keep_cursor_sprite_on_top();
+                }
+
+                // The selected source is intentionally a TOPMOST capture/input
+                // surface in several windowed/PIP paths, but it must remain
+                // directly below the magnified overlay after any global repair.
+                if !win32::window_is_above(overlay_hwnd, s.hwnd) {
+                    source_place_below(s, overlay_hwnd);
+                }
+            }
+            last_overlay_boundary_check = Instant::now();
         }
         let rect = overlay.current_rect();
         s.placed = true;
@@ -6854,11 +8430,7 @@ fn engine_main(
         // fullscreen = fixed top-centre INSIDE the content so the confined
         // cursor can always reach it) ----
         let content_now = {
-            let (fw, fh) = if s.display_aspect.0 > 0 {
-                s.display_aspect
-            } else {
-                (rect.2, rect.3)
-            };
+            let (fw, fh) = visible_presentation_aspect(s, (rect.2, rect.3));
             crate::input::content_rect(
                 crate::input::Rect {
                     x: rect.0,
@@ -6874,10 +8446,13 @@ fn engine_main(
             (content_now.x, content_now.y, content_now.w, content_now.h);
         let mut panel_no_engage: Option<(i32, i32, i32, i32)> = None;
         if panel_hwnd != 0 && panel_visible {
-            let stale_chip_suppressed =
-                panel_chipped && panel_lurk_restore_geometry_guard_active();
+            let stale_chip_suppressed = panel_chipped && panel_lurk_restore_geometry_guard_active();
             let geometry_chipped = panel_chipped && !stale_chip_suppressed;
-            let (pw, ph) = if geometry_chipped { panel_chip } else { panel_bar };
+            let (pw, ph) = if geometry_chipped {
+                panel_chip
+            } else {
+                panel_bar
+            };
             let (px, py) = panel_target_position(
                 s.mode,
                 rect,
@@ -6898,12 +8473,7 @@ fn engine_main(
                 if gui_priority_topmost {
                     // Modern GUI-topmost path: maintain one deterministic stack
                     // to avoid GUI/panel flashing while either window moves.
-                    enforce_gui_priority(
-                        gui_priority_hwnd,
-                        true,
-                        panel_hwnd,
-                        overlay_hwnd,
-                    );
+                    enforce_gui_priority(gui_priority_hwnd, true, panel_hwnd, overlay_hwnd);
                 } else {
                     // Exact v235 GUI-topmost-OFF panel contract: GUI priority is
                     // completely inactive; only repair the panel if USER32 says
@@ -6924,10 +8494,8 @@ fn engine_main(
             last_source_window_poll = Instant::now();
             let overlay_hwnd = overlay.hwnd().0 as isize;
             let cursor_hwnd = crate::input::cursor_sprite_hwnd();
-            let source_windows = win32::visible_top_level_windows_for_pid(
-                win32::window_pid(s.hwnd),
-                12,
-            );
+            let source_windows =
+                win32::visible_top_level_windows_for_pid(win32::window_pid(s.hwnd), 12);
             if source_windows != last_source_visible_windows {
                 let had_source_popup = last_source_visible_windows.len() > 1;
                 let has_source_popup = source_windows.len() > 1;
@@ -6959,15 +8527,38 @@ fn engine_main(
                 last_source_visible_windows = source_windows;
                 last_helper_compositor_diag = Instant::now();
             } else if last_helper_compositor_diag.elapsed() >= Duration::from_secs(2) {
-                win32::log_helper_compositor_snapshot(
-                    "periodic-running",
-                    gui_priority_hwnd,
-                    panel_hwnd,
-                    overlay_hwnd,
-                    cursor_hwnd,
-                    s.hwnd,
-                );
                 last_helper_compositor_diag = Instant::now();
+                if helper_compositor_diag_inflight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    let inflight = Arc::clone(&helper_compositor_diag_inflight);
+                    let diag_gui = gui_priority_hwnd;
+                    let diag_panel = panel_hwnd;
+                    let diag_overlay = overlay_hwnd;
+                    let diag_cursor = cursor_hwnd;
+                    let diag_source = s.hwnd;
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("neo-compositor-diag".to_string())
+                        .spawn(move || {
+                            win32::log_helper_compositor_snapshot(
+                                "periodic-running",
+                                diag_gui,
+                                diag_panel,
+                                diag_overlay,
+                                diag_cursor,
+                                diag_source,
+                            );
+                            inflight.store(false, Ordering::Release);
+                        })
+                    {
+                        helper_compositor_diag_inflight.store(false, Ordering::Release);
+                        log::debug!(
+                            "helper-compositor-periodic-async: spawn failed error='{}'",
+                            error
+                        );
+                    }
+                }
             }
         }
         // Desktop-DC visibility sampling is deliberately popup-boundary only.
@@ -6981,6 +8572,98 @@ fn engine_main(
         // point sampling and the real handoff could race, pulling the cursor
         // away from a source scrollbar after the virtual pointer had moved.
         let overlay_hwnd = overlay.hwnd().0 as isize;
+        let external_above_overlay =
+            win32::external_window_rects_above_overlay(overlay_hwnd, s.hwnd);
+
+        // Safety fallback for windowed sources: the magnified pointer and the
+        // hidden native source pointer live in different coordinate spaces. If
+        // a real top-level window (Task Manager, another always-on-top app,
+        // etc.) overlaps the source input rectangle, USER32 can legitimately
+        // hand native mouse ownership to that window while Neo still shows the
+        // pointer over magnified content. Rather than synthesize a second mouse
+        // stack here, stop before any ambiguous click/drag can occur.
+        //
+        // Real source-owned fullscreen is explicitly exempt: in that case the
+        // visible and source coordinate spaces coincide and ordinary native
+        // handoff to an always-on-top window is expected to work. The
+        // should_enter_live_fullscreen() probe mirrors the live-fullscreen
+        // transition guard below so a source entering fullscreen cannot be
+        // falsely stopped during the one-tick state transition.
+        let source_occlusion_hazard = if !overlay.is_visible() || external_above_overlay.is_empty()
+        {
+            None
+        } else {
+            let live_monitor_fullscreen = win32::is_monitor_fullscreen(s.hwnd);
+            let source_owned_fullscreen_now = if s.source_live_fullscreen {
+                true
+            } else if live_monitor_fullscreen {
+                let monitor_size = (s.monitor_rect.2, s.monitor_rect.3);
+                let live_presentation_signature = win32::fullscreen_presentation_signature(s.hwnd);
+                let recent_geometry_change = s
+                    .last_geom_change
+                    .is_some_and(|changed| changed.elapsed() < FULLSCREEN_ENTER_GEOMETRY_GRACE);
+                let capture_resize_intent = status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .capture_resolution_resize_intent;
+                should_enter_live_fullscreen(
+                    s.source_monitor_fullscreen,
+                    live_monitor_fullscreen,
+                    s.capture_canvas,
+                    monitor_size,
+                    s.source_presentation_signature,
+                    live_presentation_signature,
+                    capture_resize_intent,
+                    recent_geometry_change,
+                )
+            } else {
+                false
+            };
+
+            if source_owned_fullscreen_now {
+                None
+            } else {
+                let frame_hint = source_input_frame_hint(s);
+                session_source_input_reference_rect(s, frame_hint).and_then(|(src_raw, _, _)| {
+                    let src = crop_source_rect(src_raw, s.capture_crop);
+                    external_above_overlay
+                        .iter()
+                        .find_map(|&(x, y, w, h, hwnd)| {
+                            rect_intersection(src, (x, y, w, h))
+                                .map(|intersection| (s.hwnd, src, hwnd, (x, y, w, h), intersection))
+                        })
+                })
+            }
+        };
+
+        if let Some((source_hwnd, source_rect, blocker_hwnd, blocker_rect, intersection)) =
+            source_occlusion_hazard
+        {
+            log::warn!(
+                "source-occlusion-safety-stop: source={:#x} source_rect={:?} blocker={:#x} blocker_rect={:?} intersection={:?} action=stop-before-input",
+                source_hwnd,
+                source_rect,
+                blocker_hwnd,
+                blocker_rect,
+                intersection
+            );
+            input.release();
+            stop_drag_follower(&mut drag_follower);
+            drag_session_epoch = None;
+            stop_session(&mut session, &mut overlay, &mut gc, &status);
+            {
+                let mut g = status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                g.warning = Some("別のウィンドウがソースを覆ったため、拡大を停止しました。".into());
+                g.source_occlusion_notice_seq = g.source_occlusion_notice_seq.wrapping_add(1);
+                log::info!(
+                    "source-occlusion-notice: seq={} action=queued duration_ms=3000",
+                    g.source_occlusion_notice_seq
+                );
+            }
+            continue;
+        }
 
         let mut phase_input_started = Instant::now();
         let mut phase_input_finished = phase_input_started;
@@ -6989,19 +8672,24 @@ fn engine_main(
         // title-bar removal was OFF, so a full 1900x1072 frame was mapped into
         // a 1896x1011 client rect: title-bar clicks landed in the client area,
         // source-window dragging failed, and edge mapping was vertically skewed.
-        let frame_hint = if s.display_aspect.0 > 0 {
-            s.display_aspect
-        } else {
-            s.in_size
-        };
-        if let Some((src, window_frame_input, input_reference)) =
-            source_input_reference_rect(s.hwnd, s.capture_client_only, frame_hint)
+        let frame_hint = source_input_frame_hint(s);
+        if let Some((src_raw, window_frame_input, input_reference)) =
+            session_source_input_reference_rect(s, frame_hint)
         {
-            let (fw, fh) = if s.display_aspect.0 > 0 {
-                s.display_aspect
-            } else {
-                (src.2, src.3)
-            };
+            // Mouse/drag coordinates target the retained source rectangle, not
+            // the cropped-out edges. Keep raw reference selection unchanged,
+            // then offset its origin by the exact clamped user crop.
+            let src = crop_source_rect(src_raw, s.capture_crop);
+            // Input ownership/mapping must use the exact same presentation
+            // aspect as the renderer. v556 corrected the displayed pixels but
+            // left this path on the uncorrected source aspect. In Fixed mode
+            // that made part of the *visible corrected image* look like
+            // letterbox to the input state machine, so the click-through
+            // overlay could hand focus to the window underneath and the
+            // virtual cursor was mapped with the wrong offset. Keep the source
+            // reference (`frame_hint` above) unmodified; only the visible
+            // content rectangle uses the corrected presentation aspect.
+            let (fw, fh) = visible_presentation_aspect(s, (src.2, src.3));
             let content = crate::input::content_rect(
                 crate::input::Rect {
                     x: rect.0,
@@ -7035,9 +8723,7 @@ fn engine_main(
                     .with_hwnd(panel_hwnd),
                 );
             }
-            for (x, y, w, h, hwnd) in
-                win32::external_window_rects_above_overlay(overlay_hwnd, s.hwnd)
-            {
+            for &(x, y, w, h, hwnd) in &external_above_overlay {
                 no_engage.push(
                     crate::input::NoEngageRect::new(crate::input::Rect { x, y, w, h })
                         .with_hwnd(hwnd),
@@ -7047,6 +8733,8 @@ fn engine_main(
             let capture_geometry_ready = s.pending_resize_size.is_none()
                 && !(s.capture_resolution_applied && s.deferred_capture_resolution.is_some());
             let input_geometry_ready = capture_geometry_ready
+                && !s.aspect_transition_pending
+                && !s.crop_transition_pending
                 && s.input_reenable_after
                     .is_none_or(|deadline| Instant::now() >= deadline);
             if input_geometry_ready {
@@ -7439,13 +9127,14 @@ fn engine_main(
         };
         if took_frame && s.capture_canvas_suspended_for_fullscreen {
             let monitor_size = (s.monitor_rect.2, s.monitor_rect.3);
-            let frame_is_fullscreen =
-                (s.frame.w - monitor_size.0).abs() <= 2 && (s.frame.h - monitor_size.1).abs() <= 2;
+            let capture_size = s.frame.capture_size();
+            let frame_is_fullscreen = (capture_size.0 - monitor_size.0).abs() <= 2
+                && (capture_size.1 - monitor_size.1).abs() <= 2;
             if !frame_is_fullscreen {
                 log::debug!(
                     "fullscreen-transition frame ignored: observed={}x{} monitor={}x{} reason=await-native-wgc-fullscreen",
-                    s.frame.w,
-                    s.frame.h,
+                    capture_size.0,
+                    capture_size.1,
                     monitor_size.0,
                     monitor_size.1
                 );
@@ -7466,12 +9155,13 @@ fn engine_main(
             && !s.capture_resolution_reapply_pending
             && let Some(target) = s.capture_canvas
             && should_apply_capture_canvas(
-                (s.frame.w, s.frame.h),
+                s.frame.capture_size(),
                 target,
                 s.deferred_capture_resolution.is_some(),
             )
         {
-            fit_frame_canvas_dot_by_dot(&mut s.frame, target);
+            let processed_target = capture_crop_output_size(target, s.capture_crop);
+            fit_frame_canvas_dot_by_dot(&mut s.frame, processed_target);
         }
         // Apply the user FPS cap before the optional highlight-protection pass.
         // This prevents rejected frames from paying even the lightweight byte
@@ -7479,12 +9169,11 @@ fn engine_main(
         // explicit capture-size changes, and live source resizes cannot stall
         // on a static image that emits only one repaint.
         let cap_geometry_transition = took_frame
-            && (s.in_size == (0, 0)
-                || (s.frame.w, s.frame.h) != s.in_size
+            && (s.capture_in_size == (0, 0)
+                || s.crop_transition_pending
+                || s.frame.capture_size() != s.capture_in_size
                 || s.pending_resize_size.is_some()
-                || s.deferred_capture_resolution.is_some_and(|(_, applied)| {
-                    (s.frame.w, s.frame.h) != (applied.0 as i32, applied.1 as i32)
-                }));
+                || s.deferred_capture_resolution.is_some());
         // FPS cap uses target-rate decimation (for example, 20 on a 60fps
         // source must pin capture/present to a steady 20fps; 45 → 45fps).
         // The old WGC MinimumUpdateInterval gate beats against the source's
@@ -7615,6 +9304,11 @@ fn engine_main(
             chain_reprocess_forced = true;
             log::info!("chain-apply: reprocessing cached static source frame");
         }
+        if took_frame && s.crop_transition_pending {
+            // Crop revisions can reuse the same underlying WGC sequence. They
+            // are semantic image changes and must bypass duplicate suppression.
+            chain_reprocess_forced = true;
+        }
         if took_frame && !cap_skip && s.capture_hdr {
             let current_seq = s.frame.seq;
             if s.hdr_highlight_protected_seq != Some(current_seq) {
@@ -7666,6 +9360,286 @@ fn engine_main(
                 }
             }
         }
+        // v611 shadow validation: only an explicit GPU selection is eligible.
+        // Auto never initializes Vulkan and continues through the exact legacy
+        // OpenGL path. The render thread copies only 256 bytes; all Vulkan
+        // creation/compile/submit/readback work happens on a detached diagnostic
+        // thread and its result is never used for presentation.
+        if took_frame
+            && !cap_skip
+            && !s.vulkan_capture_probe_started
+            && vulkan_gpu::capture_probe_requested()
+        {
+            match s.glsl_backend_route {
+                GlslBackendRoute::LegacyOpenGl => {
+                    // start_session already recorded the Auto skip. Mark this
+                    // session complete so no per-frame work is repeated.
+                    s.vulkan_capture_probe_started = true;
+                }
+                GlslBackendRoute::VulkanSelected { luid } => {
+                    if let Some((sample, sample_x, sample_y)) =
+                        vulkan_capture_sample_rgba8(&s.frame)
+                    {
+                        s.vulkan_capture_probe_started = true;
+                        let source_w = s.frame.w;
+                        let source_h = s.frame.h;
+                        let source_seq = s.frame.seq;
+                        log::info!(
+                            "vulkan-capture-probe: phase=queued requested_luid={luid:016x} source={}x{} seq={} sample=8x8@{},{} thread=background production_glsl=OpenGL-unchanged",
+                            source_w,
+                            source_h,
+                            source_seq,
+                            sample_x,
+                            sample_y
+                        );
+                        let spawn_result = std::thread::Builder::new()
+                            .name("neo-vulkan-capture-probe".to_string())
+                            .spawn(move || {
+                                let line = match vulkan_gpu::probe_capture_sample_selected_luid(luid, &sample) {
+                                    Ok(result) => format!(
+                                        "vulkan-capture-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' source={}x{} seq={} sample=8x8@{},{} format=R8G8B8A8_UNORM transform=bgra-swap verified={}/64 input_checksum={:016x} output_checksum={:016x} expected_checksum={:016x} thread=background path=shadow-only production_glsl=OpenGL-unchanged",
+                                        luid,
+                                        result.image.gpu.luid,
+                                        result.image.gpu.name,
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        sample_x,
+                                        sample_y,
+                                        result.image.verified_pixels,
+                                        result.input_checksum,
+                                        result.image.checksum,
+                                        result.image.expected_checksum,
+                                    ),
+                                    Err(error) => format!(
+                                        "vulkan-capture-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} sample=8x8@{},{} error={error:#} fallback=OpenGL-unchanged",
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        sample_x,
+                                        sample_y,
+                                    ),
+                                };
+                                if line.contains("result=ready") {
+                                    log::info!("{line}");
+                                } else {
+                                    log::warn!("{line}");
+                                }
+                                vulkan_gpu::record_probe_result(&line);
+                            });
+                        if let Err(error) = spawn_result {
+                            let line = format!(
+                                "vulkan-capture-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} error=thread-spawn-failed:{error} fallback=OpenGL-unchanged",
+                                source_w, source_h, source_seq
+                            );
+                            log::warn!("{line}");
+                            vulkan_gpu::record_probe_result(&line);
+                        }
+                    } else if !s.frame.data.is_empty() {
+                        s.vulkan_capture_probe_started = true;
+                        let line = format!(
+                            "vulkan-capture-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
+                            s.frame.w,
+                            s.frame.h,
+                            s.frame.seq,
+                            s.frame.hdr,
+                            s.frame.data.len()
+                        );
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(&line);
+                    }
+                }
+            }
+        }
+        // v612 larger real-frame tile validation. This remains shadow-only:
+        // a one-shot 64x64 (16 KiB) CPU copy is made on the render thread,
+        // while Vulkan device creation, GLSL->SPIR-V compilation, execution,
+        // readback and exact CPU-reference verification run in a background
+        // thread. The production OpenGL context is never touched.
+        if took_frame
+            && !cap_skip
+            && !s.vulkan_frame_probe_started
+            && vulkan_gpu::frame_probe_requested()
+        {
+            match s.glsl_backend_route {
+                GlslBackendRoute::LegacyOpenGl => {
+                    s.vulkan_frame_probe_started = true;
+                }
+                GlslBackendRoute::VulkanSelected { luid } => {
+                    if let Some((tile, tile_x, tile_y)) = vulkan_capture_tile_rgba8(&s.frame) {
+                        s.vulkan_frame_probe_started = true;
+                        let source_w = s.frame.w;
+                        let source_h = s.frame.h;
+                        let source_seq = s.frame.seq;
+                        log::info!(
+                            "vulkan-frame-probe: phase=queued requested_luid={luid:016x} source={}x{} seq={} tile=64x64@{},{} copied_bytes={} thread=background reference=cpu-exact production_glsl=OpenGL-unchanged",
+                            source_w,
+                            source_h,
+                            source_seq,
+                            tile_x,
+                            tile_y,
+                            tile.len()
+                        );
+                        let spawn_result = std::thread::Builder::new()
+                            .name("neo-vulkan-frame-probe".to_string())
+                            .spawn(move || {
+                                let line = match vulkan_gpu::probe_capture_tile_selected_luid(luid, &tile) {
+                                    Ok(result) => format!(
+                                        "vulkan-frame-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' source={}x{} seq={} tile=64x64@{},{} format=R8G8B8A8_UNORM transform=bgra-swap verified={}/4096 input_checksum={:016x} output_checksum={:016x} expected_checksum={:016x} reference=cpu-exact thread=background path=shadow-only production_glsl=OpenGL-unchanged",
+                                        luid,
+                                        result.image.gpu.luid,
+                                        result.image.gpu.name,
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        tile_x,
+                                        tile_y,
+                                        result.image.verified_pixels,
+                                        result.input_checksum,
+                                        result.image.checksum,
+                                        result.image.expected_checksum,
+                                    ),
+                                    Err(error) => format!(
+                                        "vulkan-frame-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} tile=64x64@{},{} error={error:#} fallback=OpenGL-unchanged",
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        tile_x,
+                                        tile_y,
+                                    ),
+                                };
+                                if line.contains("result=ready") {
+                                    log::info!("{line}");
+                                } else {
+                                    log::warn!("{line}");
+                                }
+                                vulkan_gpu::record_probe_result(&line);
+                            });
+                        if let Err(error) = spawn_result {
+                            let line = format!(
+                                "vulkan-frame-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} error=thread-spawn-failed:{error} fallback=OpenGL-unchanged",
+                                source_w, source_h, source_seq
+                            );
+                            log::warn!("{line}");
+                            vulkan_gpu::record_probe_result(&line);
+                        }
+                    } else if !s.frame.data.is_empty() {
+                        s.vulkan_frame_probe_started = true;
+                        let line = format!(
+                            "vulkan-frame-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
+                            s.frame.w,
+                            s.frame.h,
+                            s.frame.seq,
+                            s.frame.hdr,
+                            s.frame.data.len()
+                        );
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(&line);
+                    }
+                }
+            }
+        }
+        // v613: exercise an actual Neo .glsl file through the reusable one-pass
+        // Vulkan wrapper, but remain completely shadow-only. The production
+        // OpenGL chain is not read back, modified, or replaced. Auto cannot
+        // reach this block because it carries no explicit LUID.
+        if took_frame
+            && !cap_skip
+            && !s.vulkan_user_glsl_probe_started
+            && vulkan_gpu::user_glsl_probe_requested()
+        {
+            match s.glsl_backend_route {
+                GlslBackendRoute::LegacyOpenGl => {
+                    s.vulkan_user_glsl_probe_started = true;
+                }
+                GlslBackendRoute::VulkanSelected { luid } => {
+                    if let Some((tile, tile_x, tile_y)) = vulkan_capture_tile_rgba8(&s.frame) {
+                        s.vulkan_user_glsl_probe_started = true;
+                        let source_w = s.frame.w;
+                        let source_h = s.frame.h;
+                        let source_seq = s.frame.seq;
+                        log::info!(
+                            "vulkan-user-glsl-probe: phase=queued requested_luid={luid:016x} source={}x{} seq={} tile=64x64@{},{} shader=deint_swa.glsl parser=neo-mpv thread=background production_glsl=OpenGL-unchanged",
+                            source_w,
+                            source_h,
+                            source_seq,
+                            tile_x,
+                            tile_y,
+                        );
+                        let spawn_result = std::thread::Builder::new()
+                            .name("neo-vulkan-user-glsl-probe".to_string())
+                            .spawn(move || {
+                                let shader_path = std::env::current_exe()
+                                    .ok()
+                                    .and_then(|p| p.parent().map(|parent| parent.to_path_buf()))
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                    .join("shaders")
+                                    .join("Deinterlace")
+                                    .join("deint_swa.glsl");
+                                let line = match vulkan_gpu::probe_real_user_glsl_selected_luid(
+                                    luid,
+                                    &tile,
+                                    &shader_path,
+                                ) {
+                                    Ok(result) => format!(
+                                        "vulkan-user-glsl-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' source={}x{} seq={} tile=64x64@{},{} shader='{}' pass='{}' parser=neo-mpv compiler=naga glsl=450 spirv_words={} verified={}/4096 tolerance={} input_checksum={:016x} output_checksum={:016x} expected_checksum={:016x} thread=background path=shadow-only production_glsl=OpenGL-unchanged",
+                                        luid,
+                                        result.image.gpu.luid,
+                                        result.image.gpu.name,
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        tile_x,
+                                        tile_y,
+                                        result.shader_name,
+                                        result.pass_desc,
+                                        result.image.spirv_words,
+                                        result.image.verified_pixels,
+                                        result.tolerance,
+                                        result.input_checksum,
+                                        result.image.checksum,
+                                        result.image.expected_checksum,
+                                    ),
+                                    Err(error) => format!(
+                                        "vulkan-user-glsl-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} tile=64x64@{},{} shader=deint_swa.glsl error={error:#} fallback=OpenGL-unchanged",
+                                        source_w,
+                                        source_h,
+                                        source_seq,
+                                        tile_x,
+                                        tile_y,
+                                    ),
+                                };
+                                if line.contains("result=ready") {
+                                    log::info!("{line}");
+                                } else {
+                                    log::warn!("{line}");
+                                }
+                                vulkan_gpu::record_probe_result(&line);
+                            });
+                        if let Err(error) = spawn_result {
+                            let line = format!(
+                                "vulkan-user-glsl-probe: result=unavailable requested_luid={luid:016x} source={}x{} seq={} error=thread-spawn-failed:{error} fallback=OpenGL-unchanged",
+                                source_w, source_h, source_seq
+                            );
+                            log::warn!("{line}");
+                            vulkan_gpu::record_probe_result(&line);
+                        }
+                    } else if !s.frame.data.is_empty() {
+                        s.vulkan_user_glsl_probe_started = true;
+                        let line = format!(
+                            "vulkan-user-glsl-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
+                            s.frame.w,
+                            s.frame.h,
+                            s.frame.seq,
+                            s.frame.hdr,
+                            s.frame.data.len()
+                        );
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(&line);
+                    }
+                }
+            }
+        }
         let phase_capture_finished = Instant::now();
         if took_frame {
             s.duplicate_lookahead_wait = None;
@@ -7704,6 +9678,7 @@ fn engine_main(
         };
         if !took_frame
             && s.capture_resolution_applied
+            && !s.source.uses_display_region_fallback()
             && s.capture_resolution_wait_started.is_some()
             && s.capture_resolution_repaint_last
                 .is_none_or(|last| last.elapsed() >= Duration::from_millis(120))
@@ -7712,11 +9687,12 @@ fn engine_main(
             // dimensions. Its browser viewport is still the old one, so
             // Anime4K makes that temporary mismatch especially visible as a
             // slight zoom until mouse motion causes Chromium to repaint.
-            win32::request_window_repaint(s.hwnd);
+            source_request_window_repaint(s);
             s.capture_resolution_repaint_last = Some(Instant::now());
         }
         if !took_frame
             && s.capture_resolution_applied
+            && !s.source.uses_display_region_fallback()
             && !s.capture_resolution_nudge_done
             && s.capture_resolution_wait_started
                 .is_some_and(|started| started.elapsed() >= Duration::from_millis(240))
@@ -7728,9 +9704,9 @@ fn engine_main(
             // This changes window geometry only; captured pixels are never
             // resampled by cHiDeScaler-Neo.
             let nudge = (applied.0.saturating_sub(2), applied.1.saturating_sub(2));
-            let nudged = win32::resize_client_area(s.hwnd, nudge.0, nudge.1);
-            let restored = win32::resize_client_area(s.hwnd, applied.0, applied.1);
-            win32::request_window_repaint(s.hwnd);
+            let nudged = source_resize_client_area(s, nudge.0, nudge.1);
+            let restored = source_resize_client_area(s, applied.0, applied.1);
+            source_request_window_repaint(s);
             s.capture_resolution_nudge_done = true;
             s.capture_resolution_repaint_last = Some(Instant::now());
             log::info!(
@@ -7743,6 +9719,39 @@ fn engine_main(
                 restored
             );
         }
+        // The monitor/display-region fallback captures the application's real
+        // presentation child, not the selected root HWND. A requested root
+        // client size such as 1440x810 can legitimately yield (for example)
+        // an 1151x458 presentation child and a 1152x458 even-padded WGC frame.
+        // Waiting for 1440x810 here deadlocks the transition and leaves the
+        // previous magnified frame frozen forever. Coalesce the child's relayout
+        // and make its final stable real WGC geometry the one transition target.
+        if got_new
+            && took_frame
+            && s.capture_resolution_applied
+            && s.deferred_capture_resolution.is_some()
+            && s.source.uses_display_region_fallback()
+        {
+            let observed = s.frame.capture_size();
+            match update_display_region_capture_resolution_candidate(s, observed) {
+                Some(stable_target) => {
+                    s.pending_resize_size = Some(stable_target);
+                    s.onnx_geometry_deferred_logged = false;
+                    log::info!(
+                        "capture-resolution display-region target settled: requested_root={:?} capture={}x{} action=commit-real-presentation-geometry",
+                        s.deferred_capture_resolution
+                            .map(|(requested, _)| requested),
+                        stable_target.0,
+                        stable_target.1
+                    );
+                }
+                None => {
+                    overlay.win.pump_messages();
+                    continue;
+                }
+            }
+        }
+
         // A requested capture canvas is authoritative for ONNX. Never let a
         // transient native-size frame become the first DirectML run or a
         // TensorRT shape-build request: both providers keep shape-dependent
@@ -7750,10 +9759,11 @@ fn engine_main(
         if got_new
             && took_frame
             && s.chain.has_onnx()
+            && !s.source.uses_display_region_fallback()
             && let Some((requested, applied)) = s.deferred_capture_resolution
         {
-            let observed = (s.frame.w, s.frame.h);
-            let target = (applied.0 as i32, applied.1 as i32);
+            let observed = s.frame.capture_size();
+            let target = capture_resolution_frame_target(applied);
             if observed != target {
                 if !s.onnx_geometry_deferred_logged {
                     log::info!(
@@ -7769,10 +9779,11 @@ fn engine_main(
                 }
                 if !s.capture_resolution_applied {
                     let hidden = if s.hide_source_pending {
-                        if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
+                        if let Some(was_layered) = source_hide_window_visual(s) {
                             s.hide_source_pending = false;
                             s.hid_source = Some(was_layered);
-                            status.lock().unwrap().hidden_src = Some((s.hwnd, was_layered));
+                            status.lock().unwrap().hidden_src =
+                                Some((s.hwnd, s.source_pid, was_layered));
                             true
                         } else {
                             false
@@ -7780,13 +9791,13 @@ fn engine_main(
                     } else {
                         true
                     };
-                    if hidden && win32::resize_client_area(s.hwnd, applied.0, applied.1) {
+                    if hidden && source_resize_client_area(s, applied.0, applied.1) {
                         s.capture_resolution_applied = true;
                         s.capture_resolution_wait_started = Some(Instant::now());
                         s.capture_resolution_repaint_last = None;
                         s.capture_resolution_nudge_done = false;
                         s.capture_resolution_native_fallback = false;
-                        win32::request_window_repaint(s.hwnd);
+                        source_request_window_repaint(s);
                         log::info!(
                             "capture-resolution applied before first ONNX inference: hwnd={:#x} client={}x{}",
                             s.hwnd,
@@ -7801,9 +9812,12 @@ fn engine_main(
             s.onnx_geometry_deferred_logged = false;
         } else if s.deferred_capture_resolution.is_none() {
             s.onnx_geometry_deferred_logged = false;
+            s.capture_resolution_region_candidate = None;
+            s.capture_resolution_region_candidate_since = None;
         }
         if !took_frame
             && s.capture_resolution_applied
+            && !s.source.uses_display_region_fallback()
             && !s.capture_resolution_native_fallback
             && !s.chain.has_onnx()
             && s.capture_resolution_wait_started
@@ -7829,106 +9843,181 @@ fn engine_main(
         // window shape, visibly swapping the 4:3/16:9 aspect during transition.
         let mut resize_committed = false;
         if got_new && took_frame {
+            let new_capture_size = s.frame.capture_size();
             let new_in_size = (s.frame.w, s.frame.h);
+            let capture_resize_intent = status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capture_resolution_resize_intent;
+            if s.pending_resize_size.is_none()
+                && capture_resize_intent.is_some()
+                && s.capture_in_size != (0, 0)
+                && new_capture_size != s.capture_in_size
+            {
+                // The GUI publishes this intent before ResizeClientArea and then
+                // queues SetCaptureGeometry. WGC can win that race by one frame.
+                // Do not rebuild a shape-specialized provider from that pre-commit
+                // frame; the geometry command carries the final Crop and will arm
+                // one exact target shape transaction. This is especially important
+                // for TensorRT where a mistaken intermediate shape costs seconds.
+                log::debug!(
+                    "capture-geometry precommand-frame deferred: observed={}x{} current={}x{} intent={:?} action=wait-for-transaction",
+                    new_capture_size.0,
+                    new_capture_size.1,
+                    s.capture_in_size.0,
+                    s.capture_in_size.1,
+                    capture_resize_intent
+                );
+                overlay.win.pump_messages();
+                continue;
+            }
             match s.pending_resize_size {
-                Some(pending) if new_in_size == pending => {
+                Some(pending) if new_capture_size == pending => {
+                    s.capture_in_size = new_capture_size;
                     s.in_size = new_in_size;
                     s.pending_resize_size = None;
+                    s.capture_resolution_region_candidate = None;
+                    s.capture_resolution_region_candidate_since = None;
                     resize_committed = true;
-                    // Once WGC confirms the new geometry twice, it is the
-                    // authoritative content aspect even when the session began
-                    // with an explicit capture canvas. Keeping the old canvas
-                    // here produced the zoom/crop-looking output after a live
-                    // 1280x720 -> 960x540 (or 16:9 -> 4:3) change.
-                    s.display_aspect = new_in_size;
+                    // WGC confirms raw source geometry. Ordinary window
+                    // capture keeps the established processing-size basis;
+                    // monitor-region fallback keeps presentation on the exact
+                    // retained real pixels before synthetic even-size padding.
+                    let next_display_aspect = committed_display_aspect(s, new_in_size);
+                    s.display_aspect = next_display_aspect;
                     if s.capture_canvas.is_some()
                         && !s.capture_canvas_suspended_for_fullscreen
                         && !s.capture_resolution_reapply_pending
                     {
-                        s.capture_canvas = Some(new_in_size);
+                        s.capture_canvas = Some(new_capture_size);
                     }
                     s.last_geom_change = None;
                     s.starve_released = false;
                     if s.deferred_capture_resolution.is_none() {
-                        // Never overwrite the session-origin restore snapshot.
-                        // A GUI SetWindowPos can reach Chromium/WGC before the
-                        // matching SetCaptureGeometry command reaches this
-                        // render loop. In that race the automatic resize path
-                        // used to "adopt" the newly requested capture size as
-                        // the restore target, so Stop first restored the true
-                        // origin via Status::source_recovery and cleanup then
-                        // resized it again to the most recent capture size.
-                        // Processing/display geometry may follow the new WGC
-                        // shape, but Stop always returns to the pre-capture
-                        // position, size and maximized state.
                         log::info!(
-                            "source geometry transition observed without changing session restore origin: hwnd={:#x} live_rect={:?} origin_rect={:?} origin_maximized={} display_aspect={}x{}",
+                            "source geometry transition observed without changing session restore origin: hwnd={:#x} live_rect={:?} origin_rect={:?} origin_maximized={} capture={}x{} processing={}x{} display_aspect={}x{}",
                             s.hwnd,
                             win32::window_rect(s.hwnd),
                             s.source_restore_rect,
                             s.source_was_maximized,
+                            new_capture_size.0,
+                            new_capture_size.1,
+                            new_in_size.0,
+                            new_in_size.1,
                             s.display_aspect.0,
                             s.display_aspect.1
                         );
                     }
                     log::info!(
-                        "source frame size stable after resize: {}x{}; aspect/display commit armed with filter chain preserved",
+                        "source frame size stable after resize: capture={}x{} processing={}x{}; aspect/display commit armed with filter chain preserved",
+                        new_capture_size.0,
+                        new_capture_size.1,
                         new_in_size.0,
                         new_in_size.1
                     );
                 }
-                Some(pending) if s.capture_resolution_applied && new_in_size != pending => {
-                    // Chromium/DWM may emit old-size or intermediate-size
-                    // frames after SetWindowPos succeeds. They are not a new
-                    // authoritative geometry. Keep the transition shield and
-                    // wait for the exact requested WGC frame instead of
-                    // rebuilding ONNX for a transient shape or revealing it.
+                Some(pending) if s.capture_resolution_applied && new_capture_size != pending => {
+                    // Compare capture-resolution transitions against raw WGC
+                    // geometry so a user crop can never masquerade as a source resize.
                     log::debug!(
-                        "capture-resolution transitional frame ignored: observed={}x{} current={}x{} target={}x{}",
-                        new_in_size.0,
-                        new_in_size.1,
-                        s.in_size.0,
-                        s.in_size.1,
+                        "capture-resolution transitional frame ignored: observed={}x{} current={}x{} target={}x{} processing={}x{}",
+                        new_capture_size.0,
+                        new_capture_size.1,
+                        s.capture_in_size.0,
+                        s.capture_in_size.1,
                         pending.0,
-                        pending.1
+                        pending.1,
+                        new_in_size.0,
+                        new_in_size.1
                     );
                     overlay.win.pump_messages();
                     continue;
                 }
-                Some(_) if new_in_size == s.in_size => {
+                Some(_) if new_capture_size == s.capture_in_size => {
                     s.pending_resize_size = None;
+                    if new_in_size != s.in_size {
+                        let old_size = s.in_size;
+                        reset_for_source_resize(&mut gc, s, &metrics, old_size, new_in_size, None);
+                        s.in_size = new_in_size;
+                        let next_display_aspect = committed_display_aspect(s, new_in_size);
+                        s.display_aspect = next_display_aspect;
+                    }
                     resize_committed = true;
                     log::info!(
-                        "source resize transition reverted to {}x{}; rebuilding filters without changing display aspect",
+                        "source resize transition reverted to capture={}x{} processing={}x{}; rebuilding filters without changing raw source geometry",
+                        new_capture_size.0,
+                        new_capture_size.1,
                         new_in_size.0,
                         new_in_size.1
                     );
                 }
-                Some(_) | None if s.in_size != (0, 0) && new_in_size != s.in_size => {
+                // A crop edit keeps raw WGC geometry unchanged. It may change
+                // the filter shape, or only shift which pixels are retained.
+                // Rebuild shape-dependent state only when dimensions changed.
+                Some(_) | None
+                    if s.capture_in_size != (0, 0)
+                        && new_capture_size == s.capture_in_size
+                        && (new_in_size != s.in_size || s.crop_transition_pending) =>
+                {
+                    let shape_changed = new_in_size != s.in_size;
+                    if shape_changed {
+                        let old_size = s.in_size;
+                        reset_for_source_resize(&mut gc, s, &metrics, old_size, new_in_size, None);
+                        s.in_size = new_in_size;
+                    }
+                    let next_display_aspect = committed_display_aspect(s, new_in_size);
+                    s.display_aspect = next_display_aspect;
+                    resize_committed = true;
+                    log::info!(
+                        "crop frame committed: capture={}x{} processing={}x{} display={}x{} edges=({}, {}, {}, {}) shape_changed={}",
+                        new_capture_size.0,
+                        new_capture_size.1,
+                        new_in_size.0,
+                        new_in_size.1,
+                        s.display_aspect.0,
+                        s.display_aspect.1,
+                        s.capture_crop.left,
+                        s.capture_crop.top,
+                        s.capture_crop.right,
+                        s.capture_crop.bottom,
+                        shape_changed
+                    );
+                }
+                Some(_) | None
+                    if s.capture_in_size != (0, 0) && new_capture_size != s.capture_in_size =>
+                {
                     let old_size = s.in_size;
-                    reset_for_source_resize(&mut gc, s, &metrics, old_size, new_in_size);
+                    reset_for_source_resize(
+                        &mut gc,
+                        s,
+                        &metrics,
+                        old_size,
+                        new_in_size,
+                        Some(new_capture_size),
+                    );
                     let now = Instant::now();
                     s.last_geom_change = Some(now);
                     s.last_arrival = now;
                     s.starve_released = false;
-                    let expected_capture_frame = s.capture_resolution_applied
+                    let expected_capture_frame = !s.source.uses_display_region_fallback()
+                        && s.capture_resolution_applied
                         && s.deferred_capture_resolution.is_some_and(|(_, applied)| {
-                            new_in_size == (applied.0 as i32, applied.1 as i32)
+                            new_capture_size == capture_resolution_frame_target(applied)
                         });
                     if expected_capture_frame {
-                        // A user-requested resize is deterministic. The first
-                        // exact target-size WGC frame is already the correct
-                        // static image; requiring a duplicate frame deadlocks
-                        // until mouse activity makes the source repaint.
+                        s.capture_in_size = new_capture_size;
                         s.in_size = new_in_size;
-                        s.display_aspect = new_in_size;
+                        let next_display_aspect = committed_display_aspect(s, new_in_size);
+                        s.display_aspect = next_display_aspect;
                         if s.capture_canvas.is_some() {
-                            s.capture_canvas = Some(new_in_size);
+                            s.capture_canvas = Some(new_capture_size);
                         }
                         s.pending_resize_size = None;
                         resize_committed = true;
                         log::info!(
-                            "capture-resolution first exact frame accepted: {}x{}; filtering behind the transition shield",
+                            "capture-resolution first exact frame accepted: capture={}x{} processing={}x{}; filtering behind the transition shield",
+                            new_capture_size.0,
+                            new_capture_size.1,
                             new_in_size.0,
                             new_in_size.1
                         );
@@ -7938,25 +10027,27 @@ fn engine_main(
                     }
                 }
                 _ => {
-                    // The Win32 client rect is only a startup estimate. Chrome
-                    // commonly reports a rect including compositor margins
-                    // (for example 1059x689) while WGC's exact client pixels
-                    // are 1044x682. Keeping the estimate made a filter-free
-                    // 1.0x session resample every frame and visibly blur it.
-                    // Commit the first real WGC geometry immediately. An
-                    // explicit capture canvas remains authoritative because
-                    // the source was resized to that size before capture.
-                    if s.in_size == (0, 0) {
+                    // Commit the first real WGC geometry immediately. Keep raw
+                    // source geometry separate from cropped processing geometry.
+                    if s.capture_in_size == (0, 0) {
+                        s.capture_in_size = new_capture_size;
                         s.in_size = new_in_size;
-                        s.display_aspect = initial_display_aspect(s.capture_canvas, new_in_size);
+                        s.display_aspect = if let Some(raw) = s.capture_canvas {
+                            capture_crop_output_size(raw, s.capture_crop)
+                        } else {
+                            committed_display_aspect(s, new_in_size)
+                        };
                         resize_committed = true;
                         log::info!(
-                            "initial WGC geometry committed: frame={}x{} display={}x{} capture_canvas={:?} pixel_exact={}",
+                            "initial WGC geometry committed: capture={}x{} processing={}x{} display={}x{} capture_canvas={:?} crop={} pixel_exact={}",
+                            new_capture_size.0,
+                            new_capture_size.1,
                             new_in_size.0,
                             new_in_size.1,
                             s.display_aspect.0,
                             s.display_aspect.1,
                             s.capture_canvas,
+                            s.capture_crop.enabled,
                             new_in_size == s.display_aspect
                         );
                     }
@@ -8358,12 +10449,10 @@ fn engine_main(
                             }
                             tex
                         }
-                        Ok(None) | Err(_) => {
-                            upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms)
-                        }
+                        Ok(None) | Err(_) => upload_session_frame_timed(&mut gc, s),
                     }
                 } else {
-                    upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms)
+                    upload_session_frame_timed(&mut gc, s)
                 };
                 let requested_factor = interp_factor.max(2);
                 let pair_period_s = normalized_frame_span_s(
@@ -8630,7 +10719,7 @@ fn engine_main(
                 let post_chain_start = (interp_index + 1).min(s.chain.stage_count());
                 let gpu_capable = !s.frame.hdr && ist.lock().unwrap().supports_interp_gpu();
                 if gpu_capable {
-                    let input = upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms);
+                    let input = upload_session_frame_timed(&mut gc, s);
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
                         metrics.probe(
                             name,
@@ -8809,18 +10898,14 @@ fn engine_main(
                         .period_s()
                         .or_else(|| (s.arrival_interval > 0.0).then_some(s.arrival_interval))
                         .unwrap_or(1.0 / 30.0);
-                    let output_ratio = onnx_output_ratio(
+                    let output_ratio =
+                        onnx_output_ratio(factor, Some(source_period), s.monitor_refresh_hz);
+                    let phases = onnx_interpolation_phases(
                         factor,
-                        Some(source_period),
-                        s.monitor_refresh_hz,
+                        output_ratio,
+                        onnx_x3_60hz_mode(s.monitor_refresh_hz),
+                        &mut s.flow_output_cadence,
                     );
-                    let phases =
-                        onnx_interpolation_phases(
-                            factor,
-                            output_ratio,
-                            onnx_x3_60hz_mode(s.monitor_refresh_hz),
-                            &mut s.flow_output_cadence,
-                        );
                     let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
                     let timesteps = phases
                         .into_iter()
@@ -9036,7 +11121,7 @@ fn engine_main(
                 let (mut interp_w, mut interp_h, mut cur_data) = if s.frame.hdr {
                     (s.frame.w, s.frame.h, Vec::new())
                 } else if interp_index > 0 {
-                    let input = upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms);
+                    let input = upload_session_frame_timed(&mut gc, s);
                     let m = metrics.clone();
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
                         m.probe(
@@ -9113,11 +11198,7 @@ fn engine_main(
                         // alternates between full-size and capped frames.
                         if rgba_direct {
                             if let Some(limited) = resize_rgba8_bilinear(
-                                &cur_data,
-                                interp_w,
-                                interp_h,
-                                limited_w,
-                                limited_h,
+                                &cur_data, interp_w, interp_h, limited_w, limited_h,
                             ) {
                                 let source_size = (interp_w, interp_h);
                                 interp_w = limited_w;
@@ -9315,11 +11396,8 @@ fn engine_main(
                             s.cadence.period_s().or(pair_dt).or_else(|| {
                                 (s.arrival_interval > 0.0).then_some(s.arrival_interval)
                             });
-                        let output_ratio = onnx_output_ratio(
-                            factor,
-                            source_period_s,
-                            s.monitor_refresh_hz,
-                        );
+                        let output_ratio =
+                            onnx_output_ratio(factor, source_period_s, s.monitor_refresh_hz);
                         let phases = onnx_interpolation_phases(
                             factor,
                             output_ratio,
@@ -9348,6 +11426,11 @@ fn engine_main(
                             frames,
                             ts: ts.clone(),
                             rgba: rgba_direct,
+                            prefer_dml_vulkan_shared: rgba_direct
+                                && s.chain.can_process_range_from_dml_shared(
+                                    post_chain_start,
+                                    s.chain.stage_count(),
+                                ),
                         };
                         let submitted = s
                             .interp_worker
@@ -9740,14 +11823,49 @@ fn engine_main(
                 );
                 s.phase_diag_samples += 1;
             }
+            // v652: before ordinary DirectML tries to import its output into
+            // presentation OpenGL, prefer a same-selected-GPU D3D12 -> Vulkan
+            // handoff when the rest of the chain is compatible GLSL. This is
+            // specifically the explicit cross-GPU case (for example AMD
+            // compute with NVIDIA presentation) where the GL import must fail
+            // on LUID mismatch even though DirectML and Vulkan are co-located.
             let direct_onnx = if s.frame.hdr {
                 Ok(None)
             } else {
-                s.chain
-                    .process_first_onnx_rgba8(&mut gc, s.frame.w, s.frame.h, &s.frame.data)
+                let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
+                    metrics.probe(
+                        name,
+                        if kind == StageKind::Glsl {
+                            "glsl"
+                        } else {
+                            "onnx"
+                        },
+                        ms,
+                    );
+                };
+                match s.chain.process_first_onnx_vulkan_resident_rgba8(
+                    &mut gc,
+                    s.frame.w,
+                    s.frame.h,
+                    &s.frame.data,
+                    out_size,
+                    if stats {
+                        Some(&mut resident_probe as &mut dyn FnMut(&str, StageKind, f64))
+                    } else {
+                        None
+                    },
+                ) {
+                    Ok(Some((input, name, ms))) => {
+                        Ok(Some((input, name, ms, s.chain.stage_count())))
+                    }
+                    Ok(None) | Err(_) => s
+                        .chain
+                        .process_first_onnx_rgba8(&mut gc, s.frame.w, s.frame.h, &s.frame.data)
+                        .map(|output| output.map(|(input, name, ms)| (input, name, ms, 1usize))),
+                }
             };
             match direct_onnx {
-                Ok(Some((input, name, ms))) => {
+                Ok(Some((input, name, ms, chain_start_index))) => {
                     if stats {
                         metrics.probe(&name, "onnx", ms);
                     }
@@ -9765,26 +11883,256 @@ fn engine_main(
                         Some(FrameTiming::from_frame(&s.frame, real_t0)),
                         &[],
                         downscaler,
-                        1,
+                        chain_start_index,
                     );
                 }
                 Ok(None) | Err(_) => {
-                    let input = upload_frame_timed(&mut gc, &s.frame, &mut s.last_upload_submit_ms);
-                    process_and_present(
-                        &mut gc,
-                        &mut overlay,
-                        s,
-                        &metrics,
-                        &status,
-                        input,
-                        out_size,
-                        stats,
-                        real_t0,
-                        captures,
-                        Some(FrameTiming::from_frame(&s.frame, real_t0)),
-                        &[],
-                        downscaler,
-                    );
+                    // v620 selected-GPU pre-GL milestone. WGC already delivers
+                    // ordinary SDR frames as tightly packed CPU RGBA8. When the
+                    // first production-admitted shader is deint_swa, do not upload
+                    // that frame to the render-GPU OpenGL context only to read it
+                    // straight back for Vulkan. Process the original WGC bytes on
+                    // the explicitly selected Vulkan GPU, upload the result once
+                    // for presentation, and skip stage 0. Auto never reaches this
+                    // branch because production_selected_luid() is None.
+                    // v634 independent mpv multi-pass Vulkan route. It uses the
+                    // same parsed UserShader pass graph as the existing OpenGL
+                    // interpreter. Structurally supported shaders are admitted;
+                    // unsupported features and runtime errors leave the
+                    // established OpenGL chain intact on a per-shader basis.
+                    //
+                    // v651 closes a routing hole in v648: the old pre-GL path
+                    // consumed stage 0 before FilterChain::process_from(), so a
+                    // prepared resident batch [0..N) could never match. Prefer
+                    // the complete leading batch directly from WGC RGBA8. This
+                    // keeps all inter-shader images on the selected Vulkan GPU
+                    // and uploads only the final batch result to presentation GL.
+                    let pre_gl_resident = if !s.frame.hdr
+                        && !s.source.uses_display_region_fallback()
+                        && crate::render::vulkan_multipass::production_requested()
+                    {
+                        let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
+                            metrics.probe(
+                                name,
+                                if kind == StageKind::Glsl {
+                                    "glsl"
+                                } else {
+                                    "onnx"
+                                },
+                                ms,
+                            );
+                        };
+                        s.chain.process_leading_vulkan_resident_rgba8(
+                            &mut gc,
+                            s.frame.w,
+                            s.frame.h,
+                            &s.frame.data,
+                            out_size,
+                            if stats {
+                                Some(&mut resident_probe as &mut dyn FnMut(&str, StageKind, f64))
+                            } else {
+                                None
+                            },
+                        )
+                    } else {
+                        None
+                    };
+
+                    let pre_gl_multipass = if pre_gl_resident.is_none()
+                        && !s.frame.hdr
+                        && !s.source.uses_display_region_fallback()
+                        && crate::render::vulkan_multipass::production_requested()
+                    {
+                        crate::render::vulkan_gpu::production_selected_luid().and_then(|luid| {
+                            let shader = match s.chain.stages.first() {
+                                Some(Stage::Glsl { shader, .. })
+                                    if !shader.is_post
+                                        && crate::render::vulkan_multipass::production_shader_admitted(shader) =>
+                                {
+                                    Some(shader.clone())
+                                }
+                                _ => None,
+                            }?;
+                            let route_started = Instant::now();
+                            match crate::render::vulkan_multipass::process_rgba8(
+                                luid,
+                                &shader,
+                                s.frame.w as u32,
+                                s.frame.h as u32,
+                                out_size.0.max(1) as u32,
+                                out_size.1.max(1) as u32,
+                                &s.frame.data,
+                            ) {
+                                Ok(Some(result)) => {
+                                    let upload_started = Instant::now();
+                                    let input = gc.upload_rgba8(
+                                        result.output_width as i32,
+                                        result.output_height as i32,
+                                        &result.output_rgba8,
+                                    );
+                                    let gl_upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                                    let route_ms = route_started.elapsed().as_secs_f64() * 1000.0;
+                                    s.last_upload_submit_ms = gl_upload_ms;
+                                    if stats {
+                                        metrics.probe(&shader.name(), "glsl", result.elapsed_ms);
+                                    }
+                                    if result.first_frame_active {
+                                        let line = format!(
+                                            "vulkan-multipass-glsl: result=active route=pre-gl-capture shader='{}' requested_luid={:016x} gpu='{}' input={}x{} output={}x{} passes={} validation=visual-required intermediate=fp16 transfer=wgc-cpu-to-vulkan-to-cpu-to-gl gl_readback=false display=Vulkan-result vulkan_ms={:.3} gl_upload_ms={:.3} route_ms={:.3} fallback=legacy-chain-on-error",
+                                            shader.name(), luid, result.gpu_name, s.frame.w, s.frame.h,
+                                            result.output_width, result.output_height, result.active_passes,
+                                            result.elapsed_ms, gl_upload_ms, route_ms,
+                                        );
+                                        log::info!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                    Some((input, 1usize))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    let line = format!(
+                                        "vulkan-multipass-glsl: result=fallback route=pre-gl-capture shader='{}' requested_luid={:016x} reason={:#} fallback=legacy-chain",
+                                        shader.name(), luid, error
+                                    );
+                                    log::warn!("{line}");
+                                    crate::render::vulkan_gpu::record_probe_result(&line);
+                                    None
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    let pre_gl_vulkan = if pre_gl_resident.is_none()
+                        && pre_gl_multipass.is_none()
+                        && !s.frame.hdr
+                        && !s.source.uses_display_region_fallback()
+                        && crate::render::vulkan_onepass::production_one_pass_requested()
+                    {
+                        crate::render::vulkan_gpu::production_selected_luid().and_then(|luid| {
+                            let shader = match s.chain.stages.first() {
+                                Some(Stage::Glsl { shader, .. })
+                                    if !shader.is_post
+                                        && crate::render::vulkan_onepass::production_shader_admitted(shader) =>
+                                {
+                                    Some(shader.clone())
+                                }
+                                _ => None,
+                            }?;
+                            let route_started = Instant::now();
+                            match crate::render::vulkan_onepass::process_rgba8(
+                                luid,
+                                &shader,
+                                s.frame.w as u32,
+                                s.frame.h as u32,
+                                &s.frame.data,
+                            ) {
+                                Ok(Some(result)) => {
+                                    let upload_started = Instant::now();
+                                    let input = gc.upload_rgba8(
+                                        s.frame.w,
+                                        s.frame.h,
+                                        &result.output_rgba8,
+                                    );
+                                    let gl_upload_ms =
+                                        upload_started.elapsed().as_secs_f64() * 1000.0;
+                                    let route_ms = route_started.elapsed().as_secs_f64() * 1000.0;
+                                    s.last_upload_submit_ms = gl_upload_ms;
+                                    if stats {
+                                        metrics.probe(&shader.name(), "glsl", result.elapsed_ms);
+                                    }
+                                    if let Some(profile) = &result.steady_profile {
+                                        let line = format!(
+                                            "vulkan-production-glsl: result=steady-profile route=pre-gl-capture shader='{}' requested_luid={:016x} gpu='{}' size={}x{} warmup_frames={} measured_frames={} avg_total_ms={:.3} min_total_ms={:.3} max_total_ms={:.3} avg_host_upload_ms={:.3} avg_submit_wait_ms={:.3} avg_command_record_ms={:.3} avg_queue_submit_ms={:.3} avg_fence_wait_ms={:.3} avg_host_readback_ms={:.3} readback_host_cached={} gl_upload_sample_ms={:.3} transfer=wgc-cpu-to-vulkan-to-cpu-to-gl gl_readback=false persistent_runtime=true",
+                                            shader.name(),
+                                            luid,
+                                            result.gpu_name,
+                                            s.frame.w,
+                                            s.frame.h,
+                                            profile.warmup_frames,
+                                            profile.measured_frames,
+                                            profile.avg_total_ms,
+                                            profile.min_total_ms,
+                                            profile.max_total_ms,
+                                            profile.avg_host_upload_ms,
+                                            profile.avg_submit_wait_ms,
+                                            profile.avg_command_record_ms,
+                                            profile.avg_queue_submit_ms,
+                                            profile.avg_fence_wait_ms,
+                                            profile.avg_host_readback_ms,
+                                            profile.readback_host_cached,
+                                            gl_upload_ms,
+                                        );
+                                        log::info!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                    if result.first_frame_verified {
+                                        let line = format!(
+                                            "vulkan-production-glsl: result=active route=pre-gl-capture shader='{}' requested_luid={:016x} gpu='{}' size={}x{} input_source=WGC-RGBA8 validation={} visual_check_required={} verified={}/{} tolerance={} transfer=wgc-cpu-to-vulkan-to-cpu-to-gl gl_readback=false persistent_runtime=true display=Vulkan-result vulkan_ms={:.3} gl_upload_ms={:.3} route_ms={:.3} fallback=legacy-chain-on-error",
+                                            shader.name(), luid, result.gpu_name, s.frame.w, s.frame.h,
+                                            result.validation_mode, result.visual_check_required, result.verified_pixels,
+                                            (s.frame.w as usize) * (s.frame.h as usize), result.tolerance,
+                                            result.elapsed_ms, gl_upload_ms, route_ms,
+                                        );
+                                        log::info!("{line}");
+                                        crate::render::vulkan_gpu::record_probe_result(&line);
+                                    }
+                                    Some((input, 1usize))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    let line = format!(
+                                        "vulkan-production-glsl: result=fallback route=pre-gl-capture shader='{}' requested_luid={:016x} reason={:#} fallback=legacy-chain",
+                                        shader.name(), luid, error
+                                    );
+                                    log::warn!("{line}");
+                                    crate::render::vulkan_gpu::record_probe_result(&line);
+                                    None
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some((input, chain_start_index)) =
+                        pre_gl_resident.or(pre_gl_multipass).or(pre_gl_vulkan)
+                    {
+                        process_and_present_from(
+                            &mut gc,
+                            &mut overlay,
+                            s,
+                            &metrics,
+                            &status,
+                            input,
+                            out_size,
+                            stats,
+                            real_t0,
+                            captures,
+                            Some(FrameTiming::from_frame(&s.frame, real_t0)),
+                            &[],
+                            downscaler,
+                            chain_start_index,
+                        );
+                    } else {
+                        let input = upload_session_frame_timed(&mut gc, s);
+                        process_and_present(
+                            &mut gc,
+                            &mut overlay,
+                            s,
+                            &metrics,
+                            &status,
+                            input,
+                            out_size,
+                            stats,
+                            real_t0,
+                            captures,
+                            Some(FrameTiming::from_frame(&s.frame, real_t0)),
+                            &[],
+                            downscaler,
+                        );
+                    }
                 }
             }
         } else if s.interp_pending.is_some()
@@ -9867,17 +12215,29 @@ fn engine_main(
 
 fn start_session(
     hwnd: isize,
+    source_pid: u32,
+    source_was_topmost: bool,
     specs: &[StageSpec],
     mode: ScaleMode,
     ratio: f32,
+    aspect_correction: bool,
+    aspect_correction_mode: AspectCorrectionMode,
+    aspect_width_scale: f32,
+    aspect_height_scale: f32,
+    capture_crop: CaptureCrop,
     fps_cap: Option<u32>,
     hide_source: bool,
     client_only: bool,
     hdr: bool,
     hdr_sdr_mode: HdrSdrMode,
+    explicit_gpu_luid: Option<u64>,
+    force_vulkan_glsl: bool,
+    render_gpu_luid: Option<u64>,
     // Immutable outer-window rectangle captured before any Neo-initiated
     // capture-resolution resize. Never rebase this during the session.
     source_restore_rect: Option<(i32, i32, i32, i32)>,
+    // Full placement snapshot paired with the immutable session origin.
+    source_restore_placement: Option<win32::WindowPlacementSnapshot>,
     // Maximized state paired with the immutable session-origin rectangle.
     source_was_maximized: bool,
     deferred_capture_resolution: Option<((u32, u32), (u32, u32))>,
@@ -9886,28 +12246,166 @@ fn start_session(
     duplicate_frame_reduction: bool,
     factory: &mut StageFactory,
 ) -> Result<(Session, Vec<String>, Option<String>)> {
-    // Defensive invariant: WGC edge-pads odd dimensions before the frame
-    // reaches the engine. Keep the source client, transition target and input
-    // canvas on that same even geometry so an odd PIP aspect-fit can never
-    // leave the overlay waiting for an impossible frame size.
-    let deferred_capture_resolution = deferred_capture_resolution.map(|(requested, applied)| {
-        let normalized = normalize_capture_client_size(applied);
-        if normalized != applied {
+    if !win32::window_matches_pid(hwnd, source_pid) {
+        anyhow::bail!(
+            "capture target changed before start (hwnd={hwnd:#x}, expected_pid={source_pid})"
+        );
+    }
+    let aspect_width_scale = sanitize_aspect_correction_scale(aspect_width_scale);
+    let aspect_height_scale = sanitize_aspect_correction_scale(aspect_height_scale);
+    // If the selected GPU already owns WGL, OpenGL is normally the fastest
+    // same-GPU path. Cross-GPU explicit selection still needs Vulkan so GLSL
+    // executes on the selected compute GPU. The duplicated "[Vulkan]" selector
+    // entry intentionally overrides the same-GPU optimization for users who
+    // want to exercise Vulkan on that exact adapter.
+    let vulkan_compute_luid = if force_vulkan_glsl {
+        explicit_gpu_luid
+    } else {
+        explicit_gpu_luid.filter(|selected| {
+            render_gpu_luid
+                .map(|render| render != *selected)
+                .unwrap_or(true)
+        })
+    };
+    let glsl_backend_route = vulkan_gpu::glsl_backend_route(vulkan_compute_luid);
+    vulkan_gpu::set_production_selected_luid(vulkan_compute_luid);
+    // Same-GPU Stop -> Start should not rebuild stateless Vulkan pipelines.
+    // Temporal STORAGE shaders are still dropped here to reset their history.
+    crate::render::vulkan_multipass::reset_session_runtime();
+    match glsl_backend_route {
+        GlslBackendRoute::LegacyOpenGl => {
+            if let Some(selected) = explicit_gpu_luid {
+                log::info!(
+                    "glsl-backend-route: gpu_selection=Explicit requested_luid={selected:016x} force_vulkan=false render_luid={} target=OpenGL production=OpenGL reason=selected-gpu-is-render-gpu vulkan_init=false zero_cross_gpu_transfer=true",
+                    render_gpu_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "unavailable".to_string())
+                );
+            } else {
+                log::info!(
+                    "glsl-backend-route: gpu_selection=Auto target=OpenGL production=OpenGL vulkan_init=false compatibility_path=unchanged"
+                );
+            }
+            if crate::render::vulkan_onepass::production_one_pass_requested() {
+                vulkan_gpu::record_probe_result(
+                    "vulkan-production-glsl: result=skipped reason=gpu-selection-auto target_backend=OpenGL vulkan_init=false",
+                );
+            }
+            if crate::render::vulkan_multipass::production_requested() {
+                vulkan_gpu::record_probe_result(
+                    "vulkan-multipass-glsl: result=skipped reason=gpu-selection-auto target_backend=OpenGL vulkan_init=false",
+                );
+            }
+            if vulkan_gpu::capture_probe_requested() {
+                vulkan_gpu::record_probe_result(
+                    "vulkan-capture-probe: result=skipped reason=gpu-selection-auto target_backend=OpenGL vulkan_init=false",
+                );
+            }
+            if vulkan_gpu::frame_probe_requested() {
+                vulkan_gpu::record_probe_result(
+                    "vulkan-frame-probe: result=skipped reason=gpu-selection-auto target_backend=OpenGL vulkan_init=false",
+                );
+            }
+            if vulkan_gpu::user_glsl_probe_requested() {
+                vulkan_gpu::record_probe_result(
+                    "vulkan-user-glsl-probe: result=skipped reason=gpu-selection-auto target_backend=OpenGL vulkan_init=false",
+                );
+            }
+        }
+        GlslBackendRoute::VulkanSelected { luid } => {
+            if crate::render::vulkan_multipass::production_requested() {
+                let candidate_count = specs
+                    .iter()
+                    .filter(|spec| spec.enabled && matches!(spec.kind, StageKind::Glsl))
+                    .count();
+                let line = format!(
+                    "vulkan-multipass-glsl: phase=session-start armed=true requested_luid={luid:016x} glsl_candidates={} stages={} target=Vulkan admitted=parsed-compatible-multipass intermediate=fp16 transfer=cpu-staging runtime_cache=multi fallback=OpenGL",
+                    candidate_count,
+                    specs.len()
+                );
+                log::info!("{line}");
+                vulkan_gpu::record_probe_result(&line);
+                log::info!(
+                    "glsl-backend-route: gpu_selection=Explicit requested_luid={luid:016x} force_vulkan={} target=Vulkan production=VulkanMultiPass admitted=parsed-compatible-multipass transfer=cpu-staging runtime_cache=multi fallback=OpenGL",
+                    force_vulkan_glsl
+                );
+            } else if crate::render::vulkan_onepass::production_one_pass_requested() {
+                let candidate_in_chain = specs.iter().any(|spec| {
+                    if !spec.enabled || !matches!(spec.kind, StageKind::Glsl) {
+                        return false;
+                    }
+                    let name = std::path::Path::new(&spec.path)
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("");
+                    name.eq_ignore_ascii_case("deint_swa.glsl")
+                        || (crate::render::vulkan_onepass::candidate_one_pass_validation_requested(
+                        ) && (name.eq_ignore_ascii_case("AXAA.glsl")
+                            || name.eq_ignore_ascii_case("Intel_CMAA2_lite.glsl")))
+                });
+                let admission =
+                    if crate::render::vulkan_onepass::candidate_one_pass_validation_requested() {
+                        "deint_swa+AXAA+Intel_CMAA2_lite(test-only)"
+                    } else {
+                        "deint_swa"
+                    };
+                let line = format!(
+                    "vulkan-production-glsl: phase=session-start armed=true requested_luid={luid:016x} candidate_in_chain={} stages={} target=Vulkan admitted={} transfer=cpu-staging persistent_runtime=true fallback=OpenGL",
+                    candidate_in_chain,
+                    specs.len(),
+                    admission
+                );
+                log::info!("{line}");
+                vulkan_gpu::record_probe_result(&line);
+                log::info!(
+                    "glsl-backend-route: gpu_selection=Explicit requested_luid={luid:016x} target=Vulkan production=VulkanOnePassExperimental admitted=dynamic-safe-subset transfer=cpu-staging persistent_runtime=true fallback=OpenGL"
+                );
+            } else {
+                log::info!(
+                    "glsl-backend-route: gpu_selection=Explicit requested_luid={luid:016x} target=Vulkan production=OpenGL shadow_validation=true fallback=OpenGL"
+                );
+            }
+        }
+    }
+    // WGC edge-pads odd dimensions before the frame reaches the engine.
+    // Keep the actual source-client target unchanged. WGC may replicate one
+    // right/bottom edge pixel when that client is odd-sized; frame matching
+    // uses the normalized target, while the foreign HWND must retain the raw
+    // crop-aware size so its visible content area has the requested geometry.
+    let mut deferred_capture_resolution = deferred_capture_resolution.map(|(requested, applied)| {
+        let frame_target = normalize_capture_client_size(applied);
+        let source_client_target = if capture_crop.enabled {
+            applied
+        } else {
+            // Preserve v583 exactly when user crop is OFF.
+            frame_target
+        };
+        if frame_target != applied {
             log::info!(
-                "capture-start-even-normalize: requested={}x{} applied={}x{} normalized={}x{}",
+                "capture-start-even-normalize: requested={}x{} client={}x{} frame_target={}x{} crop_enabled={}",
                 requested.0,
                 requested.1,
-                applied.0,
-                applied.1,
-                normalized.0,
-                normalized.1
+                source_client_target.0,
+                source_client_target.1,
+                frame_target.0,
+                frame_target.1,
+                capture_crop.enabled
             );
         }
-        (requested, normalized)
+        (requested, source_client_target)
     });
-    let capture_canvas = deferred_capture_resolution
+    let capture_canvas_client = deferred_capture_resolution
         .map(|(_, applied)| applied)
-        .or_else(|| capture_canvas.map(normalize_capture_client_size));
+        .or_else(|| {
+            capture_canvas.map(|applied| {
+                if capture_crop.enabled {
+                    applied
+                } else {
+                    normalize_capture_client_size(applied)
+                }
+            })
+        });
+    let mut capture_canvas = capture_canvas_client.map(normalize_capture_client_size);
     let monitor_rect = win32::monitor_rect_of(hwnd);
     let monitor_refresh_hz = win32::monitor_refresh_hz(hwnd);
     // A monitor-covering source is already fullscreen presentation content.
@@ -9926,7 +12424,7 @@ fn start_session(
             "fullscreen-pixel-exact: hwnd={hwnd:#x} client_crop=bypassed origin=(0,0) edge_pad=right/bottom-only reason=monitor-cover-source"
         );
     }
-    let display_aspect = capture_canvas
+    let display_aspect_base = capture_canvas_client
         .map(|(w, h)| (w as i32, h as i32))
         .unwrap_or_else(|| {
             if effective_client_only {
@@ -9937,12 +12435,13 @@ fn start_session(
             .map(|(_, _, w, h)| (w, h))
             .unwrap_or((0, 0))
         });
+    let mut display_aspect = capture_crop_output_size(display_aspect_base, capture_crop);
     log::info!(
         "capture monitor refresh: {:.2}Hz",
         monitor_refresh_hz.unwrap_or(0.0)
     );
     log::info!(
-        "capture-path-diag: source_pid={} monitor=({},{} {}x{}) refresh_hz={:.2} scale_mode={:?} ratio={:.3} hide_source={} client_only={} fps_cap={:?} smooth={} duplicate_reduction={}",
+        "capture-path-diag: source_pid={} monitor=({},{} {}x{}) refresh_hz={:.2} scale_mode={:?} ratio={:.3} aspect_correction={} aspect_mode={:?} aspect_scale={:.2}x{:.2} crop={} edges=({}, {}, {}, {}) hide_source={} client_only={} fps_cap={:?} smooth={} duplicate_reduction={}",
         win32::window_pid(hwnd),
         monitor_rect.0,
         monitor_rect.1,
@@ -9951,6 +12450,15 @@ fn start_session(
         monitor_refresh_hz.unwrap_or(0.0),
         mode,
         ratio,
+        aspect_correction,
+        aspect_correction_mode,
+        aspect_width_scale,
+        aspect_height_scale,
+        capture_crop.enabled,
+        capture_crop.left,
+        capture_crop.top,
+        capture_crop.right,
+        capture_crop.bottom,
         hide_source,
         effective_client_only,
         fps_cap,
@@ -9963,6 +12471,28 @@ fn start_session(
     if source_is_elevated && !win32::own_process_elevated() {
         anyhow::bail!(
             "このウィンドウは管理者権限で動作しているため拡大できません。GUIの「管理者として再起動」をオンにしてから再度お試しください"
+        );
+    }
+    // Multi-HWND/composited hosts (WPF/EVR-style and similar) and windows that
+    // already own WS_EX_LAYERED presentation are mutation-sensitive. Do not
+    // touch their chrome before WGC decides the capture route.
+    let source_layered_at_start = win32::is_layered_window(hwnd);
+    let source_owned_at_start = win32::window_owner(hwnd) != 0;
+    let source_secondary_hint = win32::wgc_has_visible_secondary_windows(hwnd);
+    if !source_monitor_fullscreen
+        && !source_secondary_hint
+        && !source_layered_at_start
+        && !source_owned_at_start
+    {
+        let _ = win32::suppress_source_rounded_corners(hwnd, source_pid);
+    } else if !source_monitor_fullscreen
+        && (source_secondary_hint || source_layered_at_start || source_owned_at_start)
+    {
+        log::info!(
+            "source-presentation-mutation-guard: hwnd={hwnd:#x} phase=pre-wgc rounded_corners=preserved layered_at_start={} owned_window={} secondary_hint={}",
+            source_layered_at_start,
+            source_owned_at_start,
+            source_secondary_hint
         );
     }
     // The user-facing HDR option now reuses the same fast RGBA8 WGC path as
@@ -9981,6 +12511,62 @@ fn start_session(
         false,
         pixel_exact_raw_hint,
     )?;
+    let wgc_host_fallback = source.uses_window_fallback();
+    let wgc_secondary_capture = source.uses_secondary_windows();
+    let wgc_display_region = source.uses_display_region_fallback();
+    let wgc_capture_hwnd = source.capture_hwnd();
+    if let Some((_, _, w, h)) = source.display_region_rect() {
+        // The WGC copy path may pad an odd right/bottom edge for processing.
+        // Presentation must remain based on the real region pixels (and the
+        // exact retained user-crop pixels), otherwise fullscreen Fit treats
+        // the synthetic pad as picture geometry and preserves false bars.
+        display_aspect = capture_crop_content_size((w, h), capture_crop);
+        log::info!(
+            "capture-display-region-aspect: source={:#x} region={}x{} display={}x{} basis=real-cropped-pixels",
+            hwnd,
+            w,
+            h,
+            display_aspect.0,
+            display_aspect.1
+        );
+    }
+    // A selected helper HWND captured through a host, or a top-level host with
+    // meaningful same-process secondary presentation windows, must remain
+    // completely application-owned while capture is active. WPF/EVR-like
+    // applications can use WS_EX_LAYERED or independent swap chains internally;
+    // alpha-hide/resize/TOPMOST mutations can otherwise blank the app even after
+    // Neo stops.
+    let source_mutation_sensitive =
+        wgc_host_fallback || wgc_secondary_capture || source_owned_at_start;
+    if source_mutation_sensitive {
+        let _ = win32::restore_source_rounded_corners(hwnd, source_pid);
+        if deferred_capture_resolution.is_some() || capture_canvas.is_some() {
+            log::warn!(
+                "wgc-composite-safe capture-resolution disabled: selected={:#x} host={:#x} fallback={} secondary_windows={} display_region={} reason=preserve-foreign-compositor",
+                hwnd,
+                wgc_capture_hwnd,
+                wgc_host_fallback,
+                wgc_secondary_capture,
+                wgc_display_region
+            );
+        }
+        deferred_capture_resolution = None;
+        capture_canvas = None;
+        log::info!(
+            "wgc-composite-safe session: selected={:#x} host={:#x} fallback={} secondary_windows={} display_region={} input_target=root source_visual_hide=disabled resize=disabled topmost_promotion=disabled",
+            hwnd,
+            wgc_capture_hwnd,
+            wgc_host_fallback,
+            wgc_secondary_capture,
+            wgc_display_region
+        );
+    }
+    source.set_user_crop(capture_crop);
+    if !win32::window_matches_pid(hwnd, source_pid) {
+        anyhow::bail!(
+            "capture target changed during WGC startup (hwnd={hwnd:#x}, expected_pid={source_pid})"
+        );
+    }
     if let Some((w, h)) = pixel_exact_raw_hint {
         log::info!(
             "fullscreen-pixel-exact-raw-lock: hwnd={hwnd:#x} raw_hint={}x{} tolerance=1px normalize=right/bottom-only material-resize=passthrough",
@@ -10036,17 +12622,25 @@ fn start_session(
     // transition). That can look like a 1-2 px zoom even with an empty filter
     // chain. The overlay is itself TOPMOST and the fullscreen source already
     // covers the monitor, so source promotion is redundant.
-    let src_was_topmost = win32::is_topmost(hwnd);
+    let src_was_topmost = source_was_topmost;
     log::info!(
-        "source-geometry-saved: hwnd={hwnd:#x} rect={source_restore_rect:?} maximized={source_was_maximized}"
+        "source-geometry-saved: hwnd={hwnd:#x} rect={source_restore_rect:?} normal_rect={:?} maximized={source_was_maximized}",
+        source_restore_placement.map(|p| p.normal_rect_xywh())
     );
     if source_monitor_fullscreen {
         log::info!(
             "source-zorder-pixel-lock: hwnd={hwnd:#x} fullscreen=true topmost_promotion=skipped original_topmost={src_was_topmost} rect={:?}",
             win32::window_rect(hwnd)
         );
+    } else if source_mutation_sensitive {
+        log::info!(
+            "source-zorder: hwnd={hwnd:#x} wgc_host={wgc_capture_hwnd:#x} topmost_promotion=skipped reason=wgc-composite-safe original_topmost={src_was_topmost}"
+        );
     } else {
-        win32::set_topmost(hwnd, true);
+        if !win32::window_matches_pid(hwnd, source_pid) {
+            anyhow::bail!("capture target changed before z-order promotion");
+        }
+        restore_source_topmost_verified(hwnd, source_pid, true);
         log::debug!(
             "source-zorder: hwnd={hwnd:#x} fullscreen=false topmost_promotion=applied original_topmost={src_was_topmost}"
         );
@@ -10055,15 +12649,29 @@ fn start_session(
     log::debug!(
         "source-presentation-origin: hwnd={hwnd:#x} signature={source_presentation_signature:?} monitor_cover={source_monitor_fullscreen}"
     );
-    let (hid_source, hide_source_pending) = if hide_source {
+    let source_visual_hide_safe = !source_mutation_sensitive && !source_layered_at_start;
+    let (hid_source, hide_source_pending) = if hide_source && source_visual_hide_safe {
         log::info!("source {hwnd:#x} visual hide deferred until first valid filtered frame");
         (None, true)
     } else {
+        if hide_source && !source_visual_hide_safe {
+            log::info!(
+                "source {hwnd:#x} visual hide skipped: wgc_host={wgc_capture_hwnd:#x} reason={} layered_at_start={} composite_safe={}",
+                if source_layered_at_start {
+                    "preexisting-layered-presentation"
+                } else {
+                    "multi-hwnd-compositor"
+                },
+                source_layered_at_start,
+                source_mutation_sensitive
+            );
+        }
         (None, false)
     };
     Ok((
         Session {
             hwnd,
+            source_pid,
             source_monitor_fullscreen,
             source_live_fullscreen: source_monitor_fullscreen,
             source_presentation_signature,
@@ -10077,10 +12685,24 @@ fn start_session(
             chain,
             mode,
             ratio,
+            aspect_correction,
+            aspect_correction_mode,
+            aspect_width_scale,
+            aspect_height_scale,
+            capture_crop,
+            capture_in_size: (0, 0),
+            crop_transition_pending: false,
+            aspect_transition_pending: false,
             fps_cap,
             capture_client_only: effective_client_only,
             capture_hdr: hdr,
             hdr_sdr_mode,
+            chain_specs: specs.to_vec(),
+            explicit_gpu_selection: explicit_gpu_luid.is_some(),
+            glsl_backend_route,
+            vulkan_capture_probe_started: false,
+            vulkan_frame_probe_started: false,
+            vulkan_user_glsl_probe_started: false,
             hdr_sdr_preprocess_logged: false,
             hdr_sdr_preprocess_error_logged: false,
             hdr_highlight_protected_seq: None,
@@ -10103,6 +12725,7 @@ fn start_session(
             hide_source_pending,
             src_was_topmost,
             source_restore_rect,
+            source_restore_placement,
             source_was_maximized,
             deferred_capture_resolution,
             capture_resolution_applied: false,
@@ -10110,6 +12733,8 @@ fn start_session(
             capture_resolution_repaint_last: None,
             capture_resolution_nudge_done: false,
             capture_resolution_native_fallback: false,
+            capture_resolution_region_candidate: None,
+            capture_resolution_region_candidate_since: None,
             onnx_geometry_deferred_logged: false,
             hist: std::collections::VecDeque::new(),
             gpu_interp_hist: std::collections::VecDeque::new(),
@@ -10180,9 +12805,16 @@ fn start_session(
             interp_post_warm: false,
             pre_chain_route_log_key: None,
             dml_rife_limit_log_key: None,
+            screenshot_burst: None,
+            dml_vulkan_rife_validation_stage: None,
+            dml_vulkan_rife_force_cpu_stage: None,
+            gpu_interp_dml_vulkan_post_disabled: false,
             last_process_ms: 0.0,
             last_compute_ms: 0.0,
             last_upload_submit_ms: 0.0,
+            display_region_upload_slot: 0,
+            display_region_upload_ring_logged: false,
+            display_region_upload_ring_fallback_logged: false,
             last_chain_submit_ms: 0.0,
             last_resample_submit_ms: 0.0,
             last_post_submit_ms: 0.0,
@@ -10243,6 +12875,124 @@ fn fit_aspect_inside(aspect: (i32, i32), bounds: (i32, i32)) -> (i32, i32) {
     )
 }
 
+fn capture_crop_output_size(base: (i32, i32), crop: CaptureCrop) -> (i32, i32) {
+    if base.0 <= 0 || base.1 <= 0 {
+        return base;
+    }
+    let applied = crop.applied_to(base.0 as u32, base.1 as u32);
+    (applied.output_w as i32, applied.output_h as i32)
+}
+
+/// Presentation geometry for the monitor-region fallback must describe the
+/// real pixels retained by the user crop, not the processing buffer after
+/// Neo's synthetic right/bottom even-size edge replication. Keeping those two
+/// coordinate spaces separate is important for odd-height presentation
+/// surfaces: filters still receive an even-sized buffer, while fullscreen Fit
+/// uses the exact cropped content aspect and can therefore reach the monitor
+/// edges when the retained picture itself matches the monitor aspect.
+fn capture_crop_content_size(base: (i32, i32), crop: CaptureCrop) -> (i32, i32) {
+    if base.0 <= 0 || base.1 <= 0 {
+        return base;
+    }
+    let applied = crop.applied_to(base.0 as u32, base.1 as u32);
+    (applied.content_w as i32, applied.content_h as i32)
+}
+
+fn committed_display_aspect(s: &Session, processing_size: (i32, i32)) -> (i32, i32) {
+    if s.source.uses_display_region_fallback() {
+        if let Some((_, _, w, h)) = s.source.display_region_rect() {
+            return capture_crop_content_size((w, h), s.capture_crop);
+        }
+    }
+    processing_size
+}
+
+fn crop_source_rect(rect: (i32, i32, i32, i32), crop: CaptureCrop) -> (i32, i32, i32, i32) {
+    if rect.2 <= 0 || rect.3 <= 0 {
+        return rect;
+    }
+    let applied = crop.applied_to(rect.2 as u32, rect.3 as u32);
+    (
+        rect.0 + applied.left as i32,
+        rect.1 + applied.top as i32,
+        applied.content_w as i32,
+        applied.content_h as i32,
+    )
+}
+
+fn source_input_frame_hint(s: &Session) -> (i32, i32) {
+    if s.capture_crop.enabled {
+        if s.capture_in_size.0 > 0 && s.capture_in_size.1 > 0 {
+            s.capture_in_size
+        } else {
+            s.frame.capture_size()
+        }
+    } else if s.display_aspect.0 > 0 && s.display_aspect.1 > 0 {
+        // Preserve v576's established reference selection exactly when the new
+        // crop feature is disabled.
+        s.display_aspect
+    } else {
+        s.in_size
+    }
+}
+
+fn corrected_presentation_aspect(
+    base: (i32, i32),
+    enabled: bool,
+    mode: AspectCorrectionMode,
+    width_scale: f32,
+    height_scale: f32,
+) -> (i32, i32) {
+    // Preserve the v555/v576 manual geometry path exactly when disabled or in
+    // Manual mode. Auto modes change presentation geometry only and recompute
+    // from the latest pre-correction aspect every time this function is called.
+    if !enabled || base.0 <= 0 || base.1 <= 0 {
+        return base;
+    }
+    match mode {
+        AspectCorrectionMode::Manual => {
+            let width_scale = sanitize_aspect_correction_scale(width_scale) as f64;
+            let height_scale = sanitize_aspect_correction_scale(height_scale) as f64;
+            (
+                ((base.0 as f64 * width_scale).round() as i32).max(1),
+                ((base.1 as f64 * height_scale).round() as i32).max(1),
+            )
+        }
+        AspectCorrectionMode::Auto4x3 => (
+            ((base.1 as f64 * (4.0 / 3.0)).round() as i32).max(1),
+            base.1.max(1),
+        ),
+        AspectCorrectionMode::Auto16x9 => (
+            ((base.1 as f64 * (16.0 / 9.0)).round() as i32).max(1),
+            base.1.max(1),
+        ),
+    }
+}
+
+fn session_presentation_aspect(s: &Session, fallback: (i32, i32)) -> (i32, i32) {
+    let base = if s.display_aspect.0 > 0 && s.display_aspect.1 > 0 {
+        s.display_aspect
+    } else {
+        fallback
+    };
+    corrected_presentation_aspect(
+        base,
+        s.aspect_correction,
+        s.aspect_correction_mode,
+        s.aspect_width_scale,
+        s.aspect_height_scale,
+    )
+}
+
+fn visible_presentation_aspect(s: &Session, fallback: (i32, i32)) -> (i32, i32) {
+    if s.aspect_transition_pending {
+        if let Some(texture) = s.last_tex {
+            return (texture.w(), texture.h());
+        }
+    }
+    session_presentation_aspect(s, fallback)
+}
+
 fn fixed_overlay_aspect_basis(frame_size: (i32, i32), client_size: (i32, i32)) -> (i32, i32) {
     if frame_size.0 > 0 && frame_size.1 > 0 {
         frame_size
@@ -10251,6 +13001,7 @@ fn fixed_overlay_aspect_basis(frame_size: (i32, i32), client_size: (i32, i32)) -
     }
 }
 
+#[cfg(test)]
 fn initial_display_aspect(
     capture_canvas: Option<(i32, i32)>,
     first_wgc_frame: (i32, i32),
@@ -10406,13 +13157,23 @@ fn overlay_geometry(s: &Session, overlay: &OverlayWindow) -> (i32, i32, i32, i32
     match s.mode {
         ScaleMode::Auto => win32::monitor_rect_of(s.hwnd),
         ScaleMode::Fixed => {
-            let (sx, sy, sw, sh) = win32::client_rect_on_screen(s.hwnd)
+            let (sx, sy, sw, sh) = s
+                .source
+                .display_region_rect()
+                .or_else(|| win32::client_rect_on_screen(s.hwnd))
                 .unwrap_or_else(|| win32::monitor_rect_of(s.hwnd));
             let (mx, my, mw, mh) = win32::monitor_rect_of(s.hwnd);
             // The Win32 client rect often changes one WGC frame before/after
             // the pixels do. Size the display from the committed frame instead
             // so old pixels are never stretched into the next aspect ratio.
-            let (aspect_w, aspect_h) = fixed_overlay_aspect_basis(s.display_aspect, (sw, sh));
+            let base_aspect = fixed_overlay_aspect_basis(s.display_aspect, (sw, sh));
+            let (aspect_w, aspect_h) = corrected_presentation_aspect(
+                base_aspect,
+                s.aspect_correction,
+                s.aspect_correction_mode,
+                s.aspect_width_scale,
+                s.aspect_height_scale,
+            );
             let (w, h) = fit_fixed_overlay_size(aspect_w, aspect_h, s.ratio, mw, mh);
             if s.placed {
                 // keep the user's position; only track size changes
@@ -10428,16 +13189,117 @@ fn overlay_geometry(s: &Session, overlay: &OverlayWindow) -> (i32, i32, i32, i32
     }
 }
 
+/// Re-check a foreign source after the immediate Stop restoration has had time
+/// to settle. Some applications process the TOPMOST/style/size notifications
+/// posted by Neo a few milliseconds later and can move or resize themselves
+/// after the first SetWindowPos already succeeded. Keep the immediate recovery
+/// path fast, then verify twice on the render thread and re-apply only when the
+/// source drifted from the immutable session-start geometry.
+fn finalize_source_geometry_restore(
+    hwnd: isize,
+    source_pid: u32,
+    rect: Option<(i32, i32, i32, i32)>,
+    placement: Option<win32::WindowPlacementSnapshot>,
+    was_maximized: bool,
+) -> bool {
+    if !win32::window_matches_pid(hwnd, source_pid) {
+        return false;
+    }
+
+    let checkpoints = [Duration::from_millis(16), Duration::from_millis(48)];
+    let mut retry_count = 0u32;
+
+    for delay in checkpoints {
+        std::thread::sleep(delay);
+        if !win32::window_matches_pid(hwnd, source_pid) {
+            log::warn!("source-geometry-finalize-aborted: hwnd={hwnd:#x} reason=identity-changed");
+            return false;
+        }
+
+        let before = win32::window_rect(hwnd);
+        let maximized_before = win32::is_maximized(hwnd);
+        let placement_before = win32::window_placement_snapshot(hwnd);
+        let normal_matches = if was_maximized {
+            match (placement_before, placement) {
+                (Some(current), Some(expected)) => {
+                    current.normal_rect_xywh() == expected.normal_rect_xywh()
+                }
+                _ => false,
+            }
+        } else {
+            true
+        };
+        let outer_matches = was_maximized || before == rect;
+        if outer_matches && normal_matches && maximized_before == was_maximized {
+            continue;
+        }
+
+        retry_count += 1;
+        let ok = win32::restore_window_origin(hwnd, rect, was_maximized, placement);
+        let after = win32::window_rect(hwnd);
+        let placement_after = win32::window_placement_snapshot(hwnd);
+        let maximized_after = win32::is_maximized(hwnd);
+        log::info!(
+            "source-geometry-finalize-retry: hwnd={hwnd:#x} attempt={retry_count} requested={rect:?} expected_normal={:?} before={before:?} before_normal={:?} after={after:?} after_normal={:?} maximized_before={maximized_before} maximized_after={maximized_after} expected_maximized={was_maximized} ok={ok}",
+            placement.map(|p| p.normal_rect_xywh()),
+            placement_before.map(|p| p.normal_rect_xywh()),
+            placement_after.map(|p| p.normal_rect_xywh()),
+        );
+    }
+
+    let final_rect = win32::window_rect(hwnd);
+    let final_placement = win32::window_placement_snapshot(hwnd);
+    let final_maximized = win32::is_maximized(hwnd);
+    let normal_ok = if was_maximized {
+        match (final_placement, placement) {
+            (Some(current), Some(expected)) => {
+                current.normal_rect_xywh() == expected.normal_rect_xywh()
+            }
+            _ => false,
+        }
+    } else {
+        true
+    };
+    let outer_ok = was_maximized || final_rect == rect;
+    let ok = outer_ok && normal_ok && final_maximized == was_maximized;
+    log::info!(
+        "source-geometry-finalized: hwnd={hwnd:#x} requested={rect:?} expected_normal={:?} final={final_rect:?} final_normal={:?} maximized={final_maximized} expected_maximized={was_maximized} retries={retry_count} ok={ok}",
+        placement.map(|p| p.normal_rect_xywh()),
+        final_placement.map(|p| p.normal_rect_xywh()),
+    );
+    ok
+}
+
 fn stop_session(
     session: &mut Option<Session>,
     overlay: &mut OverlayWindow,
     gc: &mut GlContext,
     status: &Arc<Mutex<Status>>,
 ) {
+    // Safe no-op for ordinary window capture. A structural monitor-region
+    // session temporarily excludes Neo's own top-level windows from public
+    // capture APIs; restore them before any Stop/restart transition.
+    win32::clear_own_window_capture_exclusions();
     crate::render::onnx_stage::finish_tensorrt_build_progress();
     let mut gpu_resources_safe_to_clear = true;
+    let mut final_source_geometry: Option<(
+        isize,
+        u32,
+        Option<(i32, i32, i32, i32)>,
+        Option<win32::WindowPlacementSnapshot>,
+        bool,
+    )> = None;
     if let Some(mut s) = session.take() {
         s.source.stop();
+        let source_identity_ok = win32::window_matches_pid(s.hwnd, s.source_pid);
+        if !source_identity_ok {
+            log::warn!(
+                "source-recovery-skipped: hwnd={:#x} expected_pid={} current_pid={} reason=identity-changed",
+                s.hwnd,
+                s.source_pid,
+                win32::window_pid(s.hwnd)
+            );
+        }
         if let Some(pack) = s.gpu_interp_pack_pending.take() {
             gc.cancel_commands_fence(pack.fence);
         }
@@ -10462,30 +13324,69 @@ fn stop_session(
         }
         // prev_tex is pool-managed; clear_pool below frees everything
         // ALWAYS restore the source's visual state (never leave an invisible
-        // window behind)
-        if let Some(was_layered) = s.hid_source {
-            win32::show_window_visual(s.hwnd, was_layered);
+        // window behind). Corner cleanup verifies HWND+PID internally; on an
+        // identity change it only drops Neo's stale ownership record.
+        let _ = win32::restore_source_rounded_corners(s.hwnd, s.source_pid);
+        if source_identity_ok {
+            if let Some(was_layered) = s.hid_source {
+                win32::show_window_visual(s.hwnd, was_layered);
+            }
+            if !s.src_was_topmost && !s.source_monitor_fullscreen {
+                restore_source_topmost_verified(s.hwnd, s.source_pid, false);
+            }
         }
-        if !s.src_was_topmost && !s.source_monitor_fullscreen {
-            win32::set_topmost(s.hwnd, false);
-        }
-        if let Some(rect) = s.source_restore_rect {
+        if source_identity_ok
+            && (s.source_restore_rect.is_some() || s.source_restore_placement.is_some())
+        {
             let before = win32::window_rect(s.hwnd);
-            let already_current =
-                before == Some(rect) && win32::is_maximized(s.hwnd) == s.source_was_maximized;
-            let ok =
-                already_current || win32::restore_window_rect(s.hwnd, rect, s.source_was_maximized);
+            let before_placement = win32::window_placement_snapshot(s.hwnd);
+            let normal_current = if s.source_was_maximized {
+                match (before_placement, s.source_restore_placement) {
+                    (Some(current), Some(expected)) => {
+                        current.normal_rect_xywh() == expected.normal_rect_xywh()
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+            let outer_current = s.source_was_maximized || before == s.source_restore_rect;
+            let already_current = outer_current
+                && normal_current
+                && win32::is_maximized(s.hwnd) == s.source_was_maximized;
+            let ok = already_current
+                || win32::restore_window_origin(
+                    s.hwnd,
+                    s.source_restore_rect,
+                    s.source_was_maximized,
+                    s.source_restore_placement,
+                );
             let after = win32::window_rect(s.hwnd);
+            let after_placement = win32::window_placement_snapshot(s.hwnd);
             log::info!(
-                "source-geometry-restored: hwnd={:#x} requested={rect:?} before={before:?} after={after:?} maximized={} already_current={} ok={ok}",
+                "source-geometry-restored: hwnd={:#x} requested={:?} expected_normal={:?} before={before:?} before_normal={:?} after={after:?} after_normal={:?} maximized={} already_current={} ok={ok}",
                 s.hwnd,
+                s.source_restore_rect,
+                s.source_restore_placement.map(|p| p.normal_rect_xywh()),
+                before_placement.map(|p| p.normal_rect_xywh()),
+                after_placement.map(|p| p.normal_rect_xywh()),
                 s.source_was_maximized,
                 already_current
             );
+            final_source_geometry = Some((
+                s.hwnd,
+                s.source_pid,
+                s.source_restore_rect,
+                s.source_restore_placement,
+                s.source_was_maximized,
+            ));
         }
     }
     detach_overlay_owned_helpers(overlay.hwnd().0 as isize);
     overlay.hide_for_stop();
+    if let Some((hwnd, pid, rect, placement, was_maximized)) = final_source_geometry {
+        let _ = finalize_source_geometry_restore(hwnd, pid, rect, placement, was_maximized);
+    }
     if gpu_resources_safe_to_clear {
         gc.clear_pool();
     } else {
@@ -10583,6 +13484,90 @@ fn save_screenshot_async(path: std::path::PathBuf, w: u32, h: u32, rgba: Vec<u8>
         });
 }
 
+fn save_rgb_diagnostic_async(path: std::path::PathBuf, w: u32, h: u32, rgb: Vec<u8>) {
+    let _ = std::thread::Builder::new()
+        .name("rife-diagnostic-png".into())
+        .spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file = std::fs::File::create(&path)?;
+                let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+                encoder.set_color(png::ColorType::Rgb);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder.write_header()?;
+                writer.write_image_data(&rgb)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => log::info!(
+                    "rife-dml-vulkan-validate: diagnostic-saved path={} size={}x{}",
+                    path.display(),
+                    w,
+                    h
+                ),
+                Err(error) => log::error!(
+                    "rife-dml-vulkan-validate: diagnostic-save-failed path={} error={error:#}",
+                    path.display()
+                ),
+            }
+        });
+}
+
+fn rife_validation_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("screenshots");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    (
+        root.join(format!("rife_validate_{stamp}_shared_vulkan.png")),
+        root.join(format!("rife_validate_{stamp}_cpu_visible.png")),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RifeRgbDiff {
+    mean_abs: f64,
+    max_abs: u8,
+    bad_fraction: f64,
+}
+
+fn compare_rife_rgb(a: &[u8], b: &[u8]) -> Option<RifeRgbDiff> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut sum = 0u64;
+    let mut max_abs = 0u8;
+    let mut bad = 0usize;
+    for (&av, &bv) in a.iter().zip(b) {
+        let d = av.abs_diff(bv);
+        sum += d as u64;
+        max_abs = max_abs.max(d);
+        if d >= 12 {
+            bad += 1;
+        }
+    }
+    Some(RifeRgbDiff {
+        mean_abs: sum as f64 / a.len() as f64,
+        max_abs,
+        bad_fraction: bad as f64 / a.len() as f64,
+    })
+}
+
+fn rife_diff_is_material(diff: RifeRgbDiff) -> bool {
+    // Two runs of the same stateless DirectML graph can differ by tiny rounding
+    // noise, but a transport/layout failure affects a large part of the frame.
+    // Keep the threshold deliberately loose so validation never disables the
+    // resident path for harmless 1-LSB provider differences.
+    diff.mean_abs > 2.0 || diff.bad_fraction > 0.005 || diff.max_abs > 64
+}
+
 /// Return the aspect-preserving DirectML RIFE safety size. The limit is
 /// deliberately based on logical RIFE input height (matching the mpv script),
 /// not ONNX's later 128-pixel padding. Width is rounded to the nearest even
@@ -10613,7 +13598,11 @@ fn log_directml_rife_height_limit(
             limited.1,
             DIRECTML_RIFE_MAX_HEIGHT,
             interp_index,
-            if interp_index == 0 { "first" } else { "after-prechain" },
+            if interp_index == 0 {
+                "first"
+            } else {
+                "after-prechain"
+            },
             route
         );
         s.dml_rife_limit_log_key = Some(key);
@@ -10624,19 +13613,8 @@ fn log_directml_rife_height_limit(
 /// The production DirectML RIFE path uses the GPU Spline36 limiter above; this
 /// keeps the same 1440p contract even when GPU interpolation is explicitly
 /// disabled or unavailable.
-fn resize_rgba8_bilinear(
-    src: &[u8],
-    sw: i32,
-    sh: i32,
-    dw: i32,
-    dh: i32,
-) -> Option<Vec<u8>> {
-    if sw <= 0
-        || sh <= 0
-        || dw <= 0
-        || dh <= 0
-        || src.len() != sw as usize * sh as usize * 4
-    {
+fn resize_rgba8_bilinear(src: &[u8], sw: i32, sh: i32, dw: i32, dh: i32) -> Option<Vec<u8>> {
+    if sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0 || src.len() != sw as usize * sh as usize * 4 {
         return None;
     }
     if (sw, sh) == (dw, dh) {
@@ -10648,29 +13626,86 @@ fn resize_rgba8_bilinear(
     dst.par_chunks_mut(dst_stride)
         .enumerate()
         .for_each(|(dy, row)| {
-            let sy = (((dy as f64 + 0.5) * sh as f64 / dh as f64) - 0.5)
-                .clamp(0.0, sh as f64 - 1.0);
+            let sy =
+                (((dy as f64 + 0.5) * sh as f64 / dh as f64) - 0.5).clamp(0.0, sh as f64 - 1.0);
             let y0 = sy.floor() as usize;
             let y1 = (y0 + 1).min(sh as usize - 1);
             let fy = sy - y0 as f64;
             for dx in 0..dw as usize {
-                let sx = (((dx as f64 + 0.5) * sw as f64 / dw as f64) - 0.5)
-                    .clamp(0.0, sw as f64 - 1.0);
+                let sx =
+                    (((dx as f64 + 0.5) * sw as f64 / dw as f64) - 0.5).clamp(0.0, sw as f64 - 1.0);
                 let x0 = sx.floor() as usize;
                 let x1 = (x0 + 1).min(sw as usize - 1);
                 let fx = sx - x0 as f64;
                 for channel in 0..4 {
-                    let at = |x: usize, y: usize| {
-                        src[(y * sw as usize + x) * 4 + channel] as f64
-                    };
+                    let at = |x: usize, y: usize| src[(y * sw as usize + x) * 4 + channel] as f64;
                     let top = at(x0, y0) * (1.0 - fx) + at(x1, y0) * fx;
                     let bottom = at(x0, y1) * (1.0 - fx) + at(x1, y1) * fx;
-                    row[dx * 4 + channel] =
-                        (top * (1.0 - fy) + bottom * fy).round() as u8;
+                    row[dx * 4 + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
                 }
             }
         });
     Some(dst)
+}
+
+const DISPLAY_REGION_UPLOAD_RING_SLOTS: usize = 4;
+
+/// Upload one live session frame. Ordinary window WGC retains the established
+/// pooled texture path. Monitor-region display capture rotates four dedicated
+/// upload textures. The selected presentation surface is read from the monitor
+/// while Neo's own overlay is excluded from capture; on some compositor paths
+/// DWM can retain a
+/// just-presented texture for more than one refresh. Rewriting that texture
+/// immediately can therefore block glTexSubImage2D for most of a 60 Hz frame.
+/// A storage ring removes the reuse dependency without delaying or reordering
+/// frames and leaves the Smooth/VSync pacing state machines untouched.
+fn upload_session_frame_timed(gc: &mut GlContext, s: &mut Session) -> GpuTex {
+    let started = Instant::now();
+    let use_display_region_ring = !s.display_region_upload_ring_fallback_logged
+        && !s.frame.hdr
+        && s.source.uses_display_region_fallback();
+
+    let tex = if use_display_region_ring {
+        let slot = s.display_region_upload_slot % DISPLAY_REGION_UPLOAD_RING_SLOTS;
+        match gc.upload_rgba8_capture_ring(
+            slot,
+            DISPLAY_REGION_UPLOAD_RING_SLOTS,
+            s.frame.w,
+            s.frame.h,
+            &s.frame.data,
+        ) {
+            Ok(texture) => {
+                s.display_region_upload_slot =
+                    (s.display_region_upload_slot + 1) % DISPLAY_REGION_UPLOAD_RING_SLOTS;
+                if !s.display_region_upload_ring_logged {
+                    log::info!(
+                        "display-region-upload-ring: active slots={} latency_frames=0 geometry={}x{} reason=avoid-recent-present-texture-reuse",
+                        DISPLAY_REGION_UPLOAD_RING_SLOTS,
+                        s.frame.w,
+                        s.frame.h
+                    );
+                    s.display_region_upload_ring_logged = true;
+                }
+                texture
+            }
+            Err(error) => {
+                if !s.display_region_upload_ring_fallback_logged {
+                    log::warn!(
+                        "display-region-upload-ring: disabled-for-session geometry={}x{} reason='{}' fallback=pooled",
+                        s.frame.w,
+                        s.frame.h,
+                        error
+                    );
+                    s.display_region_upload_ring_fallback_logged = true;
+                }
+                gc.upload_rgba8(s.frame.w, s.frame.h, &s.frame.data)
+            }
+        }
+    } else {
+        upload_frame(gc, &s.frame)
+    };
+    s.last_upload_submit_ms = started.elapsed().as_secs_f64() * 1000.0;
+    tex
 }
 
 /// Diagnostic wrapper for the capture-buffer -> GL texture submission.
@@ -10799,6 +13834,94 @@ fn fit_frame_canvas_dot_by_dot(frame: &mut FrameBuf, target: (i32, i32)) -> bool
     true
 }
 
+fn capture_resolution_frame_target(client_size: (u32, u32)) -> (i32, i32) {
+    let normalized = normalize_capture_client_size(client_size);
+    (normalized.0 as i32, normalized.1 as i32)
+}
+
+fn display_region_capture_frame_target(region_size: (i32, i32)) -> Option<(i32, i32)> {
+    let (w, h) = region_size;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let even = |value: i32| {
+        if value & 1 == 0 {
+            value
+        } else {
+            value.saturating_add(1)
+        }
+    };
+    Some((even(w), even(h)))
+}
+
+fn update_display_region_capture_resolution_candidate(
+    s: &mut Session,
+    observed: (i32, i32),
+) -> Option<(i32, i32)> {
+    let Some((_, _, region_w, region_h)) = s.source.display_region_rect() else {
+        s.capture_resolution_region_candidate = None;
+        s.capture_resolution_region_candidate_since = None;
+        return None;
+    };
+    let Some(reference) = display_region_capture_frame_target((region_w, region_h)) else {
+        s.capture_resolution_region_candidate = None;
+        s.capture_resolution_region_candidate_since = None;
+        return None;
+    };
+
+    // The display-region rect and the monitor-copy callback are sampled on
+    // different threads. Allow only the established even-pad tolerance; a
+    // materially different frame is still a transient compositor surface.
+    if (observed.0 - reference.0).abs() > 2 || (observed.1 - reference.1).abs() > 2 {
+        if s.capture_resolution_region_candidate.is_some() {
+            log::debug!(
+                "capture-resolution display-region candidate reset: observed={}x{} reference={}x{} reason=region-frame-mismatch",
+                observed.0,
+                observed.1,
+                reference.0,
+                reference.1
+            );
+        }
+        s.capture_resolution_region_candidate = None;
+        s.capture_resolution_region_candidate_since = None;
+        return None;
+    }
+
+    if s.capture_resolution_region_candidate != Some(observed) {
+        s.capture_resolution_region_candidate = Some(observed);
+        s.capture_resolution_region_candidate_since = Some(Instant::now());
+        log::debug!(
+            "capture-resolution display-region candidate: capture={}x{} region={}x{} settle_ms={}",
+            observed.0,
+            observed.1,
+            region_w,
+            region_h,
+            DISPLAY_REGION_CAPTURE_RESOLUTION_SETTLE.as_millis()
+        );
+        return None;
+    }
+
+    if s.capture_resolution_region_candidate_since
+        .is_some_and(|since| since.elapsed() >= DISPLAY_REGION_CAPTURE_RESOLUTION_SETTLE)
+    {
+        return Some(observed);
+    }
+    None
+}
+
+fn capture_resolution_transition_frame_ready(
+    s: &Session,
+    applied: (u32, u32),
+    frame_size: (i32, i32),
+) -> bool {
+    if s.source.uses_display_region_fallback() {
+        return s.pending_resize_size.is_none()
+            && s.capture_in_size != (0, 0)
+            && frame_size == s.capture_in_size;
+    }
+    frame_size == capture_resolution_frame_target(applied)
+}
+
 fn normalize_capture_client_size(size: (u32, u32)) -> (u32, u32) {
     let even = |value: u32, min_value: u32, max_value: u32| {
         let bounded = value.clamp(min_value, max_value);
@@ -10830,6 +13953,7 @@ fn reset_for_source_resize(
     metrics: &Metrics,
     old_size: (i32, i32),
     new_size: (i32, i32),
+    pending_capture_size: Option<(i32, i32)>,
 ) {
     log::info!(
         "source frame size changed: {}x{} -> {}x{}; preserving filter chain and preparing automatic follow",
@@ -10886,7 +14010,10 @@ fn reset_for_source_resize(
     s.last_process_ms = 0.0;
     s.last_compute_ms = 0.0;
     s.last_present_block_ms = 0.0;
-    s.pending_resize_size = Some(new_size);
+    // Source/capture geometry transitions wait for a stable raw WGC size.
+    // A user crop transition already comes from a stable cached WGC frame and
+    // therefore must not create a fake raw-size pending transition.
+    s.pending_resize_size = pending_capture_size;
     s.onnx_geometry_rebuild_pending = s.chain.has_onnx();
     metrics.reset();
     // Preserve reusable shader textures and a bounded set of old/new frame
@@ -10957,7 +14084,7 @@ fn drain_pending_interp(
         .interp_tail
         .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
-    let mut got: Vec<Option<(i32, i32, Vec<u8>)>> = (0..pending.count).map(|_| None).collect();
+    let mut got: Vec<Option<InterpPayload>> = (0..pending.count).map(|_| None).collect();
     let mut fail: Option<String> = None;
     let mut interp_run_ms = 0.0f64;
     if let Some(worker) = s.interp_worker.as_ref() {
@@ -11028,7 +14155,7 @@ fn drain_pending_interp(
     let mids_t0 = Instant::now();
     let mut deadline_miss_count = 0u32;
     for (index, value) in got.into_iter().enumerate() {
-        let Some((mw, mh, mid)) = value else {
+        let Some(payload) = value else {
             continue;
         };
         if s.smooth_pacing {
@@ -11044,7 +14171,258 @@ fn drain_pending_interp(
             wait_until_with_pump(overlay, prepare_at);
         }
         let t0 = Instant::now();
-        let tex = gc.upload_rgb8(mw, mh, &mid);
+        let (tex, chain_start, transition_route) = match payload {
+            InterpPayload::Cpu(mw, mh, mid) => (
+                gc.upload_rgb8(mw, mh, &mid),
+                pending.chain_start_index,
+                "cpu-worker",
+            ),
+            InterpPayload::DmlShared { shared, fallback } => {
+                let stage_count = s.chain.stage_count();
+                let interp_stage = match s.chain.interp_stage() {
+                    Some(crate::render::chain::InterpHandle::Onnx { stage, .. }) => Some(stage),
+                    _ => None,
+                };
+                let stage_ptr = interp_stage
+                    .as_ref()
+                    .map(|stage| std::sync::Arc::as_ptr(stage) as usize);
+
+                // If this exact stage was already proven unsafe, do not even
+                // attempt another shared import for a payload that was queued
+                // before the worker saw the disable latch.
+                if stage_ptr.is_some() && s.dml_vulkan_rife_force_cpu_stage == stage_ptr {
+                    let Some(stage) = interp_stage else {
+                        fail = Some("RIFE CPU safety fallback stage disappeared".into());
+                        continue;
+                    };
+                    let frames = fallback
+                        .frames
+                        .iter()
+                        .map(|frame| frame.as_slice())
+                        .collect::<Vec<_>>();
+                    let fallback_result = stage.lock().unwrap().process_interp_many_rgba8(
+                        fallback.w,
+                        fallback.h,
+                        &frames,
+                        &[fallback.t],
+                    );
+                    match fallback_result {
+                        Ok(mut outputs) => {
+                            let Some((mw, mh, mid)) = outputs.pop() else {
+                                fail = Some("RIFE CPU safety fallback produced no frame".into());
+                                continue;
+                            };
+                            (
+                                gc.upload_rgb8(mw, mh, &mid),
+                                pending.chain_start_index,
+                                "dml-vulkan-validation-cpu-latched",
+                            )
+                        }
+                        Err(error) => {
+                            fail = Some(format!("RIFE CPU safety fallback failed: {error:#}"));
+                            continue;
+                        }
+                    }
+                } else {
+                    match s.chain.process_range_from_dml_shared(
+                        gc,
+                        &shared,
+                        out_size,
+                        pending.chain_start_index,
+                        stage_count,
+                        None,
+                    ) {
+                        Ok(Some(tex)) => {
+                            // v656: for a RIFE-only chain, compare the exact raw
+                            // DML->D3D12->Vulkan midpoint with an independent
+                            // CPU-visible DirectML run made from the same Arc
+                            // frames and timestep. This answers the remaining
+                            // ambiguity without changing the normal RTX path.
+                            let should_validate = stage_ptr.is_some()
+                                && s.dml_vulkan_rife_validation_stage != stage_ptr
+                                && stage_count == pending.chain_start_index;
+                            if should_validate {
+                                let stage = interp_stage.expect("validated interpolation stage");
+                                let shared_rgb = gc.download_rgb8(tex);
+                                let frames = fallback
+                                    .frames
+                                    .iter()
+                                    .map(|frame| frame.as_slice())
+                                    .collect::<Vec<_>>();
+                                let cpu_result = stage.lock().unwrap().process_interp_many_rgba8(
+                                    fallback.w,
+                                    fallback.h,
+                                    &frames,
+                                    &[fallback.t],
+                                );
+                                s.dml_vulkan_rife_validation_stage = stage_ptr;
+                                match cpu_result {
+                                    Ok(mut outputs) => {
+                                        if let Some((mw, mh, cpu_rgb)) = outputs.pop() {
+                                            let (shared_path, cpu_path) = rife_validation_paths();
+                                            save_rgb_diagnostic_async(
+                                                shared_path.clone(),
+                                                tex.w() as u32,
+                                                tex.h() as u32,
+                                                shared_rgb.clone(),
+                                            );
+                                            save_rgb_diagnostic_async(
+                                                cpu_path.clone(),
+                                                mw as u32,
+                                                mh as u32,
+                                                cpu_rgb.clone(),
+                                            );
+                                            let diff = if mw == tex.w() && mh == tex.h() {
+                                                compare_rife_rgb(&shared_rgb, &cpu_rgb)
+                                            } else {
+                                                None
+                                            };
+                                            match diff {
+                                                Some(diff) if rife_diff_is_material(diff) => {
+                                                    let reason = format!(
+                                                        "RIFE DML->Vulkan validation mismatch mean_abs={:.3} max_abs={} bad_fraction={:.4}",
+                                                        diff.mean_abs,
+                                                        diff.max_abs,
+                                                        diff.bad_fraction
+                                                    );
+                                                    stage
+                                                        .lock()
+                                                        .unwrap()
+                                                        .disable_dml_cpu_interp_shared(&reason);
+                                                    s.dml_vulkan_rife_force_cpu_stage = stage_ptr;
+                                                    log::error!(
+                                                        "rife-dml-vulkan-validate: result=mismatch action=disable-resident-and-use-cpu-visible size={}x{} mean_abs={:.3} max_abs={} bad_fraction={:.4} shared_png={} cpu_png={}",
+                                                        mw,
+                                                        mh,
+                                                        diff.mean_abs,
+                                                        diff.max_abs,
+                                                        diff.bad_fraction,
+                                                        shared_path.display(),
+                                                        cpu_path.display(),
+                                                    );
+                                                    (
+                                                        gc.upload_rgb8(mw, mh, &cpu_rgb),
+                                                        pending.chain_start_index,
+                                                        "dml-vulkan-validation-mismatch-cpu",
+                                                    )
+                                                }
+                                                Some(diff) => {
+                                                    log::info!(
+                                                        "rife-dml-vulkan-validate: result=match resident=keep size={}x{} mean_abs={:.3} max_abs={} bad_fraction={:.4} shared_png={} cpu_png={}",
+                                                        mw,
+                                                        mh,
+                                                        diff.mean_abs,
+                                                        diff.max_abs,
+                                                        diff.bad_fraction,
+                                                        shared_path.display(),
+                                                        cpu_path.display(),
+                                                    );
+                                                    (
+                                                        tex,
+                                                        stage_count,
+                                                        "dml-vulkan-resident-validated",
+                                                    )
+                                                }
+                                                None => {
+                                                    let reason = format!(
+                                                        "RIFE validation geometry/buffer mismatch shared={}x{} bytes={} cpu={}x{} bytes={}",
+                                                        tex.w(),
+                                                        tex.h(),
+                                                        shared_rgb.len(),
+                                                        mw,
+                                                        mh,
+                                                        cpu_rgb.len()
+                                                    );
+                                                    stage
+                                                        .lock()
+                                                        .unwrap()
+                                                        .disable_dml_cpu_interp_shared(&reason);
+                                                    s.dml_vulkan_rife_force_cpu_stage = stage_ptr;
+                                                    log::error!(
+                                                        "rife-dml-vulkan-validate: result=geometry-mismatch action=disable-resident-and-use-cpu-visible reason={} shared_png={} cpu_png={}",
+                                                        reason,
+                                                        shared_path.display(),
+                                                        cpu_path.display(),
+                                                    );
+                                                    (
+                                                        gc.upload_rgb8(mw, mh, &cpu_rgb),
+                                                        pending.chain_start_index,
+                                                        "dml-vulkan-validation-geometry-cpu",
+                                                    )
+                                                }
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "rife-dml-vulkan-validate: result=cpu-empty resident=keep"
+                                            );
+                                            (tex, stage_count, "dml-vulkan-resident")
+                                        }
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "rife-dml-vulkan-validate: result=cpu-probe-failed resident=keep error={error:#}"
+                                        );
+                                        (tex, stage_count, "dml-vulkan-resident")
+                                    }
+                                }
+                            } else {
+                                (tex, stage_count, "dml-vulkan-resident")
+                            }
+                        }
+                        shared_result => {
+                            let reason = match shared_result {
+                                Ok(None) => "Vulkan shared-import route not admitted".to_string(),
+                                Err(error) => format!("Vulkan shared-import failed: {error:#}"),
+                                Ok(Some(_)) => unreachable!(),
+                            };
+                            let Some(stage) = interp_stage else {
+                                fail = Some(reason);
+                                continue;
+                            };
+                            let fallback_result = {
+                                let mut stage = stage.lock().unwrap();
+                                stage.disable_dml_cpu_interp_shared(&reason);
+                                let frames = fallback
+                                    .frames
+                                    .iter()
+                                    .map(|frame| frame.as_slice())
+                                    .collect::<Vec<_>>();
+                                stage.process_interp_many_rgba8(
+                                    fallback.w,
+                                    fallback.h,
+                                    &frames,
+                                    &[fallback.t],
+                                )
+                            };
+                            match fallback_result {
+                                Ok(mut outputs) => {
+                                    let Some((mw, mh, mid)) = outputs.pop() else {
+                                        fail = Some(format!(
+                                            "{reason}; CPU fallback produced no frame"
+                                        ));
+                                        continue;
+                                    };
+                                    log::warn!(
+                                        "dml-vulkan-resident-handoff: result=fallback-current-frame reason={} route=cpu-visible-interpolation",
+                                        reason
+                                    );
+                                    (
+                                        gc.upload_rgb8(mw, mh, &mid),
+                                        pending.chain_start_index,
+                                        "dml-vulkan-fallback-cpu",
+                                    )
+                                }
+                                Err(error) => {
+                                    fail =
+                                        Some(format!("{reason}; CPU fallback failed: {error:#}"));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
         let transition_presented_before = if s.provider_transition_input_suspended {
             Some(status.lock().unwrap().presented)
         } else {
@@ -11077,12 +14455,12 @@ fn drain_pending_interp(
             }),
             &[],
             downscaler,
-            pending.chain_start_index,
+            chain_start,
         );
         if let Some(presented_before) = transition_presented_before {
             let presented_after = status.lock().unwrap().presented;
             if presented_after > presented_before {
-                resume_provider_transition_after_interpolated_present(input, s, "cpu-worker");
+                resume_provider_transition_after_interpolated_present(input, s, transition_route);
             }
         }
         if s.smooth_pacing {
@@ -11237,6 +14615,19 @@ fn release_gpu_interp_permit_after_post_submit(s: &mut Session) {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn vulkan_post_single_input_compatible(shader: &crate::render::mpv::UserShader) -> bool {
+    !shader.passes.is_empty()
+        && shader.passes.iter().all(|pass| {
+            pass.hooks
+                .iter()
+                .all(|hook| matches!(hook.as_str(), "OUTPUT" | "SCALED" | "POSTKERNEL"))
+                && pass
+                    .binds
+                    .iter()
+                    .all(|bind| !matches!(bind.as_str(), "MAIN" | "RGB" | "NATIVE" | "MAINPRESUB"))
+        })
+}
+
 fn process_and_present_from(
     gc: &mut GlContext,
     overlay: &mut OverlayWindow,
@@ -11252,6 +14643,45 @@ fn process_and_present_from(
     keep_extra: &[GpuTex],
     downscaler: crate::render::scaler::Kernel,
     chain_start_index: usize,
+) {
+    process_and_present_from_impl(
+        gc,
+        overlay,
+        s,
+        metrics,
+        status,
+        input,
+        out_size,
+        stats,
+        t0,
+        captures,
+        timing,
+        keep_extra,
+        downscaler,
+        chain_start_index,
+        false,
+        0.0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_and_present_from_impl(
+    gc: &mut GlContext,
+    overlay: &mut OverlayWindow,
+    s: &mut Session,
+    metrics: &Metrics,
+    status: &Arc<Mutex<Status>>,
+    input: GpuTex,
+    out_size: (i32, i32),
+    stats: bool,
+    t0: Instant,
+    captures: u32,
+    timing: Option<FrameTiming>,
+    keep_extra: &[GpuTex],
+    downscaler: crate::render::scaler::Kernel,
+    chain_start_index: usize,
+    chain_already_processed: bool,
+    preprocessed_chain_ms: f64,
 ) {
     // `process_from()` clears chain_reprocess_pending after a successful chain
     // run. Remember whether this present came from an explicit filter edit so
@@ -11301,7 +14731,7 @@ fn process_and_present_from(
         }
     }
     if auto_stop_hold {
-        // The overload decision is already final for this workload.
+        // v554: the overload decision is already final for this workload.
         // Preserve the last complete filtered frame during the short warning
         // grace instead of continuing to consume the very GPU time needed by
         // cursor/DWM/GUI recovery. The actual shutdown is still dispatched by
@@ -11354,18 +14784,31 @@ fn process_and_present_from(
     };
     let chain_input_size = (input.w(), input.h());
     let chain_started = Instant::now();
-    let result = s.chain.process_from(
-        gc,
-        input,
-        out_size,
-        chain_start_index,
-        if stats { Some(&mut probe_fn) } else { None },
-    );
-    s.last_chain_submit_ms = chain_started.elapsed().as_secs_f64() * 1000.0;
+    let result = if chain_already_processed {
+        // v661 direct DML -> Vulkan post handoff has already executed the
+        // requested regular chain range and advanced mpv's frame builtin.
+        // Do not run an empty FilterChain::process_range here: even an empty
+        // range advances the frame counter and would turn temporal shaders into
+        // an every-other-frame sequence.
+        Ok(input)
+    } else {
+        s.chain.process_from(
+            gc,
+            input,
+            out_size,
+            chain_start_index,
+            if stats { Some(&mut probe_fn) } else { None },
+        )
+    };
+    s.last_chain_submit_ms = if chain_already_processed {
+        preprocessed_chain_ms
+    } else {
+        chain_started.elapsed().as_secs_f64() * 1000.0
+    };
     match result {
         Ok(chain_tex) => {
             s.chain_reprocess_pending = false;
-            if stats && s.chain.has_interp() && chain_start_index > 0 {
+            if stats && !chain_already_processed && s.chain.has_interp() && chain_start_index > 0 {
                 let post_stages = s
                     .chain
                     .stages
@@ -11390,12 +14833,10 @@ fn process_and_present_from(
             // transition the actual overlay is deliberately kept at the old
             // size until this new filtered frame is ready to present.
             let desired_overlay = overlay_geometry(s, overlay);
+            let overlay_rect_before_present = overlay.current_rect();
+            let mut transition_overlay_repositioned = false;
             let (vw, vh) = (desired_overlay.2, desired_overlay.3);
-            let display_aspect = if s.display_aspect.0 > 0 && s.display_aspect.1 > 0 {
-                s.display_aspect
-            } else {
-                (chain_tex.w(), chain_tex.h())
-            };
+            let display_aspect = session_presentation_aspect(s, (chain_tex.w(), chain_tex.h()));
             let (dw, dh) = fit_aspect_inside(display_aspect, (vw, vh));
             let resample_started = Instant::now();
             let mut final_tex = crate::render::scaler::resample(gc, chain_tex, dw, dh, downscaler)
@@ -11403,15 +14844,74 @@ fn process_and_present_from(
             s.last_resample_submit_ms = resample_started.elapsed().as_secs_f64() * 1000.0;
             let post_started = Instant::now();
             for (metric_label, shader) in s.chain.post_shaders_with_metric_labels() {
-                // OUTPUT/SCALED-hook shaders execute outside FilterChain::process_range,
-                // after the final display-size resample. They therefore need their own
-                // asynchronous GL_TIME_ELAPSED query; otherwise the effect is applied
-                // correctly but the per-stage statistics row never receives a sample.
-                let timer = stats
-                    .then(|| gc.begin_gpu_timer(&metric_label))
-                    .flatten();
-                let post_result =
-                    crate::render::glsl_engine::GlslEngine::run_post(gc, &shader, final_tex);
+                // Simple OUTPUT/SCALED post shaders that do not bind the original
+                // MAIN texture can also remain on the selected compute GPU. More
+                // complex two-input post shaders retain the proven OpenGL path.
+                let mut vulkan_post_applied = false;
+                if vulkan_post_single_input_compatible(&shader) {
+                    if let Some(luid) = crate::render::vulkan_gpu::production_selected_luid() {
+                        let post_started = Instant::now();
+                        let rgba = gc.download_rgba8(final_tex);
+                        match crate::render::vulkan_multipass::process_rgba8(
+                            luid,
+                            &shader,
+                            final_tex.w() as u32,
+                            final_tex.h() as u32,
+                            final_tex.w() as u32,
+                            final_tex.h() as u32,
+                            &rgba,
+                        ) {
+                            Ok(Some(result)) => {
+                                final_tex = gc.upload_rgba8(
+                                    result.output_width as i32,
+                                    result.output_height as i32,
+                                    &result.output_rgba8,
+                                );
+                                let stage_ms = post_started.elapsed().as_secs_f64() * 1000.0;
+                                if stats {
+                                    metrics.probe(&metric_label, "glsl", stage_ms);
+                                }
+                                if result.first_frame_active {
+                                    let line = format!(
+                                        "vulkan-multipass-glsl: result=active route=post-display shader='{}' requested_luid={:016x} gpu='{}' output={}x{} passes={} transfer=gl-to-cpu-to-vulkan-to-cpu-to-gl vulkan_ms={:.3} stage_ms={:.3} fallback=OpenGL-on-error",
+                                        shader.name(),
+                                        luid,
+                                        result.gpu_name,
+                                        result.output_width,
+                                        result.output_height,
+                                        result.active_passes,
+                                        result.elapsed_ms,
+                                        stage_ms,
+                                    );
+                                    log::info!("{line}");
+                                    crate::render::vulkan_gpu::record_probe_result(&line);
+                                }
+                                vulkan_post_applied = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let line = format!(
+                                    "vulkan-multipass-glsl: result=fallback route=post-display shader='{}' requested_luid={:016x} reason={:#} fallback=OpenGL",
+                                    shader.name(),
+                                    luid,
+                                    error
+                                );
+                                log::warn!("{line}");
+                                crate::render::vulkan_gpu::record_probe_result(&line);
+                            }
+                        }
+                    }
+                }
+                if vulkan_post_applied {
+                    continue;
+                }
+
+                // Complex/two-input OUTPUT/SCALED shaders execute on the established
+                // OpenGL path after the final display-size resample.
+                let timer = stats.then(|| gc.begin_gpu_timer(&metric_label)).flatten();
+                let post_result = crate::render::glsl_engine::GlslEngine::run_post_with_main(
+                    gc, &shader, chain_tex, final_tex,
+                );
                 if let Some(query) = timer {
                     gc.end_gpu_timer(query, metric_label.clone());
                 }
@@ -11439,7 +14939,14 @@ fn process_and_present_from(
             // and not after SwapBuffers (which needlessly serializes DML with
             // compositor wait). All interpolation/output buffers are per-slot.
             release_gpu_interp_permit_after_post_submit(s);
-            if overlay.size() != (desired_overlay.2, desired_overlay.3) {
+            let geometry_transition_pending =
+                s.aspect_transition_pending || s.crop_transition_pending;
+            let overlay_commit_needed = if geometry_transition_pending {
+                overlay.current_rect() != desired_overlay
+            } else {
+                overlay.size() != (desired_overlay.2, desired_overlay.3)
+            };
+            if overlay_commit_needed {
                 let old_size = overlay.size();
                 let gui_hwnd = win32::main_gui_hwnd();
                 let gui_topmost = gui_hwnd != 0
@@ -11453,6 +14960,7 @@ fn process_and_present_from(
                     desired_overlay.3,
                     gui_topmost,
                 );
+                transition_overlay_repositioned = geometry_transition_pending;
                 status.lock().unwrap().overlay_rect = desired_overlay;
                 log::info!(
                     "source aspect display committed atomically: overlay={}x{} -> {}x{} frame={}x{}",
@@ -11560,8 +15068,87 @@ fn process_and_present_from(
                 s.paced_present_deadline = None;
             }
             if let Err(e) = present_result {
+                if transition_overlay_repositioned {
+                    let gui_hwnd = win32::main_gui_hwnd();
+                    let gui_topmost = gui_hwnd != 0
+                        && win32::is_window_valid(gui_hwnd)
+                        && win32::is_topmost(gui_hwnd);
+                    reposition_overlay_for_gui_mode(
+                        overlay,
+                        overlay_rect_before_present.0,
+                        overlay_rect_before_present.1,
+                        overlay_rect_before_present.2,
+                        overlay_rect_before_present.3,
+                        gui_topmost,
+                    );
+                    status.lock().unwrap().overlay_rect = overlay_rect_before_present;
+                }
+                if s.aspect_transition_pending {
+                    // Keep the transition armed and force another cached-frame
+                    // render. This also covers Auto mode, where content aspect
+                    // changes without changing the fullscreen overlay rectangle.
+                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    log::warn!(
+                        "aspect-live-transition-present-failed: overlay_rollback={} restored={}x{} pending=true retry_cached={}",
+                        transition_overlay_repositioned,
+                        overlay_rect_before_present.2,
+                        overlay_rect_before_present.3,
+                        s.chain_reprocess_pending
+                    );
+                }
+                if s.crop_transition_pending {
+                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    log::warn!(
+                        "crop-live-transition-present-failed: pending=true retry_cached={}",
+                        s.chain_reprocess_pending
+                    );
+                }
                 status.lock().unwrap().last_error = Some(format!("{e:#}"));
             } else {
+                if s.aspect_transition_pending {
+                    s.aspect_transition_pending = false;
+                    log::info!(
+                        "aspect-live-transition-committed: enabled={} mode={:?} scale={:.2}x{:.2} overlay={}x{} content={}x{}",
+                        s.aspect_correction,
+                        s.aspect_correction_mode,
+                        s.aspect_width_scale,
+                        s.aspect_height_scale,
+                        desired_overlay.2,
+                        desired_overlay.3,
+                        final_tex.w(),
+                        final_tex.h()
+                    );
+                }
+                if s.crop_transition_pending {
+                    s.crop_transition_pending = false;
+                    s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+                    // Start the overload settle clock from the first successfully
+                    // presented frame of the new Crop geometry, not merely from
+                    // the GUI command time.  This guarantees that a slow ONNX
+                    // shape rebuild itself can never consume the settle window.
+                    if glsl_guard_eligible(s) {
+                        let guard_arm = Instant::now();
+                        s.glsl_guard.reset();
+                        s.glsl_chain_settle_until = Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE);
+                        s.glsl_chain_immediate_until =
+                            Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE + GLSL_GUARD_CHAIN_CONFIRM);
+                        log::debug!(
+                            "glsl-responsiveness-crop-settle: phase=presented duration_ms={} confirm_ms={}",
+                            GLSL_GUARD_CHAIN_SETTLE.as_millis(),
+                            GLSL_GUARD_CHAIN_CONFIRM.as_millis()
+                        );
+                    }
+                    log::info!(
+                        "crop-live-transition-committed: enabled={} edges=({}, {}, {}, {}) processing={}x{} input=resume-after-120ms",
+                        s.capture_crop.enabled,
+                        s.capture_crop.left,
+                        s.capture_crop.top,
+                        s.capture_crop.right,
+                        s.capture_crop.bottom,
+                        s.in_size.0,
+                        s.in_size.1
+                    );
+                }
                 if chain_reprocess_commit && overlay.is_visible() {
                     // WGC is change-driven, so a paused source may not deliver
                     // another frame after a filter toggle. Force DWM to consume
@@ -11576,11 +15163,13 @@ fn process_and_present_from(
                 if overlay.is_visible()
                     && s.capture_resolution_applied
                     && let Some((requested, applied)) = s.deferred_capture_resolution
-                    && (s.frame.w, s.frame.h) == (applied.0 as i32, applied.1 as i32)
+                    && capture_resolution_transition_frame_ready(s, applied, s.frame.capture_size())
                 {
                     s.deferred_capture_resolution = None;
                     s.capture_resolution_applied = false;
                     s.capture_resolution_wait_started = None;
+                    s.capture_resolution_region_candidate = None;
+                    s.capture_resolution_region_candidate_since = None;
                     s.last_client_rect = win32::client_rect_on_screen(s.hwnd);
                     s.last_geom_change = None;
                     s.starve_released = false;
@@ -11596,18 +15185,19 @@ fn process_and_present_from(
                 if !overlay.is_visible() {
                     let mut reveal_ready = true;
                     if let Some((requested, applied)) = s.deferred_capture_resolution {
-                        let target = (applied.0 as i32, applied.1 as i32);
-                        if (s.frame.w, s.frame.h) != target && !s.capture_resolution_applied {
+                        let target = capture_resolution_frame_target(applied);
+                        if s.frame.capture_size() != target && !s.capture_resolution_applied {
                             // The source window must be visually hidden before
                             // changing its client size. Otherwise a static PIP
                             // itself expands from (for example) 366x206 to
                             // 1280x720 on the desktop and looks like a giant
                             // zoomed frame even though the overlay is hidden.
                             if s.hide_source_pending {
-                                if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
+                                if let Some(was_layered) = source_hide_window_visual(s) {
                                     s.hide_source_pending = false;
                                     s.hid_source = Some(was_layered);
-                                    status.lock().unwrap().hidden_src = Some((s.hwnd, was_layered));
+                                    status.lock().unwrap().hidden_src =
+                                        Some((s.hwnd, s.source_pid, was_layered));
                                     log::info!(
                                         "source {:#x} visually hidden before deferred capture-resolution resize (was_layered={was_layered})",
                                         s.hwnd
@@ -11628,15 +15218,13 @@ fn process_and_present_from(
                             // Keep the overlay hidden while the source changes size.
                             // A source-sized transition texture appeared as a giant
                             // zoomed frame when a static browser/PIP did not repaint.
-                            if reveal_ready
-                                && win32::resize_client_area(s.hwnd, applied.0, applied.1)
-                            {
+                            if reveal_ready && source_resize_client_area(s, applied.0, applied.1) {
                                 s.capture_resolution_applied = true;
                                 s.capture_resolution_wait_started = Some(Instant::now());
                                 s.capture_resolution_repaint_last = None;
                                 s.capture_resolution_nudge_done = false;
                                 s.capture_resolution_native_fallback = false;
-                                win32::request_window_repaint(s.hwnd);
+                                source_request_window_repaint(s);
                                 reveal_ready = false;
                                 log::info!(
                                     "capture-resolution applied before overlay reveal: hwnd={:#x} requested={}x{} client={}x{}; waiting for first exact filtered frame",
@@ -11664,10 +15252,11 @@ fn process_and_present_from(
                         }
                     }
                     if reveal_ready && s.hide_source_pending && !s.source_monitor_fullscreen {
-                        if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
+                        if let Some(was_layered) = source_hide_window_visual(s) {
                             s.hide_source_pending = false;
                             s.hid_source = Some(was_layered);
-                            status.lock().unwrap().hidden_src = Some((s.hwnd, was_layered));
+                            status.lock().unwrap().hidden_src =
+                                Some((s.hwnd, s.source_pid, was_layered));
                             log::info!(
                                 "source {:#x} visually hidden after first valid filtered frame (was_layered={was_layered})",
                                 s.hwnd
@@ -11685,14 +15274,20 @@ fn process_and_present_from(
                     if reveal_ready
                         && let Some((requested, applied)) = s.deferred_capture_resolution
                     {
-                        let target = (applied.0 as i32, applied.1 as i32);
-                        if (s.frame.w, s.frame.h) == target {
+                        let target = capture_resolution_frame_target(applied);
+                        if capture_resolution_transition_frame_ready(
+                            s,
+                            applied,
+                            s.frame.capture_size(),
+                        ) {
                             s.deferred_capture_resolution = None;
                             s.capture_resolution_applied = false;
                             s.capture_resolution_wait_started = None;
                             s.capture_resolution_repaint_last = None;
                             s.capture_resolution_nudge_done = false;
                             s.capture_resolution_native_fallback = false;
+                            s.capture_resolution_region_candidate = None;
+                            s.capture_resolution_region_candidate_since = None;
                             s.last_client_rect = win32::client_rect_on_screen(s.hwnd);
                             s.last_geom_change = None;
                             s.starve_released = false;
@@ -11838,10 +15433,11 @@ fn process_and_present_from(
                         // ordering. Windowed/deferred-resize behavior is left
                         // unchanged.
                         if s.source_monitor_fullscreen && s.hide_source_pending {
-                            if let Some(was_layered) = win32::hide_window_visual(s.hwnd) {
+                            if let Some(was_layered) = source_hide_window_visual(s) {
                                 s.hide_source_pending = false;
                                 s.hid_source = Some(was_layered);
-                                status.lock().unwrap().hidden_src = Some((s.hwnd, was_layered));
+                                status.lock().unwrap().hidden_src =
+                                    Some((s.hwnd, s.source_pid, was_layered));
                                 log::info!(
                                     "source {:#x} visually hidden after opaque fullscreen overlay commit (was_layered={was_layered})",
                                     s.hwnd
@@ -11859,6 +15455,36 @@ fn process_and_present_from(
                         // The revealed frame can still be the transition
                         // shield while TensorRT compiles asynchronously.
                     }
+                }
+            }
+            if s.screenshot_burst.is_some() {
+                // `captures == 0` is the synthetic midpoint contract used by the
+                // interpolation drain. REAL endpoints carry the source-delivery
+                // delta. Even if a rare cached real frame reports zero captures,
+                // the consecutive files still preserve the exact visual cadence.
+                let kind = if s.chain.has_interp() && captures == 0 {
+                    "midpoint"
+                } else {
+                    "real"
+                };
+                let rgba = gc.download_rgba8(final_tex);
+                let (path, finished) = {
+                    let burst = s.screenshot_burst.as_mut().expect("burst exists");
+                    let path = burst.next_path(kind);
+                    let finished = burst.finished();
+                    (path, finished)
+                };
+                log::info!(
+                    "screenshot-interp-burst: action=capture kind={} size={}x{} path={}",
+                    kind,
+                    final_tex.w(),
+                    final_tex.h(),
+                    path.display()
+                );
+                save_screenshot_async(path, final_tex.w() as u32, final_tex.h() as u32, rgba);
+                if finished {
+                    s.screenshot_burst = None;
+                    log::info!("screenshot-interp-burst: action=complete");
                 }
             }
             if let Some(prev) = s.last_tex.take() {
@@ -12020,6 +15646,62 @@ mod tests {
     use crate::capture::wgc::FrameBuf;
     use half::f16;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pending_live_preset_publishes_chain_and_matching_aspect_together() {
+        let mut pending = PendingLiveUpdate::default();
+        pending.publish_aspect(AspectCorrectionState {
+            enabled: true,
+            mode: AspectCorrectionMode::Manual,
+            width_scale: 1.25,
+            height_scale: 1.0,
+        });
+        pending.publish_chain(
+            Vec::new(),
+            AspectCorrectionState {
+                enabled: false,
+                mode: AspectCorrectionMode::Manual,
+                width_scale: 1.0,
+                height_scale: 1.0,
+            },
+            CaptureCrop::default(),
+        );
+
+        let (chain, aspect, _, _, _, _) = pending.take_latest();
+        let aspect = aspect.expect("preset aspect snapshot");
+        assert!(chain.is_some());
+        assert!(!aspect.enabled);
+        assert!((aspect.width_scale - 1.0).abs() < f32::EPSILON);
+        assert!((aspect.height_scale - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pending_live_newer_direct_aspect_wins_after_preset_snapshot() {
+        let mut pending = PendingLiveUpdate::default();
+        pending.publish_chain(
+            Vec::new(),
+            AspectCorrectionState {
+                enabled: true,
+                mode: AspectCorrectionMode::Manual,
+                width_scale: 0.75,
+                height_scale: 1.0,
+            },
+            CaptureCrop::default(),
+        );
+        pending.publish_aspect(AspectCorrectionState {
+            enabled: true,
+            mode: AspectCorrectionMode::Manual,
+            width_scale: 0.80,
+            height_scale: 1.0,
+        });
+
+        let (chain, aspect, _, _, _, _) = pending.take_latest();
+        let aspect = aspect.expect("latest direct aspect");
+        assert!(chain.is_some());
+        assert!(aspect.enabled);
+        assert!((aspect.width_scale - 0.80).abs() < f32::EPSILON);
+        assert!((aspect.height_scale - 1.0).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn directml_rife_height_limit_matches_mpv_1440_policy() {
@@ -12193,6 +15875,7 @@ mod tests {
             seq: 7,
             received_at: None,
             source_time_100ns: Some(123),
+            ..FrameBuf::default()
         };
         assert!(resize_static_rgba8_frame(&mut frame, (4, 2)));
         assert_eq!((frame.w, frame.h), (4, 2));
@@ -13262,6 +16945,62 @@ mod tests {
     }
 
     #[test]
+    fn smooth_pacer_live_workload_reset_discards_heavy_budget_history() {
+        let mut pacer = SmoothPacer::default();
+        for _ in 0..30 {
+            pacer.observe_process(0.050);
+        }
+        assert_eq!(pacer.process_samples_s.len(), 30);
+        let cleared = pacer.reset_workload_history();
+        assert_eq!(cleared, 30);
+        assert!(pacer.process_samples_s.is_empty());
+        assert!(pacer.next_present.is_none());
+        assert!(!pacer.compositor_paced);
+    }
+
+    #[test]
+    fn cadence_live_workload_reset_preserves_stable_source_history() {
+        let mut cadence = CadenceEstimator::default();
+        let mut t = 0i64;
+        for seq in 1..=24u64 {
+            t += 416_667;
+            cadence.observe_frame(Some(t), seq);
+        }
+        let before = cadence.period_s().unwrap();
+        assert!((before - 1.0 / 24.0).abs() < 0.001);
+        let preserved = cadence.reset_transition_anchor_preserve_history();
+        assert!(preserved > 0);
+        assert_eq!(cadence.intervals.len(), preserved);
+        assert!(cadence.prev_t.is_none());
+        assert!(cadence.prev_seq.is_none());
+        let after = cadence.period_s().unwrap();
+        assert!((after - before).abs() < 1e-9);
+
+        // The first post-edit frame re-anchors without injecting the transition
+        // gap into the cadence history.
+        cadence.observe_frame(Some(t + 900_000), 100);
+        assert_eq!(cadence.intervals.len(), preserved);
+        assert!((cadence.period_s().unwrap() - before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cadence_live_workload_reset_preserves_forced_lock() {
+        let mut cadence = CadenceEstimator::default();
+        cadence.force_period(1.0 / 24.0);
+        let mut t = 0i64;
+        for seq in 1..=12u64 {
+            t += 416_667;
+            cadence.observe_frame(Some(t), seq);
+        }
+        let preserved = cadence.reset_transition_anchor_preserve_history();
+        assert!(preserved > 0);
+        assert_eq!(cadence.intervals.len(), preserved);
+        assert!(cadence.prev_t.is_none());
+        assert!(cadence.prev_seq.is_none());
+        assert!((cadence.period_s().unwrap() - 1.0 / 24.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn smooth_pacer_gap_fill_present_forces_a_full_next_period() {
         let period = 1.0 / 24.0;
         let base = Instant::now();
@@ -13620,6 +17359,161 @@ mod tests {
     }
 
     #[test]
+    fn aspect_correction_is_display_only_ratio_math() {
+        // 16:9 -> 4:3 by compressing width only.
+        assert_eq!(
+            corrected_presentation_aspect(
+                (1920, 1080),
+                true,
+                AspectCorrectionMode::Manual,
+                0.75,
+                1.0
+            ),
+            (1440, 1080)
+        );
+        // CPS2-style 384x224 correction used by the requesting Magpie user.
+        assert_eq!(
+            corrected_presentation_aspect(
+                (384, 224),
+                true,
+                AspectCorrectionMode::Manual,
+                0.78,
+                1.0
+            ),
+            (300, 224)
+        );
+    }
+
+    #[test]
+    fn auto_aspect_modes_follow_the_current_pre_correction_ratio() {
+        assert_eq!(
+            corrected_presentation_aspect(
+                (384, 224),
+                true,
+                AspectCorrectionMode::Auto4x3,
+                1.0,
+                1.0,
+            ),
+            (299, 224)
+        );
+        assert_eq!(
+            corrected_presentation_aspect(
+                (640, 480),
+                true,
+                AspectCorrectionMode::Auto16x9,
+                1.0,
+                1.0,
+            ),
+            (853, 480)
+        );
+    }
+
+    #[test]
+    fn crop_geometry_clamps_to_non_empty_and_keeps_input_rect_on_retained_pixels() {
+        let disabled = CaptureCrop::default().applied_to(641, 479);
+        assert_eq!((disabled.output_w, disabled.output_h), (641, 479));
+
+        let crop = CaptureCrop {
+            enabled: true,
+            left: 100,
+            top: 50,
+            right: 100,
+            bottom: 50,
+        };
+        assert_eq!(capture_crop_output_size((1920, 1080), crop), (1720, 980));
+        assert_eq!(
+            crop_source_rect((10, 20, 1920, 1080), crop),
+            (110, 70, 1720, 980)
+        );
+
+        let extreme = CaptureCrop {
+            enabled: true,
+            left: 9999,
+            top: 9999,
+            right: 9999,
+            bottom: 9999,
+        };
+        let applied = extreme.applied_to(320, 240);
+        assert_eq!((applied.content_w, applied.content_h), (1, 1));
+        assert_eq!((applied.output_w, applied.output_h), (2, 2));
+    }
+
+    #[test]
+    fn display_region_presentation_uses_real_crop_pixels_not_even_processing_pad() {
+        let crop = CaptureCrop {
+            enabled: true,
+            left: 146,
+            top: 0,
+            right: 146,
+            bottom: 0,
+        };
+        // A 912x349 presentation surface keeps 620x349 real pixels. The
+        // processing buffer is 620x350 because the last row is replicated, but
+        // fullscreen Fit must use 620x349 so the synthetic row never becomes
+        // part of the visible aspect ratio.
+        assert_eq!(capture_crop_content_size((912, 349), crop), (620, 349));
+        assert_eq!(capture_crop_output_size((912, 349), crop), (620, 350));
+        // The presentation basis reaches essentially the full 16:9 monitor,
+        // while the padded processing basis would leave a visibly wider bar.
+        assert_eq!(fit_aspect_inside((620, 349), (1920, 1080)), (1919, 1080));
+        assert_eq!(fit_aspect_inside((620, 350), (1920, 1080)), (1913, 1080));
+    }
+
+    #[test]
+    fn display_region_no_crop_preserves_odd_real_height_for_presentation() {
+        assert_eq!(
+            capture_crop_content_size((912, 349), CaptureCrop::default()),
+            (912, 349)
+        );
+    }
+
+    #[test]
+    fn disabled_aspect_correction_preserves_original_basis_exactly() {
+        assert_eq!(
+            corrected_presentation_aspect(
+                (1920, 1080),
+                false,
+                AspectCorrectionMode::Manual,
+                0.75,
+                1.25
+            ),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn aspect_corrected_input_content_matches_corrected_fixed_presentation() {
+        // Regression for v556: 560x316 displayed with width x0.75 becomes
+        // 420x316 (~4:3). The Fixed overlay is 588x442 at 1.4x. Input must
+        // therefore cover the corrected image (essentially the whole overlay),
+        // not the old 16:9-only 588x332 strip that left live click-through
+        // bands above and below the visible image.
+        let corrected = corrected_presentation_aspect(
+            (560, 316),
+            true,
+            AspectCorrectionMode::Manual,
+            0.75,
+            1.0,
+        );
+        assert_eq!(corrected, (420, 316));
+        let overlay_size = fit_fixed_overlay_size(corrected.0, corrected.1, 1.4, 1920, 1080);
+        assert_eq!(overlay_size, (588, 442));
+        let content = crate::input::content_rect(
+            crate::input::Rect {
+                x: 1035,
+                y: 145,
+                w: overlay_size.0,
+                h: overlay_size.1,
+            },
+            corrected.0,
+            corrected.1,
+        );
+        assert_eq!(content.y, 145);
+        assert_eq!(content.h, 442);
+        assert!(content.w >= 587);
+    }
+
+    #[test]
     fn fixed_overlay_fit_preserves_aspect_when_clamped_to_monitor() {
         let (w, h) = fit_fixed_overlay_size(1280, 720, 2.0, 1920, 1080);
         assert_eq!((w, h), (1920, 1080));
@@ -13663,6 +17557,30 @@ mod tests {
         assert_eq!(normalize_capture_client_size((640, 359)), (640, 360));
         assert_eq!(normalize_capture_client_size((959, 719)), (960, 720));
         assert_eq!(normalize_capture_client_size((640, 360)), (640, 360));
+    }
+
+    #[test]
+    fn display_region_capture_target_uses_real_child_pixels_not_root_client_size() {
+        assert_eq!(
+            display_region_capture_frame_target((1151, 458)),
+            Some((1152, 458))
+        );
+        assert_ne!(
+            display_region_capture_frame_target((1151, 458)),
+            Some(capture_resolution_frame_target((1440, 810)))
+        );
+    }
+
+    #[test]
+    fn display_region_capture_target_only_even_pads_the_real_region() {
+        assert_eq!(
+            display_region_capture_frame_target((911, 395)),
+            Some((912, 396))
+        );
+        assert_eq!(
+            display_region_capture_frame_target((912, 396)),
+            Some((912, 396))
+        );
     }
 
     #[test]

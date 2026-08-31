@@ -4,7 +4,7 @@
 //! checks for `backends/tensorrt/backend.json`; an installed pack additionally
 //! proves that the TensorRT and CUDA execution providers can be registered.
 
-use crate::platform::gpu::{GpuAdapter, enumerate_adapters};
+use crate::platform::gpu::{GpuAdapter, enumerate_adapters_quiet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -51,6 +51,10 @@ pub struct TensorRtAvailability {
     pub available: bool,
     pub reason: Option<String>,
     pub device_id: Option<i32>,
+    /// Canonical DXGI identity of the CUDA device selected for TensorRT.
+    /// Auto and an explicit selection that resolve to the same physical GPU
+    /// must share this identity so they also share engine/session caches.
+    pub gpu_luid: Option<u64>,
     pub manifest: Option<TensorRtManifest>,
     pub backend_dir: Option<PathBuf>,
 }
@@ -161,7 +165,7 @@ fn resolve_cuda_device(
     backend_dir: &Path,
     adapters: &[GpuAdapter],
     selected_adapter_luid: Option<u64>,
-) -> Result<i32, String> {
+) -> Result<(i32, u64), String> {
     let nvidia: Vec<&GpuAdapter> = adapters
         .iter()
         .filter(|adapter| adapter.vendor_id == NVIDIA_VENDOR_ID)
@@ -225,7 +229,16 @@ fn resolve_cuda_device(
     unsafe {
         let _ = FreeLibrary(module);
     }
-    result
+    if let Ok(device_id) = &result {
+        log::info!(
+            "tensorrt-gpu-map: dxgi_luid={:016x} dxgi_device_id={} cuda_device_id={} gpu='{}' mapping=exact-luid",
+            target.luid,
+            target.device_id,
+            device_id,
+            target.name,
+        );
+    }
+    result.map(|device_id| (device_id, target.luid))
 }
 
 fn probe_execution_providers(device_id: i32) -> Result<(), String> {
@@ -347,6 +360,31 @@ pub fn detect_tensorrt_backend(
             Some(manifest),
         );
     }
+    // GPU changes are allowed without restarting Neo in v636. Reject an
+    // explicit non-NVIDIA selection before hashing/loading the TensorRT pack;
+    // this makes AMD/Intel -> DirectML switching immediate and guarantees that
+    // TensorRT never silently runs on a different GPU than the user's choice.
+    let adapters = enumerate_adapters_quiet();
+    if let Some(luid) = selected_adapter_luid {
+        match adapters.iter().find(|adapter| adapter.luid == luid) {
+            Some(adapter) if adapter.vendor_id != NVIDIA_VENDOR_ID => {
+                return unavailable(
+                    format!(
+                        "the selected GPU '{}' is not NVIDIA; TensorRT requires an NVIDIA GPU",
+                        adapter.name
+                    ),
+                    Some(manifest),
+                );
+            }
+            None => {
+                return unavailable(
+                    format!("the selected DXGI adapter LUID {luid:016x} is unavailable"),
+                    Some(manifest),
+                );
+            }
+            _ => {}
+        }
+    }
     if manifest.tensor_rt.trim().is_empty()
         || manifest.tensor_rt.contains("使用")
         || manifest.tensor_rt.contains("exact")
@@ -420,11 +458,11 @@ pub fn detect_tensorrt_backend(
     if let Err(error) = register_dll_directories(&[runtime_dir.as_path(), backend_dir.as_path()]) {
         return unavailable(error, Some(manifest));
     }
-    let adapters = enumerate_adapters();
-    let device_id = match resolve_cuda_device(&backend_dir, &adapters, selected_adapter_luid) {
-        Ok(device_id) => device_id,
-        Err(error) => return unavailable(error, Some(manifest)),
-    };
+    let (device_id, gpu_luid) =
+        match resolve_cuda_device(&backend_dir, &adapters, selected_adapter_luid) {
+            Ok(mapping) => mapping,
+            Err(error) => return unavailable(error, Some(manifest)),
+        };
     if let Err(error) = ensure_provider_aliases(&runtime_dir, &backend_dir) {
         return unavailable(error, Some(manifest));
     }
@@ -442,9 +480,81 @@ pub fn detect_tensorrt_backend(
         available: true,
         reason: None,
         device_id: Some(device_id),
+        gpu_luid: Some(gpu_luid),
         manifest: Some(manifest),
         backend_dir: Some(backend_dir),
     }
+}
+
+fn migrate_legacy_cuda_cache_root(
+    tensor_root: &Path,
+    canonical_runtime_root: &Path,
+    availability: &TensorRtAvailability,
+    runtime: &str,
+) {
+    let (Some(_gpu_luid), Some(device_id)) = (availability.gpu_luid, availability.device_id) else {
+        return;
+    };
+    let legacy_runtime_root = tensor_root
+        .join(format!("cuda-device-{device_id}"))
+        .join(runtime);
+    if legacy_runtime_root == canonical_runtime_root || !legacy_runtime_root.is_dir() {
+        return;
+    }
+
+    if !canonical_runtime_root.exists() {
+        if let Some(parent) = canonical_runtime_root.parent()
+            && std::fs::create_dir_all(parent).is_ok()
+            && std::fs::rename(&legacy_runtime_root, canonical_runtime_root).is_ok()
+        {
+            log::info!(
+                "tensorrt-cache: migrated legacy GPU root old={} new={}",
+                legacy_runtime_root.display(),
+                canonical_runtime_root.display()
+            );
+            let _ = std::fs::remove_dir(tensor_root.join(format!("cuda-device-{device_id}")));
+            return;
+        }
+    }
+
+    // Both roots can exist after a user has already exercised Auto and an
+    // explicit selector. Merge only non-conflicting model directories. Cache
+    // keys are content/runtime based, so a missing destination directory is
+    // safe to move once the CUDA ordinal has been proven to map to this LUID.
+    if std::fs::create_dir_all(canonical_runtime_root).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&legacy_runtime_root) else {
+        return;
+    };
+    let mut moved = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        let is_model_cache =
+            name_text.len() == 32 && name_text.chars().all(|ch| ch.is_ascii_hexdigit());
+        if !is_model_cache {
+            continue;
+        }
+        let source = entry.path();
+        let target = canonical_runtime_root.join(&name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(&source, &target).is_ok() {
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        log::info!(
+            "tensorrt-cache: merged legacy GPU root old={} new={} moved_entries={}",
+            legacy_runtime_root.display(),
+            canonical_runtime_root.display(),
+            moved
+        );
+    }
+    let _ = std::fs::remove_dir(&legacy_runtime_root);
+    let _ = std::fs::remove_dir(tensor_root.join(format!("cuda-device-{device_id}")));
 }
 
 pub fn tensorrt_cache_root(
@@ -477,19 +587,23 @@ pub fn tensorrt_cache_root(
             )
         })
         .unwrap_or_else(|| "runtime-unavailable".into());
-    let gpu = selected_adapter_luid
+    // Cache by the physical GPU actually selected for TensorRT, not by how
+    // the user selected it. In particular, Auto and an explicit selector that
+    // both resolve to the same NVIDIA adapter must share one engine cache.
+    let gpu = availability
+        .gpu_luid
         .map(|luid| format!("luid-{luid:016x}"))
+        .or_else(|| selected_adapter_luid.map(|luid| format!("luid-{luid:016x}")))
         .or_else(|| {
             availability
                 .device_id
                 .map(|device| format!("cuda-device-{device}"))
         })
         .unwrap_or_else(|| "gpu-unresolved".into());
-    app_dir
-        .join("cache")
-        .join("TensorRT")
-        .join(gpu)
-        .join(runtime)
+    let tensor_root = app_dir.join("cache").join("TensorRT");
+    let root = tensor_root.join(gpu).join(&runtime);
+    migrate_legacy_cuda_cache_root(&tensor_root, &root, availability, &runtime);
+    root
 }
 
 #[cfg(test)]
@@ -527,5 +641,38 @@ mod tests {
         assert!(safe_manifest_relative_path("runtime/cudart64_12.dll").is_ok());
         assert!(safe_manifest_relative_path("../onnxruntime.dll").is_err());
         assert!(safe_manifest_relative_path(r"C:\Windows\System32\version.dll").is_err());
+    }
+
+    #[test]
+    fn auto_and_explicit_same_gpu_share_tensorrt_cache_root() {
+        let app =
+            std::env::temp_dir().join(format!("neo-trt-cache-root-test-{}", std::process::id()));
+        let availability = TensorRtAvailability {
+            available: true,
+            device_id: Some(0),
+            gpu_luid: Some(0xFEB8),
+            manifest: Some(TensorRtManifest {
+                backend_api: BACKEND_API,
+                name: "test".into(),
+                architecture: "x86_64".into(),
+                onnxruntime: ORT_COMPAT_VERSION.into(),
+                tensor_rt: "10.14.1.48".into(),
+                cuda_major: 12,
+                provider: "TensorRT+CUDA".into(),
+                required_files: Vec::new(),
+                onnxruntime_sha256: String::new(),
+                file_sha256: BTreeMap::new(),
+            }),
+            backend_dir: None,
+        };
+        assert_eq!(
+            tensorrt_cache_root(&app, &availability, None),
+            tensorrt_cache_root(&app, &availability, Some(0xFEB8))
+        );
+        assert!(
+            tensorrt_cache_root(&app, &availability, None)
+                .to_string_lossy()
+                .contains("luid-000000000000feb8")
+        );
     }
 }

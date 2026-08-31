@@ -7,17 +7,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use chidescaler_neo::core::config::{
+    ASPECT_CORRECTION_SCALE_MAX, ASPECT_CORRECTION_SCALE_MIN, AspectCorrectionMode, CaptureCrop,
     CaptureResolution, OnnxBackendPreference, ScaleMode, Settings, StageKind, StageSpec,
-    UiLanguage, UiLanguageMode, UiMode, app_dir,
+    UiLanguage, UiLanguageMode, UiMode, app_dir, sanitize_aspect_correction_scale,
 };
 use chidescaler_neo::core::metrics::StageStat;
 use chidescaler_neo::core::presets::{
-    PresetEditError, PresetStore, discover_filters, load_settings, save_settings,
+    PresetAspectCorrection, PresetEditError, PresetStore, discover_filters, load_settings,
+    save_settings,
 };
 use chidescaler_neo::engine::{Cmd, EngineHandle, Status, panel_target_position};
 use chidescaler_neo::i18n;
 use chidescaler_neo::input;
 use chidescaler_neo::logging;
+use chidescaler_neo::platform::gpu::{self, GpuAdapter};
 use chidescaler_neo::platform::hotkeys::{
     HotkeyEvent, HotkeyThread, HotkeyValidationError, hotkey_is_available, validate_user_hotkey,
 };
@@ -25,6 +28,7 @@ use chidescaler_neo::platform::win32;
 use chidescaler_neo::render::onnx_backend::{
     TensorRtAvailability, detect_tensorrt_backend, tensorrt_cache_root,
 };
+use chidescaler_neo::render::{vulkan_gpu, vulkan_onepass};
 use eframe::egui;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -46,10 +50,40 @@ const HK_GUI_TOPMOST: i32 = 4;
 // an enabled HDR request to the engine while the gate is false.
 const HDR_CAPTURE_OPTION_ENABLED: bool = false;
 
+fn gpu_selector_visible(adapters: &[GpuAdapter]) -> bool {
+    adapters.len() >= 2
+}
+
+/// Auto keeps compute on the actual WGL device so GPU-direct sharing remains
+/// available. An explicit user choice is different: it remains authoritative
+/// for ONNX even if Windows/the display driver refuses to move WGL. This keeps
+/// a useful dGPU inference escape hatch on hybrid systems where full-process
+/// GPU selection is not honored.
+fn resolve_compute_gpu_luid(requested: Option<u64>, render: Option<u64>) -> Option<u64> {
+    requested.or(render)
+}
+
+fn cross_gpu_compute_active(requested: Option<u64>, render: Option<u64>) -> bool {
+    matches!((requested, render), (Some(requested), Some(render)) if requested != render)
+}
+
 fn tensorrt_option_visible(availability: &TensorRtAvailability) -> bool {
     availability.available
 }
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// TensorRT Crop execution is allowed only for a geometry that belongs to the
+/// selected/saved preset. The enabled flag is intentionally ignored here so a
+/// saved Crop can still be toggled OFF/ON while TensorRT is active without
+/// opening arbitrary shape editing.
+fn capture_crop_geometry_matches(a: CaptureCrop, b: CaptureCrop) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+}
+
+fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> bool {
+    !current.enabled || capture_crop_geometry_matches(current, saved)
+}
+
+const BUILD_ID: &str = "20260831-v0.99.1-public";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -361,9 +395,14 @@ const FULL_SETTINGS_BOTTOM_GUTTER: f32 = 36.0;
 // difference from FULL_SETTINGS_BOTTOM_GUTTER is a safety reserve for frame
 // strokes, DPI rounding and ScrollArea bookkeeping.
 const FULL_SETTINGS_VISIBLE_BOTTOM_PADDING: f32 = 20.0;
-// When a monitor is too narrow to keep the localized Start/preset/action
-// toolbar on one physical row, reserve the wrapped row explicitly instead of
-// letting it steal the bottom border from the resource meter.
+// Fallback reserve for frame/DPI/ScrollArea bookkeeping. The Full window now
+// re-evaluates its target on every actual layout-state change (stats, chain,
+// language, wrapping) and is allowed to shrink as well as grow. Keep this
+// small fixed reserve only so the final row is never flush with the viewport.
+const FULL_SETTINGS_MEASURED_EXTRA_HEIGHT: f32 = 28.0;
+// Extra height per additional wrapped toolbar line. Other settings rows use
+// their measured width with a 32pt line reserve; the toolbar buttons need a
+// little more vertical room.
 const FULL_TOOLBAR_WRAP_EXTRA_HEIGHT: f32 = 44.0;
 
 fn language_popup_height(mode: UiMode) -> f32 {
@@ -429,8 +468,12 @@ fn full_chain_height(filter_count: usize, stats_on: bool) -> f32 {
 }
 
 fn full_settings_height(stats_on: bool, stats_rows: usize) -> f32 {
-    330.0
+    // Aspect correction and user crop each have a dedicated row. Keeping both
+    // separate avoids language-dependent wrapping in the established timing
+    // and options rows.
+    394.0
         + FULL_SETTINGS_BOTTOM_GUTTER
+        + FULL_SETTINGS_MEASURED_EXTRA_HEIGHT
         + if stats_on {
             // Includes the statistics divider, summary, optional monitor
             // line, row spacing, and a compact bottom padding matching the
@@ -441,6 +484,16 @@ fn full_settings_height(stats_on: bool, stats_rows: usize) -> f32 {
         } else {
             0.0
         }
+}
+
+fn full_wrapped_row_extra(row_width: f32, usable_width: f32, per_extra_line: f32) -> f32 {
+    let usable_width = usable_width.max(1.0);
+    if row_width <= usable_width + 0.5 {
+        0.0
+    } else {
+        let lines = (row_width / usable_width).ceil().clamp(1.0, 3.0);
+        (lines - 1.0) * per_extra_line.max(0.0)
+    }
 }
 
 fn full_layout_key(width: f32, monitor_height: f32, desired_height: f32) -> i32 {
@@ -720,9 +773,44 @@ fn cleanup_removed_browser_launcher_artifacts(app_dir: &std::path::Path) {
 }
 
 fn main() -> eframe::Result {
+    // One-shot cursor rescue is an isolated same-EXE helper.  It must branch
+    // before logging, singleton setup, GUI creation, GPU detection, or any
+    // render/capture initialization.
+    if std::env::args().any(|arg| arg == "--cursor-rescue") {
+        chidescaler_neo::input::run_cursor_rescue_once();
+        return Ok(());
+    }
+    // The janitor is the same portable EXE running in a tiny no-GUI mode. It
+    // must bypass logging, elevation and singleton setup so it can outlive and
+    // recover the main process even after a hard kill.
+    if let Some(parent_pid) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--cursor-janitor=")
+            .and_then(|v| v.parse::<u32>().ok())
+    }) {
+        chidescaler_neo::input::run_cursor_janitor(parent_pid);
+        return Ok(());
+    }
+
     logging::init();
     install_emergency_cleanup();
-    log::info!("cHiDeScaler-Neo version {APP_VERSION}");
+    log::info!("cHiDeScaler-Neo build {BUILD_ID}");
+    // v617 production-test breadcrumb: record the opt-in as soon as the real
+    // GUI process starts, before elevation, settings load, singleton handoff,
+    // WGPU/WGL creation, or any Vulkan initialization.  This makes a second-
+    // instance handoff distinguishable from a render-routing failure.
+    if vulkan_onepass::production_one_pass_requested() {
+        let sink_present = std::env::var("NEO_VULKAN_PROBE_RESULT")
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        let line = format!(
+            "vulkan-production-glsl: phase=process-entry build={} env=enabled result_sink={} pid={} singleton=not-checked vulkan_init=false",
+            BUILD_ID,
+            sink_present,
+            std::process::id(),
+        );
+        log::info!("{line}");
+        vulkan_gpu::record_probe_result(&line);
+    }
     // Keep the native egui event loop responsive when the render worker is
     // saturating the same low-end GPU. This is thread-local only: capture,
     // provider and process priorities are unchanged.
@@ -765,16 +853,31 @@ fn main() -> eframe::Result {
     let gui_screenshot_test = std::env::var_os("NEO_GUI_SCREENSHOT").is_some();
     if !win32::acquire_single_instance() && !gui_screenshot_test {
         log::warn!("another cHiDeScaler-Neo instance is already running; focusing it and exiting");
+        if vulkan_onepass::production_one_pass_requested() {
+            let line = format!(
+                "vulkan-production-glsl: result=blocked reason=single-instance-already-running build={} pid={} action=close-existing-Neo-and-rerun vulkan_init=false",
+                BUILD_ID,
+                std::process::id(),
+            );
+            log::warn!("{line}");
+            vulkan_gpu::record_probe_result(&line);
+        }
         win32::activate_other_instance("cHiDeScaler-Neo");
         return Ok(());
     } else if gui_screenshot_test {
         log::info!("gui screenshot test: singleton focus handoff bypassed");
     }
-    // Portable hybrid-GPU preference: vendor driver export hints are embedded
-    // in this EXE (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance).
-    // Do not persist a Windows GPU preference; when a driver ignores these
-    // hints, adapter selection is left to Windows and the system default.
-    log::info!("gpu-preference: portable vendor hints enabled; no registry changes");
+    if !gui_screenshot_test {
+        chidescaler_neo::input::spawn_cursor_janitor();
+    }
+    // Portable hybrid-GPU default: vendor driver export hints are embedded in
+    // this EXE (NvOptimusEnablement / AmdPowerXpressRequestHighPerformance).
+    // Normal startup never persists a Windows GPU preference. v643 keeps
+    // WGPU/WGL as presentation devices and switches compute backends directly,
+    // so a manual GPU change while capture is stopped requires no Neo restart.
+    log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
+    // Public releases keep the native title stable and user-facing.
+    // Detailed build identification remains available in the diagnostic log.
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -831,6 +934,7 @@ fn main() -> eframe::Result {
     );
     let mut app = GuiCaptionDragRedrawGate::new(eframe_app);
     event_loop.run_app(&mut app)?;
+
     Ok(())
 }
 
@@ -1974,6 +2078,15 @@ fn capture_resolution_fullscreen_guard(
     session_origin_fullscreen.unwrap_or(live_fullscreen)
 }
 
+#[cfg(test)]
+fn capture_resolution_content_size(client_size: (i32, i32), crop: CaptureCrop) -> (i32, i32) {
+    if !crop.enabled || client_size.0 <= 0 || client_size.1 <= 0 {
+        return client_size;
+    }
+    let applied = crop.applied_to(client_size.0 as u32, client_size.1 as u32);
+    (applied.content_w as i32, applied.content_h as i32)
+}
+
 fn capture_resolution_label(v: Option<CaptureResolution>, lang: UiLanguage) -> String {
     match v {
         Some(r) if u64::from(r.w) * 3 == u64::from(r.h) * 4 => {
@@ -2254,6 +2367,9 @@ struct PanelDiagSnapshot {
 #[derive(Clone, Copy, Debug)]
 struct PendingUiModeTransition {
     mode: UiMode,
+    /// True for an actual Mini/Basic/Full mode switch. False for a protected
+    /// same-Full content resize (for example Stats ON -> OFF).
+    mode_change: bool,
     target: egui::Vec2,
     armed_at: Instant,
     /// False while only the native/root surface is being resized. Once true,
@@ -2280,7 +2396,21 @@ struct App {
     store: PresetStore,
     chain: Vec<StageSpec>,
     saved_chain: Vec<StageSpec>,
+    saved_aspect_correction: PresetAspectCorrection,
+    saved_crop: CaptureCrop,
+    saved_capture_resolution: Option<CaptureResolution>,
     available: Vec<(StageKind, String)>,
+    /// Hardware DXGI adapters exposed only in Full mode when two or more are
+    /// present. The stable LUID, not the volatile list index, is persisted.
+    gpu_adapters: Vec<GpuAdapter>,
+    /// Legacy v635 restart-handoff signal. v636 no longer creates this for GPU
+    /// selection, but honoring an inherited marker keeps upgrade handoffs safe.
+    gpu_handoff_ready_path: Option<std::path::PathBuf>,
+    gpu_handoff_signaled: bool,
+    gpu_selection_verified: bool,
+    /// Opt-in Vulkan LUID probe used only to validate the future GLSL backend.
+    /// It never changes the active OpenGL/GLSL path.
+    vulkan_gpu_probe_done: bool,
     filter_picker_open: bool,
     hotkey_editor_open: bool,
     hotkey_editor_candidate: String,
@@ -2296,6 +2426,24 @@ struct App {
     capture_resolution_fullscreen_notice_open: bool,
     capture_resolution_fullscreen_notice_seen_seq: u64,
     capture_resolution_reapply_seen_seq: u64,
+    /// Last engine-side source-occlusion safety-stop notice consumed by the GUI.
+    source_occlusion_notice_seen_seq: u64,
+    /// A short, non-blocking topmost explanation shown after an occlusion stop.
+    source_occlusion_notice_until: Option<Instant>,
+    source_occlusion_notice_hwnd: isize,
+    /// DirectML/GLSL crop preview stays live, but DragValue can emit near-60 Hz
+    /// shape changes. Keep only the newest crop and publish it at a bounded
+    /// cadence so the image continues moving without geometry-reset storms.
+    live_crop_pending: Option<CaptureCrop>,
+    live_crop_last_sent: Option<Instant>,
+    /// Crop DragValue can change every GUI frame. Persist only the settled
+    /// value after the gesture instead of rewriting settings.json per pixel.
+    crop_settings_save_due: Option<Instant>,
+    /// TensorRT Crop geometry is preset-owned in v597: numeric editing is
+    /// DirectML-only. Keep the existing settled commit fields for the permitted
+    /// saved-Crop ON/OFF toggle and as a defensive barrier for future callers.
+    tensorrt_crop_commit_pending: Option<CaptureCrop>,
+    tensorrt_crop_commit_due: Option<Instant>,
     last_poll: Instant,
     save_as_open: bool,
     save_as_name: String,
@@ -2374,6 +2522,11 @@ struct App {
     mini_language_width_applied: Option<i32>,
     basic_language_width_applied: Option<i32>,
     full_language_width_applied: Option<i32>,
+    /// Extra vertical space required by wrapped Full settings rows. Computed
+    /// from the same measured widths as the root Full target and fed back into
+    /// the bottom panel on the next frame so narrow/localized layouts do not
+    /// donate that space to the filter-chain panel instead.
+    full_settings_wrap_extra: f32,
     /// A GUI mode change is resized first and committed only after the root
     /// viewport reports the requested final inner size. This prevents a fast
     /// WGPU/DWM path from presenting a half-transition layout.
@@ -2429,6 +2582,24 @@ impl App {
         }
         let gui_test_mode = std::env::var("NEO_GUI_SCREENSHOT_MODE").unwrap_or_default();
         let mut settings = load_settings(&dir);
+        let gpu_adapters = gpu::enumerate_adapters();
+        if let Some(saved_luid) = settings.gpu_adapter_luid
+            && gpu::adapter_for_luid(&gpu_adapters, Some(saved_luid)).is_none()
+        {
+            log::warn!(
+                "gpu-selection-startup-fallback: saved_luid={saved_luid:016x} reason=adapter-not-present -> Auto"
+            );
+            settings.gpu_adapter_luid = None;
+            settings.gpu_force_vulkan = false;
+            save_settings(&dir, &settings);
+        } else if settings.gpu_adapter_luid.is_none() && settings.gpu_force_vulkan {
+            // There is deliberately no "Auto [Vulkan]" entry. Older/corrupt
+            // settings must not silently turn Auto into a Vulkan route.
+            settings.gpu_force_vulkan = false;
+            save_settings(&dir, &settings);
+        }
+        let gpu_handoff_ready_path =
+            std::env::var_os("NEO_GPU_HANDOFF_READY").map(std::path::PathBuf::from);
         let custom_locales = i18n::discover_custom_locales(&dir);
         // QA-only override used by the mandatory external-locale layout test.
         // It never writes settings and has no effect unless explicitly set.
@@ -2457,6 +2628,9 @@ impl App {
             settings.custom_language = None;
         }
         settings.fps_cap = settings.fps_cap.clamp(5, MAX_FPS_CAP);
+        settings.aspect_width_scale = sanitize_aspect_correction_scale(settings.aspect_width_scale);
+        settings.aspect_height_scale =
+            sanitize_aspect_correction_scale(settings.aspect_height_scale);
         let cli_locale =
             std::env::args().find_map(|arg| arg.strip_prefix("--test-locale=").map(str::to_owned));
         let locale_test_override = cli_locale
@@ -2481,11 +2655,89 @@ impl App {
         install_ui_fonts(&cc.egui_ctx);
         select_ui_font_for_locale(&cc.egui_ctx, initial_language);
         logging::set_file_logging(&dir, settings.log_on);
-        log::info!("cHiDeScaler-Neo version {APP_VERSION}");
+        log::info!("cHiDeScaler-Neo build {BUILD_ID} app_dir={}", dir.display());
+        // v628 compatibility inventory: parser/compiler only. It deliberately
+        // runs before any selected-GPU Vulkan production route and never creates
+        // a Vulkan instance or changes the stable OpenGL path.
+        if vulkan_onepass::compatibility_scan_requested() {
+            vulkan_onepass::scan_bundled_compatibility(&dir);
+        }
+        if chidescaler_neo::render::vulkan_multipass::compatibility_scan_requested() {
+            chidescaler_neo::render::vulkan_multipass::scan_bundled_compatibility(&dir);
+        }
         let ratio_text = format!("{:.1}", settings.ratio);
         let capture_resolution_text =
             capture_resolution_label(settings.capture_resolution, initial_language);
         let store = PresetStore::load(&dir);
+        let active_aspect_correction = store
+            .active()
+            .map(|preset| preset.effective_aspect_correction())
+            .unwrap_or_default();
+        let active_crop = store
+            .active()
+            .map(|preset| preset.effective_crop())
+            .unwrap_or_default();
+        // v672: fixed capture-resolution metadata remains preset-owned, while
+        // missing metadata means "inherit the current GUI value". This lets users
+        // compare multiple presets at one capture resolution without each legacy /
+        // unspecified preset forcing the selector back to Auto. A fixed preset still
+        // keeps its saved value as the dirty-marker baseline, while an unspecified
+        // preset adopts the current settings.json value as its baseline.
+        let active_preset_capture_resolution =
+            store.active().and_then(|preset| preset.capture_resolution);
+        let active_capture_resolution_baseline =
+            active_preset_capture_resolution.or(settings.capture_resolution);
+        if let Some(saved_aspect) = store.active().and_then(|preset| preset.aspect_correction) {
+            let saved_aspect = saved_aspect.sanitized();
+            saved_aspect.apply_to_settings(&mut settings);
+            log::info!(
+                "preset-aspect-load: source=startup preset='{}' metadata=present enabled={} scale={:.2}x{:.2}",
+                store.data.active,
+                saved_aspect.enabled,
+                saved_aspect.width_scale,
+                saved_aspect.height_scale
+            );
+        } else {
+            // Legacy/bundled presets have no aspect metadata. Preserve the
+            // existing settings.json value on startup so v557's ordinary UI
+            // persistence is not regressed. On a genuinely first launch,
+            // Settings::default() is still OFF / 1.00 x 1.00. Explicitly
+            // selecting a legacy preset later uses the safe preset default
+            // (OFF / 1.00 x 1.00), preventing a prior CPS2 correction from
+            // leaking into an unrelated preset.
+            log::info!(
+                "preset-aspect-load: source=startup preset='{}' metadata=legacy settings_preserved=true enabled={} scale={:.2}x{:.2}",
+                store.data.active,
+                settings.aspect_correction,
+                settings.aspect_width_scale,
+                settings.aspect_height_scale
+            );
+        }
+        if let Some(saved_crop) = store.active().and_then(|preset| preset.crop) {
+            settings.capture_crop = saved_crop;
+            log::info!(
+                "preset-crop-load: source=startup preset='{}' metadata=present enabled={} edges=({}, {}, {}, {})",
+                store.data.active,
+                saved_crop.enabled,
+                saved_crop.left,
+                saved_crop.top,
+                saved_crop.right,
+                saved_crop.bottom
+            );
+        } else {
+            // Match the established aspect-metadata startup behavior: a legacy
+            // active preset does not erase settings.json on launch, while an
+            // explicit preset selection below uses the safe OFF/zero default.
+            log::info!(
+                "preset-crop-load: source=startup preset='{}' metadata=legacy settings_preserved=true enabled={} edges=({}, {}, {}, {})",
+                store.data.active,
+                settings.capture_crop.enabled,
+                settings.capture_crop.left,
+                settings.capture_crop.top,
+                settings.capture_crop.right,
+                settings.capture_crop.bottom
+            );
+        }
         let chain: Vec<StageSpec> = store
             .active()
             .map(|p| {
@@ -2498,11 +2750,31 @@ impl App {
             .unwrap_or_default();
         let available = discover_filters(&dir);
         let tensorrt_availability = detect_tensorrt_backend(&dir, settings.gpu_adapter_luid);
+        let tensorrt_crop_start_allowed =
+            tensorrt_crop_switch_allowed(settings.capture_crop, active_crop);
         let onnx_backend_selected = if settings.onnx_backend == OnnxBackendPreference::TensorRT
             && tensorrt_availability.available
+            && tensorrt_crop_start_allowed
         {
             OnnxBackendPreference::TensorRT
         } else {
+            if settings.onnx_backend == OnnxBackendPreference::TensorRT
+                && tensorrt_availability.available
+                && !tensorrt_crop_start_allowed
+            {
+                log::warn!(
+                    "onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason=unsaved-crop-geometry current=({}, {}, {}, {}) saved=({}, {}, {}, {})",
+                    settings.capture_crop.left,
+                    settings.capture_crop.top,
+                    settings.capture_crop.right,
+                    settings.capture_crop.bottom,
+                    active_crop.left,
+                    active_crop.top,
+                    active_crop.right,
+                    active_crop.bottom
+                );
+                settings.onnx_backend = OnnxBackendPreference::DirectML;
+            }
             OnnxBackendPreference::DirectML
         };
         let trt_cache_root =
@@ -2542,9 +2814,17 @@ impl App {
             app_dir: dir,
             settings,
             saved_chain: chain.clone(),
+            saved_aspect_correction: active_aspect_correction,
+            saved_crop: active_crop,
+            saved_capture_resolution: active_capture_resolution_baseline,
             chain,
             store,
             available,
+            gpu_adapters,
+            gpu_handoff_ready_path,
+            gpu_handoff_signaled: false,
+            gpu_selection_verified: false,
+            vulkan_gpu_probe_done: false,
             filter_picker_open: gui_test_mode.eq_ignore_ascii_case("filters"),
             hotkey_editor_open: gui_test_mode.eq_ignore_ascii_case("hotkey"),
             hotkey_editor_candidate,
@@ -2560,6 +2840,14 @@ impl App {
             capture_resolution_fullscreen_notice_open: false,
             capture_resolution_fullscreen_notice_seen_seq: 0,
             capture_resolution_reapply_seen_seq: 0,
+            source_occlusion_notice_seen_seq: 0,
+            source_occlusion_notice_until: None,
+            source_occlusion_notice_hwnd: 0,
+            live_crop_pending: None,
+            live_crop_last_sent: None,
+            crop_settings_save_due: None,
+            tensorrt_crop_commit_pending: None,
+            tensorrt_crop_commit_due: None,
             last_poll: Instant::now() - Duration::from_secs(1),
             save_as_open: gui_test_save_as,
             save_as_name: gui_test_save_as_name,
@@ -2608,6 +2896,7 @@ impl App {
             mini_language_width_applied: None,
             basic_language_width_applied: None,
             full_language_width_applied: None,
+            full_settings_wrap_extra: 0.0,
             pending_ui_mode: None,
             locale_test_override,
             custom_locales,
@@ -2623,8 +2912,384 @@ impl App {
             .unwrap_or_else(|| effective_language(self.settings.language_mode))
     }
 
+    fn maybe_finalize_gpu_selection_startup(&mut self) {
+        if self.gpu_selection_verified && self.gpu_handoff_signaled && self.vulkan_gpu_probe_done {
+            return;
+        }
+        let status = self.engine.status.lock().unwrap().clone();
+        if !status.render_gpu_ready {
+            return;
+        }
+
+        if !self.gpu_selection_verified {
+            let requested = self.settings.gpu_adapter_luid;
+            match (requested, status.render_gpu_luid) {
+                (Some(requested), Some(actual)) if requested == actual => {
+                    let name = gpu::adapter_for_luid(&self.gpu_adapters, Some(requested))
+                        .map(|adapter| adapter.name.as_str())
+                        .unwrap_or("unknown");
+                    log::info!(
+                        "gpu-selection-verified: requested_luid={requested:016x} actual_gl_luid={actual:016x} result=match name='{}'",
+                        name
+                    );
+                }
+                (Some(requested), Some(actual)) => {
+                    log::warn!(
+                        "gpu-selection-verified: requested_luid={requested:016x} actual_gl_luid={actual:016x} result=mismatch renderer='{}'; compute remains on selected GPU (ONNX + compatible Vulkan GLSL), presentation stays on OpenGL GPU and cross-GPU staging may apply",
+                        status.render_gpu_name
+                    );
+                }
+                (Some(requested), None) => {
+                    log::warn!(
+                        "gpu-selection-verified: requested_luid={requested:016x} actual_gl_luid=unavailable result=unverified renderer='{}'",
+                        status.render_gpu_name
+                    );
+                }
+                (None, Some(actual)) => {
+                    log::info!(
+                        "gpu-selection-active: requested=Auto actual_gl_luid={actual:016x} renderer='{}'",
+                        status.render_gpu_name
+                    );
+                }
+                (None, None) => {
+                    log::info!(
+                        "gpu-selection-active: requested=Auto actual_gl_luid=unavailable renderer='{}'",
+                        status.render_gpu_name
+                    );
+                }
+            }
+            self.gpu_selection_verified = true;
+        }
+
+        if !self.gpu_handoff_signaled {
+            if let Some(path) = self.gpu_handoff_ready_path.take() {
+                gpu::signal_relaunch_render_ready(
+                    &path,
+                    status.render_gpu_luid,
+                    &status.render_gpu_name,
+                );
+            }
+            self.gpu_handoff_signaled = true;
+        }
+
+        // v610 experimental foundation: retain the exact-LUID/GLSL probes and add
+        // an opt-in synthetic RGBA storage-image probe. All probe results use the dedicated
+        // result-file sink independent of the normal diagnostic log. None of these paths
+        // touches a capture frame, GL texture, user filter, ONNX resource,
+        // compositor, input state, or presentation resource.
+        if !self.vulkan_gpu_probe_done {
+            // v616: write an application-side breadcrumb before any capture session exists.
+            // This separates "the BAT launched Neo but Neo did not see the opt-in" from
+            // "the opt-in was seen but capture/session routing never started".  It does
+            // not create a Vulkan instance or touch the render path.
+            if vulkan_onepass::production_one_pass_requested() {
+                let requested = self.settings.gpu_adapter_luid;
+                let requested_text = requested
+                    .map(|luid| format!("{luid:016x}"))
+                    .unwrap_or_else(|| "Auto".to_string());
+                let actual_text = status
+                    .render_gpu_luid
+                    .map(|luid| format!("{luid:016x}"))
+                    .unwrap_or_else(|| "unavailable".to_string());
+                let sink_present = std::env::var("NEO_VULKAN_PROBE_RESULT")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false);
+                let line = format!(
+                    "vulkan-production-glsl: phase=process-start build={} env=enabled result_sink={} requested_luid={} actual_gl_luid={} renderer='{}' vulkan_init=false next=session-start",
+                    BUILD_ID,
+                    sink_present,
+                    requested_text,
+                    actual_text,
+                    status.render_gpu_name.replace('\r', " ").replace('\n', " "),
+                );
+                log::info!("{line}");
+                vulkan_gpu::record_probe_result(&line);
+            }
+
+            let target_luid = self.settings.gpu_adapter_luid.or(status.render_gpu_luid);
+            if vulkan_gpu::probe_requested() {
+                match target_luid {
+                    Some(target_luid) => match vulkan_gpu::probe_selected_luid(target_luid) {
+                        Ok(result) => {
+                            let line = format!(
+                                "vulkan-gpu-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' vendor={:04x} device={:04x} api={} queue_family={} queue_flags={:?} path=diagnostic-only glsl_backend=OpenGL-unchanged",
+                                target_luid,
+                                result.luid,
+                                result.name,
+                                result.vendor_id,
+                                result.device_id,
+                                result.api_version_string(),
+                                result.queue_family_index,
+                                result.queue_flags,
+                            );
+                            log::info!("{line}");
+                            vulkan_gpu::record_probe_result(&line);
+                        }
+                        Err(error) => {
+                            let line = format!(
+                                "vulkan-gpu-probe: result=unavailable requested_luid={target_luid:016x} error={error:#} fallback=OpenGL-unchanged"
+                            );
+                            log::warn!("{line}");
+                            vulkan_gpu::record_probe_result(&line);
+                        }
+                    },
+                    None => {
+                        let line = "vulkan-gpu-probe: result=skipped reason=no-dxgi-luid fallback=OpenGL-unchanged";
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(line);
+                    }
+                }
+            }
+            if vulkan_gpu::glsl_probe_requested() {
+                match target_luid {
+                    Some(target_luid) => {
+                        match vulkan_gpu::probe_glsl_compute_selected_luid(target_luid) {
+                            Ok(result) => {
+                                let line = format!(
+                                    "vulkan-glsl-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' vendor={:04x} device={:04x} api={} queue_family={} queue_flags={:?} compiler=naga glsl=450 spirv_words={} workload=u32x64 verified={}/64 checksum={} expected_checksum=4096 path=diagnostic-only user_glsl_backend=OpenGL-unchanged",
+                                    target_luid,
+                                    result.gpu.luid,
+                                    result.gpu.name,
+                                    result.gpu.vendor_id,
+                                    result.gpu.device_id,
+                                    result.gpu.api_version_string(),
+                                    result.gpu.queue_family_index,
+                                    result.gpu.queue_flags,
+                                    result.spirv_words,
+                                    result.verified_values,
+                                    result.checksum,
+                                );
+                                log::info!("{line}");
+                                vulkan_gpu::record_probe_result(&line);
+                            }
+                            Err(error) => {
+                                let line = format!(
+                                    "vulkan-glsl-probe: result=unavailable requested_luid={target_luid:016x} error={error:#} fallback=OpenGL-unchanged"
+                                );
+                                log::warn!("{line}");
+                                vulkan_gpu::record_probe_result(&line);
+                            }
+                        }
+                    }
+                    None => {
+                        let line = "vulkan-glsl-probe: result=skipped reason=no-dxgi-luid fallback=OpenGL-unchanged";
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(line);
+                    }
+                }
+            }
+            if vulkan_gpu::image_probe_requested() {
+                match target_luid {
+                    Some(target_luid) => {
+                        match vulkan_gpu::probe_glsl_image_selected_luid(target_luid) {
+                            Ok(result) => {
+                                let line = format!(
+                                    "vulkan-image-probe: result=ready requested_luid={:016x} matched_luid={:016x} name='{}' vendor={:04x} device={:04x} api={} queue_family={} queue_flags={:?} compiler=naga glsl=450 spirv_words={} format=R8G8B8A8_UNORM image=8x8 transform=bgra-swap verified={}/64 checksum={:016x} expected_checksum={:016x} path=diagnostic-only user_glsl_backend=OpenGL-unchanged",
+                                    target_luid,
+                                    result.gpu.luid,
+                                    result.gpu.name,
+                                    result.gpu.vendor_id,
+                                    result.gpu.device_id,
+                                    result.gpu.api_version_string(),
+                                    result.gpu.queue_family_index,
+                                    result.gpu.queue_flags,
+                                    result.spirv_words,
+                                    result.verified_pixels,
+                                    result.checksum,
+                                    result.expected_checksum,
+                                );
+                                log::info!("{line}");
+                                vulkan_gpu::record_probe_result(&line);
+                            }
+                            Err(error) => {
+                                let line = format!(
+                                    "vulkan-image-probe: result=unavailable requested_luid={target_luid:016x} error={error:#} fallback=OpenGL-unchanged"
+                                );
+                                log::warn!("{line}");
+                                vulkan_gpu::record_probe_result(&line);
+                            }
+                        }
+                    }
+                    None => {
+                        let line = "vulkan-image-probe: result=skipped reason=no-dxgi-luid fallback=OpenGL-unchanged";
+                        log::warn!("{line}");
+                        vulkan_gpu::record_probe_result(line);
+                    }
+                }
+            }
+            self.vulkan_gpu_probe_done = true;
+        }
+    }
+
+    fn gpu_selector_control(&mut self, ui: &mut egui::Ui, lang: UiLanguage, enabled: bool) {
+        if !gpu_selector_visible(&self.gpu_adapters) {
+            return;
+        }
+
+        // One compact selector carries two independent pieces of state:
+        // physical GPU LUID and compatible-GLSL routing policy. The duplicated
+        // "[Vulkan]" rows are intentionally placed after the ordinary GPU rows
+        // so users who only need to correct Windows' iGPU auto-selection can
+        // keep the normal same-GPU OpenGL fast path.
+        let mut choice = (
+            self.settings.gpu_adapter_luid,
+            self.settings.gpu_force_vulkan && self.settings.gpu_adapter_luid.is_some(),
+        );
+        let selected_text = match gpu::adapter_for_luid(&self.gpu_adapters, choice.0) {
+            Some(adapter) if choice.1 => format!("{} [Vulkan]", adapter.name),
+            Some(adapter) => adapter.name.clone(),
+            None => i18n::text(lang, "common.auto").to_string(),
+        };
+        let original_choice = choice;
+        let mut changed = false;
+        let group = ui.add_enabled_ui(enabled, |ui| {
+            ui.label("GPU:");
+            let response = egui::ComboBox::from_id_salt("gpu_adapter_selector")
+                .width(190.0)
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut choice,
+                            (None, false),
+                            i18n::text(lang, "common.auto"),
+                        )
+                        .changed();
+                    for adapter in &self.gpu_adapters {
+                        changed |= ui
+                            .selectable_value(
+                                &mut choice,
+                                (Some(adapter.luid), false),
+                                &adapter.name,
+                            )
+                            .changed();
+                    }
+                    ui.separator();
+                    for adapter in &self.gpu_adapters {
+                        let label = format!("{} [Vulkan]", adapter.name);
+                        changed |= ui
+                            .selectable_value(&mut choice, (Some(adapter.luid), true), label)
+                            .changed();
+                    }
+                })
+                .response;
+            response.on_hover_text(i18n::text(lang, "gpu.select_help"));
+        });
+        if !enabled {
+            group
+                .response
+                .on_hover_text(i18n::text(lang, "gpu.stop_to_change"));
+        }
+        if changed && choice != original_choice {
+            let (requested, force_vulkan_glsl) = choice;
+            let render_gpu_luid = self.engine.status.lock().unwrap().render_gpu_luid;
+            let effective_gpu_luid = resolve_compute_gpu_luid(requested, render_gpu_luid);
+            let gpu_adapter = gpu::device_id_for_luid(&self.gpu_adapters, effective_gpu_luid);
+            let requested_name = gpu::adapter_for_luid(&self.gpu_adapters, requested)
+                .map(|adapter| {
+                    if force_vulkan_glsl {
+                        format!("{} [Vulkan]", adapter.name)
+                    } else {
+                        adapter.name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "Auto".to_string());
+
+            // TensorRT's device id is CUDA-specific and cannot be reused after
+            // a DXGI selection change. [Vulkan] changes only GLSL routing, so
+            // ONNX/TensorRT identity remains the same physical selected GPU.
+            let auto_tensorrt_unambiguous = requested.is_some()
+                || self
+                    .gpu_adapters
+                    .iter()
+                    .filter(|adapter| adapter.vendor_id == 0x10de)
+                    .count()
+                    == 1;
+            let same_tensorrt_gpu = self.tensorrt_availability.available
+                && auto_tensorrt_unambiguous
+                && self.tensorrt_availability.gpu_luid == effective_gpu_luid;
+            let new_tensorrt = if same_tensorrt_gpu {
+                log::info!(
+                    "tensorrt-gpu-map-reuse: requested_luid={} effective_luid={} cuda_device_id={:?} reason=same-physical-gpu",
+                    requested
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    effective_gpu_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    self.tensorrt_availability.device_id,
+                );
+                self.tensorrt_availability.clone()
+            } else {
+                detect_tensorrt_backend(&self.app_dir, requested)
+            };
+            let mut backend = self.onnx_backend_selected;
+            if backend == OnnxBackendPreference::TensorRT && !new_tensorrt.available {
+                log::warn!(
+                    "gpu-selection-tensorrt-fallback: requested_luid={} name='{}' reason='{}' active=DirectML",
+                    requested
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    requested_name,
+                    new_tensorrt
+                        .reason
+                        .as_deref()
+                        .unwrap_or("selected GPU is not available to TensorRT"),
+                );
+                backend = OnnxBackendPreference::DirectML;
+                self.settings.onnx_backend = OnnxBackendPreference::DirectML;
+                self.onnx_backend_selected = OnnxBackendPreference::DirectML;
+                self.onnx_backend_pending = None;
+            }
+            self.tensorrt_availability = new_tensorrt;
+            self.settings.gpu_adapter_luid = requested;
+            self.settings.gpu_force_vulkan = force_vulkan_glsl;
+            save_settings(&self.app_dir, &self.settings);
+            let cache_root =
+                tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, requested);
+            chidescaler_neo::render::onnx_stage::maintain_tensorrt_cache(&cache_root);
+            self.engine.send(Cmd::SetGpuSelection {
+                gpu_adapter,
+                explicit_gpu_luid: requested,
+                force_vulkan_glsl,
+                backend,
+                trt_device_id: self.tensorrt_availability.device_id,
+                cache_root,
+            });
+            log::info!(
+                "gpu-selection-requested: luid={} name='{}' force_vulkan={} effective_luid={} dml_device={:?} onnx_backend={backend:?} trt_device={:?} relaunch=false presentation_gpu_unchanged=true",
+                requested
+                    .map(|luid| format!("{luid:016x}"))
+                    .unwrap_or_else(|| "Auto".to_string()),
+                requested_name,
+                force_vulkan_glsl,
+                effective_gpu_luid
+                    .map(|luid| format!("{luid:016x}"))
+                    .unwrap_or_else(|| "Auto".to_string()),
+                gpu_adapter,
+                self.tensorrt_availability.device_id,
+            );
+        }
+    }
+
     fn request_onnx_backend_switch(&mut self, backend: OnnxBackendPreference) {
         if backend == OnnxBackendPreference::TensorRT && !self.tensorrt_availability.available {
+            return;
+        }
+        if backend == OnnxBackendPreference::TensorRT
+            && !tensorrt_crop_switch_allowed(self.settings.capture_crop, self.saved_crop)
+        {
+            log::warn!(
+                "onnx-backend-switch-blocked: requested=TensorRT reason=unsaved-crop-geometry current=({}, {}, {}, {}) saved=({}, {}, {}, {})",
+                self.settings.capture_crop.left,
+                self.settings.capture_crop.top,
+                self.settings.capture_crop.right,
+                self.settings.capture_crop.bottom,
+                self.saved_crop.left,
+                self.saved_crop.top,
+                self.saved_crop.right,
+                self.saved_crop.bottom
+            );
             return;
         }
         // Reflect the user's requested state immediately. The render engine
@@ -2662,11 +3327,11 @@ impl App {
         let target = match mode {
             UiMode::Mini => {
                 self.mini_language_width_applied = None;
-                self.resize_mini_for_language(ui, lang)
+                self.resize_mini_for_language(ui, lang, true)
             }
             UiMode::Basic => {
                 self.basic_language_width_applied = None;
-                let target = self.resize_basic_for_language(ui, lang);
+                let target = self.resize_basic_for_language(ui, lang, true);
                 self.basic_stats_layout_applied = Some(self.settings.stats_on);
                 self.basic_stats_rows_applied = Some(self.basic_stats_rows());
                 target
@@ -2690,14 +3355,14 @@ impl App {
                 target.y,
                 pixels_per_point,
             );
-        // Fail-safe only. If desktop capture/window creation is unavailable,
-        // preserve v467's proven no-transition behavior rather than exposing a
-        // half-resized WGPU frame.
-        let cloak_applied =
-            !shield_applied && self.gui_hwnd != 0 && win32::set_window_cloaked(self.gui_hwnd, true);
+        // Fail-visible safety: if the snapshot cannot be created, continue the
+        // resize without hiding the root GUI. A compositor failure must never
+        // leave the application cloaked or waiting for an uncloak retry.
+        let cloak_applied = false;
 
         self.pending_ui_mode = Some(PendingUiModeTransition {
             mode,
+            mode_change: true,
             target,
             armed_at: Instant::now(),
             mode_committed: false,
@@ -2770,20 +3435,27 @@ impl App {
                 }
             }
             if transition.shield_applied {
-                // One compositor sync while the owned snapshot is still above
-                // the root GUI guarantees DWM has consumed the final surface
-                // before the shield disappears. This runs only on explicit UI
-                // mode switches, never in the video Present loop.
-                win32::sync_gui_transition_with_dwm();
+                // The snapshot already covers the transition. Never block the
+                // GUI thread waiting synchronously for DWM during a surface
+                // resize; fail-visible behavior is safer than a frozen GUI.
                 win32::keep_gui_transition_snapshot_topmost();
                 win32::hide_gui_transition_snapshot();
             }
-            log::info!(
-                "ui-mode-transition: revealed mode={:?} snapshot_released={} uncloaked_fallback={}",
-                transition.mode,
-                transition.shield_applied,
-                transition.cloak_applied
-            );
+            if transition.mode_change {
+                log::info!(
+                    "ui-mode-transition: revealed mode={:?} snapshot_released={} uncloaked_fallback={}",
+                    transition.mode,
+                    transition.shield_applied,
+                    transition.cloak_applied
+                );
+            } else {
+                log::info!(
+                    "full-layout-transition: revealed target={:.1}x{:.1} snapshot_released={}",
+                    transition.target.x,
+                    transition.target.y,
+                    transition.shield_applied
+                );
+            }
             self.pending_ui_mode = None;
             ctx.request_repaint();
             return;
@@ -2803,29 +3475,66 @@ impl App {
             return;
         }
 
-        self.settings.ui_mode = transition.mode;
-        save_settings(&self.app_dir, &self.settings);
+        // A same-Full shrink is cosmetic, never worth risking a stuck GUI. If
+        // the native/WGPU surface did not reach the requested smaller geometry
+        // inside the guard interval, remove the shield and keep the current
+        // working size. Unlike an actual mode switch there is nothing that must
+        // be committed. A later real layout change will produce a fresh key.
+        if !geometry_ready && timed_out && !transition.mode_change {
+            if transition.shield_applied {
+                win32::hide_gui_transition_snapshot();
+            }
+            log::warn!(
+                "full-layout-transition: resize-timeout-cancelled target={:.1}x{:.1} current={:?} action=keep-current",
+                transition.target.x,
+                transition.target.y,
+                current.as_ref().map(|size| (size.x, size.y))
+            );
+            self.pending_ui_mode = None;
+            ctx.request_repaint();
+            return;
+        }
+
+        if transition.mode_change {
+            self.settings.ui_mode = transition.mode;
+            save_settings(&self.app_dir, &self.settings);
+        }
         transition.mode_committed = true;
         transition.hidden_warmup_frames = 2;
         transition.committed_at = Some(Instant::now());
         self.pending_ui_mode = Some(transition);
-        if geometry_ready {
+        if transition.mode_change {
+            if geometry_ready {
+                log::info!(
+                    "ui-mode-transition: committed-covered mode={:?} target={:.1}x{:.1} warmup_frames=2",
+                    transition.mode,
+                    transition.target.x,
+                    transition.target.y
+                );
+            } else {
+                log::warn!(
+                    "ui-mode-transition: commit-timeout-covered mode={:?} target={:.1}x{:.1} current={:?} warmup_frames=2",
+                    transition.mode,
+                    transition.target.x,
+                    transition.target.y,
+                    current.as_ref().map(|size| (size.x, size.y))
+                );
+            }
+            log::info!("ui-mode: switched to {:?}", transition.mode);
+        } else if geometry_ready {
             log::info!(
-                "ui-mode-transition: committed-covered mode={:?} target={:.1}x{:.1} warmup_frames=2",
-                transition.mode,
+                "full-layout-transition: committed-covered target={:.1}x{:.1} warmup_frames=2",
                 transition.target.x,
                 transition.target.y
             );
         } else {
             log::warn!(
-                "ui-mode-transition: commit-timeout-covered mode={:?} target={:.1}x{:.1} current={:?} warmup_frames=2",
-                transition.mode,
+                "full-layout-transition: commit-timeout-covered target={:.1}x{:.1} current={:?} warmup_frames=2",
                 transition.target.x,
                 transition.target.y,
                 current.as_ref().map(|size| (size.x, size.y))
             );
         }
-        log::info!("ui-mode: switched to {:?}", transition.mode);
         ctx.request_repaint_after(Duration::from_millis(8));
     }
 
@@ -2841,7 +3550,12 @@ impl App {
         438.0 + self.basic_stats_rows() as f32 * 22.0
     }
 
-    fn resize_mini_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) -> egui::Vec2 {
+    fn resize_mini_for_language(
+        &mut self,
+        ui: &egui::Ui,
+        lang: UiLanguage,
+        allow_shrink: bool,
+    ) -> egui::Vec2 {
         let measure = |text: &str, size: f32| {
             ui.painter()
                 .layout_no_wrap(
@@ -2867,6 +3581,14 @@ impl App {
         let desired = (localized_width * zoom + 650.0)
             .max(MINI_DEFAULT_SIZE[0])
             .min((monitor_width - 32.0).max(MINI_DEFAULT_SIZE[0]));
+        let current_width = ui
+            .ctx()
+            .input(|input| input.viewport().inner_rect.map(|r| r.width() * zoom));
+        let desired = if allow_shrink {
+            desired
+        } else {
+            current_width.map_or(desired, |w| desired.max(w))
+        };
         let width_key = desired.round() as i32;
         let target = egui::vec2(desired / zoom, MINI_DEFAULT_SIZE[1] / zoom);
         if self.mini_language_width_applied == Some(width_key) {
@@ -2900,13 +3622,21 @@ impl App {
         } else {
             BASIC_DEFAULT_SIZE[1]
         };
+        let current_height =
+            ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.height() * zoom));
+        let height = current_height.map_or(height, |current| height.max(current));
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             width.max(BASIC_MIN_SIZE[0]) / zoom,
             height / zoom,
         )));
     }
 
-    fn resize_basic_for_language(&mut self, ui: &egui::Ui, lang: UiLanguage) -> egui::Vec2 {
+    fn resize_basic_for_language(
+        &mut self,
+        ui: &egui::Ui,
+        lang: UiLanguage,
+        allow_shrink: bool,
+    ) -> egui::Vec2 {
         let label_width: f32 = [
             tr(lang, "", "Display:"),
             tr(lang, "", "Fullscreen"),
@@ -2935,6 +3665,14 @@ impl App {
         let desired = (label_width * zoom + 490.0)
             .max(BASIC_DEFAULT_SIZE[0])
             .min((monitor_width - 32.0).max(BASIC_DEFAULT_SIZE[0]));
+        let current_width = ui
+            .ctx()
+            .input(|input| input.viewport().inner_rect.map(|r| r.width() * zoom));
+        let desired = if allow_shrink {
+            desired
+        } else {
+            current_width.map_or(desired, |w| desired.max(w))
+        };
         let width_key = desired.round() as i32;
         let height = if self.settings.stats_on {
             self.basic_stats_height()
@@ -2998,6 +3736,28 @@ impl App {
             + 2.0 * separator_width
             + 2.0 * item_gap;
 
+        let row_aspect = bounded_checkbox_width(ui, i18n::text(lang, "settings.aspect_correction"))
+            + bounded_plain_label_width(ui, i18n::text(lang, "settings.aspect_mode"))
+            + 112.0
+            + bounded_plain_label_width(ui, i18n::text(lang, "settings.aspect_width"))
+            + bounded_plain_label_width(ui, i18n::text(lang, "settings.aspect_height"))
+            // Two DragValue controls plus their gaps.
+            + 132.0
+            + 7.0 * item_gap;
+        let row_crop = bounded_checkbox_width(ui, i18n::text(lang, "settings.crop"))
+            + [
+                "settings.crop_left",
+                "settings.crop_top",
+                "settings.crop_right",
+                "settings.crop_bottom",
+            ]
+            .iter()
+            .map(|key| bounded_plain_label_width(ui, i18n::text(lang, key)))
+            .sum::<f32>()
+            // Four compact integer DragValues.
+            + 224.0
+            + 9.0 * item_gap;
+
         // Requested order:
         // FPS cap -> duplicate reduction -> rendering stabilization
         // -> VSync -> TensorRT.
@@ -3031,11 +3791,17 @@ impl App {
         } else {
             0.0
         };
+        let gpu_option_width = if gpu_selector_visible(&self.gpu_adapters) {
+            bounded_plain_label_width(ui, "GPU:") + 190.0 + separator_width + 3.0 * item_gap
+        } else {
+            0.0
+        };
         let row_options = option_labels
             .iter()
             .map(|text| bounded_checkbox_width(ui, text))
             .sum::<f32>()
             + hdr_option_width
+            + gpu_option_width
             + 30.0
             + separator_width
             + (option_labels.len() as f32 + 3.0) * item_gap;
@@ -3098,6 +3864,8 @@ impl App {
             start_button_width + preset_width + action_width + separator_width + 7.0 * item_gap;
 
         let required_row_width = row_display
+            .max(row_aspect)
+            .max(row_crop)
             .max(row_cadence)
             .max(row_options)
             .max(row_cursor)
@@ -3111,35 +3879,144 @@ impl App {
             .ctx()
             .input(|input| input.viewport().monitor_size.map(|size| size.y * zoom))
             .unwrap_or(1000.0);
-        let available_width = (monitor_width - 32.0).max(FULL_DEFAULT_SIZE[0]);
+        // Cap Full mode to the actual Windows work area, not only egui's raw
+        // monitor size. The outer Win32 frame/title bar is outside egui's
+        // InnerSize, so subtract its live non-client extent before choosing the
+        // maximum inner viewport. This guarantees Full never grows behind the
+        // taskbar or beyond the monitor; extra content stays in the existing
+        // chain/settings ScrollAreas instead.
+        let monitor_cap_width = (monitor_width - 16.0).max(320.0);
+        let monitor_cap_height = (monitor_height - 16.0).max(320.0);
+        let (work_cap_width, work_cap_height, work_area) =
+            if self.gui_hwnd != 0 && win32::is_window_valid(self.gui_hwnd) {
+                let work = win32::monitor_work_area_of(self.gui_hwnd);
+                let (frame_w, frame_h) = match (
+                    win32::window_rect(self.gui_hwnd),
+                    win32::client_rect_on_screen(self.gui_hwnd),
+                ) {
+                    (Some((_, _, ow, oh)), Some((_, _, cw, ch))) => {
+                        ((ow - cw).max(0), (oh - ch).max(0))
+                    }
+                    _ => (16, 40),
+                };
+                (
+                    (work.2 - frame_w - 8).max(320) as f32,
+                    (work.3 - frame_h - 8).max(320) as f32,
+                    Some(work),
+                )
+            } else {
+                (monitor_cap_width, monitor_cap_height, None)
+            };
+        let max_inner_width = monitor_cap_width.min(work_cap_width);
+        let max_inner_height = monitor_cap_height.min(work_cap_height);
+        let effective_min_width = FULL_MIN_SIZE[0].min(max_inner_width);
+        let effective_min_height = FULL_MIN_SIZE[1].min(max_inner_height);
+        let preferred_width = FULL_DEFAULT_SIZE[0].min(max_inner_width);
         let desired_unclamped = (required_row_width + FULL_LAYOUT_FIXED_RESERVE) * zoom;
         let desired = desired_unclamped
-            .max(FULL_DEFAULT_SIZE[0])
-            .min(available_width);
+            .max(preferred_width)
+            .max(effective_min_width)
+            .min(max_inner_width);
+        // Full mode is content-sized, not grow-only. The layout key below
+        // prevents resize spam, while allowing stats OFF, shorter chains, or a
+        // narrower locale to shrink the window back immediately. User manual
+        // resizing is still preserved until a real layout requirement changes.
         let usable_content_width = (desired / zoom - FULL_LAYOUT_FIXED_RESERVE).max(1.0);
-        let toolbar_wrap_extra = if row_toolbar > usable_content_width + 0.5 {
-            FULL_TOOLBAR_WRAP_EXTRA_HEIGHT
-        } else {
-            0.0
-        };
+        // Every settings row that uses horizontal_wrapped participates in the
+        // height model.  Previously only the preset toolbar did, so a narrow
+        // monitor or a wider localization could silently create another visual
+        // row without increasing the native Full window and clip the bottom.
+        let settings_wrap_extra = [
+            row_display,
+            row_aspect,
+            row_crop,
+            row_cadence,
+            row_options,
+            row_cursor,
+        ]
+        .into_iter()
+        .map(|width| full_wrapped_row_extra(width, usable_content_width, 32.0))
+        .sum::<f32>();
+        let toolbar_wrap_extra = full_wrapped_row_extra(
+            row_toolbar,
+            usable_content_width,
+            FULL_TOOLBAR_WRAP_EXTRA_HEIGHT,
+        );
+        let total_wrap_extra = settings_wrap_extra + toolbar_wrap_extra;
+        // The bottom settings panel owns these wrapped rows, so its own exact
+        // height must receive the same extra space as the outer Full window.
+        // Otherwise the extra native height is accidentally donated to the
+        // chain panel and the settings area scrolls/clips despite free space.
+        self.full_settings_wrap_extra = total_wrap_extra;
 
         let desired_content_height = 166.0
-            + toolbar_wrap_extra
+            + total_wrap_extra
             + full_chain_height(self.chain.len(), self.settings.stats_on)
             + full_settings_height(self.settings.stats_on, self.basic_stats_rows());
         let desired_height = desired_content_height
-            .max(FULL_MIN_SIZE[1])
-            .min((monitor_height - 32.0).max(FULL_MIN_SIZE[1]));
-        let layout_key = full_layout_key(desired, monitor_height, desired_height);
+            .max(effective_min_height)
+            .min(max_inner_height);
+        let layout_key = full_layout_key(desired, max_inner_height, desired_height);
         let target = egui::vec2(desired / zoom, desired_height / zoom);
         if self.full_language_width_applied == Some(layout_key) {
             return target;
         }
 
+        // Never stack a second root-surface resize on top of an existing
+        // protected transition. Keep the new key unapplied; once the current
+        // transition reveals, the next frame re-measures and targets the newest
+        // requirement.
+        if self.pending_ui_mode.is_some() && self.settings.ui_mode == UiMode::Full {
+            return target;
+        }
+
+        let current_size = ui
+            .ctx()
+            .input(|input| input.viewport().inner_rect.map(|r| r.size()));
+        let shrinking_existing_full = self.settings.ui_mode == UiMode::Full
+            && current_size
+                .as_ref()
+                .is_some_and(|size| target.x + 1.5 < size.x || target.y + 1.5 < size.y);
+
+        // v570 deliberately avoided direct same-Full WGPU surface shrink after
+        // it could stall the GUI. Preserve that safety while still allowing
+        // Stats OFF / shorter chains to reclaim stale blank space: cover the
+        // old GUI with the same native snapshot shield used by mode switches,
+        // resize underneath it, then reveal only after target frames are warm.
+        if shrinking_existing_full {
+            egui::Popup::close_all(ui.ctx());
+            let pixels_per_point = ui.ctx().pixels_per_point().max(0.1);
+            let shield_applied = self.gui_hwnd != 0
+                && win32::show_gui_transition_snapshot(
+                    self.gui_hwnd,
+                    target.x,
+                    target.y,
+                    pixels_per_point,
+                );
+            self.pending_ui_mode = Some(PendingUiModeTransition {
+                mode: UiMode::Full,
+                mode_change: false,
+                target,
+                armed_at: Instant::now(),
+                mode_committed: false,
+                hidden_warmup_frames: 0,
+                committed_at: None,
+                shield_applied,
+                cloak_applied: false,
+            });
+            log::info!(
+                "full-layout-transition: prepared current={:?} target={:.1}x{:.1} shield={}",
+                current_size.as_ref().map(|size| (size.x, size.y)),
+                target.x,
+                target.y,
+                shield_applied
+            );
+        }
+
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                desired / zoom,
-                FULL_MIN_SIZE[1] / zoom,
+                effective_min_width / zoom,
+                effective_min_height / zoom,
             )));
         ui.ctx()
             .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
@@ -3148,17 +4025,23 @@ impl App {
             )));
         self.full_language_width_applied = Some(layout_key);
         log::debug!(
-            "full-layout: language={} width={desired:.0} height={desired_height:.0} stats={} rows={} model=basic-style reserve={:.0} usable={usable_content_width:.0} required(display={:.0},cadence={:.0},options={:.0},cursor={:.0},toolbar={:.0}) toolbar_wrapped={}",
+            "full-layout: language={} width={desired:.0} height={desired_height:.0} stats={} rows={} model=workarea-scroll reserve={:.0} usable={usable_content_width:.0} required(display={:.0},aspect={:.0},crop={:.0},cadence={:.0},options={:.0},cursor={:.0},toolbar={:.0}) wrap_extra={total_wrap_extra:.0} toolbar_wrapped={} max_inner={:.0}x{:.0} work_area={:?} scroll_limited={}",
             i18n::tag(lang),
             self.settings.stats_on,
             self.basic_stats_rows(),
             FULL_LAYOUT_FIXED_RESERVE * zoom,
             row_display * zoom,
+            row_aspect * zoom,
+            row_crop * zoom,
             row_cadence * zoom,
             row_options * zoom,
             row_cursor * zoom,
             row_toolbar * zoom,
-            toolbar_wrap_extra > 0.0
+            toolbar_wrap_extra > 0.0,
+            max_inner_width,
+            max_inner_height,
+            work_area,
+            desired_content_height > max_inner_height + 0.5
         );
         target
     }
@@ -3363,20 +4246,16 @@ impl App {
 
         let old = self.settings.hotkey_toggle.clone();
         self.hotkeys.stop();
-        let replacement = HotkeyThread::start(
-            Self::hotkey_bindings(&canonical),
-            self.engine.stop_handle(),
-        );
+        let replacement =
+            HotkeyThread::start(Self::hotkey_bindings(&canonical), self.engine.stop_handle());
         if replacement
             .registration_failures
             .iter()
             .any(|(id, _)| *id == HK_TOGGLE)
         {
             drop(replacement);
-            self.hotkeys = HotkeyThread::start(
-                Self::hotkey_bindings(&old),
-                self.engine.stop_handle(),
-            );
+            self.hotkeys =
+                HotkeyThread::start(Self::hotkey_bindings(&old), self.engine.stop_handle());
             return Err(tr(
                 lang,
                 "登録中に競合が発生しました。以前のショートカットへ戻しました。",
@@ -3403,24 +4282,42 @@ impl App {
         let current_size = win32::client_rect_on_screen(self.target_hwnd)
             .map(|(_, _, w, h)| (w, h))
             .unwrap_or((res.w as i32, res.h as i32));
-        let applied = if is_picture_in_picture_title(&title) {
+        // Capture Resolution is the raw/pre-crop capture canvas. Crop is a
+        // downstream view into that fixed canvas and must never resize the
+        // foreign source HWND. This keeps live Crop responsive and prevents
+        // WGC transitional-frame stalls. PIP keeps its existing aspect-safe fit
+        // against the raw client aspect.
+        let capture_target = if is_picture_in_picture_title(&title) {
             fit_resolution_preserving_aspect(res, current_size)
         } else {
             res
         };
-        if applied != res {
+        if capture_target != res {
             log::info!(
-                "capture-resolution PIP aspect-safe fit: hwnd={:#x} requested={}x{} current_aspect_source={}x{} applied={}x{}",
+                "capture-resolution PIP aspect-safe fit: hwnd={:#x} requested={}x{} current_capture={}x{} applied_capture={}x{}",
                 self.target_hwnd,
                 res.w,
                 res.h,
                 current_size.0,
                 current_size.1,
-                applied.w,
-                applied.h
+                capture_target.w,
+                capture_target.h
             );
         }
-        Some((res, applied))
+        if self.settings.capture_crop.enabled {
+            log::debug!(
+                "capture-resolution fixed-canvas plan: requested={}x{} applied={}x{} crop=({}, {}, {}, {}) crop_stage=post-capture",
+                res.w,
+                res.h,
+                capture_target.w,
+                capture_target.h,
+                self.settings.capture_crop.left,
+                self.settings.capture_crop.top,
+                self.settings.capture_crop.right,
+                self.settings.capture_crop.bottom
+            );
+        }
+        Some((res, capture_target))
     }
 
     fn capture_resolution_disabled_for_target(&self) -> bool {
@@ -3447,7 +4344,7 @@ impl App {
             status
                 .source_recovery
                 .as_ref()
-                .and_then(|(hwnd, rect, _, _)| {
+                .and_then(|(hwnd, _, rect, _, _, _)| {
                     if *hwnd != self.target_hwnd {
                         return None;
                     }
@@ -3497,6 +4394,7 @@ impl App {
             self.engine.send(Cmd::SetCaptureGeometry {
                 requested: (res.w, res.h),
                 applied: (applied.w, applied.h),
+                capture_crop: self.settings.capture_crop,
             });
             log::info!(
                 "capture-resolution applied: hwnd={:#x} requested={}x{} client={}x{} engine_transition=armed",
@@ -3549,6 +4447,107 @@ impl App {
             }
         }
         self.engine.send(Cmd::SetNoEngage(live_no_engage));
+
+        if !running {
+            self.live_crop_pending = None;
+            self.live_crop_last_sent = None;
+            // If capture stops during the short Crop save debounce, do not lose
+            // the user's final value. Idle editing also lands here on the next
+            // GUI update and is persisted immediately.
+            if self.crop_settings_save_due.take().is_some() {
+                save_settings(&self.app_dir, &self.settings);
+                log::debug!(
+                    "crop-settings-save: idle/stop flush enabled={} edges=({}, {}, {}, {})",
+                    self.settings.capture_crop.enabled,
+                    self.settings.capture_crop.left,
+                    self.settings.capture_crop.top,
+                    self.settings.capture_crop.right,
+                    self.settings.capture_crop.bottom
+                );
+            }
+            self.tensorrt_crop_commit_pending = None;
+            self.tensorrt_crop_commit_due = None;
+        } else {
+            // Keep ordinary DirectML/GLSL Crop visibly live without publishing
+            // every 1 px DragValue sample. 33 ms is fast enough for a fluid
+            // preview while cutting shape-change rebuild pressure substantially.
+            if let Some(crop) = self.live_crop_pending {
+                let pointer_down = win32::left_mouse_button_down();
+                let due = !pointer_down
+                    || self.settings.capture_resolution.is_none()
+                    || self
+                        .live_crop_last_sent
+                        .map_or(true, |sent| sent.elapsed() >= Duration::from_millis(33));
+                if due {
+                    self.live_crop_pending = None;
+                    self.live_crop_last_sent = Some(Instant::now());
+                    self.engine.send(Cmd::SetCaptureCrop { crop });
+                    log::debug!(
+                        "crop-live-throttle: publish enabled={} edges=({}, {}, {}, {}) pointer_down={} cadence_ms=33",
+                        crop.enabled,
+                        crop.left,
+                        crop.top,
+                        crop.right,
+                        crop.bottom,
+                        pointer_down
+                    );
+                }
+            }
+
+            // Crop persistence is deliberately decoupled from render updates.
+            // Saving settings.json and re-sending SetMode for every 1 px edit
+            // adds avoidable GUI/disk/command traffic and does not affect Crop.
+            if self
+                .crop_settings_save_due
+                .is_some_and(|due| !win32::left_mouse_button_down() && Instant::now() >= due)
+            {
+                self.crop_settings_save_due = None;
+                save_settings(&self.app_dir, &self.settings);
+                log::debug!(
+                    "crop-settings-save: settled enabled={} edges=({}, {}, {}, {})",
+                    self.settings.capture_crop.enabled,
+                    self.settings.capture_crop.left,
+                    self.settings.capture_crop.top,
+                    self.settings.capture_crop.right,
+                    self.settings.capture_crop.bottom
+                );
+            }
+
+            // TensorRT Crop execution accepts saved geometry only. Keep the
+            // existing transaction as a final safety net for the ON/OFF toggle
+            // (and any future non-DragValue caller): the render thread still sees
+            // only one settled Crop state. DirectML owns numeric Crop editing.
+            if self.tensorrt_crop_commit_pending.is_some() {
+                if win32::left_mouse_button_down() {
+                    self.tensorrt_crop_commit_due = None;
+                } else if self.tensorrt_crop_commit_due.is_none() {
+                    self.tensorrt_crop_commit_due =
+                        Some(Instant::now() + Duration::from_millis(220));
+                    log::debug!("tensorrt-crop-transaction: mouse-up settle armed debounce_ms=220");
+                } else if self
+                    .tensorrt_crop_commit_due
+                    .is_some_and(|due| Instant::now() >= due)
+                {
+                    let crop = self
+                        .tensorrt_crop_commit_pending
+                        .take()
+                        .unwrap_or(self.settings.capture_crop);
+                    self.tensorrt_crop_commit_due = None;
+                    // Capture Resolution is a fixed pre-crop canvas, so a Crop
+                    // commit must never resize the foreign source HWND. TensorRT
+                    // still receives only the final shape to avoid engine-build churn.
+                    self.engine.send(Cmd::SetCaptureCrop { crop });
+                    log::info!(
+                        "tensorrt-crop-transaction: commit final enabled={} edges=({}, {}, {}, {}) geometry_transaction=false fixed_capture_canvas=true",
+                        crop.enabled,
+                        crop.left,
+                        crop.top,
+                        crop.right,
+                        crop.bottom
+                    );
+                }
+            }
+        }
 
         let poll_ms = if running { 80 } else { 250 };
         if self.last_poll.elapsed() < Duration::from_millis(poll_ms) {
@@ -3675,7 +4674,7 @@ impl App {
         let own_elevated = win32::own_process_elevated();
         let candidate_elevated = win32::process_elevated(win32::window_pid(foreground));
         if may_follow_foreground_target(running, own_elevated, candidate_elevated) {
-            let fg = foreground;
+            let fg = win32::normalize_capture_target(foreground);
             if fg != 0
                 && !win32::is_own_window(fg)
                 && win32::is_window_valid(fg)
@@ -3695,6 +4694,20 @@ impl App {
         if self.target_hwnd == 0 {
             return;
         }
+        // A large owned presentation helper may become foreground after the
+        // user clicks the video surface. Keep the user's logical source on the
+        // structural root host; do not let an internal presentation HWND turn
+        // into an independent fullscreen/windowed target.
+        let normalized_target = win32::normalize_capture_target(self.target_hwnd);
+        if normalized_target != self.target_hwnd {
+            log::info!(
+                "capture-start-target-normalized: selected={:#x} root={:#x} reason=owned-presentation-surface",
+                self.target_hwnd,
+                normalized_target
+            );
+            self.target_hwnd = normalized_target;
+            self.target_title = win32::window_title(normalized_target);
+        }
         if !win32::own_process_elevated()
             && win32::process_elevated(win32::window_pid(self.target_hwnd)) == Some(true)
         {
@@ -3711,7 +4724,30 @@ impl App {
         // restore the exact window the user selected, even after in-session
         // moves, resizes, fullscreen toggles, or an off-screen displacement.
         let source_restore_rect = win32::window_rect(self.target_hwnd);
+        let source_restore_placement = win32::window_placement_snapshot(self.target_hwnd);
         let source_was_maximized = win32::is_maximized(self.target_hwnd);
+        let source_pid = win32::window_pid(self.target_hwnd);
+        if source_pid == 0 {
+            let lang = self.effective_language();
+            self.engine.status.lock().unwrap().last_error = Some(
+                tr(
+                    lang,
+                    "キャプチャ対象が見つかりません。",
+                    "The capture target is no longer available.",
+                )
+                .to_string(),
+            );
+            return;
+        }
+        let source_was_topmost = win32::is_topmost(self.target_hwnd);
+        let source_was_layered =
+            win32::source_window_layered(self.target_hwnd, source_pid).unwrap_or(false);
+        let source_corner_preference = win32::window_corner_preference(self.target_hwnd);
+        log::debug!(
+            "capture-start-window-placement: hwnd={:#x} outer={source_restore_rect:?} normal={:?} maximized={source_was_maximized}",
+            self.target_hwnd,
+            source_restore_placement.map(|p| p.normal_rect_xywh())
+        );
         // A monitor-covering browser video keeps its input coordinate system at
         // native fullscreen geometry. Resizing that HWND makes cursor mapping
         // diverge, so this session deliberately uses the source resolution.
@@ -3749,15 +4785,18 @@ impl App {
         };
         let capture_canvas = capture_resolution_plan.map(|(_, applied)| (applied.w, applied.h));
         if !capture_resolution_ready {
-            if let Some(rect) = source_restore_rect {
-                let restored =
-                    win32::restore_window_rect(self.target_hwnd, rect, source_was_maximized);
-                log::warn!(
-                    "capture-resolution abort restore: hwnd={:#x} rect={rect:?} maximized={} ok={restored}",
-                    self.target_hwnd,
-                    source_was_maximized
-                );
-            }
+            let restored = win32::restore_window_origin(
+                self.target_hwnd,
+                source_restore_rect,
+                source_was_maximized,
+                source_restore_placement,
+            );
+            log::warn!(
+                "capture-resolution abort restore: hwnd={:#x} rect={source_restore_rect:?} normal_rect={:?} maximized={} ok={restored}",
+                self.target_hwnd,
+                source_restore_placement.map(|p| p.normal_rect_xywh()),
+                source_was_maximized
+            );
             let lang = self.effective_language();
             self.engine.status.lock().unwrap().last_error = Some(
                 tr(
@@ -3789,11 +4828,40 @@ impl App {
         self.engine.send(Cmd::SetDuplicateFrameReduction(
             self.settings.duplicate_frame_reduction,
         ));
+        // Auto keeps ONNX on the actual WGL adapter for the fastest GPU-direct
+        // path. An explicit user choice remains authoritative for ONNX even if
+        // Windows/driver did not move WGL: hybrid systems may still gain far
+        // more from dGPU inference than they lose to the existing cross-GPU
+        // transfer fallback. Never silently force an explicit dGPU request back
+        // onto an iGPU merely to preserve sharing.
+        let render_gpu_luid = self.engine.status.lock().unwrap().render_gpu_luid;
+        let requested_gpu_luid = self.settings.gpu_adapter_luid;
+        let effective_gpu_luid = resolve_compute_gpu_luid(requested_gpu_luid, render_gpu_luid);
+        if cross_gpu_compute_active(requested_gpu_luid, render_gpu_luid) {
+            let requested = requested_gpu_luid.unwrap();
+            let actual = render_gpu_luid.unwrap();
+            log::warn!(
+                "gpu-selection-cross-gpu: render_luid={actual:016x} onnx_luid={requested:016x} mode=explicit-compute-override gpu_direct_sharing=disabled-or-fallback reason=user-selected-gpu"
+            );
+        }
+        let gpu_adapter = gpu::device_id_for_luid(&self.gpu_adapters, effective_gpu_luid);
+        let gpu_name = gpu::adapter_for_luid(&self.gpu_adapters, effective_gpu_luid)
+            .map(|adapter| adapter.name.as_str())
+            .unwrap_or("Auto");
         log::info!(
-            "capture-start-request: hwnd={:#x} title='{}' filters={} gpu_device_id=None gpu_name=Auto (high performance)",
+            "capture-start-request: hwnd={:#x} title='{}' filters={} gpu_requested_luid={} gpu_force_vulkan={} gpu_effective_luid={} gpu_device_id={:?} gpu_name='{}'",
             self.target_hwnd,
             self.target_title,
-            self.chain.iter().filter(|stage| stage.enabled).count()
+            self.chain.iter().filter(|stage| stage.enabled).count(),
+            requested_gpu_luid
+                .map(|luid| format!("{luid:016x}"))
+                .unwrap_or_else(|| "Auto".to_string()),
+            self.settings.gpu_force_vulkan,
+            effective_gpu_luid
+                .map(|luid| format!("{luid:016x}"))
+                .unwrap_or_else(|| "Auto".to_string()),
+            gpu_adapter,
+            gpu_name
         );
         log::info!(
             "privilege-diag: neo_elevated={} source_pid={} source_elevated={:?}",
@@ -3801,19 +4869,39 @@ impl App {
             win32::window_pid(self.target_hwnd),
             win32::process_elevated(win32::window_pid(self.target_hwnd))
         );
-        // An explicit capture resolution describes the source client area.
-        // Always crop decorations in this mode so the captured dimensions and
-        // statistics remain exactly equal to the requested size.
+        // An explicit capture resolution describes the retained content area.
+        // With user crop enabled Neo enlarges the source client by those margins
+        // so the post-crop pixels equal the selected size. Client-only WGC is
+        // still mandatory so decorations cannot enter that geometry.
         let effective_client_only =
             self.settings.client_only || self.settings.capture_resolution.is_some();
         if effective_client_only != self.settings.client_only {
             log::info!("capture-resolution: forcing client-area WGC crop");
         }
+        chidescaler_neo::input::publish_janitor_source_recovery(
+            self.target_hwnd,
+            source_pid,
+            source_restore_rect,
+            source_restore_placement,
+            source_was_maximized,
+            source_was_topmost,
+            source_was_layered,
+            source_corner_preference,
+        );
         self.engine.send(Cmd::Start {
             hwnd: self.target_hwnd,
+            source_pid,
+            source_was_topmost,
             specs: self.chain.clone(),
             mode: self.settings.scale_mode,
             ratio: self.settings.ratio,
+            aspect_correction: self.settings.aspect_correction,
+            aspect_correction_mode: self.settings.aspect_correction_mode,
+            aspect_width_scale: sanitize_aspect_correction_scale(self.settings.aspect_width_scale),
+            aspect_height_scale: sanitize_aspect_correction_scale(
+                self.settings.aspect_height_scale,
+            ),
+            capture_crop: self.settings.capture_crop,
             fps_cap: self
                 .settings
                 .fps_cap_enabled
@@ -3822,8 +4910,15 @@ impl App {
             client_only: effective_client_only,
             hdr: hdr_capture_requested(&self.settings),
             hdr_sdr_mode: self.settings.hdr_sdr_mode,
-            gpu_adapter: None,
+            gpu_adapter,
+            // Physical GPU selection and GLSL backend policy are independent.
+            // A normal explicit selection keeps same-GPU OpenGL, cross-GPU
+            // selection uses Vulkan automatically, and a [Vulkan] row forces
+            // compatible GLSL through Vulkan on that selected adapter.
+            explicit_gpu_luid: requested_gpu_luid,
+            force_vulkan_glsl: self.settings.gpu_force_vulkan,
             source_restore_rect,
+            source_restore_placement,
             source_was_maximized,
             deferred_capture_resolution,
             capture_canvas,
@@ -3929,7 +5024,18 @@ impl App {
 
     fn apply_live(&self) {
         if self.running() {
-            self.engine.send(Cmd::ApplyChain(self.chain.clone()));
+            self.engine.send(Cmd::ApplyChain {
+                specs: self.chain.clone(),
+                aspect_correction: self.settings.aspect_correction,
+                aspect_correction_mode: self.settings.aspect_correction_mode,
+                aspect_width_scale: sanitize_aspect_correction_scale(
+                    self.settings.aspect_width_scale,
+                ),
+                aspect_height_scale: sanitize_aspect_correction_scale(
+                    self.settings.aspect_height_scale,
+                ),
+                capture_crop: self.settings.capture_crop,
+            });
         }
     }
 
@@ -3957,22 +5063,87 @@ impl App {
     }
 
     fn select_preset(&mut self, name: &str) {
-        if let Some(p) = self.store.data.presets.iter().find(|p| p.name == name) {
-            self.chain = p
-                .chain
+        if let Some(preset) = self.store.data.presets.iter().find(|p| p.name == name) {
+            let chain = preset.chain.clone();
+            let aspect_correction = preset.effective_aspect_correction();
+            let crop = preset.effective_crop();
+            let preset_capture_resolution = preset.capture_resolution;
+            let capture_resolution_was_specified = preset_capture_resolution.is_some();
+            // v672: a preset only owns the capture resolution when it actually
+            // stores a fixed value. Missing metadata inherits the current GUI value
+            // instead of forcing Auto, which keeps comparison runs at one resolution.
+            let selected_capture_resolution =
+                preset_capture_resolution.or(self.settings.capture_resolution);
+            self.chain = chain
                 .iter()
                 .filter(|stage| !is_frozen_neoflow_stage(stage))
                 .cloned()
                 .collect();
-            self.saved_chain = p.chain.clone();
+            self.saved_chain = chain;
+            aspect_correction.apply_to_settings(&mut self.settings);
+            self.settings.capture_crop = crop;
+            self.settings.capture_resolution = selected_capture_resolution;
+            let lang = self.effective_language();
+            self.capture_resolution_text =
+                capture_resolution_label(self.settings.capture_resolution, lang);
+            self.saved_aspect_correction = aspect_correction;
+            self.saved_crop = crop;
+            // For an unspecified preset, the inherited GUI value becomes the
+            // comparison baseline. Therefore selecting it does not immediately
+            // create a false dirty '*' marker; later user changes still do.
+            self.saved_capture_resolution = selected_capture_resolution;
             self.store.data.active = name.to_string();
             self.store.save();
+            save_settings(&self.app_dir, &self.settings);
+            let running = self.running();
+            // Preserve the established preset chain/aspect/crop transaction first.
+            // Only a preset with an explicit fixed resolution is allowed to invoke
+            // the live capture-resolution state machine; unspecified presets leave
+            // the source geometry and GUI selector untouched.
             self.apply_live();
+            if running && capture_resolution_was_specified {
+                let _ = self.apply_capture_resolution_to_target();
+            }
+            log::info!(
+                "preset-state-load: source=selection preset='{}' aspect_enabled={} aspect_mode={:?} aspect_scale={:.2}x{:.2} crop_enabled={} crop=({}, {}, {}, {}) capture_resolution_saved={} capture_resolution_effective={} inherited={}",
+                name,
+                aspect_correction.enabled,
+                aspect_correction.mode,
+                aspect_correction.width_scale,
+                aspect_correction.height_scale,
+                crop.enabled,
+                crop.left,
+                crop.top,
+                crop.right,
+                crop.bottom,
+                preset_capture_resolution
+                    .map(|r| format!("{}x{}", r.w, r.h))
+                    .unwrap_or_else(|| "unspecified".to_string()),
+                selected_capture_resolution
+                    .map(|r| format!("{}x{}", r.w, r.h))
+                    .unwrap_or_else(|| "Auto".to_string()),
+                !capture_resolution_was_specified
+            );
         }
+    }
+
+    fn current_preset_aspect_correction(&self) -> PresetAspectCorrection {
+        PresetAspectCorrection::from_settings(&self.settings)
+    }
+
+    fn current_preset_crop(&self) -> CaptureCrop {
+        self.settings.capture_crop
+    }
+
+    fn current_preset_capture_resolution(&self) -> Option<CaptureResolution> {
+        self.settings.capture_resolution
     }
 
     fn dirty(&self) -> bool {
         self.chain != self.saved_chain
+            || self.current_preset_aspect_correction() != self.saved_aspect_correction
+            || self.current_preset_crop() != self.saved_crop
+            || self.current_preset_capture_resolution() != self.saved_capture_resolution
     }
 
     /// soft, rounded little move button ("∧" / "∨" look)
@@ -4082,9 +5253,7 @@ impl App {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 let overlay = status.overlay_hwnd;
-                if overlay != 0
-                    && win32::is_window_valid(overlay)
-                    && win32::is_own_window(overlay)
+                if overlay != 0 && win32::is_window_valid(overlay) && win32::is_own_window(overlay)
                 {
                     // First recommit the fullscreen overlay into TOPMOST without
                     // lifting the panel yet. Then rebuild the helper stack in
@@ -4092,9 +5261,7 @@ impl App {
                     win32::recommit_overlay_below_helpers(0, overlay);
 
                     let anchor = self.compositor_anchor_hwnd;
-                    if anchor != 0
-                        && win32::is_window_valid(anchor)
-                        && win32::is_own_window(anchor)
+                    if anchor != 0 && win32::is_window_valid(anchor) && win32::is_own_window(anchor)
                     {
                         win32::raise_topmost(anchor);
                     }
@@ -4301,7 +5468,8 @@ impl App {
     // to repaint a second panel swapchain.
     fn control_panel(&mut self, ctx: &egui::Context, status: &Status) {
         let lang = self.effective_language();
-        let show = status.running && !status.stopping && self.panel_visible && self.settings.panel_show;
+        let show =
+            status.running && !status.stopping && self.panel_visible && self.settings.panel_show;
         let effective_show = show && self.panel_placed_for_run;
         // v465 has no hidden WGPU keep-alive panel. Physical visibility follows
         // the logical/native GDI panel visibility exactly.
@@ -4723,9 +5891,8 @@ impl App {
             });
         // Pre-v465 behavior: lurk is a completely invisible hit area.  Never
         // leave the cached GDI child visible as a dark lurk chip.
-        let mirror_visible = final_show
-            && !final_lurk
-            && (!self.panel_gdi_reveal_pending || panel_geometry_ready);
+        let mirror_visible =
+            final_show && !final_lurk && (!self.panel_gdi_reveal_pending || panel_geometry_ready);
         win32::update_panel_gdi_mirror(
             self.panel_hwnd,
             mirror_size.0,
@@ -4759,8 +5926,7 @@ impl App {
             // only part of those cached pixels. Re-publish the same complete
             // 297x33 frame once *after* the host becomes visible. Keep ordinary
             // FPS/hover updates on their existing small dirty-region path.
-            let reveal_republish =
-                win32::republish_panel_gdi_mirror_full(self.panel_hwnd);
+            let reveal_republish = win32::republish_panel_gdi_mirror_full(self.panel_hwnd);
             self.panel_gdi_reveal_pending = false;
             log::debug!(
                 "panel-atomic-reveal-commit: hwnd={:#x} size={}x{} anchor_required={} order=mirror-anchor-host-last reveal_republish={}",
@@ -4843,8 +6009,8 @@ impl App {
             // lurking.  Validate the mirror against the state we actually
             // require instead: visible for the bar, hidden for the lurk chip.
             let mirror_should_be_visible = final_show && !final_lurk;
-            let mirror_mismatch = final_show
-                && (!gdi_mirror_valid || gdi_mirror_visible != mirror_should_be_visible);
+            let mirror_mismatch =
+                final_show && (!gdi_mirror_valid || gdi_mirror_visible != mirror_should_be_visible);
             let draw_stall = panel_viewport_draw_ms >= 12.0;
             let heartbeat_stall = panel_diag_gap_ms >= 900.0;
             let anomaly = size_mismatch
@@ -4964,7 +6130,6 @@ impl App {
             self.toggle_gui_topmost();
         }
     }
-
 
     /// Restore only the compositor keep-alive part of the pre-v465 floating
     /// panel architecture.  The actual panel is still native GDI and all cursor
@@ -5244,6 +6409,99 @@ impl App {
 }
 
 impl App {
+    /// Three-second, non-blocking explanation for the windowed-source occlusion
+    /// safety stop. The actual Stop/recovery has already completed in the engine;
+    /// this viewport is GUI-only and never participates in capture/input routing.
+    fn render_source_occlusion_notice(&mut self, ctx: &egui::Context, lang: UiLanguage) {
+        let Some(until) = self.source_occlusion_notice_until else {
+            if self.source_occlusion_notice_hwnd != 0
+                && !win32::is_window_valid(self.source_occlusion_notice_hwnd)
+            {
+                self.source_occlusion_notice_hwnd = 0;
+            }
+            return;
+        };
+        let now = Instant::now();
+        if now >= until {
+            self.source_occlusion_notice_until = None;
+            self.source_occlusion_notice_hwnd = 0;
+            log::info!("source-occlusion-notice: action=expired");
+            return;
+        }
+
+        let monitor_size = ctx
+            .input(|input| input.viewport().monitor_size)
+            .unwrap_or(egui::vec2(1280.0, 720.0));
+        let size = [
+            500.0_f32.min((monitor_size.x - 32.0).max(320.0)),
+            112.0_f32.min((monitor_size.y - 48.0).max(96.0)),
+        ];
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_title("cHiDeScaler-Neo Safety Notice")
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_inner_size(size);
+        if self.source_occlusion_notice_hwnd == 0 {
+            let z = ctx.zoom_factor();
+            if let Some(outer) = ctx.input(|input| input.viewport().outer_rect) {
+                let center = outer.center();
+                viewport = viewport.with_position([
+                    (center.x * z - size[0] * 0.5).max(8.0),
+                    (center.y * z - size[1] * 0.5).max(8.0),
+                ]);
+            }
+        }
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("neo_source_occlusion_notice"),
+            viewport,
+            |ctx2, _| {
+                let frame = egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(28, 25, 18))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(214, 164, 66),
+                    ))
+                    .corner_radius(egui::CornerRadius::same(7))
+                    .inner_margin(egui::Margin::same(14));
+                egui::CentralPanel::default().frame(frame).show(ctx2, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(i18n::text(lang, "source_occlusion.notice_title"))
+                                .family(locale_font_family(lang))
+                                .strong()
+                                .size(13.0),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(i18n::text(lang, "source_occlusion.notice"))
+                                .family(locale_font_family(lang))
+                                .size(12.0),
+                        );
+                    });
+                });
+            },
+        );
+
+        if self.source_occlusion_notice_hwnd == 0
+            && let Some(hwnd) = win32::find_own_window("cHiDeScaler-Neo Safety Notice")
+        {
+            self.source_occlusion_notice_hwnd = hwnd;
+            log::info!("source-occlusion-notice: hwnd={hwnd:#x} action=shown duration_ms=3000");
+        }
+        if self.source_occlusion_notice_hwnd != 0
+            && win32::is_window_valid(self.source_occlusion_notice_hwnd)
+        {
+            if !win32::is_topmost(self.source_occlusion_notice_hwnd) {
+                win32::set_own_topmost(self.source_occlusion_notice_hwnd, true);
+            }
+            win32::raise_topmost(self.source_occlusion_notice_hwnd);
+        }
+        ctx.request_repaint_after((until - now).min(Duration::from_millis(100)));
+    }
+
     /// Mini overload warning must stay on the already-existing root GUI surface.
     ///
     /// v465 removed the floating panel's WGPU viewport after low-spec machines
@@ -5261,9 +6519,7 @@ impl App {
         status: &Status,
         running: bool,
     ) {
-        if self.settings.ui_mode != UiMode::Mini
-            || !running
-            || !status.glsl_overload_notice_latched
+        if self.settings.ui_mode != UiMode::Mini || !running || !status.glsl_overload_notice_latched
         {
             return;
         }
@@ -5289,11 +6545,9 @@ impl App {
                 // Label then wraps to two rows and the floating warning reaches
                 // the capture button below.  A pre-laid-out galley has no wrap
                 // path at all, so the warning remains exactly one line.
-                let galley = ui.painter().layout_no_wrap(
-                    warning.to_owned(),
-                    font,
-                    egui::Color32::WHITE,
-                );
+                let galley =
+                    ui.painter()
+                        .layout_no_wrap(warning.to_owned(), font, egui::Color32::WHITE);
                 let ink = galley.mesh_bounds;
                 const WARNING_H: f32 = 25.0;
                 const WARNING_MIN_W: f32 = 104.0;
@@ -5303,15 +6557,10 @@ impl App {
                 const ICON_TEXT_GAP: f32 = 5.0;
                 let group_w = ICON_W + ICON_TEXT_GAP + ink.width();
                 let warning_w = (group_w + WARNING_PAD_X * 2.0).max(WARNING_MIN_W);
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(warning_w, WARNING_H),
-                    egui::Sense::hover(),
-                );
-                ui.painter().rect_filled(
-                    rect,
-                    5.0,
-                    egui::Color32::from_rgb(50, 39, 18),
-                );
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(warning_w, WARNING_H), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 5.0, egui::Color32::from_rgb(50, 39, 18));
                 ui.painter().rect_stroke(
                     rect,
                     5.0,
@@ -5353,7 +6602,8 @@ impl App {
                     desired_ink_left - ink.min.x,
                     rect.center().y - ink.center().y,
                 );
-                ui.painter().galley(galley_pos, galley, egui::Color32::WHITE);
+                ui.painter()
+                    .galley(galley_pos, galley, egui::Color32::WHITE);
             });
     }
 
@@ -5917,27 +7167,58 @@ impl App {
             }
             Kind::SaveAs => {
                 if save_as_overwrite {
-                    match self
-                        .store
-                        .overwrite_active_as(&self.save_as_name, &self.chain)
-                    {
+                    let aspect_correction = self.current_preset_aspect_correction();
+                    let crop = self.current_preset_crop();
+                    let capture_resolution = self.current_preset_capture_resolution();
+                    match self.store.overwrite_active_as(
+                        &self.save_as_name,
+                        &self.chain,
+                        aspect_correction,
+                        crop,
+                        capture_resolution,
+                    ) {
                         Ok(name) => {
                             self.saved_chain = self.chain.clone();
+                            self.saved_aspect_correction = aspect_correction;
+                            self.saved_crop = crop;
+                            self.saved_capture_resolution = capture_resolution;
                             self.store.save();
                             self.save_as_open = false;
                             self.save_as_error = None;
-                            log::info!("preset-overwrite: name={name}");
+                            log::info!(
+                                "preset-overwrite: name={name} aspect_enabled={} aspect_scale={:.2}x{:.2}",
+                                aspect_correction.enabled,
+                                aspect_correction.width_scale,
+                                aspect_correction.height_scale
+                            );
                         }
                         Err(error) => self.save_as_error = Some(error),
                     }
                 } else if save_as_new {
-                    match self.store.save_as_new(&self.save_as_name, &self.chain) {
+                    let aspect_correction = self.current_preset_aspect_correction();
+                    let crop = self.current_preset_crop();
+                    let capture_resolution = self.current_preset_capture_resolution();
+                    match self.store.save_as_new(
+                        &self.save_as_name,
+                        &self.chain,
+                        aspect_correction,
+                        crop,
+                        capture_resolution,
+                    ) {
                         Ok(name) => {
                             self.saved_chain = self.chain.clone();
+                            self.saved_aspect_correction = aspect_correction;
+                            self.saved_crop = crop;
+                            self.saved_capture_resolution = capture_resolution;
                             self.store.save();
                             self.save_as_open = false;
                             self.save_as_error = None;
-                            log::info!("preset-save-as: name={name}");
+                            log::info!(
+                                "preset-save-as: name={name} aspect_enabled={} aspect_scale={:.2}x{:.2}",
+                                aspect_correction.enabled,
+                                aspect_correction.width_scale,
+                                aspect_correction.height_scale
+                            );
                         }
                         Err(error) => self.save_as_error = Some(error),
                     }
@@ -5977,6 +7258,7 @@ impl eframe::App for App {
         // same legacy value plus raw per-engine/per-process evidence so GPU
         // behavior can be diagnosed without external screenshots.
         let _ = self.resource_monitor.sample();
+        self.maybe_finalize_gpu_selection_startup();
         if let Some(path) = self.gui_test_screenshot_path.clone() {
             let screenshot = ctx.input(|input| {
                 input.events.iter().find_map(|event| match event {
@@ -6041,8 +7323,13 @@ impl eframe::App for App {
             || hotkey_status.running
             || hotkey_status.stopping
             || hotkey_provider_preparing;
-        if self.was_capture_busy && !capture_busy_now {
+        let capture_became_idle = self.was_capture_busy && !capture_busy_now;
+        if capture_became_idle {
             self.capture_idle_since = Instant::now();
+            // A confirmed ordinary busy->idle transition has completed the
+            // proven source restoration path. The janitor must not later undo
+            // user changes made to that source while Neo remains open.
+            chidescaler_neo::input::clear_janitor_source_recovery();
             log::debug!(
                 "capture-idle-epoch-advanced: stale queued toggle hotkeys can no longer start capture"
             );
@@ -6086,9 +7373,9 @@ impl eframe::App for App {
 
         let mut toggle_hotkey_handled = false;
         while let Ok(event) = self.hotkeys.rx.try_recv() {
-            if event.handled_while_minimized {
+            if event.handled_directly {
                 log::info!(
-                    "hotkey-dispatch-ignored: id={} binding='{}' reason=already-handled-while-minimized",
+                    "hotkey-dispatch-ignored: id={} binding='{}' reason=already-handled-on-hotkey-thread",
                     event.id,
                     event.binding
                 );
@@ -6162,7 +7449,16 @@ impl eframe::App for App {
         }
         let mut status = self.engine.status.lock().unwrap().clone();
 
-        // The established GLSL overload detector remains the sole authority.
+        if status.source_occlusion_notice_seq != self.source_occlusion_notice_seen_seq {
+            self.source_occlusion_notice_seen_seq = status.source_occlusion_notice_seq;
+            self.source_occlusion_notice_until = Some(Instant::now() + Duration::from_secs(3));
+            log::info!(
+                "source-occlusion-notice: seq={} action=armed duration_ms=3000",
+                status.source_occlusion_notice_seq
+            );
+        }
+
+        // v555: the existing GLSL overload detector remains the sole authority.
         // Once it has armed a deadline, keep the warning readable for the full
         // grace period and then enter the exact same Stop path as the user's
         // normal Stop button. Engine::send(Cmd::Stop) therefore retains all of
@@ -6271,12 +7567,12 @@ impl eframe::App for App {
             self.settings.language = lang;
         }
 
-        // When the root GUI is not physically visible above the video
+        // v555: when the root GUI is not physically visible above the video
         // overlay (GUI topmost OFF/cloaked, minimized, or simply behind the
         // windowed overlay), mirror the same overload-stop notice directly on
         // the magnified content using a cached native GDI helper. This does not
-        // create another WGPU surface, avoiding low-spec GUI corruption.
-        // content_rect is physical desktop geometry for both
+        // create another WGPU surface and therefore preserves v551's low-spec
+        // corruption fix. content_rect is physical desktop geometry for both
         // fullscreen and windowed magnification, so moves/resizes naturally
         // reposition the notice without touching WGC/GLSL/Present.
         let root_gui_notice_visible = self.gui_hwnd != 0
@@ -6300,7 +7596,7 @@ impl eframe::App for App {
             win32::hide_overload_notice_gdi();
         }
 
-        // Low-spec GLSL protection is intentionally visible. The
+        // Low-spec GLSL protection is intentionally visible. v555 keeps the
         // established overload thresholds unchanged, but a proven overload now
         // enters a six-second readable warning grace and then the ordinary Stop route. During
         // the grace the engine holds the last complete filtered frame whenever
@@ -6436,7 +7732,7 @@ impl eframe::App for App {
         let mut language_changed = false;
         egui::Panel::top("top").show(root, |ui| {
             if mini_ui {
-                self.resize_mini_for_language(ui, lang);
+                self.resize_mini_for_language(ui, lang, false);
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -6768,7 +8064,16 @@ impl eframe::App for App {
                     } else {
                         None
                     };
-                    let control_mode = if status.stopping {
+                    // The Start/Stop control is also hit-tested by the global
+                    // WH_MOUSE_LL path so it can commit on physical DOWN. An
+                    // egui::Window (such as the filter picker) shares the same
+                    // native HWND as the main GUI, so Win32 z-order alone cannot
+                    // distinguish a click on the foreground picker from the
+                    // Start/Stop button underneath it. Disable the lock-free
+                    // surface while the picker is open; egui then owns those
+                    // clicks exclusively and the surface is republished on the
+                    // first frame after the picker closes.
+                    let control_mode = if self.filter_picker_open || status.stopping {
                         chidescaler_neo::input::MAIN_CONTROL_DISABLED
                     } else if preparing || running {
                         chidescaler_neo::input::MAIN_CONTROL_STOP
@@ -7076,6 +8381,9 @@ impl eframe::App for App {
                         .clicked()
                 {
                     let active = self.store.data.active.clone();
+                    let aspect_correction = self.current_preset_aspect_correction();
+                    let crop = self.current_preset_crop();
+                    let capture_resolution = self.current_preset_capture_resolution();
                     if let Some(p) = self
                         .store
                         .data
@@ -7084,8 +8392,21 @@ impl eframe::App for App {
                         .find(|p| p.name == active)
                     {
                         p.chain = self.chain.clone();
+                        p.aspect_correction = Some(aspect_correction);
+                        p.crop = Some(crop);
+                        p.capture_resolution = capture_resolution;
                         self.saved_chain = self.chain.clone();
+                        self.saved_aspect_correction = aspect_correction;
+                        self.saved_crop = crop;
+                        self.saved_capture_resolution = capture_resolution;
                         self.store.save();
+                        log::info!(
+                            "preset-aspect-save: preset='{}' enabled={} scale={:.2}x{:.2}",
+                            active,
+                            aspect_correction.enabled,
+                            aspect_correction.width_scale,
+                            aspect_correction.height_scale
+                        );
                     }
                 }
                 if full_ui && control_row_button(ui, tr(lang, "別名で保存", "Save As")).clicked()
@@ -7096,9 +8417,20 @@ impl eframe::App for App {
                 }
                 if full_ui && control_row_button(ui, tr(lang, "新規", "New")).clicked() {
                     let default_name = tr(lang, "新規プリセット", "New Preset");
-                    let name = self.store.create_blank(default_name);
+                    let aspect_correction = self.current_preset_aspect_correction();
+                    let crop = self.current_preset_crop();
+                    let capture_resolution = self.current_preset_capture_resolution();
+                    let name = self.store.create_blank(
+                        default_name,
+                        aspect_correction,
+                        crop,
+                        capture_resolution,
+                    );
                     self.chain.clear();
                     self.saved_chain.clear();
+                    self.saved_aspect_correction = aspect_correction;
+                    self.saved_crop = crop;
+                    self.saved_capture_resolution = capture_resolution;
                     self.store.save();
                     self.apply_live();
                     log::info!("preset-created: name={name} chain=empty");
@@ -7193,7 +8525,7 @@ impl eframe::App for App {
             egui::Panel::top("basic_controls")
                 .show_separator_line(false)
                 .show(root, |ui| {
-                    self.resize_basic_for_language(ui, lang);
+                    self.resize_basic_for_language(ui, lang, false);
                     ui.add_space(6.0);
                     let mut settings_changed = false;
                     // Give horizontal_wrapped rows breathing room when labels
@@ -7373,7 +8705,8 @@ impl eframe::App for App {
             // chain cannot fit in full, its existing ScrollArea handles it.
             let chain_height = desired_chain_height.min((available_height - 240.0).max(150.0));
             let desired_bottom_height =
-                full_settings_height(self.settings.stats_on, self.basic_stats_rows());
+                full_settings_height(self.settings.stats_on, self.basic_stats_rows())
+                    + self.full_settings_wrap_extra;
             let bottom_height =
                 desired_bottom_height.min((available_height - chain_height).max(240.0));
             egui::Panel::bottom("bottom")
@@ -7383,9 +8716,16 @@ impl eframe::App for App {
                 .id_salt("full_settings_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+            // Full mode follows the current content in both directions. Stats
+            // ON/OFF, chain-length changes, locale changes and toolbar wrapping
+            // all change the layout key, so the native window grows or shrinks
+            // exactly once for that new requirement instead of retaining stale
+            // blank space from a previous state.
             self.resize_full_for_language(ui, lang);
             ui.add_space(6.0);
             let mut settings_changed = false;
+            let mut aspect_changed = false;
+            let mut crop_changed = false;
             // row 1: display mode / ratio / fps cap
             ui.horizontal_wrapped(|ui| {
                 settings_changed |= self.display_mode_controls(ui, lang);
@@ -7416,6 +8756,175 @@ impl eframe::App for App {
                 settings_changed |= self.capture_resolution_controls(ui, lang, running);
             });
             ui.add_space(2.0);
+            // Display-only aspect correction. Capture/WGC geometry and every
+            // ONNX/GLSL processing stage remain on their original pixels.
+            // Auto modes derive the target ratio from the current pre-correction
+            // presentation aspect; Manual preserves v576's numeric controls.
+            ui.horizontal_wrapped(|ui| {
+                let aspect_response = ink_centered_checkbox(
+                    ui,
+                    &mut self.settings.aspect_correction,
+                    i18n::text(lang, "settings.aspect_correction"),
+                )
+                .on_hover_text(i18n::text(lang, "aspect.help"));
+                if aspect_response.changed() {
+                    settings_changed = true;
+                    aspect_changed = true;
+                }
+
+                ui.add_enabled_ui(self.settings.aspect_correction, |ui| {
+                    bounded_plain_label(
+                        ui,
+                        i18n::text(lang, "settings.aspect_mode"),
+                        MAX_TRANSLATED_PLAIN_LABEL_WIDTH,
+                    );
+                    let selected_mode = match self.settings.aspect_correction_mode {
+                        AspectCorrectionMode::Manual => "Manual",
+                        AspectCorrectionMode::Auto4x3 => "4:3 (Auto)",
+                        AspectCorrectionMode::Auto16x9 => "16:9 (Auto)",
+                    };
+                    egui::ComboBox::from_id_salt("aspect_correction_mode")
+                        .width(112.0)
+                        .selected_text(selected_mode)
+                        .show_ui(ui, |ui| {
+                            for (mode, label) in [
+                                (AspectCorrectionMode::Manual, "Manual"),
+                                (AspectCorrectionMode::Auto4x3, "4:3 (Auto)"),
+                                (AspectCorrectionMode::Auto16x9, "16:9 (Auto)"),
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        self.settings.aspect_correction_mode == mode,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.settings.aspect_correction_mode = mode;
+                                    settings_changed = true;
+                                    aspect_changed = true;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(i18n::text(lang, "aspect.help"));
+                });
+
+                let manual_values_enabled = self.settings.aspect_correction
+                    && self.settings.aspect_correction_mode == AspectCorrectionMode::Manual;
+                ui.add_enabled_ui(manual_values_enabled, |ui| {
+                    bounded_plain_label(
+                        ui,
+                        i18n::text(lang, "settings.aspect_width"),
+                        MAX_TRANSLATED_PLAIN_LABEL_WIDTH,
+                    );
+                    let mut width_scale = self.settings.aspect_width_scale;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut width_scale)
+                                .range(ASPECT_CORRECTION_SCALE_MIN..=ASPECT_CORRECTION_SCALE_MAX)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .on_hover_text(i18n::text(lang, "aspect.help"))
+                        .changed()
+                    {
+                        self.settings.aspect_width_scale =
+                            sanitize_aspect_correction_scale(width_scale);
+                        settings_changed = true;
+                        aspect_changed = true;
+                    }
+
+                    bounded_plain_label(
+                        ui,
+                        i18n::text(lang, "settings.aspect_height"),
+                        MAX_TRANSLATED_PLAIN_LABEL_WIDTH,
+                    );
+                    let mut height_scale = self.settings.aspect_height_scale;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut height_scale)
+                                .range(ASPECT_CORRECTION_SCALE_MIN..=ASPECT_CORRECTION_SCALE_MAX)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .on_hover_text(i18n::text(lang, "aspect.help"))
+                        .changed()
+                    {
+                        self.settings.aspect_height_scale =
+                            sanitize_aspect_correction_scale(height_scale);
+                        settings_changed = true;
+                        aspect_changed = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            // User crop is performed after Neo's existing client/title-bar crop
+            // and before GLSL/ONNX. Values are persisted with each preset.
+            // TensorRT may execute a saved Crop, but arbitrary shape editing is
+            // DirectML-only so a DragValue scrub can never fan out into engine
+            // builds for intermediate dimensions.
+            ui.horizontal_wrapped(|ui| {
+                let backend_switching =
+                    self.onnx_backend_pending.is_some() || status.onnx_backend_switching;
+                let tensorrt_crop_locked = self.onnx_backend_selected
+                    == OnnxBackendPreference::TensorRT
+                    || status.onnx_backend == OnnxBackendPreference::TensorRT
+                    || backend_switching;
+                let crop_response = ink_centered_checkbox_enabled(
+                    ui,
+                    !backend_switching,
+                    &mut self.settings.capture_crop.enabled,
+                    i18n::text(lang, "settings.crop"),
+                )
+                .on_hover_text(i18n::text(lang, "crop.help"));
+                if crop_response.changed() {
+                    if self.settings.capture_crop.enabled && tensorrt_crop_locked {
+                        // TensorRT can re-enable only the selected preset's saved
+                        // rectangle. Any unsaved DirectML edit is deliberately
+                        // ignored rather than becoming a new TensorRT shape.
+                        self.settings.capture_crop.left = self.saved_crop.left;
+                        self.settings.capture_crop.top = self.saved_crop.top;
+                        self.settings.capture_crop.right = self.saved_crop.right;
+                        self.settings.capture_crop.bottom = self.saved_crop.bottom;
+                    }
+                    crop_changed = true;
+                }
+
+                let crop_value_editor = ui.add_enabled_ui(
+                    self.settings.capture_crop.enabled && !tensorrt_crop_locked,
+                    |ui| {
+                        for (key, value) in [
+                            ("settings.crop_left", &mut self.settings.capture_crop.left),
+                            ("settings.crop_top", &mut self.settings.capture_crop.top),
+                            ("settings.crop_right", &mut self.settings.capture_crop.right),
+                            ("settings.crop_bottom", &mut self.settings.capture_crop.bottom),
+                        ] {
+                            bounded_plain_label(
+                                ui,
+                                i18n::text(lang, key),
+                                MAX_TRANSLATED_PLAIN_LABEL_WIDTH,
+                            );
+                            if ui
+                                .add(egui::DragValue::new(value).range(0..=8192).speed(1.0))
+                                .on_hover_text(i18n::text(lang, "crop.help"))
+                                .changed()
+                            {
+                                crop_changed = true;
+                            }
+                        }
+                    },
+                );
+                if tensorrt_crop_locked {
+                    crop_value_editor
+                        .response
+                        .on_hover_text(i18n::text(lang, "crop.tensorrt_edit_locked"));
+                }
+            });
+            // Visually separate source geometry controls (aspect/crop) from
+            // timing and rendering options below. Keep this as a single native
+            // egui separator so it adds minimal height and follows the current
+            // theme/DPI automatically.
+            ui.separator();
             // Row 2 starts after capture resolution at every window width.
             // The important timing controls keep the requested fixed order in
             // every language: FPS cap -> duplicate reduction -> rendering
@@ -7482,6 +8991,12 @@ impl eframe::App for App {
                         self.onnx_backend_pending.is_some() || status.onnx_backend_switching;
                     let mut tensorrt_on =
                         self.onnx_backend_selected == OnnxBackendPreference::TensorRT;
+                    let crop_switch_allowed =
+                        tensorrt_crop_switch_allowed(self.settings.capture_crop, self.saved_crop);
+                    // An active TensorRT session must always remain switchable
+                    // OFF. The saved-Crop gate applies only when entering TRT.
+                    let backend_control_enabled =
+                        !backend_switching && (tensorrt_on || crop_switch_allowed);
                     let backend_label = if backend_switching {
                         i18n::text(lang, "tensorrt.preparing_label")
                     } else {
@@ -7489,12 +9004,16 @@ impl eframe::App for App {
                     };
                     let response = ink_centered_checkbox_enabled(
                         ui,
-                        !backend_switching,
+                        backend_control_enabled,
                         &mut tensorrt_on,
                         backend_label,
                     )
                     .on_hover_text({
                         let mut help = i18n::text(lang, "tensorrt.help").to_owned();
+                        if !crop_switch_allowed && !tensorrt_on {
+                            help.push('\n');
+                            help.push_str(i18n::text(lang, "tensorrt.crop_unsaved_help"));
+                        }
                         if status.onnx_cuda_stages > 0 {
                             help.push('\n');
                             help.push_str(&i18n::format_text(
@@ -7563,7 +9082,7 @@ impl eframe::App for App {
                 {
                     settings_changed = true;
                 }
-                // A fixed capture resolution is defined in client-area pixels, so
+                // A fixed capture resolution defines the raw/pre-crop capture canvas;
                 // client-only capture is mandatory while a resolution is selected.
                 // Keep the user's manual setting untouched underneath the forced
                 // visual state so switching Capture Resolution back to Auto restores
@@ -7628,6 +9147,18 @@ impl eframe::App for App {
                     );
                     settings_changed = true;
                 }
+                if gpu_selector_visible(&self.gpu_adapters) {
+                    ui.separator();
+                    let gpu_change_enabled = !(
+                        status.starting
+                            || status.running
+                            || status.stopping
+                            || status.onnx_backend_switching
+                            || self.onnx_backend_pending.is_some()
+                            || chidescaler_neo::render::onnx_stage::tensorrt_is_preparing()
+                    );
+                    self.gpu_selector_control(ui, lang, gpu_change_enabled);
+                }
                 ui.separator();
                 let open_folder =
                     folder_icon_button(ui, i18n::text(lang, "settings.open_folder"));
@@ -7655,7 +9186,7 @@ impl eframe::App for App {
             ui.add_space(2.0);
             // row 2.5: cursor & interpolation options
             let mut input_opts_changed = false;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ink_centered_checkbox(
                     ui,
                     &mut self.settings.cursor_autohide,
@@ -7788,6 +9319,68 @@ impl eframe::App for App {
 
                 self.resource_meter(&mut columns[1]);
             });
+            if aspect_changed && running {
+                self.engine.send(Cmd::SetAspectCorrection {
+                    enabled: self.settings.aspect_correction,
+                    mode: self.settings.aspect_correction_mode,
+                    width_scale: sanitize_aspect_correction_scale(
+                        self.settings.aspect_width_scale,
+                    ),
+                    height_scale: sanitize_aspect_correction_scale(
+                        self.settings.aspect_height_scale,
+                    ),
+                });
+            }
+            if crop_changed {
+                // Persist the settled Crop once after the gesture. This remains
+                // independent of the render-path update cadence below.
+                self.crop_settings_save_due =
+                    Some(Instant::now() + Duration::from_millis(160));
+            }
+            if crop_changed && running {
+                if self.onnx_backend_selected == OnnxBackendPreference::TensorRT {
+                    // Numeric Crop editing is disabled while TensorRT is
+                    // active. Keep the established final-commit transaction for
+                    // the permitted saved-Crop ON/OFF change.
+                    self.tensorrt_crop_commit_pending = Some(self.settings.capture_crop);
+                    self.tensorrt_crop_commit_due = if win32::left_mouse_button_down() {
+                        None
+                    } else {
+                        Some(Instant::now() + Duration::from_millis(220))
+                    };
+                    log::debug!(
+                        "tensorrt-crop-transaction: staged enabled={} edges=({}, {}, {}, {}) pointer_down={}",
+                        self.settings.capture_crop.enabled,
+                        self.settings.capture_crop.left,
+                        self.settings.capture_crop.top,
+                        self.settings.capture_crop.right,
+                        self.settings.capture_crop.bottom,
+                        win32::left_mouse_button_down()
+                    );
+                } else if self.settings.capture_resolution.is_some() {
+                    // Only fixed Capture Resolution needs throttling. Capture=Auto
+                    // keeps v591's exact immediate live-crop behavior.
+                    let crop = self.settings.capture_crop;
+                    let pointer_down = win32::left_mouse_button_down();
+                    let can_publish_now = !pointer_down
+                        || self
+                            .live_crop_last_sent
+                            .map_or(true, |sent| sent.elapsed() >= Duration::from_millis(33));
+                    if can_publish_now {
+                        self.live_crop_pending = None;
+                        self.live_crop_last_sent = Some(Instant::now());
+                        self.engine.send(Cmd::SetCaptureCrop { crop });
+                    } else {
+                        self.live_crop_pending = Some(crop);
+                    }
+                } else {
+                    self.live_crop_pending = None;
+                    self.live_crop_last_sent = None;
+                    self.engine.send(Cmd::SetCaptureCrop {
+                        crop: self.settings.capture_crop,
+                    });
+                }
+            }
             if settings_changed {
                 save_settings(&self.app_dir, &self.settings);
                 if running {
@@ -8546,27 +10139,58 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if control_row_button(ui, tr(lang, "上書き保存", "Overwrite")).clicked()
                         {
-                            match self
-                                .store
-                                .overwrite_active_as(&self.save_as_name, &self.chain)
-                            {
+                            let aspect_correction = self.current_preset_aspect_correction();
+                            let crop = self.current_preset_crop();
+                            let capture_resolution = self.current_preset_capture_resolution();
+                            match self.store.overwrite_active_as(
+                                &self.save_as_name,
+                                &self.chain,
+                                aspect_correction,
+                                crop,
+                                capture_resolution,
+                            ) {
                                 Ok(name) => {
                                     self.saved_chain = self.chain.clone();
+                                    self.saved_aspect_correction = aspect_correction;
+                                    self.saved_crop = crop;
+                                    self.saved_capture_resolution = capture_resolution;
                                     self.store.save();
                                     self.save_as_open = false;
-                                    log::info!("preset-overwrite: name={name}");
+                                    log::info!(
+                                        "preset-overwrite: name={name} aspect_enabled={} aspect_scale={:.2}x{:.2}",
+                                        aspect_correction.enabled,
+                                        aspect_correction.width_scale,
+                                        aspect_correction.height_scale
+                                    );
                                 }
                                 Err(error) => self.save_as_error = Some(error),
                             }
                         }
                         if control_row_button(ui, tr(lang, "別名で保存", "Save As")).clicked()
                         {
-                            match self.store.save_as_new(&self.save_as_name, &self.chain) {
+                            let aspect_correction = self.current_preset_aspect_correction();
+                            let crop = self.current_preset_crop();
+                            let capture_resolution = self.current_preset_capture_resolution();
+                            match self.store.save_as_new(
+                                &self.save_as_name,
+                                &self.chain,
+                                aspect_correction,
+                                crop,
+                                capture_resolution,
+                            ) {
                                 Ok(name) => {
                                     self.saved_chain = self.chain.clone();
+                                    self.saved_aspect_correction = aspect_correction;
+                                    self.saved_crop = crop;
+                                    self.saved_capture_resolution = capture_resolution;
                                     self.store.save();
                                     self.save_as_open = false;
-                                    log::info!("preset-save-as: name={name}");
+                                    log::info!(
+                                        "preset-save-as: name={name} aspect_enabled={} aspect_scale={:.2}x{:.2}",
+                                        aspect_correction.enabled,
+                                        aspect_correction.width_scale,
+                                        aspect_correction.height_scale
+                                    );
                                 }
                                 Err(error) => self.save_as_error = Some(error),
                             }
@@ -8610,6 +10234,7 @@ impl eframe::App for App {
                 });
         }
 
+        self.render_source_occlusion_notice(ctx, lang);
         self.render_mini_glsl_overload_notice(ctx, lang, &status, running);
         self.render_mini_dialog_host(ctx, lang, &status, running);
 
@@ -8637,6 +10262,31 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // v618 production-test exit guard. The ordinary product path is untouched.
+        // If a driver/helper teardown stalls after the GUI has already entered the
+        // normal close path, guarantee that this opt-in test process cannot remain
+        // resident forever. External cursor/source state is restored below before
+        // the watchdog deadline can fire; the cursor janitor remains the final
+        // process-level recovery net if hard termination becomes necessary.
+        if vulkan_onepass::production_one_pass_requested() {
+            let line = format!(
+                "vulkan-production-glsl: phase=on-exit-begin build={} pid={} watchdog_ms=4500",
+                BUILD_ID,
+                std::process::id(),
+            );
+            vulkan_onepass::record_route_once("on-exit-begin", &line);
+            let pid = std::process::id();
+            let _ = std::thread::Builder::new()
+                .name("vulkan-production-exit-watchdog".into())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(4_500));
+                    let line = format!(
+                        "vulkan-production-glsl: result=forced-process-exit reason=shutdown-timeout pid={pid} watchdog_ms=4500 action=process-exit"
+                    );
+                    vulkan_gpu::record_probe_result(&line);
+                    std::process::exit(0);
+                });
+        }
         // Never leave a temporary transition helper alive during shutdown.
         win32::hide_gui_transition_snapshot();
         if self.gui_hwnd != 0 && win32::is_cloaked(self.gui_hwnd) {
@@ -8646,26 +10296,116 @@ impl eframe::App for App {
             save_settings(&self.app_dir, &self.settings);
             self.store.save();
         }
-        // Release confinement before waiting for a potentially blocked GPU
-        // provider. shutdown() also runs engine-level source recovery on timeout.
+        // v583 restores the stable close contract. The caption WndProc already
+        // hid the GUI, so allow the render/provider thread its bounded 2.5 s
+        // graceful shutdown window without making the user stare at a blocked
+        // window. v586 stops native input before slow provider-cache teardown;
+        // if the remaining provider cleanup still exceeds the bound, the
+        // independent janitor remains the final process-level safety net.
         chidescaler_neo::input::emergency_release_all();
-        // The process is exiting. Visible source/cursor recovery above is the
-        // user-facing correctness boundary; do not keep the root viewport alive
-        // waiting for render-thread destructors/provider teardown. The engine is
-        // asked to shut down and its JoinHandle is detached immediately.
-        self.engine.shutdown_for_app_exit();
-        // shutdown_for_app_exit() already takes/restores hidden_src before it
-        // detaches the render thread. Do not take the shared Status mutex here:
-        // the detached thread may be in its final status update, and blocking
-        // on that mutex would reintroduce a close-button stall.
+        if vulkan_onepass::production_one_pass_requested() {
+            // v622: the selected-GPU Vulkan runtime is render-thread TLS. Avoid
+            // vendor vkDestroy* calls from the TLS destructor on application
+            // close, then use the ordinary bounded shutdown/join again. This
+            // lets the render thread terminate normally instead of detaching a
+            // live worker and relying on a later process watchdog.
+            vulkan_onepass::prepare_runtime_for_process_exit();
+        }
+        if chidescaler_neo::render::vulkan_multipass::production_requested() {
+            chidescaler_neo::render::vulkan_multipass::prepare_runtime_for_process_exit();
+        }
+        self.engine.shutdown();
+        if vulkan_onepass::production_one_pass_requested() {
+            let line = format!(
+                "vulkan-production-glsl: phase=engine-shutdown-returned build={} pid={} mode=bounded-join-tls-abandon",
+                BUILD_ID,
+                std::process::id(),
+            );
+            vulkan_onepass::record_route_once("engine-shutdown-returned", &line);
+        }
         chidescaler_neo::input::emergency_release_all();
         self.hotkeys.stop();
+        if vulkan_onepass::production_one_pass_requested() {
+            let line = format!(
+                "vulkan-production-glsl: phase=on-exit-complete build={} pid={}",
+                BUILD_ID,
+                std::process::id(),
+            );
+            vulkan_onepass::record_route_once("on-exit-complete", &line);
+        }
     }
 }
 
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn gpu_auto_follows_actual_render_adapter() {
+        assert_eq!(resolve_compute_gpu_luid(None, Some(0x22)), Some(0x22));
+        assert!(!cross_gpu_compute_active(None, Some(0x22)));
+    }
+
+    #[test]
+    fn explicit_gpu_remains_onnx_authority_when_wgl_mismatches() {
+        assert_eq!(resolve_compute_gpu_luid(Some(0x44), Some(0x22)), Some(0x44));
+        assert!(cross_gpu_compute_active(Some(0x44), Some(0x22)));
+    }
+
+    #[test]
+    fn tensorrt_crop_gate_allows_only_saved_active_geometry() {
+        let saved = CaptureCrop {
+            enabled: true,
+            left: 12,
+            top: 34,
+            right: 56,
+            bottom: 78,
+        };
+
+        // ON/OFF is intentionally not part of the geometry lock: TensorRT may
+        // toggle a preset's saved rectangle without opening numeric editing.
+        let same_geometry_disabled = CaptureCrop {
+            enabled: false,
+            ..saved
+        };
+        assert!(capture_crop_geometry_matches(same_geometry_disabled, saved));
+        assert!(tensorrt_crop_switch_allowed(same_geometry_disabled, saved));
+
+        let same_geometry_enabled = CaptureCrop {
+            enabled: true,
+            ..saved
+        };
+        assert!(tensorrt_crop_switch_allowed(same_geometry_enabled, saved));
+
+        // An active unsaved DirectML edit must not be allowed to create a new
+        // TensorRT shape merely by toggling the backend.
+        let unsaved_active = CaptureCrop {
+            enabled: true,
+            left: saved.left + 1,
+            ..saved
+        };
+        assert!(!tensorrt_crop_switch_allowed(unsaved_active, saved));
+
+        // Disabled Crop is shape-neutral, so TensorRT can still be entered. If
+        // Crop is enabled later under TRT, the UI restores saved geometry first.
+        let unsaved_disabled = CaptureCrop {
+            enabled: false,
+            left: saved.left + 1,
+            ..saved
+        };
+        assert!(tensorrt_crop_switch_allowed(unsaved_disabled, saved));
+    }
+
+    #[test]
+    fn tensorrt_crop_ui_keeps_numeric_editing_locked_to_directml() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("self.settings.capture_crop.enabled && !tensorrt_crop_locked"));
+        assert!(source.contains("self.settings.capture_crop.left = self.saved_crop.left"));
+        assert!(source.contains(
+            "onnx-backend-switch-blocked: requested=TensorRT reason=unsaved-crop-geometry"
+        ));
+        assert!(source.contains("onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason=unsaved-crop-geometry"));
+    }
 
     #[test]
     fn gui_surfaces_use_autonovsync_and_sparse_caption_drag_redraws() {
@@ -8693,6 +10433,48 @@ mod app_tests {
     }
 
     #[test]
+    fn full_layout_retargets_both_directions_when_requirements_change() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn resize_full_for_language")
+            .expect("resize_full_for_language must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("fn resource_meter")
+            .expect("resource_meter must follow resize_full_for_language");
+        let resize = &tail[..end];
+        assert!(resize.contains("full_layout_key"));
+        assert!(!resize.contains("allow_shrink"));
+        assert!(!resize.contains("current_size.map_or"));
+    }
+
+    #[test]
+    fn full_layout_shrink_uses_snapshot_guard_instead_of_uncovered_surface_shrink() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn resize_full_for_language")
+            .expect("resize_full_for_language must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("fn resource_meter")
+            .expect("resource_meter must follow resize_full_for_language");
+        let resize = &tail[..end];
+        assert!(resize.contains("shrinking_existing_full"));
+        assert!(resize.contains("show_gui_transition_snapshot"));
+        assert!(resize.contains("mode_change: false"));
+
+        let commit_start = source
+            .find("fn commit_pending_ui_mode_if_ready")
+            .expect("transition commit function");
+        let commit_tail = &source[commit_start..];
+        let commit_end = commit_tail
+            .find("fn basic_stats_rows")
+            .expect("basic_stats_rows boundary");
+        let commit = &commit_tail[..commit_end];
+        assert!(commit.contains("resize-timeout-cancelled"));
+    }
+
+    #[test]
     fn full_chain_height_follows_statistics_mode() {
         assert_eq!(full_chain_height(8, true), 226.0);
         assert_eq!(full_chain_height(3, true), 226.0);
@@ -8703,8 +10485,8 @@ mod app_tests {
 
     #[test]
     fn full_settings_reserve_no_statistics_space_when_disabled() {
-        assert_eq!(full_settings_height(false, 12), 366.0);
-        assert_eq!(full_settings_height(true, 2), 524.0);
+        assert_eq!(full_settings_height(false, 12), 458.0);
+        assert_eq!(full_settings_height(true, 2), 616.0);
     }
 
     #[test]
@@ -8715,8 +10497,32 @@ mod app_tests {
     }
 
     #[test]
+    fn full_wrapped_rows_reserve_only_the_extra_visual_lines() {
+        assert_eq!(full_wrapped_row_extra(700.0, 800.0, 32.0), 0.0);
+        assert_eq!(full_wrapped_row_extra(801.0, 800.0, 32.0), 32.0);
+        assert_eq!(full_wrapped_row_extra(1601.0, 800.0, 32.0), 64.0);
+    }
+
+    #[test]
+    fn full_bottom_panel_consumes_the_measured_settings_wrap_extra() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("self.full_settings_wrap_extra = settings_wrap_extra"));
+        assert!(source.contains(") + self.full_settings_wrap_extra;"));
+    }
+
+    #[test]
     fn fps_cap_ui_reaches_native_240fps_limit() {
         assert_eq!(MAX_FPS_CAP, 240);
+    }
+
+    #[test]
+    fn aspect_correction_defaults_are_noop_and_bounds_are_conservative() {
+        let settings = Settings::default();
+        assert!(!settings.aspect_correction);
+        assert_eq!(settings.aspect_width_scale, 1.0);
+        assert_eq!(settings.aspect_height_scale, 1.0);
+        assert_eq!(ASPECT_CORRECTION_SCALE_MIN, 0.50);
+        assert_eq!(ASPECT_CORRECTION_SCALE_MAX, 2.00);
     }
 
     #[test]
@@ -8898,7 +10704,7 @@ mod app_tests {
         assert!(FULL_SETTINGS_BOTTOM_GUTTER >= 32.0);
         assert!(FULL_SETTINGS_VISIBLE_BOTTOM_PADDING >= 18.0);
         assert!(FULL_SETTINGS_BOTTOM_GUTTER > FULL_SETTINGS_VISIBLE_BOTTOM_PADDING);
-        assert_eq!(full_settings_height(false, 0), 366.0);
+        assert_eq!(full_settings_height(false, 0), 458.0);
         assert!(full_settings_height(true, 3) > full_settings_height(false, 0));
     }
 
@@ -8906,8 +10712,8 @@ mod app_tests {
     fn full_stats_off_two_and_three_filter_layouts_exceed_old_clipping_sizes() {
         let two_filters = 166.0 + full_chain_height(2, false) + full_settings_height(false, 2);
         let three_filters = 166.0 + full_chain_height(3, false) + full_settings_height(false, 3);
-        assert_eq!(two_filters, 758.0);
-        assert_eq!(three_filters, 814.0);
+        assert_eq!(two_filters, 850.0);
+        assert_eq!(three_filters, 906.0);
         assert!(two_filters > 722.0);
         assert!(three_filters > 778.0);
     }
@@ -8917,8 +10723,8 @@ mod app_tests {
         assert!(FULL_TOOLBAR_WRAP_EXTRA_HEIGHT >= 40.0);
         let one_line = 166.0 + full_chain_height(3, false) + full_settings_height(false, 3);
         let wrapped = one_line + FULL_TOOLBAR_WRAP_EXTRA_HEIGHT;
-        assert_eq!(one_line, 814.0);
-        assert!(wrapped >= 854.0);
+        assert_eq!(one_line, 906.0);
+        assert!(wrapped >= 946.0);
     }
 
     #[test]
@@ -9039,7 +10845,9 @@ mod app_tests {
         let main = include_str!("main.rs");
         let engine = include_str!("engine.rs");
         let win32 = include_str!("platform/win32.rs");
-        assert!(engine.contains("GLSL_OVERLOAD_AUTO_STOP_GRACE: Duration = Duration::from_secs(6)"));
+        assert!(
+            engine.contains("GLSL_OVERLOAD_AUTO_STOP_GRACE: Duration = Duration::from_secs(6)")
+        );
         assert!(engine.contains("glsl_overload_auto_stop_deadline"));
         assert!(engine.contains("action=warn-then-normal-stop"));
         assert!(engine.contains("if auto_stop_hold"));
@@ -9239,6 +11047,34 @@ mod app_tests {
     }
 
     #[test]
+    fn capture_resolution_crop_off_is_geometry_transparent() {
+        let crop = CaptureCrop {
+            enabled: false,
+            bottom: 23,
+            ..CaptureCrop::default()
+        };
+        assert_eq!(
+            capture_resolution_content_size((960, 540), crop),
+            (960, 540)
+        );
+    }
+
+    #[test]
+    fn capture_resolution_crop_is_post_capture_and_does_not_expand_canvas() {
+        let crop = CaptureCrop {
+            enabled: true,
+            bottom: 23,
+            ..CaptureCrop::default()
+        };
+        // The raw fixed capture canvas stays 960x540; Crop removes pixels only
+        // after capture instead of growing the foreign source to 960x563.
+        assert_eq!(
+            capture_resolution_content_size((960, 540), crop),
+            (960, 517)
+        );
+    }
+
+    #[test]
     fn capture_resolution_fullscreen_guard_uses_session_origin() {
         // Neo-created 1920x1080 must not block a later 854x480 request.
         assert!(!capture_resolution_fullscreen_guard(Some(false), true));
@@ -9263,6 +11099,22 @@ mod app_tests {
             capture_resolution_label(size, UiLanguage::EnUs),
             "640x480 (4:3)"
         );
+    }
+
+    #[test]
+    fn unspecified_preset_capture_resolution_inherits_current_gui_value() {
+        let current = Some(CaptureResolution { w: 1280, h: 720 });
+        let preset = None;
+        let selected = preset.or(current);
+        assert_eq!(selected, current);
+    }
+
+    #[test]
+    fn fixed_preset_capture_resolution_overrides_current_gui_value() {
+        let current = Some(CaptureResolution { w: 1280, h: 720 });
+        let preset = Some(CaptureResolution { w: 640, h: 480 });
+        let selected = preset.or(current);
+        assert_eq!(selected, preset);
     }
 
     #[test]
@@ -9379,21 +11231,11 @@ mod app_tests {
 
     #[test]
     fn panel_stop_is_idempotent_and_never_becomes_start() {
-        assert!(App::should_dispatch_panel_stop(
-            false, true, false, false
-        ));
-        assert!(App::should_dispatch_panel_stop(
-            true, false, false, false
-        ));
-        assert!(App::should_dispatch_panel_stop(
-            false, false, false, true
-        ));
-        assert!(!App::should_dispatch_panel_stop(
-            false, false, true, false
-        ));
-        assert!(!App::should_dispatch_panel_stop(
-            false, false, false, false
-        ));
+        assert!(App::should_dispatch_panel_stop(false, true, false, false));
+        assert!(App::should_dispatch_panel_stop(true, false, false, false));
+        assert!(App::should_dispatch_panel_stop(false, false, false, true));
+        assert!(!App::should_dispatch_panel_stop(false, false, true, false));
+        assert!(!App::should_dispatch_panel_stop(false, false, false, false));
 
         let source = include_str!("main.rs");
         let panel_state = source
@@ -9760,9 +11602,16 @@ mod app_tests {
             .split("fn control_panel")
             .next()
             .expect("toggle boundary");
-        let cloak = toggle.find("set_window_cloaked(self.gui_hwnd, true)").expect("OFF cloak");
-        let pending = toggle.find("self.gui_topmost_off_pending = true").expect("OFF pending");
-        assert!(cloak < pending, "GUI must be cloaked before anchor creation is armed");
+        let cloak = toggle
+            .find("set_window_cloaked(self.gui_hwnd, true)")
+            .expect("OFF cloak");
+        let pending = toggle
+            .find("self.gui_topmost_off_pending = true")
+            .expect("OFF pending");
+        assert!(
+            cloak < pending,
+            "GUI must be cloaked before anchor creation is armed"
+        );
         assert!(
             toggle.contains("GUI topmost on cloak release"),
             "TOPMOST ON must explicitly release the retained OFF cloak"
@@ -9787,7 +11636,9 @@ mod app_tests {
             .split("fn toggle_gui_topmost")
             .next()
             .expect("commit boundary");
-        let demote = commit.find("set_own_topmost(self.gui_hwnd, false)").expect("GUI demote");
+        let demote = commit
+            .find("set_own_topmost(self.gui_hwnd, false)")
+            .expect("GUI demote");
         let restack = commit
             .find("recommit_overlay_below_helpers(0, overlay)")
             .expect("TOPMOST helper restack");
@@ -9795,7 +11646,9 @@ mod app_tests {
             .find("GUI topmost off cloak retained")
             .expect("running OFF cloak retention");
         assert!(demote < restack, "GUI must be demoted while still cloaked");
-        assert!(restack < retain, "helper order must settle before the OFF cloak is retained");
+        assert!(
+            restack < retain,
+            "helper order must settle before the OFF cloak is retained"
+        );
     }
-
 }
