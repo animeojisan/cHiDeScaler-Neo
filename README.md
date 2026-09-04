@@ -70,7 +70,7 @@ The author cannot be held responsible for any malfunction, damage, trouble, or o
 
 cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムにキャプチャし、GLSL / ONNXによる映像処理を適用して拡大表示するWindows用ポータブルアプリケーションです。
 
-📖 [Wiki / Documentation](https://github.com/animeojisan/cHiDeScaler-Neo/wiki)
+📖 [Wiki / FAQ](https://github.com/animeojisan/cHiDeScaler-Neo/wiki)
 
 ## 主な機能
 
