@@ -11,6 +11,8 @@
 
 cHiDeScaler-Neo captures a Windows application window and applies real-time GLSL / ONNX video processing.
 
+📖 [Wiki / FAQ](https://github.com/animeojisan/cHiDeScaler-Neo/wiki)
+
 ## Features
 
 * Windows Graphics Capture (WGC)
