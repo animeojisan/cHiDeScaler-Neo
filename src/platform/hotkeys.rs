@@ -179,6 +179,15 @@ pub enum BackgroundGui {
     Hidden,
 }
 
+fn direct_background_stop_allowed(background_gui: BackgroundGui, capture_active: bool) -> bool {
+    // Keep the proven minimized-window fast Stop path, but never use it while
+    // the root GUI is hidden in the notification area. Tray-hidden Start and
+    // Stop must both wake the root viewport and run through the same GUI-side
+    // toggle dispatcher so ending a capture cannot collapse application
+    // lifetime together with the temporary overlay/panel viewports.
+    capture_active && background_gui == BackgroundGui::Minimized
+}
+
 pub struct HotkeyThread {
     pub rx: Receiver<HotkeyEvent>,
     pub registration_failures: Vec<(i32, String)>,
@@ -225,9 +234,10 @@ impl HotkeyThread {
                             .map(|(_, binding)| binding.clone())
                             .unwrap_or_else(|| format!("id:{id}"));
                         let received_at = Instant::now();
-                        // v583 stable contract: ordinary Stop uses the proven
-                        // v578 path. Only a minimized GUI bypasses the egui
-                        // queue, exactly as before the emergency-stop rewrite.
+                        // Ordinary Stop keeps the proven direct path only for a
+                        // genuinely minimized native window. A tray-hidden root is
+                        // different: Start and Stop are both routed through egui so
+                        // the resident root viewport outlives the capture session.
                         let gui_hwnd = super::win32::main_gui_hwnd();
                         let background_gui = if gui_hwnd != 0
                             && !super::win32::is_window_visible(gui_hwnd)
@@ -239,8 +249,10 @@ impl HotkeyThread {
                             BackgroundGui::Foreground
                         };
                         let handled_directly = id == HK_TOGGLE
-                            && background_gui != BackgroundGui::Foreground
-                            && minimized_stop.is_active();
+                            && direct_background_stop_allowed(
+                                background_gui,
+                                minimized_stop.is_active(),
+                            );
                         if handled_directly {
                             log::info!(
                                 "hotkey-minimized-direct-dispatch: id={id} binding='{binding}' action=stop"
@@ -320,6 +332,23 @@ mod tests {
             validate_user_hotkey("Ctrl+Alt+Shift+Z"),
             Err(HotkeyValidationError::KeyCount)
         );
+    }
+
+    #[test]
+    fn tray_hidden_toggle_never_uses_the_direct_engine_stop_lane() {
+        assert!(!direct_background_stop_allowed(BackgroundGui::Hidden, true));
+        assert!(direct_background_stop_allowed(
+            BackgroundGui::Minimized,
+            true
+        ));
+        assert!(!direct_background_stop_allowed(
+            BackgroundGui::Foreground,
+            true
+        ));
+        assert!(!direct_background_stop_allowed(
+            BackgroundGui::Minimized,
+            false
+        ));
     }
 
     #[test]
