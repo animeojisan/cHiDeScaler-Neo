@@ -235,7 +235,7 @@ impl Metrics {
         let stage_ms = {
             let e = g.snap.stages.entry(name.to_string()).or_default();
             e.kind = kind.to_string();
-            e.ms = if e.ms == 0.0 {
+            e.ms = if e.ms == 0.0 || (kind == "dlssnr" && (ms < 0.0 || e.ms < 0.0)) {
                 ms
             } else {
                 e.ms * 0.9 + ms * 0.1
@@ -264,7 +264,10 @@ impl Metrics {
         }
         g.captures += captures;
         g.snap.in_size = in_size;
-        g.snap.out_size = out_size;
+        // Idle/duplicate ticks pass (0, 0): they do not replace the displayed image.
+        if out_size.0 > 0 && out_size.1 > 0 {
+            g.snap.out_size = out_size;
+        }
         if let Some(mut total_ms) = present_latency_ms.filter(|ms| ms.is_finite() && *ms >= 0.0) {
             if let Some(process_ms) = pipeline_ms.filter(|ms| ms.is_finite() && *ms >= 0.0) {
                 total_ms = total_ms.max(process_ms);
@@ -374,6 +377,19 @@ fn latency_ms_to_frames(latency_ms: f64, frame_ms: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{Metrics, latency_ms_to_frames};
+
+    #[test]
+    fn idle_ticks_preserve_displayed_resolution_until_reset() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        metrics.frame(true, 1, Some(4.0), Some(4.0), (640, 360), (1280, 720));
+        metrics.frame(true, 0, None, None, (640, 360), (0, 0));
+        assert_eq!(metrics.snapshot().out_size, (1280, 720));
+        metrics.frame(false, 0, None, Some(0.0), (640, 360), (0, 0));
+        assert_eq!(metrics.snapshot().out_size, (1280, 720));
+        metrics.reset();
+        assert_eq!(metrics.snapshot().out_size, (0, 0));
+    }
 
     #[test]
     fn panel_metrics_are_independent_and_do_not_enable_stage_probes() {
@@ -601,5 +617,20 @@ mod tests {
         assert_eq!(snap.in_size, (640, 480));
         assert_eq!(snap.internal_size, (2560, 1920));
         assert_eq!(snap.out_size, (1280, 960));
+    }
+
+    #[test]
+    fn dlssnr_initializing_and_failure_are_not_averaged_as_processing_time() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        let name = "DLSS Neural Rendering [D3D12]";
+        metrics.probe(name, "dlssnr", -1.0);
+        assert_eq!(metrics.snapshot().stages[name].ms, -1.0);
+        metrics.probe(name, "dlssnr", 4.0);
+        assert_eq!(metrics.snapshot().stages[name].ms, 4.0);
+        metrics.probe(name, "dlssnr", -2.0);
+        assert_eq!(metrics.snapshot().stages[name].ms, -2.0);
+        metrics.probe(name, "dlssnr", 3.0);
+        assert_eq!(metrics.snapshot().stages[name].ms, 3.0);
     }
 }

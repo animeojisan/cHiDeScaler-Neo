@@ -1,6 +1,6 @@
 [package]
 name = "chidescaler-neo"
-version = "0.99.1"
+version = "0.99.2"
 edition = "2024"
 description = "AI Upscaler & Frame Interpolator for Windows"
 license-file = "LICENSE"
@@ -15,7 +15,7 @@ glow = "0.17.0"
 half = "2.7.1"
 log = "0.4.33"
 naga = { version = "29.0.4", features = ["glsl-in", "spv-out"] }
-ort = { version = "2.0.0-rc.12", features = ["directml", "cuda", "tensorrt", "load-dynamic", "half"] }
+ort = { version = "2.0.0-rc.12", features = ["directml", "cuda", "tensorrt", "load-dynamic", "half", "api-22"] }
 png = "0.18.1"
 raw-window-handle = "0.6"
 rayon = "1.12.0"

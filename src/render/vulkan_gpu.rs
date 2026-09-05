@@ -245,10 +245,10 @@ pub fn glsl_probe_requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Append one diagnostic probe result to an explicitly requested result file.
-/// This is deliberately independent of Neo's normal "Save log" setting so
-/// diagnostics can run without changing persistent application settings.
-/// Failure to write the helper file is non-fatal and never changes rendering.
+/// Append one diagnostic probe result to an opt-in result file selected by the
+/// `NEO_VULKAN_PROBE_RESULT` environment variable. This is deliberately
+/// independent of Neo's normal "Save log" setting. Failure to write the helper
+/// file is non-fatal and never changes the production OpenGL path.
 pub fn record_probe_result(line: &str) {
     let Ok(path) = std::env::var("NEO_VULKAN_PROBE_RESULT") else {
         return;

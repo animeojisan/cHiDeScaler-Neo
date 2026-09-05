@@ -82,8 +82,8 @@ fn route_diag_keys() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Write a production-routing breadcrumb once per process. This is deliberately
-/// independent of Neo's normal file-logging setting so opt-in diagnostics can
-/// explain a safe OpenGL fallback even when ordinary file logging is disabled.
+/// independent of Neo's normal file-logging setting so opt-in Vulkan diagnostics
+/// can explain a safe OpenGL fallback without changing the production route.
 pub fn record_route_once(key: impl Into<String>, line: &str) {
     let key = key.into();
     if route_diag_keys().lock().unwrap().insert(key) {

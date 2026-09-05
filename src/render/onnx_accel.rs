@@ -1,17 +1,12 @@
-//! NeoAccel: conservative temporal-spatial acceleration for local ONNX image CNNs.
+//! NeoAccel ONNX acceleration experiments.
 //!
-//! The model is still executed by DirectML. NeoAccel removes work that cannot
-//! affect the final image: unchanged input areas are reused, while a changed
-//! area is expanded by the model's full receptive field and inferred as one
-//! aligned crop. The crop path is enabled only for graphs validated to contain
-//! local, translation-equivariant operators. Every crop geometry must pass
-//! repeated full-frame quality proofs and is rechecked periodically.
-//!
-//! This deliberately avoids a large vendor runtime. On RDNA 4, 16-pixel crop
-//! alignment also keeps DirectML convolution shapes friendly to the GPU's
-//! 16x16 matrix execution units, while the same code remains portable.
+//! v691 keeps the rejected v684-v686 temporal-detail/motion-warp experiment
+//! retired. Active NeoAccel is backend-aware: TensorRT may probe FP16+INT8,
+//! while the DirectML preference may probe the optional Windows ML MIGraphX
+//! AMD provider. No active NeoAccel path reuses or synthesizes video frames.
 
 use anyhow::{Result, anyhow};
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, fs, path::Path};
 
@@ -31,6 +26,16 @@ const DEFAULT_PROOF_TOLERANCE: usize = 1;
 const DEFAULT_PROOF_MAX_MISMATCH_RATIO: f32 = 0.001;
 const DEFAULT_PROOF_PASSES: u32 = 2;
 const DEFAULT_REPROOF_INTERVAL: u32 = 300;
+
+// v684 temporal-detail reuse experiment. NeoAccel never chains reconstructed
+// frames: one exact ONNX frame may feed at most one reconstructed frame, then
+// the next source frame is forced through the original model again.
+const TEMPORAL_BLOCK: usize = 32;
+const TEMPORAL_SEARCH_RADIUS: i32 = 12;
+const TEMPORAL_SEARCH_SAMPLE_STEP: usize = 16;
+const TEMPORAL_VALIDATE_SAMPLE_STEP: usize = 8;
+const TEMPORAL_MIN_CONFIDENT_RATIO: f32 = 0.70;
+const TEMPORAL_MAX_MEAN_ERROR: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rect {
@@ -115,6 +120,18 @@ pub struct PatchPlan {
     pub geometry: CropGeometry,
 }
 
+#[derive(Clone, Debug)]
+pub struct TemporalFlowPlan {
+    /// RGBA8 coarse motion field. R/G encode signed current->previous source
+    /// displacement as byte(value + 128), B is confidence, A stores validation
+    /// MAE (255 marks a border cell excluded from global confidence).
+    pub rgba: Vec<u8>,
+    pub grid_w: usize,
+    pub grid_h: usize,
+    pub confident_ratio: f32,
+    pub mean_error: f32,
+}
+
 #[derive(Debug)]
 pub enum Decision {
     Bypass,
@@ -135,6 +152,16 @@ pub struct NeoAccelState {
     pub low_motion_streak: u32,
     pub validated_geometries: HashMap<CropGeometry, GeometryValidation>,
     pub texture_key: String,
+    /// v684: persistent exact-AI output, matching ordinary Spline36 baseline,
+    /// and coarse current->previous motion field used only on the one skipped
+    /// frame between exact ONNX runs.
+    pub temporal_ai_key: String,
+    pub temporal_base_key: String,
+    pub temporal_flow_key: String,
+    pub temporal_ready: bool,
+    pub temporal_skip_allowed: bool,
+    pub temporal_full_frames: u64,
+    pub temporal_reused_frames: u64,
     pub proof_tolerance: u8,
     pub proof_max_mismatch_ratio: f32,
     proof_passes_required: u8,
@@ -148,6 +175,9 @@ pub struct NeoAccelState {
 
 impl NeoAccelState {
     pub fn new(plan: LocalModelPlan, texture_key: String) -> Self {
+        let temporal_ai_key = format!("{texture_key}:temporal-ai");
+        let temporal_base_key = format!("{texture_key}:temporal-base");
+        let temporal_flow_key = format!("{texture_key}:temporal-flow");
         Self {
             plan,
             previous_input: Vec::new(),
@@ -159,6 +189,13 @@ impl NeoAccelState {
             low_motion_streak: 0,
             validated_geometries: HashMap::new(),
             texture_key,
+            temporal_ai_key,
+            temporal_base_key,
+            temporal_flow_key,
+            temporal_ready: false,
+            temporal_skip_allowed: false,
+            temporal_full_frames: 0,
+            temporal_reused_frames: 0,
             proof_tolerance: env_usize("CHIDE_NEOACCEL_PROOF_TOLERANCE", DEFAULT_PROOF_TOLERANCE)
                 .clamp(0, 4) as u8,
             proof_max_mismatch_ratio: env_f32(
@@ -190,6 +227,8 @@ impl NeoAccelState {
         self.input_size = Some((width, height));
         self.output_size = None;
         self.active = false;
+        self.temporal_ready = false;
+        self.temporal_skip_allowed = false;
         self.low_motion_streak = 0;
         self.validated_geometries.clear();
     }
@@ -197,6 +236,8 @@ impl NeoAccelState {
     pub fn disable_permanently(&mut self) {
         self.permanently_disabled = true;
         self.active = false;
+        self.temporal_ready = false;
+        self.temporal_skip_allowed = false;
         self.cached_output.clear();
         self.validated_geometries.clear();
     }
@@ -204,6 +245,217 @@ impl NeoAccelState {
     pub fn commit_input(&mut self, rgba: &[u8]) {
         self.previous_input.clear();
         self.previous_input.extend_from_slice(rgba);
+    }
+
+    /// Commit a real full-frame ONNX result as the only source allowed to feed
+    /// one temporal reuse frame. Reconstructed frames are never committed.
+    pub fn temporal_commit_full(
+        &mut self,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+        output_size: (usize, usize),
+    ) {
+        if self.input_size != Some((width, height)) {
+            self.reset_for_size(width, height);
+        }
+        self.commit_input(rgba);
+        self.output_size = Some(output_size);
+        self.temporal_ready = true;
+        self.temporal_skip_allowed = true;
+        self.temporal_full_frames = self.temporal_full_frames.saturating_add(1);
+    }
+
+    pub fn temporal_commit_reuse(&mut self) {
+        // Force the following source frame through the exact model. This is the
+        // hard no-drift invariant of the v684 experiment.
+        self.temporal_skip_allowed = false;
+        self.temporal_reused_frames = self.temporal_reused_frames.saturating_add(1);
+    }
+
+    pub fn temporal_can_attempt(&self, width: usize, height: usize, rgba_len: usize) -> bool {
+        !self.permanently_disabled
+            && self.temporal_ready
+            && self.temporal_skip_allowed
+            && self.input_size == Some((width, height))
+            && self.previous_input.len() == rgba_len
+            && self.output_size.is_some()
+    }
+
+    /// Estimate a deliberately coarse current->previous motion field from the
+    /// already CPU-visible WGC RGBA buffers. This is not frame interpolation:
+    /// it only tells the shader where the previous exact AI *detail residual*
+    /// came from. Ambiguous/changed blocks receive low confidence and therefore
+    /// contribute no old AI detail.
+    pub fn temporal_flow_plan(
+        &self,
+        width: usize,
+        height: usize,
+        rgba: &[u8],
+    ) -> Option<TemporalFlowPlan> {
+        if !self.temporal_can_attempt(width, height, rgba.len()) {
+            return None;
+        }
+        let grid_w = width.div_ceil(TEMPORAL_BLOCK);
+        let grid_h = height.div_ceil(TEMPORAL_BLOCK);
+        let cells = grid_w.checked_mul(grid_h)?;
+        if cells == 0 {
+            return None;
+        }
+
+        let prev = &self.previous_input;
+        let mut rgba_flow = vec![0u8; cells * 4];
+        rgba_flow
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(cell, out)| {
+                let bx = cell % grid_w;
+                let by = cell / grid_w;
+                let x0 = bx * TEMPORAL_BLOCK;
+                let y0 = by * TEMPORAL_BLOCK;
+                let x1 = (x0 + TEMPORAL_BLOCK).min(width);
+                let y1 = (y0 + TEMPORAL_BLOCK).min(height);
+
+                #[inline]
+                fn luma(buf: &[u8], width: usize, x: usize, y: usize) -> i32 {
+                    let i = (y * width + x) * 4;
+                    (54 * buf[i] as i32 + 183 * buf[i + 1] as i32 + 19 * buf[i + 2] as i32) >> 8
+                }
+
+                // Exhaustive integer search, but only four samples per 32x32
+                // block. This costs roughly the same number of comparisons as
+                // the old 16-sample coarse search while avoiding its fatal
+                // assumption that nearby integer shifts remain correlated.
+                let mut search_samples = [(0usize, 0usize, 0i32); 4];
+                let mut search_count = 0usize;
+                let mut y = y0 + (TEMPORAL_SEARCH_SAMPLE_STEP / 2).min(y1.saturating_sub(y0));
+                while y < y1 {
+                    let mut x = x0 + (TEMPORAL_SEARCH_SAMPLE_STEP / 2).min(x1.saturating_sub(x0));
+                    while x < x1 {
+                        if x >= TEMPORAL_SEARCH_RADIUS as usize
+                            && y >= TEMPORAL_SEARCH_RADIUS as usize
+                            && x + (TEMPORAL_SEARCH_RADIUS as usize) < width
+                            && y + (TEMPORAL_SEARCH_RADIUS as usize) < height
+                            && search_count < search_samples.len()
+                        {
+                            search_samples[search_count] = (x, y, luma(rgba, width, x, y));
+                            search_count += 1;
+                        }
+                        x = x.saturating_add(TEMPORAL_SEARCH_SAMPLE_STEP);
+                    }
+                    y = y.saturating_add(TEMPORAL_SEARCH_SAMPLE_STEP);
+                }
+                if search_count == 0 {
+                    // A narrow border block cannot safely search the full
+                    // radius. It contributes no old detail and is excluded from
+                    // the global reuse-confidence denominator (A=255 sentinel).
+                    out.copy_from_slice(&[128, 128, 0, 255]);
+                    return;
+                }
+
+                let mut best_dx = 0i32;
+                let mut best_dy = 0i32;
+                let mut best_sad = u64::MAX;
+                for dy in -TEMPORAL_SEARCH_RADIUS..=TEMPORAL_SEARCH_RADIUS {
+                    for dx in -TEMPORAL_SEARCH_RADIUS..=TEMPORAL_SEARCH_RADIUS {
+                        let mut sad = 0u64;
+                        for &(x, y, current_luma) in &search_samples[..search_count] {
+                            let px = (x as i32 + dx) as usize;
+                            let py = (y as i32 + dy) as usize;
+                            sad += (current_luma - luma(prev, width, px, py)).unsigned_abs() as u64;
+                        }
+                        // Resolve flat/repeating-area ties toward smaller motion.
+                        let penalty = (dx.unsigned_abs() + dy.unsigned_abs()) as u64;
+                        let cost = sad.saturating_mul(16).saturating_add(penalty);
+                        let best_cost = best_sad.saturating_mul(16).saturating_add(
+                            (best_dx.unsigned_abs() + best_dy.unsigned_abs()) as u64,
+                        );
+                        if cost < best_cost {
+                            best_sad = sad;
+                            best_dx = dx;
+                            best_dy = dy;
+                        }
+                    }
+                }
+
+                // Validate the selected vector on a denser 4x4 sample lattice.
+                // A moving object, occlusion, subtitle change, fade, etc. can
+                // win the sparse search accidentally; this second pass turns
+                // such blocks into confidence=0 rather than ghosting old detail.
+                let mut validation_sad = 0u64;
+                let mut validation_count = 0usize;
+                let mut y = y0 + (TEMPORAL_VALIDATE_SAMPLE_STEP / 2).min(y1.saturating_sub(y0));
+                while y < y1 {
+                    let mut x = x0 + (TEMPORAL_VALIDATE_SAMPLE_STEP / 2).min(x1.saturating_sub(x0));
+                    while x < x1 {
+                        let px = x as i32 + best_dx;
+                        let py = y as i32 + best_dy;
+                        if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
+                            validation_sad += (luma(rgba, width, x, y)
+                                - luma(prev, width, px as usize, py as usize))
+                            .unsigned_abs() as u64;
+                            validation_count += 1;
+                        }
+                        x = x.saturating_add(TEMPORAL_VALIDATE_SAMPLE_STEP);
+                    }
+                    y = y.saturating_add(TEMPORAL_VALIDATE_SAMPLE_STEP);
+                }
+                if validation_count == 0 {
+                    out.copy_from_slice(&[128, 128, 0, 255]);
+                    return;
+                }
+
+                let mae = validation_sad as f32 / validation_count as f32;
+                let boundary = best_dx.unsigned_abs() as i32 >= TEMPORAL_SEARCH_RADIUS
+                    || best_dy.unsigned_abs() as i32 >= TEMPORAL_SEARCH_RADIUS;
+                let mut confidence = if mae <= 3.0 {
+                    255u8
+                } else if mae <= 8.0 {
+                    230
+                } else if mae <= 14.0 {
+                    190
+                } else if mae <= TEMPORAL_MAX_MEAN_ERROR {
+                    150
+                } else {
+                    0
+                };
+                if boundary {
+                    confidence = confidence.min(96);
+                }
+                out[0] = (best_dx + 128).clamp(0, 255) as u8;
+                out[1] = (best_dy + 128).clamp(0, 255) as u8;
+                out[2] = confidence;
+                out[3] = mae.clamp(0.0, 254.0) as u8;
+            });
+
+        let mut confident = 0usize;
+        let mut valid = 0usize;
+        let mut error_sum = 0u64;
+        for cell in rgba_flow.chunks_exact(4) {
+            if cell[3] == 255 {
+                continue;
+            }
+            valid += 1;
+            if cell[2] >= 150 {
+                confident += 1;
+            }
+            error_sum += cell[3] as u64;
+        }
+        if valid == 0 {
+            return None;
+        }
+        let confident_ratio = confident as f32 / valid as f32;
+        let mean_error = error_sum as f32 / valid as f32;
+        if confident_ratio < TEMPORAL_MIN_CONFIDENT_RATIO || mean_error > TEMPORAL_MAX_MEAN_ERROR {
+            return None;
+        }
+        Some(TemporalFlowPlan {
+            rgba: rgba_flow,
+            grid_w,
+            grid_h,
+            confident_ratio,
+            mean_error,
+        })
     }
 
     pub fn geometry_needs_proof(&self, geometry: CropGeometry) -> bool {
@@ -1028,6 +1280,64 @@ mod tests {
         let proof = compare_output_patch(&full, 16, 1, affected, &patch, 1, 0.01);
         assert!(!proof.accepted);
         assert_eq!(proof.max_delta, 2);
+    }
+
+    #[test]
+    fn temporal_flow_tracks_translation_and_rejects_scene_change() {
+        let (width, height) = (384usize, 256usize);
+        let mut previous = vec![0u8; width * height * 4];
+        let mut value = 0x1234_5678u32;
+        for pixel in previous.chunks_exact_mut(4) {
+            value = value.wrapping_mul(1664525).wrapping_add(1013904223);
+            pixel[0] = (value >> 24) as u8;
+            pixel[1] = (value >> 16) as u8;
+            pixel[2] = (value >> 8) as u8;
+            pixel[3] = 255;
+        }
+        let mut state = NeoAccelState::new(
+            LocalModelPlan {
+                halo_x: 0,
+                halo_y: 0,
+                scale_hint: 2,
+                conv_count: 0,
+                alignment: 1,
+            },
+            "temporal-test".into(),
+        );
+        state.temporal_commit_full(width, height, &previous, (width * 2, height * 2));
+
+        // Current picture is previous shifted right 5 / down 3, therefore a
+        // current pixel maps back to previous at (-5,-3).
+        let mut shifted = vec![0u8; previous.len()];
+        for y in 3..height {
+            for x in 5..width {
+                let dst = (y * width + x) * 4;
+                let src = ((y - 3) * width + (x - 5)) * 4;
+                shifted[dst..dst + 4].copy_from_slice(&previous[src..src + 4]);
+            }
+        }
+        let flow = state
+            .temporal_flow_plan(width, height, &shifted)
+            .expect("translated picture should be reusable");
+        let center_x = flow.grid_w / 2;
+        let center_y = flow.grid_h / 2;
+        let i = (center_y * flow.grid_w + center_x) * 4;
+        assert_eq!(flow.rgba[i] as i32 - 128, -5);
+        assert_eq!(flow.rgba[i + 1] as i32 - 128, -3);
+        assert!(flow.confident_ratio >= TEMPORAL_MIN_CONFIDENT_RATIO);
+
+        // A deterministic unrelated scene must fail the global confidence gate
+        // and force a real ONNX run.
+        let mut scene = vec![0u8; previous.len()];
+        let mut value = 0x8765_4321u32;
+        for pixel in scene.chunks_exact_mut(4) {
+            value = value.wrapping_mul(22695477).wrapping_add(1);
+            pixel[0] = (value >> 24) as u8;
+            pixel[1] = (value >> 16) as u8;
+            pixel[2] = (value >> 8) as u8;
+            pixel[3] = 255;
+        }
+        assert!(state.temporal_flow_plan(width, height, &scene).is_none());
     }
 
     #[test]

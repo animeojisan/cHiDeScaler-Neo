@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "chidescaler-neo"
-version = "0.99.1"
+version = "0.99.2"
 dependencies = [
  "anyhow",
  "ash",

@@ -137,3 +137,9 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 
 - `source_occlusion.notice_title` — short title for the source-overlap safety-stop notice.
 - `source_occlusion.notice` — short explanation shown for 3 seconds after the source-overlap safety stop.
+| `glsl.params.edit` | Edit GLSL parameters |
+| `glsl.params.title_suffix` | Parameters |
+| `glsl.params.live_help` | Changes are applied live while capture is running. |
+| `glsl.params.reset` | Reset to defaults |
+| `common.close` | Close |
+

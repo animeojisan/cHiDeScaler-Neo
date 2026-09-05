@@ -1,0 +1,33 @@
+{
+  "backend_api": 1,
+  "name": "Neo DLSS Neural Rendering Feature 18 Backend",
+  "architecture": "x86_64",
+  "bridge_abi": 1,
+  "bridge": "neo_dlssnr_backend.dll",
+  "runtime": "runtime/nvngx_dlssnr.dll",
+  "required_files": [
+    "neo_dlssnr_backend.dll"
+  ],
+  "file_sha256": {
+    "neo_dlssnr_backend.dll": "9DE23095447FEE777B0A4DC710D7BBADA43ABEC24464D394145CC9EE513B9462"
+  },
+  "runtime_candidates": [
+    "runtime/nvngx_dlssnr.dll",
+    "runtime/community/nvngx_dlssnr.dll",
+    "runtime/mod/nvngx_dlssnr.dll"
+  ],
+  "allow_user_runtime_replacement": true,
+  "replaceable_runtime_files": [
+    "runtime/nvngx_dlssnr.dll",
+    "runtime/community/nvngx_dlssnr.dll",
+    "runtime/mod/nvngx_dlssnr.dll"
+  ],
+  "compatibility_tags": [
+    "dlss-neural-rendering",
+    "feature18",
+    "zero-guidance",
+    "same-resolution",
+    "user-runtime",
+    "eval-options-v1"
+  ]
+}

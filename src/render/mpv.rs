@@ -94,6 +94,7 @@ impl ParamTy {
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
+    pub desc: String,
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -287,6 +288,9 @@ pub struct UserShader {
     /// hooks only OUTPUT/SCALED etc: runs on the final display-size image
     /// after scaling, not on the source planes
     pub is_post: bool,
+    /// Neo extension: rerun this stage and the remaining chain at the physical
+    /// display refresh cadence. Ordinary shaders never set this flag.
+    pub display_hz: bool,
     pub params: Vec<Param>,
     /// //!TEXTURE embedded data textures (LUTs), bindable by name
     pub textures: Vec<ShaderTexture>,
@@ -304,6 +308,9 @@ impl UserShader {
         let source_hash = hasher.finish();
         let (passes, params, textures) = parse_passes(src);
         let passes = expand_multi_hook_passes(passes);
+        let display_hz = src
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("//!DISPLAY_HZ"));
         let mut hooks_rgb = false;
         let mut uses_chroma = false;
         let mut is_compute = false;
@@ -339,6 +346,7 @@ impl UserShader {
             uses_chroma,
             is_compute,
             is_post: any_hook && all_post,
+            display_hz,
             params,
             textures,
         }
@@ -443,6 +451,7 @@ fn parse_passes(src: &str) -> (Vec<Pass>, Vec<Param>, Vec<ShaderTexture>) {
                 }
                 pending_param = Some(Param {
                     name: pval,
+                    desc: String::new(),
                     min: f32::NEG_INFINITY,
                     max: f32::INFINITY,
                     default: 0.0,
@@ -453,7 +462,10 @@ fn parse_passes(src: &str) -> (Vec<Pass>, Vec<Param>, Vec<ShaderTexture>) {
             }
             if let Some(p) = pending_param.as_mut() {
                 match pkey.as_str() {
-                    "DESC" => continue,
+                    "DESC" => {
+                        p.desc = pval;
+                        continue;
+                    }
                     "TYPE" => {
                         p.ty = ParamTy::parse(&pval);
                         continue;
@@ -750,10 +762,25 @@ mod tests {
         let sh = UserShader::parse("crt.glsl", src);
         assert_eq!(sh.params.len(), 1);
         assert_eq!(sh.params[0].name, "bright");
+        assert_eq!(sh.params[0].desc, "Brightness");
         assert!((sh.params[0].default - 1.2).abs() < 1e-6);
         assert_eq!(sh.passes.len(), 1);
         assert_eq!(sh.passes[0].desc, "");
         assert!(sh.is_rgb);
+    }
+
+    #[test]
+    fn parse_display_hz_extension_is_opt_in() {
+        let ordinary = UserShader::parse(
+            "ordinary.glsl",
+            "//!HOOK RGB\n//!BIND HOOKED\nvec4 hook(){return HOOKED_tex(HOOKED_pos);}",
+        );
+        let refresh = UserShader::parse(
+            "refresh.glsl",
+            "//!DISPLAY_HZ\n//!HOOK RGB\n//!BIND HOOKED\nvec4 hook(){return HOOKED_tex(HOOKED_pos);}",
+        );
+        assert!(!ordinary.display_hz);
+        assert!(refresh.display_hz);
     }
 
     #[test]

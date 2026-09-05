@@ -34,6 +34,18 @@ use std::time::{Duration, Instant};
 // dequeue made that queue a permanent 80ms A/V offset once presentation was
 // paced exactly to the source cadence. Keep only the newest pending frame;
 // sequence-gap detection below safely skips interpolation if WGC really bursts.
+
+#[inline]
+fn metrics_kind_label(kind: StageKind) -> &'static str {
+    match kind {
+        StageKind::Glsl => "glsl",
+        StageKind::Slangp => "slangp",
+        StageKind::Dlssnr => "dlssnr",
+        StageKind::Onnx => "onnx",
+        StageKind::Flow => "gpu",
+    }
+}
+
 const NEOFLOW_QUEUE_MAX: usize = 1;
 const ONNX_INTERP_QUEUE_MAX: usize = 3;
 const SMOOTH_PACING_QUEUE_MAX: usize = 1;
@@ -637,6 +649,14 @@ pub struct EngineStopHandle {
 }
 
 impl EngineStopHandle {
+    pub fn is_active(&self) -> bool {
+        let state = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.starting || state.running
+    }
+
     pub fn request_stop(&self, reason: &str) {
         let active = {
             let state = self
@@ -2019,6 +2039,18 @@ struct Session {
     source_restart_since: Option<Instant>,
     source_restart_last: Instant,
     last_tex: Option<GpuTex>,
+    /// Cached output immediately before the first //!DISPLAY_HZ stage.
+    /// It is reused only by the display-cadence replay path; ordinary chains
+    /// leave this None and keep the v676 lifecycle unchanged.
+    display_hz_base_tex: Option<GpuTex>,
+    display_hz_start_index: Option<usize>,
+    display_hz_tick: u64,
+    display_hz_next_present: Instant,
+    display_hz_route_log_key: Option<String>,
+    /// v682: isolated async ONNX prefix used only by the exact ordinary
+    /// DirectML/TensorRT ONNX -> CRT Beam Simulator-Neo chain. Ordinary
+    /// chains leave this None, preserving the established non-Beam path.
+    beam_onnx_worker: Option<BeamOnnxWorker>,
     last_present: Instant,
     // Start of the most recent SwapBuffers call. Interpolation pacing must
     // anchor to submission time, not completion time, because a healthy DWM
@@ -4156,6 +4188,173 @@ struct ReadyGpuInterpOutput {
     preprocessed_chain_ms: f64,
 }
 
+struct BeamOnnxJob {
+    w: i32,
+    h: i32,
+    rgba: Vec<u8>,
+    timing: FrameTiming,
+}
+
+struct BeamOnnxResult {
+    w: i32,
+    h: i32,
+    rgba: Vec<u8>,
+    timing: FrameTiming,
+    run_ms: f64,
+}
+
+struct BeamOnnxWorker {
+    job_tx: Option<SyncSender<BeamOnnxJob>>,
+    result_rx: Receiver<std::result::Result<BeamOnnxResult, String>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    metric_name: String,
+    /// True from successful submission until the render thread consumes the
+    /// corresponding result. This forbids back-to-back provider jobs from
+    /// starting before Beam has presented the previous completed frame.
+    provider_slot_busy: AtomicBool,
+}
+
+impl BeamOnnxWorker {
+    fn spawn(
+        stage: Arc<Mutex<crate::render::onnx_stage::OnnxStage>>,
+        metric_name: String,
+        provider_name: &'static str,
+    ) -> Self {
+        let (job_tx, job_rx) = sync_channel::<BeamOnnxJob>(1);
+        let (result_tx, result_rx) = channel();
+        let thread = std::thread::Builder::new()
+            .name("beam-onnx-worker".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let started = Instant::now();
+                    let result = stage
+                        .lock()
+                        .map_err(|_| "stage mutex poisoned".to_string())
+                        .and_then(|mut stage| {
+                            stage
+                                .process_rgba8_native_output(job.w, job.h, &job.rgba)
+                                .map_err(|e| format!("{e:#}"))
+                        });
+                    let run_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let message = result.map(|(w, h, rgba)| BeamOnnxResult {
+                        w,
+                        h,
+                        rgba,
+                        timing: job.timing,
+                        run_ms,
+                    });
+                    if result_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn Beam ONNX worker");
+        log::info!(
+            "beam-onnx-worker-ready: route={}-ONNX-to-CRT-Beam queue=single-slot-no-backlog isolated=true present_before_next_submit=true",
+            provider_name
+        );
+        Self {
+            job_tx: Some(job_tx),
+            result_rx,
+            thread: Some(thread),
+            metric_name,
+            provider_slot_busy: AtomicBool::new(false),
+        }
+    }
+
+    fn submit(&self, job: BeamOnnxJob) {
+        let Some(tx) = self.job_tx.as_ref() else {
+            return;
+        };
+        // One provider job may be running OR waiting for Beam presentation,
+        // never both. Keep the newest displayed Beam base while busy and drop
+        // only the source update; source audio/timing cannot be delayed with us.
+        if self
+            .provider_slot_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        match tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.provider_slot_busy.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    fn take_latest(&self) -> Option<std::result::Result<BeamOnnxResult, String>> {
+        let mut latest = None;
+        while let Ok(result) = self.result_rx.try_recv() {
+            latest = Some(result);
+        }
+        if latest.is_some() {
+            // The slot becomes reusable only when the render thread has taken
+            // the result. submit() is intentionally called after Beam present.
+            self.provider_slot_busy.store(false, Ordering::Release);
+        }
+        latest
+    }
+}
+
+impl Drop for BeamOnnxWorker {
+    fn drop(&mut self) {
+        self.job_tx.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn beam_display_hz_index(chain: &FilterChain) -> Option<usize> {
+    let index = chain.display_hz_index()?;
+    match &chain.stages[index] {
+        Stage::Glsl { shader, .. }
+            if shader.display_hz
+                && shader
+                    .name()
+                    .eq_ignore_ascii_case("CRT Beam Simulator-Neo.glsl") =>
+        {
+            Some(index)
+        }
+        _ => None,
+    }
+}
+
+fn beam_async_onnx_stage(
+    chain: &FilterChain,
+) -> Option<(
+    Arc<Mutex<crate::render::onnx_stage::OnnxStage>>,
+    String,
+    &'static str,
+)> {
+    if chain.stages.len() != 2 || beam_display_hz_index(chain) != Some(1) || chain.has_interp() {
+        return None;
+    }
+    let (stage, metric_name) = match &chain.stages[0] {
+        Stage::Onnx {
+            stage,
+            is_interp: false,
+            ..
+        } => (stage.clone(), chain.stages[0].metrics_name()),
+        _ => return None,
+    };
+    let provider_name = stage.lock().ok().and_then(|stage| match stage.provider {
+        crate::render::onnx_stage::OnnxProvider::DirectML => Some("DirectML"),
+        crate::render::onnx_stage::OnnxProvider::TensorRT => Some("TensorRT"),
+        crate::render::onnx_stage::OnnxProvider::MigraphX
+        | crate::render::onnx_stage::OnnxProvider::Cuda => None,
+    })?;
+    Some((stage, metric_name, provider_name))
+}
+
+fn make_beam_onnx_worker(chain: &FilterChain) -> Option<BeamOnnxWorker> {
+    beam_async_onnx_stage(chain).map(|(stage, metric_name, provider_name)| {
+        BeamOnnxWorker::spawn(stage, metric_name, provider_name)
+    })
+}
+
 struct PendingGpuInterp {
     generation: u64,
     pair_id: u64,
@@ -4499,6 +4698,41 @@ fn apply_chain_update(
     metrics: &Metrics,
     status: &Arc<Mutex<Status>>,
 ) {
+    // Beam-only async prefix owns the old ONNX stage; retire it before replacing the chain.
+    if let Some(values) = crate::core::dlssnr::options_only_change(&s.chain_specs, specs) {
+        if s.chain.set_dlssnr_options(values) {
+            s.chain_specs = specs.to_vec();
+            // DLSSNR option changes are semantic image changes even when WGC is
+            // completely static. In particular, changing Render Preset drops the
+            // isolated Feature-18 worker, so dlssnr_needs_refresh() cannot become
+            // true until one frame has first been submitted to start the new worker.
+            // Force that submission from the cached source frame instead of waiting
+            // for a mouse/UI repaint in the captured application.
+            s.chain_reprocess_pending = !s.frame.data.is_empty();
+            if s.chain_reprocess_pending {
+                // The cached output belongs to the previous NR configuration.
+                // Make the semantic refresh win over every duplicate/cadence reuse
+                // gate without disturbing interpolation/provider history.
+                s.duplicate_signature = None;
+                s.smooth_content_signature = None;
+                s.smooth_content_seq = 0;
+                s.smooth_content_unique_since_duplicate = 4;
+                s.smooth_content_last_candidate_seq = None;
+                s.smooth_content_last_candidate_time = None;
+                s.smooth_content_pattern_hits = 0;
+                s.smooth_content_candidate_gaps.clear();
+                s.smooth_content_24p_detected = false;
+                s.paced_present_deadline = None;
+            }
+            log::debug!(
+                "dlssnr-options-update: values={values:?} stage_reused=true live_update=true cached_reprocess={}",
+                s.chain_reprocess_pending
+            );
+            return;
+        }
+    }
+    s.beam_onnx_worker = None;
+    reset_display_hz_cache(s, gc, "chain-update");
     let old_interp = s.chain.interp_key();
     let old_interp_pre = s
         .chain
@@ -4776,6 +5010,7 @@ fn apply_chain_update(
             .any(|known| known == &next_glsl_key);
     s.chain = chain;
     s.chain_specs = specs.to_vec();
+    s.beam_onnx_worker = make_beam_onnx_worker(&s.chain);
 
     // v668: changing the live chain is a workload boundary even when no frame
     // interpolator is involved.  Discard processing-budget/deadline history,
@@ -4905,6 +5140,7 @@ fn apply_chain_update(
         state.onnx_cuda_stages = usage.cuda;
         state.onnx_directml_fallbacks = usage.directml_fallback;
     }
+    sync_display_hz_chain_warning(status, &s.chain);
     log::info!(
         "chain-apply: requested={} enabled={} interp={:?} stages={:?}",
         requested,
@@ -4958,6 +5194,7 @@ fn reset_gpu_interp_for_backend_switch(
 }
 
 fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext, reason: &str) {
+    reset_display_hz_cache(s, gc, reason);
     if let Some(pack) = s.gpu_interp_pack_pending.take() {
         gc.cancel_commands_fence(pack.fence);
     }
@@ -5019,6 +5256,8 @@ fn switch_onnx_backend(
         crate::render::onnx_stage::finish_tensorrt_build_progress();
         return true;
     };
+
+    reset_display_hz_cache(s, gc, "onnx-backend-switch");
 
     let (mut candidate_chain, errors) = FilterChain::from_specs(&mut candidate_factory, specs);
     let requested = specs.iter().filter(|spec| spec.enabled).count();
@@ -5408,15 +5647,7 @@ fn drain_gpu_interp_stream(
                     let detailed = metrics.detailed_enabled() && pending.frame.seq % 30 == 0;
                     let m = metrics.clone();
                     let mut probe_fn = |name: &str, kind: StageKind, ms: f64| {
-                        m.probe(
-                            name,
-                            if kind == StageKind::Glsl {
-                                "glsl"
-                            } else {
-                                "onnx"
-                            },
-                            ms,
-                        );
+                        m.probe(name, metrics_kind_label(kind), ms);
                     };
                     // The ordinary FilterChain path advances mpv's `frame`
                     // builtin before executing GLSL. This direct path skips
@@ -5647,6 +5878,7 @@ fn drain_gpu_interp_stream(
                     mid_chain_start,
                     true,
                     preprocessed_chain_ms,
+                    false,
                 );
             } else {
                 process_and_present_from(
@@ -9092,7 +9324,22 @@ fn engine_main(
         // deadlines. A second 20 ms WGC wait made 30p interpolation miss a
         // just-arrived frame and alternate between roughly 33/42 ms input
         // gaps, accumulating and dropping queued frames.
-        let capture_wait = if s.smooth_pacing && s.last_tex.is_some() {
+        let capture_wait = if s.chain.has_display_hz() && s.last_tex.is_some() {
+            if beam_display_hz_index(&s.chain).is_some() && s.display_hz_base_tex.is_some() {
+                // v682 Beam-specialized cadence: wait toward the absolute display
+                // deadline instead of polling WGC every 1 ms. WGC still wakes this
+                // wait immediately for a real source frame, while a static/24p
+                // source no longer burns ~8 one-millisecond loops per 120 Hz tick.
+                // The 10 ms cap keeps message/input service responsive on 60 Hz.
+                s.display_hz_next_present
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(10))
+            } else {
+                // Non-Beam Display-Hz shaders retain the established v681
+                // polling behavior unchanged.
+                Duration::from_millis(1)
+            }
+        } else if s.smooth_pacing && s.last_tex.is_some() {
             Duration::from_millis(2)
         } else {
             Duration::from_millis(20)
@@ -10065,6 +10312,7 @@ fn engine_main(
                         state.onnx_cuda_stages = usage.cuda;
                         state.onnx_directml_fallbacks = usage.directml_fallback;
                     }
+                    s.beam_onnx_worker = make_beam_onnx_worker(&s.chain);
                     log::info!(
                         "onnx-geometry-session-rebuilt: input={}x{} stages={} gl_cache=preserved reason=shape-specific-runtime-reset",
                         s.in_size.0,
@@ -10369,6 +10617,9 @@ fn engine_main(
             // Geometry/HDR/mode transitions must establish a fresh baseline.
             s.duplicate_signature = frame_signature(&s.frame);
         }
+        // A static capture needs one refresh when the isolated NR initialization
+        // completes. No worker/atomic access occurs for ordinary chains.
+        let dlssnr_refresh = s.chain.dlssnr_needs_refresh() && !s.frame.data.is_empty();
         if got_new && took_frame && !cap_skip && !duplicate_skip && !smooth_content_duplicate {
             // The only frames that reach the chain have passed both gates in this
             // exact order: FPS cap -> duplicate reduction -> GLSL/ONNX/interpolation.
@@ -10388,7 +10639,9 @@ fn engine_main(
             }
             metrics.set_source_fps(s.cadence.period_s().map(|period| 1.0 / period));
         }
-        if got_new && took_frame && !cap_skip && !duplicate_skip && !smooth_content_duplicate {
+        if dlssnr_refresh
+            || (got_new && took_frame && !cap_skip && !duplicate_skip && !smooth_content_duplicate)
+        {
             // render target size: at least 2x the source so mpv shaders with
             // WHEN "OUTPUT/MAIN > 1.2" activate even at small display ratios
             // (the presented image is then supersampled down = better quality)
@@ -10413,7 +10666,81 @@ fn engine_main(
             // Per-stage GLSL timing calls glFinish before and after every
             // stage. Sampling preserves useful GUI statistics without
             // serializing the GPU pipeline on every video frame.
-            let stats = metrics.detailed_enabled() && s.frame.seq % 30 == 0;
+            // A stopped source may never reach the next sampled sequence.
+            // Publish completion/options-refresh timing once, not every idle tick.
+            let stats = metrics.detailed_enabled() && (dlssnr_refresh || s.frame.seq % 30 == 0);
+
+            // v682 Beam-specialized route. This branch exists only when the
+            // exact ordinary DirectML/TensorRT ONNX -> CRT Beam chain was
+            // admitted. With no CRT Beam Simulator-Neo, beam_onnx_worker is
+            // None and execution falls through to the established v681 path.
+            if s.beam_onnx_worker.is_some() {
+                let timing = FrameTiming::from_frame(&s.frame, t0);
+                let job = BeamOnnxJob {
+                    w: s.frame.w,
+                    h: s.frame.h,
+                    rgba: s.frame.data.clone(),
+                    timing,
+                };
+
+                // Consume/present the previous provider result before launching
+                // the next provider job. v680 did the reverse, so a fresh DML
+                // dispatch could occupy the same GPU exactly while Beam tried
+                // to render/present the already-finished frame.
+                let (metric_name, result) = {
+                    let worker = s.beam_onnx_worker.as_ref().expect("Beam worker exists");
+                    (worker.metric_name.clone(), worker.take_latest())
+                };
+                if let Some(result) = result {
+                    match result {
+                        Ok(done) => {
+                            if stats {
+                                metrics.probe(&metric_name, "onnx", done.run_ms);
+                            }
+                            let upload_started = Instant::now();
+                            let tex = gc.upload_rgba8(done.w, done.h, &done.rgba);
+                            s.last_upload_submit_ms =
+                                upload_started.elapsed().as_secs_f64() * 1000.0;
+                            let delivered = s.source.delivered();
+                            let captures = delivered.saturating_sub(s.metric_seq) as u32;
+                            s.metric_seq = delivered;
+                            process_and_present_from(
+                                &mut gc,
+                                &mut overlay,
+                                s,
+                                &metrics,
+                                &status,
+                                tex,
+                                out_size,
+                                stats,
+                                t0,
+                                captures,
+                                Some(done.timing),
+                                &[],
+                                downscaler,
+                                1,
+                            );
+                        }
+                        Err(error) => {
+                            let msg = format!("Beam専用ONNX処理: {error}");
+                            log::error!("beam-onnx-worker-error: {error}");
+                            let mut state = status.lock().unwrap();
+                            if !state.chain_errors.contains(&msg) {
+                                state.chain_errors.push(msg);
+                            }
+                        }
+                    }
+                }
+
+                // Only after Beam has had its present opportunity do we submit
+                // the newest source update. Queue capacity=1 keeps source
+                // latency bounded without ever blocking the render thread.
+                if let Some(worker) = s.beam_onnx_worker.as_ref() {
+                    worker.submit(job);
+                }
+                overlay.win.pump_messages();
+                continue;
+            }
 
             // ---- frame interpolation: synthesize (factor-1) in-between
             // frames, pacing each at k/factor of the arrival interval ----
@@ -10721,15 +11048,7 @@ fn engine_main(
                 if gpu_capable {
                     let input = upload_session_frame_timed(&mut gc, s);
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
-                        metrics.probe(
-                            name,
-                            if kind == StageKind::Glsl {
-                                "glsl"
-                            } else {
-                                "onnx"
-                            },
-                            ms,
-                        );
+                        metrics.probe(name, metrics_kind_label(kind), ms);
                     };
                     let cur_tex = if interp_index > 0 {
                         match s.chain.process_range(
@@ -11124,15 +11443,7 @@ fn engine_main(
                     let input = upload_session_frame_timed(&mut gc, s);
                     let m = metrics.clone();
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
-                        m.probe(
-                            name,
-                            if kind == StageKind::Glsl {
-                                "glsl"
-                            } else {
-                                "onnx"
-                            },
-                            ms,
-                        );
+                        m.probe(name, metrics_kind_label(kind), ms);
                     };
                     match s.chain.process_range(
                         &mut gc,
@@ -11773,6 +12084,22 @@ fn engine_main(
             } else {
                 pace_processing_start(s, &mut overlay)
             };
+            // Re-evaluating a cached still is new work, not a delayed old video frame.
+            let real_timing = if dlssnr_refresh
+                && !(got_new
+                    && took_frame
+                    && !cap_skip
+                    && !duplicate_skip
+                    && !smooth_content_duplicate)
+            {
+                FrameTiming {
+                    received_at: None,
+                    source_time_100ns: None,
+                    fallback_start: real_t0,
+                }
+            } else {
+                FrameTiming::from_frame(&s.frame, real_t0)
+            };
             if crate::logging::diagnostics_enabled() && captures > 1 && s.phase_diag_samples < 12 {
                 log::debug!(
                     "frame-phase diag: captures={} seq={} since_present_ms={:.2} setup_ms={:.2} cursor_ms={:.2} watchdog_ms={:.2} zorder_ms={:.2} geometry_ms={:.2} panel_ms={:.2} foreground_ms={:.2} input_ms={:.2} post_input_ms={:.2} capture_wait_take_ms={:.2} pre_process_ms={:.2}",
@@ -11833,15 +12160,7 @@ fn engine_main(
                 Ok(None)
             } else {
                 let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
-                    metrics.probe(
-                        name,
-                        if kind == StageKind::Glsl {
-                            "glsl"
-                        } else {
-                            "onnx"
-                        },
-                        ms,
-                    );
+                    metrics.probe(name, metrics_kind_label(kind), ms);
                 };
                 match s.chain.process_first_onnx_vulkan_resident_rgba8(
                     &mut gc,
@@ -11880,7 +12199,7 @@ fn engine_main(
                         stats,
                         real_t0,
                         captures,
-                        Some(FrameTiming::from_frame(&s.frame, real_t0)),
+                        Some(real_timing),
                         &[],
                         downscaler,
                         chain_start_index,
@@ -11912,15 +12231,7 @@ fn engine_main(
                         && crate::render::vulkan_multipass::production_requested()
                     {
                         let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
-                            metrics.probe(
-                                name,
-                                if kind == StageKind::Glsl {
-                                    "glsl"
-                                } else {
-                                    "onnx"
-                                },
-                                ms,
-                            );
+                            metrics.probe(name, metrics_kind_label(kind), ms);
                         };
                         s.chain.process_leading_vulkan_resident_rgba8(
                             &mut gc,
@@ -12110,7 +12421,7 @@ fn engine_main(
                             stats,
                             real_t0,
                             captures,
-                            Some(FrameTiming::from_frame(&s.frame, real_t0)),
+                            Some(real_timing),
                             &[],
                             downscaler,
                             chain_start_index,
@@ -12128,7 +12439,7 @@ fn engine_main(
                             stats,
                             real_t0,
                             captures,
-                            Some(FrameTiming::from_frame(&s.frame, real_t0)),
+                            Some(real_timing),
                             &[],
                             downscaler,
                         );
@@ -12159,6 +12470,48 @@ fn engine_main(
                 Instant::now(),
                 downscaler,
             );
+        } else if s.display_hz_base_tex.is_some()
+            && !s.chain_reprocess_pending
+            && !s.capture_resolution_applied
+            && s.deferred_capture_resolution.is_none()
+            && s.pending_resize_size.is_none()
+            && !s.aspect_transition_pending
+            && !s.crop_transition_pending
+            && Instant::now() >= s.display_hz_next_present
+        {
+            // No new content frame is required here. Re-run only the suffix
+            // beginning at the user's first //!DISPLAY_HZ shader and present
+            // it at the physical monitor cadence. This is refresh-cycle
+            // rendering, not motion interpolation: the cached prefix pixels
+            // are identical until a real/interpolated content frame arrives.
+            let replay_index = display_hz_replay_index(s);
+            if let (Some(base), Some(index)) = (s.display_hz_base_tex, replay_index) {
+                if s.display_hz_start_index == Some(index) {
+                    s.paced_present_deadline = None;
+                    let out_size = virtual_shader_output_size((s.frame.w, s.frame.h));
+                    let now = Instant::now();
+                    let stats = metrics.detailed_enabled() && s.display_hz_tick % 120 == 0;
+                    process_and_present_from_impl(
+                        &mut gc,
+                        &mut overlay,
+                        s,
+                        &metrics,
+                        &status,
+                        base,
+                        out_size,
+                        stats,
+                        now,
+                        0,
+                        None,
+                        &[base],
+                        downscaler,
+                        index,
+                        false,
+                        0.0,
+                        false,
+                    );
+                }
+            }
         } else if s.smooth_pacing
             && !interp_active
             && s.last_tex.is_some()
@@ -12610,7 +12963,12 @@ fn start_session(
         );
     }
     source.set_queue_enabled(chain.has_interp());
-    let warning: Option<String> = None;
+    let warning = display_hz_chain_warning(&chain);
+    if let Some(message) = warning.as_deref() {
+        log::warn!(
+            "display-hz-safety: action=bypass-display-hz-stage reason=display-hz-before-interpolation order_preserved=true message={message}"
+        );
+    }
     log::info!(
         "source-fullscreen-origin: hwnd={hwnd:#x} monitor_cover={source_monitor_fullscreen} client_only_requested={client_only} client_only_effective={effective_client_only}"
     );
@@ -12668,6 +13026,7 @@ fn start_session(
         }
         (None, false)
     };
+    let beam_onnx_worker = make_beam_onnx_worker(&chain);
     Ok((
         Session {
             hwnd,
@@ -12710,6 +13069,12 @@ fn start_session(
             source_restart_since: None,
             source_restart_last: Instant::now() - Duration::from_secs(1),
             last_tex: None,
+            display_hz_base_tex: None,
+            display_hz_start_index: None,
+            display_hz_tick: 0,
+            display_hz_next_present: Instant::now(),
+            display_hz_route_log_key: None,
+            beam_onnx_worker,
             last_present: Instant::now(),
             last_present_started: Instant::now(),
             frame: FrameBuf::default(),
@@ -14577,6 +14942,146 @@ fn drain_pending_interp(
     }
 }
 
+fn reset_display_hz_cache(s: &mut Session, gc: &mut GlContext, reason: &str) {
+    if let Some(texture) = s.display_hz_base_tex.take() {
+        gc.recycle(texture);
+    }
+    s.display_hz_start_index = None;
+    s.display_hz_tick = 0;
+    s.display_hz_next_present = Instant::now();
+    s.display_hz_route_log_key = None;
+    if s.chain.has_display_hz() {
+        log::debug!("display-hz-cache-reset: reason={reason}");
+    }
+}
+
+fn display_hz_refresh(s: &Session) -> Option<f64> {
+    s.monitor_refresh_hz
+        .filter(|hz| hz.is_finite() && *hz >= 30.0 && *hz <= 1000.0)
+}
+
+const DISPLAY_HZ_INTERP_WARNING: &str = "Display-Hz GLSL が RIFE / DRBA より前に配置されているため、安定性保護のためこのDisplay-Hz GLSLを一時的に無効化しました。フィルター順序やチェック状態は変更していません。有効にする場合は Display-Hz GLSL を RIFE / DRBA より後ろへ移動してください。";
+
+fn display_hz_chain_warning(chain: &FilterChain) -> Option<String> {
+    let display = chain.display_hz_index()?;
+    let interp = chain.interp_index()?;
+    (display < interp).then(|| DISPLAY_HZ_INTERP_WARNING.to_string())
+}
+
+fn sync_display_hz_chain_warning(status: &Arc<Mutex<Status>>, chain: &FilterChain) {
+    let next = display_hz_chain_warning(chain);
+    let mut state = status.lock().unwrap();
+    match next {
+        Some(message) => {
+            if state.warning.as_deref() != Some(message.as_str()) {
+                // Do not silently rearrange the user's filter chain. The warning
+                // explains why only refresh-cycle replay is disabled. If another
+                // unrelated safety warning is already visible, preserve it.
+                if state.warning.is_none()
+                    || state.warning.as_deref() == Some(DISPLAY_HZ_INTERP_WARNING)
+                {
+                    state.warning = Some(message);
+                }
+            }
+        }
+        None => {
+            if state.warning.as_deref() == Some(DISPLAY_HZ_INTERP_WARNING) {
+                state.warning = None;
+            }
+        }
+    }
+}
+
+fn display_hz_replay_index(s: &mut Session) -> Option<usize> {
+    let index = s.chain.display_hz_index()?;
+    let refresh = display_hz_refresh(s)?;
+    let reason = if let Some(interp) = s.chain.interp_index() {
+        if index < interp {
+            Some(format!("before-interpolation:{index}<{interp}"))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // v677 is intentionally conservative on cross-GPU/forced-Vulkan routes.
+    // The shader still executes in the user's chosen order, but refresh-cycle
+    // replay is kept on the established same-GPU OpenGL presentation path.
+    let reason = reason.or_else(|| {
+        crate::render::vulkan_gpu::production_selected_luid()
+            .map(|_| "selected-vulkan-route".to_string())
+    });
+    if let Some(reason) = reason {
+        let key = format!("disabled:{index}:{reason}");
+        if s.display_hz_route_log_key.as_deref() != Some(&key) {
+            log::info!(
+                "display-hz-route: active=false stage_index={} refresh_hz={:.2} reason={} order_preserved=true",
+                index,
+                refresh,
+                reason
+            );
+            s.display_hz_route_log_key = Some(key);
+        }
+        return None;
+    }
+    let key = format!("active:{index}:{refresh:.3}");
+    if s.display_hz_route_log_key.as_deref() != Some(&key) {
+        log::info!(
+            "display-hz-route: active=true stage_index={} refresh_hz={:.2} order_preserved=true policy=first-display-hz-stage-through-chain-end",
+            index,
+            refresh
+        );
+        s.display_hz_route_log_key = Some(key);
+    }
+    Some(index)
+}
+
+fn set_display_hz_clock_for_render(s: &mut Session) {
+    if !s.chain.has_display_hz() {
+        return;
+    }
+    let refresh = display_hz_refresh(s).unwrap_or(60.0);
+    crate::render::glsl_engine::set_display_clock(s.display_hz_tick, refresh);
+    s.display_hz_tick = s.display_hz_tick.saturating_add(1);
+}
+
+fn schedule_next_display_hz_present(s: &mut Session, now: Instant) {
+    if s.display_hz_base_tex.is_none() || display_hz_replay_index(s).is_none() {
+        return;
+    }
+    let refresh = display_hz_refresh(s).unwrap_or(60.0);
+    let period_s = 1.0 / refresh;
+
+    if beam_display_hz_index(&s.chain).is_some() {
+        // v682 Beam cadence is phase-preserving. The previous implementation
+        // re-anchored every deadline to `actual_present + period`, so the 1 ms
+        // WGC poll plus loop/driver overhead was permanently added to every
+        // refresh. A nominal 8.33 ms 120 Hz period therefore drifted toward
+        // 9-11 ms (roughly 90-110 fps). Advance the existing clock by whole
+        // periods instead; a late tick is recovered by a shorter following
+        // interval rather than lowering the long-term refresh rate.
+        if s.display_hz_next_present <= now {
+            let late_s = now
+                .saturating_duration_since(s.display_hz_next_present)
+                .as_secs_f64();
+            let steps = (late_s / period_s).floor() + 1.0;
+            s.display_hz_next_present =
+                s.display_hz_next_present + Duration::from_secs_f64(period_s * steps);
+        }
+    } else {
+        // Keep every non-Beam Display-Hz shader on the established v681 clock.
+        s.display_hz_next_present = now + Duration::from_secs_f64(period_s);
+    }
+}
+
+fn keep_display_hz_base(s: &Session, keep: &mut Vec<GpuTex>) {
+    if let Some(base) = s.display_hz_base_tex
+        && !keep.iter().any(|item| item.tex == base.tex)
+    {
+        keep.push(base);
+    }
+}
+
 fn process_and_present(
     gc: &mut GlContext,
     overlay: &mut OverlayWindow,
@@ -14661,6 +15166,7 @@ fn process_and_present_from(
         chain_start_index,
         false,
         0.0,
+        true,
     );
 }
 
@@ -14682,11 +15188,16 @@ fn process_and_present_from_impl(
     chain_start_index: usize,
     chain_already_processed: bool,
     preprocessed_chain_ms: f64,
+    chain_frame_tick: bool,
 ) {
     // `process_from()` clears chain_reprocess_pending after a successful chain
     // run. Remember whether this present came from an explicit filter edit so
     // we can synchronously commit that one frame to DWM below.
     let chain_reprocess_commit = s.chain_reprocess_pending;
+    // Capture the DLSSNR semantic refresh state before process_from() consumes it.
+    // This flag belongs to this present operation, so it must be local to this
+    // function rather than borrowed from the outer capture loop.
+    let dlssnr_refresh_commit = s.chain.dlssnr_needs_refresh();
 
     // Selected filters are part of the requested image semantics. Never omit
     // any post-interpolation stage. The low-spec admission guard is therefore
@@ -14742,7 +15253,9 @@ fn process_and_present_from_impl(
             keep.push(last_good);
         }
         keep.extend_from_slice(keep_extra);
+        keep_display_hz_base(s, &mut keep);
         gc.release_frame(&keep);
+        schedule_next_display_hz_present(s, Instant::now());
         return;
     }
 
@@ -14753,7 +15266,9 @@ fn process_and_present_from_impl(
             keep.push(last_good);
         }
         keep.extend_from_slice(keep_extra);
+        keep_display_hz_base(s, &mut keep);
         gc.release_frame(&keep);
+        schedule_next_display_hz_present(s, Instant::now());
         return;
     }
 
@@ -14766,38 +15281,99 @@ fn process_and_present_from_impl(
             keep.push(last_good);
         }
         keep.extend_from_slice(keep_extra);
+        keep_display_hz_base(s, &mut keep);
         gc.release_frame(&keep);
+        schedule_next_display_hz_present(s, Instant::now());
         return;
     }
 
     let m = metrics.clone();
     let mut probe_fn = |name: &str, kind: StageKind, ms: f64| {
-        m.probe(
-            name,
-            if kind == StageKind::Glsl {
-                "glsl"
-            } else {
-                "onnx"
-            },
-            ms,
-        );
+        m.probe(name, metrics_kind_label(kind), ms);
     };
     let chain_input_size = (input.w(), input.h());
     let chain_started = Instant::now();
+    set_display_hz_clock_for_render(s);
+    let display_replay_index = if chain_already_processed {
+        None
+    } else {
+        display_hz_replay_index(s).filter(|index| *index >= chain_start_index)
+    };
     let result = if chain_already_processed {
         // v661 direct DML -> Vulkan post handoff has already executed the
         // requested regular chain range and advanced mpv's frame builtin.
-        // Do not run an empty FilterChain::process_range here: even an empty
-        // range advances the frame counter and would turn temporal shaders into
-        // an every-other-frame sequence.
+        // Display-Hz shaders are excluded from that shared-post route, so a
+        // replay-capable range always reaches the ordinary branch below.
         Ok(input)
+    } else if let Some(display_index) = display_replay_index {
+        if !chain_frame_tick {
+            // Refresh-cycle replay: `input` is the cached pre-boundary texture.
+            // Never advance mpv's normal frame counter on synthetic display
+            // refreshes; only neo_display_frame moves here.
+            s.chain.process_from_with_frame_tick(
+                gc,
+                input,
+                out_size,
+                display_index,
+                if stats { Some(&mut probe_fn) } else { None },
+                false,
+            )
+        } else if display_index > chain_start_index {
+            // New real/interpolated image: run the prefix exactly once, retain
+            // its output, then execute the Display-Hz suffix for this refresh.
+            match s.chain.process_range_with_frame_tick(
+                gc,
+                input,
+                out_size,
+                chain_start_index,
+                display_index,
+                if stats { Some(&mut probe_fn) } else { None },
+                true,
+            ) {
+                Ok(base) => {
+                    if let Some(old) = s.display_hz_base_tex.replace(base)
+                        && old.tex != base.tex
+                    {
+                        gc.recycle(old);
+                    }
+                    s.display_hz_start_index = Some(display_index);
+                    s.chain.process_from_with_frame_tick(
+                        gc,
+                        base,
+                        out_size,
+                        display_index,
+                        if stats { Some(&mut probe_fn) } else { None },
+                        false,
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            // The Display-Hz shader is the first stage of this processing
+            // range. Retain the incoming image directly as the replay base.
+            if let Some(old) = s.display_hz_base_tex.replace(input)
+                && old.tex != input.tex
+            {
+                gc.recycle(old);
+            }
+            s.display_hz_start_index = Some(display_index);
+            s.chain.process_from_with_frame_tick(
+                gc,
+                input,
+                out_size,
+                display_index,
+                if stats { Some(&mut probe_fn) } else { None },
+                true,
+            )
+        }
     } else {
-        s.chain.process_from(
+        s.chain.process_from_with_frame_tick(
             gc,
             input,
             out_size,
             chain_start_index,
             if stats { Some(&mut probe_fn) } else { None },
+            chain_frame_tick,
         )
     };
     s.last_chain_submit_ms = if chain_already_processed {
@@ -14975,6 +15551,21 @@ fn process_and_present_from_impl(
             let compute_elapsed = t0.elapsed();
             s.last_compute_ms = compute_elapsed.as_secs_f64() * 1000.0;
 
+            // A newly captured/ONNX-completed Beam frame must replace one
+            // refresh tick, not create an extra source-cadence present between
+            // two Beam ticks. Align real Beam updates to the same absolute
+            // display clock. Replay calls pass chain_frame_tick=false and have
+            // already cleared the ordinary pacer.
+            if chain_frame_tick
+                && s.chain.has_display_hz()
+                && s.display_hz_base_tex.is_some()
+                && beam_display_hz_index(&s.chain).is_some()
+            {
+                let now = Instant::now();
+                s.paced_present_deadline =
+                    (s.display_hz_next_present > now).then_some(s.display_hz_next_present);
+            }
+
             let pacer_wait_started = Instant::now();
             if let Some(deadline) = s.paced_present_deadline.take() {
                 wait_until_with_pump(overlay, deadline);
@@ -15149,14 +15740,17 @@ fn process_and_present_from_impl(
                         s.in_size.1
                     );
                 }
-                if chain_reprocess_commit && overlay.is_visible() {
-                    // WGC is change-driven, so a paused source may not deliver
-                    // another frame after a filter toggle. Force DWM to consume
-                    // this newly filtered SwapBuffers result now rather than
-                    // relying on a later mouse/hover repaint to make it visible.
+                if (chain_reprocess_commit || dlssnr_refresh_commit) && overlay.is_visible() {
+                    // WGC is change-driven, so a paused/static source may not
+                    // produce another compositor event after a semantic filter
+                    // edit. DLSSNR also completes Feature creation/options refresh
+                    // asynchronously. Flush both kinds of semantic refresh so the
+                    // newly filtered SwapBuffers result becomes visible immediately,
+                    // without requiring mouse movement over the captured window.
                     overlay.flush_compositor();
                     log::info!(
-                        "chain-reprocess-present-commit: action=dwm-flush filtered_frame_visible=true"
+                        "chain-reprocess-present-commit: reason={} action=dwm-flush filtered_frame_visible=true",
+                        if dlssnr_refresh_commit { "dlssnr-refresh" } else { "chain-change" }
                     );
                 }
                 s.present_cadence.record(present_time.instant);
@@ -15492,9 +16086,12 @@ fn process_and_present_from_impl(
             }
             let mut keep = vec![final_tex];
             keep.extend_from_slice(keep_extra);
+            keep_display_hz_base(s, &mut keep);
             gc.release_frame(&keep);
             s.last_tex = Some(final_tex);
             s.last_present = Instant::now();
+            let display_presented_at = s.last_present;
+            schedule_next_display_hz_present(s, display_presented_at);
             s.last_filter_retry_log = None;
             status.lock().unwrap().presented += 1;
             let elapsed_ms = present_time.instant.duration_since(t0).as_secs_f64() * 1000.0;
@@ -15527,7 +16124,9 @@ fn process_and_present_from_impl(
             let msg = format!("{e:#}");
             if crate::render::onnx_stage::onnx_cancel_requested() {
                 log::info!("filter-chain inference cancelled for Stop: {msg}");
-                gc.release_frame(keep_extra);
+                let mut keep = keep_extra.to_vec();
+                keep_display_hz_base(s, &mut keep);
+                gc.release_frame(&keep);
                 s.last_process_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 return;
             }
@@ -15550,6 +16149,7 @@ fn process_and_present_from_impl(
                 let _ = overlay.present(gc, last_good);
                 let mut keep = vec![last_good];
                 keep.extend_from_slice(keep_extra);
+                keep_display_hz_base(s, &mut keep);
                 gc.release_frame(&keep);
                 if s.last_filter_retry_log
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
@@ -15558,7 +16158,9 @@ fn process_and_present_from_impl(
                     s.last_filter_retry_log = Some(Instant::now());
                 }
             } else {
-                gc.release_frame(keep_extra);
+                let mut keep = keep_extra.to_vec();
+                keep_display_hz_base(s, &mut keep);
+                gc.release_frame(&keep);
                 if s.last_filter_retry_log
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(2))
                 {
@@ -15567,6 +16169,7 @@ fn process_and_present_from_impl(
                 }
             }
             s.last_process_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            schedule_next_display_hz_present(s, Instant::now());
             update_glsl_guard_after_processed(s, status);
         }
     }

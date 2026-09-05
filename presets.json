@@ -472,6 +472,33 @@
       }
     },
     {
+      "name": "RIFE Lite XS  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "enabled": true
+        }
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      },
+      "capture_resolution": {
+        "w": 1280,
+        "h": 720
+      }
+    },
+    {
       "name": "RIFE Lite S  FG",
       "chain": [
         {
@@ -502,6 +529,38 @@
       ]
     },
     {
+      "name": "RIFE Lite XS + FSRCNNX  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
+          "enabled": true
+        }
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      },
+      "capture_resolution": {
+        "w": 1280,
+        "h": 720
+      }
+    },
+    {
       "name": "RIFE Lite S + FSRCNNX  FG",
       "chain": [
         {
@@ -530,6 +589,51 @@
           "enabled": true
         }
       ]
+    },
+    {
+      "name": "RIFE Lite XS + Anime4K  [720p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Resize/Spline16_Neo.glsl",
+          "enabled": true,
+          "params": {
+            "RESIZE_SCALE": 0.75
+          }
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
+          "enabled": true
+        }
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      },
+      "capture_resolution": {
+        "w": 1280,
+        "h": 720
+      }
     },
     {
       "name": "RIFE Lite S + Anime4K  [720p]  FG",
@@ -598,6 +702,43 @@
           "enabled": true
         }
       ]
+    },
+    {
+      "name": "RIFE Lite XS + Anime4K  [1080p]  FG",
+      "chain": [
+        {
+          "kind": "onnx",
+          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
+          "enabled": true
+        },
+        {
+          "kind": "glsl",
+          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
+          "enabled": true
+        }
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      },
+      "capture_resolution": {
+        "w": 1280,
+        "h": 720
+      }
     },
     {
       "name": "RIFE Lite S + Anime4K  [1080p]  FG",

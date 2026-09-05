@@ -1053,15 +1053,21 @@ pub fn take_panel_stop_action() -> bool {
 pub fn set_main_control_surface(hwnd: isize, rect: Option<(i32, i32, i32, i32)>, mode: u32) {
     if mode == MAIN_CONTROL_DISABLED || hwnd == 0 {
         MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        MAIN_DIRECT_ACTIVE.store(false, Ordering::Release);
+        MAIN_ACTIONS.store(0, Ordering::Release);
         ACTIVE_MAIN_GUI_HWND.store(hwnd, Ordering::Release);
         return;
     }
     let Some((x, y, w, h)) = rect else {
         MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        MAIN_DIRECT_ACTIVE.store(false, Ordering::Release);
+        MAIN_ACTIONS.store(0, Ordering::Release);
         return;
     };
     if w <= 0 || h <= 0 {
         MAIN_CONTROL_MODE.store(MAIN_CONTROL_DISABLED, Ordering::Release);
+        MAIN_DIRECT_ACTIVE.store(false, Ordering::Release);
+        MAIN_ACTIONS.store(0, Ordering::Release);
         return;
     }
     // A few physical pixels cover rounding between egui points, DPI scaling
@@ -8327,6 +8333,21 @@ pub fn content_rect(overlay: Rect, frame_w: i32, frame_h: i32) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabling_main_control_clears_queued_and_pressed_state() {
+        MAIN_ACTIONS.store(MAIN_ACTION_STOP, Ordering::Release);
+        MAIN_DIRECT_ACTIVE.store(true, Ordering::Release);
+
+        set_main_control_surface(0x1234, None, MAIN_CONTROL_DISABLED);
+
+        assert_eq!(take_main_actions(), 0);
+        assert!(!main_control_direct_pressed());
+        assert_eq!(
+            MAIN_CONTROL_MODE.load(Ordering::Acquire),
+            MAIN_CONTROL_DISABLED
+        );
+    }
 
     #[test]
     fn letterbox_content() {

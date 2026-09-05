@@ -1638,6 +1638,271 @@ impl GlContext {
         Ok(texture)
     }
 
+    /// Copy a 2D RGBA U8/F16 texture into persistent storage of the same
+    /// precision without a CPU readback. Slang pass feedback/history uses this
+    /// so the external preset's temporal resources survive `release_frame`.
+    pub fn copy_to_persistent_rgba(&mut self, key: &str, src: GpuTex) -> Result<GpuTex, String> {
+        if src.comps() != 4 || !matches!(src.key.dtype, Dtype::U8 | Dtype::F16) {
+            return Err(format!(
+                "persistent RGBA copy requires 4-channel U8/F16 input, got comps={} dtype={:?}",
+                src.comps(),
+                src.key.dtype
+            ));
+        }
+        let recreate = self.persist.get(key).is_some_and(|existing| {
+            existing.w() != src.w()
+                || existing.h() != src.h()
+                || existing.comps() != 4
+                || existing.key.dtype != src.key.dtype
+        });
+        if recreate {
+            self.remove_persistent_texture(key);
+        }
+        let dst = if let Some(existing) = self.persist.get(key).copied() {
+            existing
+        } else {
+            let texture = self.make_persistent_empty_rgba(key, src.w(), src.h(), src.key.dtype)?;
+            texture
+        };
+        const COPY_FRAG: &str = "#version 330\nin vec2 v_uv; out vec4 frag;\nuniform sampler2D tex;\nvoid main(){ frag = texture(tex, v_uv); }\n";
+        let prog = self.program_named("persistent-copy-rgba-generic", COPY_FRAG)?;
+        self.bind_target(dst);
+        let gl = self.gl.clone();
+        unsafe {
+            gl.use_program(Some(prog));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(src.tex));
+            if let Some(loc) = gl.get_uniform_location(prog, "tex") {
+                gl.uniform_1_i32(Some(&loc), 0);
+            }
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        }
+        self.unbind_target();
+        Ok(dst)
+    }
+
+    fn make_persistent_empty_rgba(
+        &mut self,
+        key: &str,
+        w: i32,
+        h: i32,
+        dtype: Dtype,
+    ) -> Result<GpuTex, String> {
+        let gl = &self.gl;
+        let texture = unsafe {
+            let tex = gl.create_texture().map_err(|e| e.to_string())?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            let (internal, format, ty) = formats(4, dtype);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                internal,
+                w,
+                h,
+                0,
+                format,
+                ty,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_S,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_WRAP_T,
+                glow::CLAMP_TO_EDGE as i32,
+            );
+            GpuTex {
+                tex,
+                key: TexKey {
+                    w,
+                    h,
+                    d: 1,
+                    comps: 4,
+                    dtype,
+                },
+                offset_x: 0.0,
+                offset_y: 0.0,
+            }
+        };
+        self.persist.insert(key.to_string(), texture);
+        Ok(texture)
+    }
+
+    /// Copy any 2D texture into a persistent RGBA8 texture without a CPU
+    /// readback. v684 NeoAccel uses this to retain an exact ONNX frame and its
+    /// matching non-AI baseline across the following source frame.
+    pub fn copy_to_persistent_rgba8(&mut self, key: &str, src: GpuTex) -> Result<GpuTex, String> {
+        let recreate = self.persist.get(key).is_some_and(|existing| {
+            existing.w() != src.w()
+                || existing.h() != src.h()
+                || existing.comps() != 4
+                || existing.key.dtype != Dtype::U8
+        });
+        if recreate {
+            self.remove_persistent_texture(key);
+        }
+        let dst = if let Some(existing) = self.persist.get(key).copied() {
+            existing
+        } else {
+            let gl = &self.gl;
+            let texture = unsafe {
+                let tex = gl.create_texture().map_err(|e| e.to_string())?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    src.w(),
+                    src.h(),
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_S,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_WRAP_T,
+                    glow::CLAMP_TO_EDGE as i32,
+                );
+                GpuTex {
+                    tex,
+                    key: TexKey {
+                        w: src.w(),
+                        h: src.h(),
+                        d: 1,
+                        comps: 4,
+                        dtype: Dtype::U8,
+                    },
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                }
+            };
+            self.persist.insert(key.to_string(), texture);
+            texture
+        };
+
+        const COPY_FRAG: &str = "#version 330\nin vec2 v_uv; out vec4 frag;\nuniform sampler2D tex;\nvoid main(){ frag = texture(tex, v_uv); }\n";
+        let prog = self.program_named("neoaccel-temporal-copy-rgba8", COPY_FRAG)?;
+        self.bind_target(dst);
+        let gl = self.gl.clone();
+        unsafe {
+            gl.use_program(Some(prog));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(src.tex));
+            if let Some(loc) = gl.get_uniform_location(prog, "tex") {
+                gl.uniform_1_i32(Some(&loc), 0);
+            }
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        }
+        self.unbind_target();
+        Ok(dst)
+    }
+
+    /// Compose the current non-AI upscale with motion-warped detail from the
+    /// previous exact ONNX output. `flow` is a coarse current->previous field
+    /// encoded by NeoAccel. Low-confidence blocks receive no historical detail.
+    pub fn neoaccel_temporal_detail_compose(
+        &mut self,
+        current_base: GpuTex,
+        previous_ai: GpuTex,
+        previous_base: GpuTex,
+        flow: GpuTex,
+        input_w: i32,
+        input_h: i32,
+    ) -> Result<GpuTex, String> {
+        if current_base.w() != previous_ai.w()
+            || current_base.h() != previous_ai.h()
+            || current_base.w() != previous_base.w()
+            || current_base.h() != previous_base.h()
+            || input_w <= 0
+            || input_h <= 0
+        {
+            return Err("NeoAccel temporal texture geometry mismatch".into());
+        }
+        const FRAG: &str = r#"#version 330
+in vec2 v_uv; out vec4 frag;
+uniform sampler2D current_base;
+uniform sampler2D previous_ai;
+uniform sampler2D previous_base;
+uniform sampler2D flow_tex;
+uniform vec2 inv_input_size;
+void main(){
+    vec4 flow_sample = texture(flow_tex, v_uv);
+    vec2 motion_px = floor(flow_sample.rg * 255.0 + 0.5) - vec2(128.0);
+    float confidence = smoothstep(0.56, 0.86, flow_sample.b);
+    vec2 prev_uv = clamp(v_uv + motion_px * inv_input_size, vec2(0.0), vec2(1.0));
+    vec3 base = texture(current_base, v_uv).rgb;
+    vec3 detail = texture(previous_ai, prev_uv).rgb - texture(previous_base, prev_uv).rgb;
+    // Hard cap only pathological residuals. Normal AI edge/detail energy passes
+    // unchanged; the confidence gate handles occlusion/content changes.
+    detail = clamp(detail, vec3(-0.25), vec3(0.25));
+    frag = vec4(clamp(base + detail * confidence, 0.0, 1.0), 1.0);
+}
+"#;
+        let prog = self.program_named("neoaccel-temporal-detail-v686", FRAG)?;
+        let out = self.make_tex(current_base.w(), current_base.h(), 4, Dtype::F16);
+        self.bind_target(out);
+        let gl = self.gl.clone();
+        unsafe {
+            gl.use_program(Some(prog));
+            for (unit, name, tex) in [
+                (0u32, "current_base", current_base),
+                (1u32, "previous_ai", previous_ai),
+                (2u32, "previous_base", previous_base),
+                (3u32, "flow_tex", flow),
+            ] {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex.tex));
+                if let Some(loc) = gl.get_uniform_location(prog, name) {
+                    gl.uniform_1_i32(Some(&loc), unit as i32);
+                }
+            }
+            if let Some(loc) = gl.get_uniform_location(prog, "inv_input_size") {
+                gl.uniform_2_f32(Some(&loc), 1.0 / input_w as f32, 1.0 / input_h as f32);
+            }
+            gl.bind_vertex_array(Some(self.quad_vao));
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            gl.bind_vertex_array(None);
+            gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        }
+        self.unbind_target();
+        Ok(out)
+    }
+
     pub fn persistent_texture_by_key(&self, key: &str) -> Option<GpuTex> {
         self.persist.get(key).copied()
     }
@@ -1835,6 +2100,67 @@ impl GlContext {
 
     pub fn cached_program(&self, key: &str) -> Option<glow::Program> {
         self.prog_cache.get(key).copied()
+    }
+
+    /// Compile (or fetch cached) a program with caller-supplied vertex and
+    /// fragment stages. Used by the clean-room Libretro Slang preset runner;
+    /// ordinary mpv GLSL continues to use `program_named` unchanged.
+    pub fn program_pair_named(
+        &mut self,
+        key: &str,
+        vertex: &str,
+        fragment: &str,
+    ) -> Result<glow::Program, String> {
+        if let Some(p) = self.prog_cache.get(key) {
+            return Ok(*p);
+        }
+        let gl = &self.gl;
+        unsafe {
+            let compile = |ty: u32, src: &str, label: &str| -> Result<glow::Shader, String> {
+                let sh = gl.create_shader(ty).map_err(|e| e.to_string())?;
+                gl.shader_source(sh, src);
+                gl.compile_shader(sh);
+                if !gl.get_shader_compile_status(sh) {
+                    let info = gl.get_shader_info_log(sh);
+                    gl.delete_shader(sh);
+                    return Err(format!("{label} shader: {info}"));
+                }
+                Ok(sh)
+            };
+            let vs = compile(glow::VERTEX_SHADER, vertex, "vertex")?;
+            let fs = match compile(glow::FRAGMENT_SHADER, fragment, "fragment") {
+                Ok(shader) => shader,
+                Err(error) => {
+                    gl.delete_shader(vs);
+                    return Err(error);
+                }
+            };
+            let prog = gl.create_program().map_err(|e| e.to_string())?;
+            gl.attach_shader(prog, vs);
+            gl.attach_shader(prog, fs);
+            gl.link_program(prog);
+            gl.delete_shader(vs);
+            gl.delete_shader(fs);
+            if !gl.get_program_link_status(prog) {
+                let info = gl.get_program_info_log(prog);
+                gl.delete_program(prog);
+                return Err(format!("link: {info}"));
+            }
+            self.prog_cache.insert(key.to_string(), prog);
+            Ok(prog)
+        }
+    }
+
+    /// Draw Neo's shared fullscreen quad with the currently active program and
+    /// framebuffer. This keeps Slang passes on the same VAO convention as the
+    /// existing mpv GLSL renderer (location 0 = Position, 1 = TexCoord).
+    pub fn draw_fullscreen(&self) {
+        unsafe {
+            self.gl.bind_vertex_array(Some(self.quad_vao));
+            self.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            self.gl.bind_vertex_array(None);
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        }
     }
 
     pub fn program_named(&mut self, key: &str, frag: &str) -> Result<glow::Program, String> {

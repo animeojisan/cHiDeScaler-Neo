@@ -169,6 +169,14 @@ pub struct HotkeyEvent {
     pub binding: String,
     pub received_at: Instant,
     pub handled_directly: bool,
+    pub background_gui: BackgroundGui,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundGui {
+    Foreground,
+    Minimized,
+    Hidden,
 }
 
 pub struct HotkeyThread {
@@ -183,6 +191,7 @@ impl HotkeyThread {
     pub fn start(
         keys: Vec<(i32, String)>,
         minimized_stop: crate::engine::EngineStopHandle,
+        wake_gui: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         let (tx, rx): (Sender<HotkeyEvent>, Receiver<HotkeyEvent>) = channel();
         let (id_tx, id_rx) = channel();
@@ -220,14 +229,27 @@ impl HotkeyThread {
                         // v578 path. Only a minimized GUI bypasses the egui
                         // queue, exactly as before the emergency-stop rewrite.
                         let gui_hwnd = super::win32::main_gui_hwnd();
+                        let background_gui = if gui_hwnd != 0
+                            && !super::win32::is_window_visible(gui_hwnd)
+                        {
+                            BackgroundGui::Hidden
+                        } else if gui_hwnd != 0 && super::win32::is_minimized(gui_hwnd) {
+                            BackgroundGui::Minimized
+                        } else {
+                            BackgroundGui::Foreground
+                        };
                         let handled_directly = id == HK_TOGGLE
-                            && gui_hwnd != 0
-                            && super::win32::is_minimized(gui_hwnd);
+                            && background_gui != BackgroundGui::Foreground
+                            && minimized_stop.is_active();
                         if handled_directly {
                             log::info!(
                                 "hotkey-minimized-direct-dispatch: id={id} binding='{binding}' action=stop"
                             );
                             minimized_stop.request_stop("minimized-global-hotkey");
+                        } else if id == HK_TOGGLE
+                            && background_gui != BackgroundGui::Foreground
+                        {
+                            let _ = super::win32::wake_background_gui(gui_hwnd);
                         }
                         if id == HK_QUIT {
                             // The janitor only starts its timeout clock here. It
@@ -244,7 +266,9 @@ impl HotkeyThread {
                             binding,
                             received_at,
                             handled_directly,
+                            background_gui,
                         });
+                        wake_gui();
                     }
                     DispatchMessageW(&msg);
                 }

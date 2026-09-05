@@ -3567,6 +3567,56 @@ pub fn activate_window(hwnd: isize) {
     }
 }
 
+pub fn hide_own_window(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe { ShowWindow(HWND(hwnd as *mut _), SW_HIDE).as_bool() }
+}
+
+pub fn restore_own_window(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe {
+        let window = HWND(hwnd as *mut _);
+        let _ = ShowWindow(
+            window,
+            if IsIconic(window).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            },
+        );
+        let _ = SetForegroundWindow(window);
+    }
+    true
+}
+
+pub fn minimize_own_window(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe { ShowWindow(HWND(hwnd as *mut _), SW_MINIMIZE).as_bool() }
+}
+
+/// Let eframe drain a global-hotkey command while its root window is hidden or
+/// minimized, without presenting that GUI to the user. The caller restores the
+/// previous background state immediately after dispatch on the GUI thread.
+pub fn wake_background_gui(hwnd: isize) -> bool {
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe {
+        let window = HWND(hwnd as *mut _);
+        let _ = set_window_cloaked(hwnd, true);
+        let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+        let _ = RedrawWindow(Some(window), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+        let _ = PostMessageW(Some(window), WM_PAINT, WPARAM(0), LPARAM(0));
+    }
+    true
+}
+
 pub fn window_title(hwnd: isize) -> String {
     unsafe {
         let h = HWND(hwnd as *mut _);

@@ -22,8 +22,12 @@ fn default_true() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StageKind {
+    Dlssnr,
     Glsl,
     Onnx,
+    /// External Libretro Slang preset (.slangp). The preset and shader files
+    /// are user-supplied and are not bundled into Neo.
+    Slangp,
     /// built-in GPU filter (e.g. NeoFlow frame interpolation)
     Flow,
 }
@@ -262,13 +266,20 @@ pub struct Settings {
     /// perceptual duplicate. Presentation cadence is preserved.
     #[serde(default)]
     pub duplicate_frame_reduction: bool,
-    /// Reuse exact previous ONNX output and infer only safely bounded changed
-    /// regions for supported local CNN models.
-    #[serde(default = "default_true_s")]
+    /// Dormant compatibility field for the frozen NeoAccel experiments. v692
+    /// forces this false at startup and does not expose it in the GUI. Retained
+    /// only so older settings.json files continue to deserialize cleanly.
+    #[serde(default)]
     pub neo_accel: bool,
     /// keep the GUI window always on top (user option, default off)
     #[serde(default)]
     pub gui_topmost: bool,
+    /// Start with the main GUI hidden in the Windows notification area.
+    #[serde(default)]
+    pub start_in_tray: bool,
+    /// Hide the main GUI in the notification area when it is minimized.
+    #[serde(default)]
+    pub minimize_to_tray: bool,
     /// show the floating control panel during capture (default on)
     #[serde(default = "default_true_s")]
     pub panel_show: bool,
@@ -413,6 +424,8 @@ impl Default for Settings {
             duplicate_frame_reduction: false,
             neo_accel: false,
             gui_topmost: false,
+            start_in_tray: false,
+            minimize_to_tray: false,
             panel_show: true,
             log_on: false,
             hide_source: true,
@@ -442,8 +455,8 @@ impl Default for Settings {
     }
 }
 
-/// Resolve a spec path against the app dir; searches shaders/ and models/
-/// by basename as a fallback (robust against moved preset files).
+/// Resolve a spec path against the app dir; searches shaders/, models/, and
+/// slangp/ by basename as a fallback (robust against moved preset files).
 pub fn resolve_path(app_dir: &std::path::Path, p: &str) -> std::path::PathBuf {
     let pb = std::path::PathBuf::from(p);
     if pb.is_absolute() && pb.exists() {
@@ -454,7 +467,7 @@ pub fn resolve_path(app_dir: &std::path::Path, p: &str) -> std::path::PathBuf {
         return direct;
     }
     if let Some(base) = pb.file_name() {
-        for sub in ["shaders", "models", "."] {
+        for sub in ["shaders", "models", "slangp", "."] {
             let c = app_dir.join(sub).join(base);
             if c.exists() {
                 return c;
@@ -463,7 +476,7 @@ pub fn resolve_path(app_dir: &std::path::Path, p: &str) -> std::path::PathBuf {
         // categorized default layout (shaders/CRT/…, models/RIFE/…): find by
         // basename recursively so presets saved with old flat paths keep
         // working after the folder reorganization
-        for sub in ["shaders", "models"] {
+        for sub in ["shaders", "models", "slangp"] {
             if let Some(found) = find_by_basename(&app_dir.join(sub), base, 3) {
                 return found;
             }
@@ -526,6 +539,21 @@ mod tests {
         assert!(!Settings::default().log_on);
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(!parsed.log_on);
+    }
+
+    #[test]
+    fn task_tray_options_are_opt_in_and_round_trip() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.start_in_tray);
+        assert!(!legacy.minimize_to_tray);
+
+        let mut settings = Settings::default();
+        settings.start_in_tray = true;
+        settings.minimize_to_tray = true;
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(parsed.start_in_tray);
+        assert!(parsed.minimize_to_tray);
     }
 
     #[test]

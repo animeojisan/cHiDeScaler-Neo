@@ -8,6 +8,7 @@ use super::gl::{Dtype, GlContext, GpuTex};
 use super::glsl_engine::GlslEngine;
 use super::mpv::UserShader;
 use super::onnx_stage::{OnnxProvider, OnnxStage, PreparedDmlSharedOutput};
+use super::slangp::SlangStage;
 use super::{vulkan_multipass, vulkan_onepass};
 use crate::core::config::{OnnxBackendPreference, StageKind, StageSpec, resolve_path};
 use anyhow::{Context, Result, anyhow};
@@ -77,6 +78,9 @@ fn upload_vulkan_bridge_rgba8(
 }
 
 pub enum Stage {
+    Dlssnr {
+        stage: super::dlssnr_stage::DlssNrStage,
+    },
     Glsl {
         name: String,
         key: String,
@@ -90,6 +94,13 @@ pub enum Stage {
         // mutex on every render tick serialized GL presentation behind the
         // DirectML RIFE worker and also delayed live chain edits.
         is_interp: bool,
+    },
+    /// One externally supplied Libretro Slang preset. Its internal passes are
+    /// deliberately kept behind one chain stage/UI item.
+    Slangp {
+        name: String,
+        key: String,
+        stage: SlangStage,
     },
     /// built-in GPU frame interpolation (handled by the engine)
     Flow {
@@ -114,15 +125,19 @@ pub enum InterpHandle {
 impl Stage {
     pub fn name(&self) -> &str {
         match self {
+            Stage::Dlssnr { .. } => "DLSS Neural Rendering [D3D12]",
             Stage::Glsl { name, .. } => name,
             Stage::Onnx { name, .. } => name,
+            Stage::Slangp { name, .. } => name,
             Stage::Flow { name, .. } => name,
         }
     }
     pub fn kind(&self) -> StageKind {
         match self {
+            Stage::Dlssnr { .. } => StageKind::Dlssnr,
             Stage::Glsl { .. } => StageKind::Glsl,
             Stage::Onnx { .. } => StageKind::Onnx,
+            Stage::Slangp { .. } => StageKind::Slangp,
             Stage::Flow { .. } => StageKind::Flow,
         }
     }
@@ -130,7 +145,7 @@ impl Stage {
         match self {
             Stage::Flow { .. } => true,
             Stage::Onnx { is_interp, .. } => *is_interp,
-            Stage::Glsl { .. } => false,
+            Stage::Glsl { .. } | Stage::Slangp { .. } | Stage::Dlssnr { .. } => false,
         }
     }
 
@@ -140,6 +155,7 @@ impl Stage {
                 let provider = match stage.lock().unwrap().provider {
                     OnnxProvider::TensorRT => "TensorRT",
                     OnnxProvider::DirectML => "DirectML",
+                    OnnxProvider::MigraphX => "MIGraphX",
                     OnnxProvider::Cuda => "CUDA",
                 };
                 format!("{name} [{provider}]")
@@ -155,6 +171,7 @@ struct OnnxCacheKey {
     preference: OnnxBackendPreference,
     dml_adapter: Option<i32>,
     trt_device: Option<i32>,
+    neo_accel: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -274,6 +291,12 @@ impl StageFactory {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| spec.path.clone());
         match spec.kind {
+            StageKind::Dlssnr => Ok(Stage::Dlssnr {
+                stage: super::dlssnr_stage::DlssNrStage::new(
+                    self.base_dir.clone(),
+                    crate::core::dlssnr::options(spec),
+                ),
+            }),
             StageKind::Flow => {
                 if spec.path.starts_with("builtin:") && !BUILTIN_NEOFLOW_ENABLED {
                     anyhow::bail!("built-in NeoFlow is temporarily disabled");
@@ -312,13 +335,14 @@ impl StageFactory {
                         let shader =
                             UserShader::load(&key).map_err(|e| anyhow!("load {key}: {e}"))?;
                         log::info!(
-                            "glsl-load: name={} passes={} rgb={} chroma_emulation={} compute={} post={}",
+                            "glsl-load: name={} passes={} rgb={} chroma_emulation={} compute={} post={} display_hz={}",
                             shader.name(),
                             shader.passes.len(),
                             shader.is_rgb,
                             shader.uses_chroma,
                             shader.is_compute,
-                            shader.is_post
+                            shader.is_post,
+                            shader.display_hz
                         );
                         let s = Rc::new(shader);
                         self.shaders.insert(key.clone(), s.clone());
@@ -334,9 +358,26 @@ impl StageFactory {
                             param.value = value.clamp(param.min, param.max);
                         }
                     }
+                    if crate::logging::diagnostics_enabled() {
+                        log::debug!(
+                            "glsl-params-applied: name={} params={:?}",
+                            configured.name(),
+                            configured
+                                .params
+                                .iter()
+                                .map(|param| (param.name.as_str(), param.value))
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     Rc::new(configured)
                 };
                 Ok(Stage::Glsl { name, key, shader })
+            }
+            StageKind::Slangp => {
+                let stage = SlangStage::load(&path, &spec.params)
+                    .with_context(|| format!("load external SLANGP {}", path.display()))?;
+                let name = stage.display_name().to_string();
+                Ok(Stage::Slangp { name, key, stage })
             }
             StageKind::Onnx => {
                 let cache_key = OnnxCacheKey {
@@ -344,6 +385,11 @@ impl StageFactory {
                     preference: self.onnx_preference,
                     dml_adapter: self.gpu_adapter,
                     trt_device: self.trt_device_id,
+                    neo_accel: super::onnx_accel::neoaccel_enabled()
+                        && super::onnx_accel::analyze_local_image_model(&path)
+                            .ok()
+                            .flatten()
+                            .is_some(),
                 };
                 let (stage, is_interp) = match self.onnx.get(&cache_key) {
                     Some((s, is_interp)) => {
@@ -479,7 +525,7 @@ impl StageFactory {
                     poisoned.into_inner()
                 })
                 .provider;
-            provider != OnnxProvider::DirectML
+            !matches!(provider, OnnxProvider::DirectML | OnnxProvider::MigraphX)
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
@@ -572,6 +618,7 @@ fn vulkan_batch_shader_isolated(shader: &UserShader) -> bool {
         || shader.uses_chroma
         || shader.is_compute
         || shader.is_post
+        || shader.display_hz
         || shader.textures.iter().any(|texture| texture.storage)
     {
         return false;
@@ -664,6 +711,7 @@ fn build_vulkan_resident_batch(
         uses_chroma: false,
         is_compute: false,
         is_post: false,
+        display_hz: false,
         params,
         textures,
     };
@@ -706,6 +754,7 @@ fn build_vulkan_resident_batches(stages: &[Stage]) -> Vec<VulkanResidentBatch> {
 
 pub struct FilterChain {
     pub stages: Vec<Stage>,
+    dlssnr_index: Option<usize>,
     neodeint_bypass: bool,
     dml_temporal_limit_log_keys: HashSet<(usize, i32, i32, i32, i32)>,
     vulkan_resident_batches: Vec<VulkanResidentBatch>,
@@ -752,6 +801,7 @@ impl FilterChain {
     pub fn empty() -> Self {
         Self {
             stages: Vec::new(),
+            dlssnr_index: None,
             neodeint_bypass: false,
             dml_temporal_limit_log_keys: HashSet::new(),
             vulkan_resident_batches: Vec::new(),
@@ -766,6 +816,9 @@ impl FilterChain {
     pub fn prepare_gpu_transition(&mut self, gc: &mut GlContext) {
         gc.finish();
         for stage in &mut self.stages {
+            if let Stage::Dlssnr { stage } = stage {
+                stage.reset();
+            }
             if let Stage::Onnx { stage, .. } = stage {
                 let mut stage = stage.lock().unwrap_or_else(|poisoned| {
                     log::error!("onnx-stage-lock-poisoned: action=recover-for-gpu-retirement");
@@ -775,6 +828,7 @@ impl FilterChain {
                 stage.retire_tensorrt_temporal_gpu_bridge(gc);
                 stage.retire_dml_temporal_gpu_bridge(gc);
                 stage.retire_interp_gpu_bridges(gc);
+                stage.retire_neoaccel_textures(gc);
                 stage.retire_direct_output(gc);
             }
         }
@@ -835,6 +889,9 @@ impl FilterChain {
 
     pub fn reset_backend_runtime_state(&mut self) {
         for stage in &mut self.stages {
+            if let Stage::Dlssnr { stage } = stage {
+                stage.reset();
+            }
             if let Stage::Onnx { stage, .. } = stage {
                 stage.lock().unwrap().reset_backend_runtime_state();
             }
@@ -878,6 +935,7 @@ impl FilterChain {
                     let provider = match stage.lock().unwrap().provider {
                         OnnxProvider::TensorRT => "TensorRT",
                         OnnxProvider::DirectML => "DirectML",
+                        OnnxProvider::MigraphX => "MIGraphX",
                         OnnxProvider::Cuda => "CUDA",
                     };
                     format!("{name} [{provider}]")
@@ -899,6 +957,26 @@ impl FilterChain {
         self.stages.iter().any(Stage::is_interp)
     }
 
+    pub fn dlssnr_needs_refresh(&self) -> bool {
+        self.dlssnr_index
+            .and_then(|i| self.stages.get(i))
+            .is_some_and(|s| matches!(s, Stage::Dlssnr { stage } if stage.needs_refresh()))
+    }
+
+    pub fn set_dlssnr_options(
+        &mut self,
+        values: crate::core::dlssnr::DlssNrOptions,
+    ) -> bool {
+        if let Some(Stage::Dlssnr { stage }) =
+            self.dlssnr_index.and_then(|i| self.stages.get_mut(i))
+        {
+            stage.set_options(values);
+            true
+        } else {
+            false
+        }
+    }
+
     /// True when starting this chain can execute any ONNX inference, including
     /// interpolation stages that are driven by the engine outside process_range.
     pub fn has_onnx(&self) -> bool {
@@ -911,6 +989,18 @@ impl FilterChain {
         self.stages
             .iter()
             .any(|stage| matches!(stage, Stage::Glsl { .. }))
+    }
+
+    /// First shader explicitly requesting physical display-cadence replay.
+    /// The GUI order is authoritative; Neo never moves this stage.
+    pub fn display_hz_index(&self) -> Option<usize> {
+        self.stages
+            .iter()
+            .position(|stage| matches!(stage, Stage::Glsl { shader, .. } if shader.display_hz))
+    }
+
+    pub fn has_display_hz(&self) -> bool {
+        self.display_hz_index().is_some()
     }
 
     pub fn has_neodeint(&self) -> bool {
@@ -965,7 +1055,7 @@ impl FilterChain {
         self.stages
             .iter()
             .skip(start_index)
-            .any(|stage| matches!(stage, Stage::Glsl { .. }))
+            .any(|stage| matches!(stage, Stage::Glsl { .. } | Stage::Slangp { .. }))
     }
 
     pub fn interp_provider(&self) -> Option<OnnxProvider> {
@@ -1110,7 +1200,7 @@ impl FilterChain {
             match stage.provider {
                 OnnxProvider::TensorRT => usage.tensorrt += 1,
                 OnnxProvider::Cuda => usage.cuda += 1,
-                OnnxProvider::DirectML => usage.directml += 1,
+                OnnxProvider::DirectML | OnnxProvider::MigraphX => usage.directml += 1,
             }
             if stage.fallback_reason.is_some() {
                 usage.directml_fallback += 1;
@@ -1147,7 +1237,9 @@ impl FilterChain {
                         stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?
                     }
                     Stage::Flow { .. } => (pre.w(), pre.h(), rgb),
-                    Stage::Glsl { .. } => unreachable!(),
+                    Stage::Glsl { .. } | Stage::Slangp { .. } | Stage::Dlssnr { .. } => {
+                        unreachable!()
+                    }
                 };
                 anyhow::ensure!(
                     iw > 0 && ih > 0 && interpolated.len() == (iw as usize) * (ih as usize) * 3,
@@ -1216,6 +1308,22 @@ impl FilterChain {
                 Err(e) => errors.push(format!("{}: {e:#}", spec.path)),
             }
         }
+        // One NR evaluation per real endpoint, never per generated frame.
+        // Preserve the relative order of all existing stages.
+        if let Some(index) = stages
+            .iter()
+            .position(|s| matches!(s, Stage::Dlssnr { .. }))
+        {
+            let nr = stages.remove(index);
+            stages.retain(|s| !matches!(s, Stage::Dlssnr { .. }));
+            let position = stages
+                .iter()
+                .position(|s| {
+                    s.is_interp() || matches!(s, Stage::Glsl { shader, .. } if shader.display_hz)
+                })
+                .unwrap_or(stages.len());
+            stages.insert(position, nr);
+        }
         factory.prune_onnx_to(&stages);
         // Fail safe on chain creation. A static progressive source can be
         // reprocessed immediately after a GUI toggle, before the engine has
@@ -1227,6 +1335,9 @@ impl FilterChain {
         let vulkan_resident_batches = build_vulkan_resident_batches(&stages);
         (
             Self {
+                dlssnr_index: stages
+                    .iter()
+                    .position(|s| matches!(s, Stage::Dlssnr { .. })),
                 stages,
                 neodeint_bypass,
                 dml_temporal_limit_log_keys: HashSet::new(),
@@ -1379,6 +1490,7 @@ impl FilterChain {
         let metrics_name = match stage.provider {
             OnnxProvider::TensorRT => format!("{name} [TensorRT]"),
             OnnxProvider::DirectML => format!("{name} [DirectML]"),
+            OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
             OnnxProvider::Cuda => format!("{name} [CUDA]"),
         };
         // Let the ordinary GPU chain own over-limit DirectML temporal input so
@@ -1389,7 +1501,14 @@ impl FilterChain {
         }
         stage.prepare_tensorrt_input_shape(w, h);
         super::onnx_stage::mark_tensorrt_model_started(&stage.name);
-        let tex = if stage.should_try_tensorrt_gpu_texture(w, h) {
+        // v687: this compatibility hook is intentionally a no-op. The rejected
+        // temporal-reuse experiment no longer synthesizes frames; NeoAccel now
+        // changes only TensorRT engine precision at session-build time.
+        let tex = if let Some((_ow, _oh, texture)) =
+            stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
+        {
+            texture
+        } else if stage.should_try_tensorrt_gpu_texture(w, h) {
             let source = gc.upload_rgba8(w, h, rgba);
             if let Some(texture) = stage.process_gpu_texture(gc, source)? {
                 texture
@@ -1397,10 +1516,6 @@ impl FilterChain {
                 let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
                 gc.upload_rgba8(ow, oh, &out)
             }
-        } else if let Some((_ow, _oh, texture)) =
-            stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
-        {
-            texture
         } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba) {
             texture
         } else {
@@ -1567,8 +1682,28 @@ impl FilterChain {
         start_index: usize,
         probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
     ) -> Result<GpuTex> {
+        self.process_from_with_frame_tick(gc, input, out_size, start_index, probe, true)
+    }
+
+    pub fn process_from_with_frame_tick(
+        &mut self,
+        gc: &mut GlContext,
+        input: GpuTex,
+        out_size: (i32, i32),
+        start_index: usize,
+        probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+        advance_frame: bool,
+    ) -> Result<GpuTex> {
         let end_index = self.stages.len();
-        self.process_range(gc, input, out_size, start_index, end_index, probe)
+        self.process_range_with_frame_tick(
+            gc,
+            input,
+            out_size,
+            start_index,
+            end_index,
+            probe,
+            advance_frame,
+        )
     }
 
     pub(crate) fn can_process_range_from_dml_shared(
@@ -1604,6 +1739,7 @@ impl FilterChain {
             .all(|stage| match stage {
                 Stage::Glsl { shader, .. } => {
                     !shader.is_post
+                        && !shader.display_hz
                         && shader.name() != "NeoDeint.glsl"
                         && vulkan_multipass::production_shader_admitted(shader)
                 }
@@ -1833,7 +1969,20 @@ impl FilterChain {
         out_size: (i32, i32),
         start_index: usize,
         end_index: usize,
+        probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+    ) -> Result<GpuTex> {
+        self.process_range_with_frame_tick(gc, input, out_size, start_index, end_index, probe, true)
+    }
+
+    pub fn process_range_with_frame_tick(
+        &mut self,
+        gc: &mut GlContext,
+        input: GpuTex,
+        out_size: (i32, i32),
+        start_index: usize,
+        end_index: usize,
         mut probe: Option<&mut dyn FnMut(&str, StageKind, f64)>,
+        advance_frame: bool,
     ) -> Result<GpuTex> {
         let mut cur = input;
         // Use stable per-chain labels. Metrics previously used only the file
@@ -1850,13 +1999,30 @@ impl FilterChain {
         // not insert glFinish or otherwise disturb the measured frame rate.
         if let Some(p) = probe.as_deref_mut() {
             for (label, gpu_ms) in gc.poll_gpu_timers() {
-                p(&label, StageKind::Glsl, gpu_ms);
+                let kind = metric_labels
+                    .iter()
+                    .position(|candidate| candidate == &label)
+                    .and_then(|index| self.stages.get(index))
+                    .map(Stage::kind)
+                    .unwrap_or(StageKind::Glsl);
+                p(&label, kind, gpu_ms);
             }
         }
         // mpv `frame` builtin: one tick per processed frame (interpolated
         // in-betweens each count as a frame, like mpv's own interpolation)
-        crate::render::glsl_engine::advance_frame();
+        if advance_frame {
+            crate::render::glsl_engine::advance_frame();
+        }
         let range_end = end_index.min(self.stages.len());
+        // Stability rule for refresh-cycle shaders: interpolation is driven by
+        // the engine outside this ordinary per-frame loop. A Display-Hz shader
+        // placed before RIFE/DRBA would modulate the endpoints that the
+        // interpolator consumes, which is both visually misleading and a poor
+        // route for a first conservative implementation. Preserve the user's
+        // GUI order and enabled checkbox, but bypass only that incompatible
+        // Display-Hz stage at runtime. Moving it after interpolation makes it
+        // active again automatically.
+        let interp_index_for_display_hz_guard = self.interp_index();
 
         // v662: a second consecutive GLSL stage used to fall out of the
         // conservative v648 resident-batch gate whenever the first shader was
@@ -1881,6 +2047,7 @@ impl FilterChain {
                             stage,
                             Stage::Glsl { shader, .. }
                                 if !shader.is_post
+                                    && !shader.display_hz
                                     && shader.name() != "NeoDeint.glsl"
                                     && vulkan_multipass::production_shader_admitted(shader)
                         )
@@ -2210,6 +2377,11 @@ impl FilterChain {
             .take(range_end)
             .skip(start_index)
         {
+            if interp_index_for_display_hz_guard.is_some_and(|interp| stage_index < interp)
+                && matches!(stage, Stage::Glsl { shader, .. } if shader.display_hz)
+            {
+                continue;
+            }
             if neodeint_bypass
                 && matches!(
                     stage,
@@ -2220,8 +2392,10 @@ impl FilterChain {
             }
             let handled_by_engine = stage.is_interp();
             let stage_kind = stage.kind();
-            let t0 = (probe.is_some() && !handled_by_engine && stage_kind != StageKind::Glsl)
-                .then(std::time::Instant::now);
+            let t0 = (probe.is_some()
+                && !handled_by_engine
+                && !matches!(stage_kind, StageKind::Glsl | StageKind::Slangp))
+            .then(std::time::Instant::now);
             match stage {
                 Stage::Glsl { shader, .. } if shader.is_post => {
                     // post-stage (OUTPUT/SCALED hook): applied after the
@@ -2497,6 +2671,43 @@ impl FilterChain {
                         cur = applied.with_context(|| {
                             format!("GLSL stage failed: {} ({})", shader.name(), shader.path)
                         })?;
+                    }
+                }
+                Stage::Dlssnr { stage } => {
+                    let started = std::time::Instant::now();
+                    // Alignment failure must also be fail-open.
+                    let aligned = if cur.has_offset() {
+                        crate::render::scaler::align_offset(gc, cur).unwrap_or(cur)
+                    } else {
+                        cur
+                    };
+                    if !aligned.has_offset() {
+                        cur = stage.apply(gc, aligned);
+                    }
+                    if let Some(p) = probe.as_deref_mut() {
+                        p(
+                            &metric_labels[stage_index],
+                            StageKind::Dlssnr,
+                            stage.metric_ms(started.elapsed().as_secs_f64() * 1000.0),
+                        );
+                    }
+                }
+                Stage::Slangp { stage, .. } => {
+                    if cur.has_offset() {
+                        cur = crate::render::scaler::align_offset(gc, cur)
+                            .context("failed to align pending mpv shader OFFSET before SLANGP")?;
+                    }
+                    let timer = probe
+                        .is_some()
+                        .then(|| gc.begin_gpu_timer(&metric_labels[stage_index]))
+                        .flatten();
+                    cur = stage
+                        .apply(gc, cur, out_size, advance_frame)
+                        .with_context(|| {
+                            format!("SLANGP stage failed: {}", stage.display_name())
+                        })?;
+                    if let Some(query) = timer {
+                        gc.end_gpu_timer(query, metric_labels[stage_index].clone());
                     }
                 }
                 Stage::Onnx {

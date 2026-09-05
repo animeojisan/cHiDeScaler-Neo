@@ -9,8 +9,9 @@
 use chidescaler_neo::core::config::{
     ASPECT_CORRECTION_SCALE_MAX, ASPECT_CORRECTION_SCALE_MIN, AspectCorrectionMode, CaptureCrop,
     CaptureResolution, OnnxBackendPreference, ScaleMode, Settings, StageKind, StageSpec,
-    UiLanguage, UiLanguageMode, UiMode, app_dir, sanitize_aspect_correction_scale,
+    UiLanguage, UiLanguageMode, UiMode, app_dir, resolve_path, sanitize_aspect_correction_scale,
 };
+use chidescaler_neo::core::dlssnr::DlssNrOptions;
 use chidescaler_neo::core::metrics::StageStat;
 use chidescaler_neo::core::presets::{
     PresetAspectCorrection, PresetEditError, PresetStore, discover_filters, load_settings,
@@ -22,9 +23,14 @@ use chidescaler_neo::input;
 use chidescaler_neo::logging;
 use chidescaler_neo::platform::gpu::{self, GpuAdapter};
 use chidescaler_neo::platform::hotkeys::{
-    HotkeyEvent, HotkeyThread, HotkeyValidationError, hotkey_is_available, validate_user_hotkey,
+    BackgroundGui, HotkeyEvent, HotkeyThread, HotkeyValidationError, hotkey_is_available,
+    validate_user_hotkey,
 };
+use chidescaler_neo::platform::startup;
+use chidescaler_neo::platform::tray::{TrayEvent, TrayLabels, TrayThread};
 use chidescaler_neo::platform::win32;
+use chidescaler_neo::render::dlssnr_backend::detect_dlssnr_backend_pack;
+use chidescaler_neo::render::mpv::{Param, ParamTy, UserShader};
 use chidescaler_neo::render::onnx_backend::{
     TensorRtAvailability, detect_tensorrt_backend, tensorrt_cache_root,
 };
@@ -83,7 +89,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20260831-v0.99.1-public";
+const BUILD_ID: &str = "20260905-v0.99.2-public";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -302,7 +308,14 @@ fn stats_rows_in_filter_chain_order(
     chain: &[StageSpec],
     rows: Vec<(String, StageStat)>,
 ) -> Vec<(String, StageStat)> {
-    let mut remaining = rows.into_iter().map(Some).collect::<Vec<_>>();
+    let nr_enabled = chain
+        .iter()
+        .any(|s| s.kind == StageKind::Dlssnr && s.enabled);
+    let mut remaining = rows
+        .into_iter()
+        .filter(|(_, s)| s.kind != "dlssnr" || nr_enabled)
+        .map(Some)
+        .collect::<Vec<_>>();
     let mut ordered = Vec::with_capacity(remaining.len());
     let mut totals = std::collections::HashMap::<String, usize>::new();
     for stage in chain.iter().filter(|stage| stage.enabled) {
@@ -321,6 +334,8 @@ fn stats_rows_in_filter_chain_order(
         let match_index = remaining.iter().position(|entry| {
             entry.as_ref().is_some_and(|(label, _)| {
                 let same_filter = metric_row_base_name(label).eq_ignore_ascii_case(&expected)
+                    || (stage.kind == StageKind::Dlssnr
+                        && metric_row_base_name(label) == "DLSS Neural Rendering")
                     || (stage.kind == StageKind::Flow
                         && label.eq_ignore_ascii_case("Frame interpolation"));
                 same_filter
@@ -341,6 +356,8 @@ fn stats_rows_in_filter_chain_order(
             let kind = match stage.kind {
                 StageKind::Glsl => "glsl",
                 StageKind::Onnx => "onnx",
+                StageKind::Slangp => "slangp",
+                StageKind::Dlssnr => "dlssnr",
                 StageKind::Flow => "gpu",
             };
             ordered.push((
@@ -688,6 +705,8 @@ fn chain_stage_name_job(
     let (badge, badge_color) = match kind {
         StageKind::Glsl => ("GLSL", egui::Color32::from_rgb(90, 170, 255)),
         StageKind::Onnx => ("ONNX", egui::Color32::from_rgb(140, 220, 120)),
+        StageKind::Slangp => ("SLANGP", egui::Color32::from_rgb(232, 142, 152)),
+        StageKind::Dlssnr => ("DLSSNR", egui::Color32::from_rgb(140, 220, 120)),
         StageKind::Flow => ("FG", flow_accent_color()),
     };
     let normal = egui::TextFormat {
@@ -773,6 +792,13 @@ fn cleanup_removed_browser_launcher_artifacts(app_dir: &std::path::Path) {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|arg| arg == "--dlssnr-worker") {
+        if let Err(error) = chidescaler_neo::render::dlssnr_stage::run_worker() {
+            eprintln!("DLSSNR worker: {error}");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     // One-shot cursor rescue is an isolated same-EXE helper.  It must branch
     // before logging, singleton setup, GUI creation, GPU detection, or any
     // render/capture initialization.
@@ -844,7 +870,7 @@ fn main() -> eframe::Result {
                 .map(|(width, _)| (basic_restored_width(width), BASIC_DEFAULT_SIZE[1])),
             UiMode::Full => st.win_size,
         };
-        (st.win_pos, size, st.ui_mode)
+        (st.win_pos, size, st.ui_mode, st.start_in_tray)
     };
     // single instance: two running copies would each install a WH_MOUSE_LL hook
     // and fight over ClipCursor/SetCursorPos, producing exactly the erratic
@@ -892,7 +918,8 @@ fn main() -> eframe::Result {
         .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title("cHiDeScaler-Neo");
+        .with_title("cHiDeScaler-Neo")
+        .with_visible(!saved.3);
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
         if (min_size[0]..=4000.0).contains(&w) && (min_size[1]..=4000.0).contains(&h) {
@@ -953,6 +980,13 @@ fn load_icon() -> Option<egui::IconData> {
         width: info.width,
         height: info.height,
     })
+}
+
+fn tray_labels(lang: UiLanguage) -> TrayLabels {
+    TrayLabels {
+        show: i18n::text(lang, "tray.show").to_string(),
+        exit: i18n::text(lang, "tray.exit").to_string(),
+    }
 }
 
 fn locale_font_family(lang: UiLanguage) -> egui::FontFamily {
@@ -2234,8 +2268,9 @@ fn build_filter_tree(available: &[(StageKind, String)]) -> FilterNode {
             continue;
         }
         let mut parts: Vec<&str> = path.split('/').collect();
-        // hide the shaders/models root folder
-        if parts.len() > 1 && (parts[0] == "shaders" || parts[0] == "models") {
+        // Hide technical root folders. External Slang packs keep their own
+        // subfolder hierarchy (e.g. 1080p Flat/Virtual Boy) below this point.
+        if parts.len() > 1 && matches!(parts[0], "shaders" | "models" | "slangp") {
             parts.remove(0);
         }
         let file = parts.pop().unwrap_or_default().to_string();
@@ -2299,6 +2334,8 @@ fn render_filter_tree_picker(
         let badge = match kind {
             StageKind::Glsl => "GLSL",
             StageKind::Onnx => "ONNX",
+            StageKind::Slangp => "SLANGP",
+            StageKind::Dlssnr => "DLSSNR",
             StageKind::Flow => tr(lang, "内蔵", "Built-in"),
         };
         let response = ui.selectable_label(false, format!("[{badge}] {display}"));
@@ -2352,6 +2389,64 @@ fn is_resize_shader_path(path: &str) -> bool {
         .starts_with("shaders/resize/")
 }
 
+#[derive(Clone)]
+struct GlslParamEditor {
+    index: usize,
+    title: String,
+    params: Vec<Param>,
+}
+
+fn discover_glsl_param_paths(
+    app_dir: &std::path::Path,
+    available: &[(StageKind, String)],
+) -> HashSet<String> {
+    available
+        .iter()
+        .filter_map(|(kind, path)| {
+            if *kind != StageKind::Glsl {
+                return None;
+            }
+            let resolved = resolve_path(app_dir, path);
+            let has_params = std::fs::read_to_string(resolved)
+                .ok()
+                .is_some_and(|source| {
+                    source.lines().any(|line| {
+                        line.trim_start()
+                            .to_ascii_uppercase()
+                            .starts_with("//!PARAM ")
+                    })
+                });
+            has_params.then(|| path.clone())
+        })
+        .collect()
+}
+
+fn pen_edit_button(ui: &mut egui::Ui, hover: &str) -> bool {
+    let response = ui
+        .add(
+            egui::Button::new("")
+                .min_size(egui::vec2(28.0, 24.0))
+                .corner_radius(egui::CornerRadius::same(8)),
+        )
+        .on_hover_text(hover);
+    let center = response.rect.center();
+    let color = ui.style().interact(&response).fg_stroke.color;
+    let stroke = egui::Stroke::new(1.7, color);
+    let tip = center + egui::vec2(-5.0, 5.0);
+    let upper = center + egui::vec2(3.2, -3.2);
+    let cap = center + egui::vec2(5.0, -5.0);
+    let side = egui::vec2(1.35, 1.35);
+    let painter = ui.painter();
+    painter.line_segment([tip - side, upper - side], stroke);
+    painter.line_segment([tip + side, upper + side], stroke);
+    painter.line_segment([upper - side, cap - side], stroke);
+    painter.line_segment([upper + side, cap + side], stroke);
+    painter.line_segment([cap - side, cap + side], stroke);
+    painter.line_segment([tip - side, tip + side], stroke);
+    painter.line_segment([tip, tip + egui::vec2(-1.4, 1.4)], stroke);
+    response.clicked()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PanelDiagSnapshot {
     rect: Option<(i32, i32, i32, i32)>,
@@ -2391,15 +2486,30 @@ struct PendingUiModeTransition {
 struct App {
     engine: EngineHandle,
     hotkeys: HotkeyThread,
+    tray: Option<TrayThread>,
+    egui_ctx: egui::Context,
+    tray_hidden: bool,
+    tray_exit_requested: bool,
+    tray_retry_after: Option<Instant>,
+    tray_running_applied: Option<bool>,
+    tray_language_applied: Option<UiLanguage>,
     app_dir: std::path::PathBuf,
     settings: Settings,
     store: PresetStore,
     chain: Vec<StageSpec>,
     saved_chain: Vec<StageSpec>,
+    dlssnr: Option<StageSpec>,
+    dlssnr_installed: bool,
+    dlssnr_editor: Option<DlssNrOptions>,
+    dlssnr_saved_presets: [DlssNrOptions; 4],
+    dlssnr_options_supported: bool,
+    dlssnr_advanced_options_supported: bool,
     saved_aspect_correction: PresetAspectCorrection,
     saved_crop: CaptureCrop,
     saved_capture_resolution: Option<CaptureResolution>,
     available: Vec<(StageKind, String)>,
+    glsl_param_paths: HashSet<String>,
+    glsl_param_editor: Option<GlslParamEditor>,
     /// Hardware DXGI adapters exposed only in Full mode when two or more are
     /// present. The stable LUID, not the volatile list index, is persisted.
     gpu_adapters: Vec<GpuAdapter>,
@@ -2541,6 +2651,21 @@ struct App {
 }
 
 impl App {
+    /// egui editor windows share the root HWND with the main controls. While
+    /// one is open, the low-level physical-DOWN route must not hit the stale
+    /// Start/Stop rectangle painted underneath that editor.
+    fn main_control_overlay_open(&self) -> bool {
+        self.filter_picker_open
+            || self.hotkey_editor_open
+            || self.resize_scale_editor.is_some()
+            || self.dlssnr_editor.is_some()
+            || self.glsl_param_editor.is_some()
+            || self.save_as_open
+            || self.confirm_delete
+            || self.elevated_target_notice.is_some()
+            || self.capture_resolution_fullscreen_notice_open
+    }
+
     fn hotkey_bindings(toggle: &str) -> Vec<(i32, String)> {
         vec![
             (HK_TOGGLE, toggle.to_string()),
@@ -2636,8 +2761,11 @@ impl App {
         let locale_test_override = cli_locale
             .or_else(|| std::env::var("NEO_GUI_LANGUAGE").ok())
             .map(|tag| i18n::from_bcp47(&tag));
-        // NeoAccel is frozen: retain the backend for later evaluation, but
-        // keep it disabled and hidden from the GUI in this release.
+        // v692: NeoAccel is frozen/dormant until a new acceleration design is chosen.
+        // Ignore any legacy settings.json value so neither TensorRT Q/DQ nor AMD
+        // MIGraphX experiments can be activated accidentally. Keep the source
+        // implementation intact for a future explicit revival.
+        settings.neo_accel = false;
         chidescaler_neo::render::onnx_accel::set_neoaccel_enabled(false);
         settings.ui_mode = match gui_test_mode.to_ascii_lowercase().as_str() {
             "mini" => UiMode::Mini,
@@ -2748,7 +2876,45 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let (chain, legacy_dlssnr) = chidescaler_neo::core::dlssnr::split(chain);
+        if legacy_dlssnr.is_some() {
+            log::info!(
+                "dlssnr-preset-state-ignored: source=startup action=manual-enable-required"
+            );
+        }
+        // DLSSNR remains experimental: ordinary Neo presets never restore its
+        // ON/OFF state. Every app session starts with DLSSNR disabled and the
+        // user explicitly enables it when needed.
+        let dlssnr: Option<StageSpec> = None;
         let available = discover_filters(&dir);
+        let glsl_param_paths = discover_glsl_param_paths(&dir, &available);
+        // Startup only discovers the pack. Hashing/loading happens in the
+        // isolated worker after an enabled DLSSNR stage is actually executed.
+        let dlssnr_availability = detect_dlssnr_backend_pack(&dir);
+        let dlssnr_manifest_present = dlssnr_availability
+            .backend_dir
+            .as_deref()
+            .is_some_and(|path| path.join("backend.json").is_file());
+        if dlssnr_manifest_present {
+            if dlssnr_availability.installed {
+                log::info!(
+                    "dlssnr-backend-discovery: installed=true action=defer-load-until-explicit-enable path={}",
+                    dlssnr_availability
+                        .backend_dir
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                );
+            } else {
+                log::warn!(
+                    "dlssnr-backend-discovery: installed=false reason='{}' action=renderer-unchanged",
+                    dlssnr_availability
+                        .reason
+                        .as_deref()
+                        .unwrap_or("invalid DLSSNR Backend Pack")
+                );
+            }
+        }
         let tensorrt_availability = detect_tensorrt_backend(&dir, settings.gpu_adapter_luid);
         let tensorrt_crop_start_allowed =
             tensorrt_crop_switch_allowed(settings.capture_crop, active_crop);
@@ -2792,7 +2958,30 @@ impl App {
         let hotkeys = HotkeyThread::start(
             Self::hotkey_bindings(&settings.hotkey_toggle),
             engine.stop_handle(),
+            {
+                let wake_ctx = cc.egui_ctx.clone();
+                std::sync::Arc::new(move || wake_ctx.request_repaint())
+            },
         );
+        // Ordinary minimize remains an ordinary taskbar minimize. Preserve the
+        // legacy field only for settings-file compatibility, never behavior.
+        settings.minimize_to_tray = false;
+        if let Err(error) = startup::set_enabled(settings.start_in_tray) {
+            log::warn!(
+                "startup-registration-sync-failed: enabled={} error={error}",
+                settings.start_in_tray
+            );
+        }
+        let tray_enabled = settings.start_in_tray;
+        let tray_language = effective_language(settings.language_mode);
+        let tray = if tray_enabled {
+            let wake_ctx = cc.egui_ctx.clone();
+            TrayThread::start(tray_labels(tray_language), move || {
+                wake_ctx.request_repaint()
+            })
+        } else {
+            None
+        };
         let hotkey_editor_candidate = settings.hotkey_toggle.clone();
         let gui_test_screenshot_path = std::env::var_os("NEO_GUI_SCREENSHOT").map(Into::into);
         let gui_test_save_as = gui_test_mode.eq_ignore_ascii_case("save_as");
@@ -2808,18 +2997,44 @@ impl App {
             .unwrap_or(0);
         let qa_auto_start = qa_target_hwnd != 0 && std::env::var_os("NEO_QA_AUTO_START").is_some();
         let qa_panel_preview = std::env::var_os("NEO_QA_PANEL_PREVIEW").is_some();
+        let dlssnr_saved_presets = chidescaler_neo::core::dlssnr::load_user_presets(&dir);
         Self {
             engine,
             hotkeys,
+            tray,
+            egui_ctx: cc.egui_ctx.clone(),
+            tray_hidden: settings.start_in_tray,
+            tray_exit_requested: false,
+            tray_retry_after: None,
+            tray_running_applied: None,
+            tray_language_applied: None,
             app_dir: dir,
             settings,
             saved_chain: chain.clone(),
+            dlssnr,
+            dlssnr_installed: dlssnr_availability.installed,
+            dlssnr_editor: None,
+            dlssnr_saved_presets,
+            dlssnr_options_supported: dlssnr_availability
+                .manifest
+                .as_ref()
+                .is_some_and(|m| {
+                    m.compatibility_tags
+                        .iter()
+                        .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+                }),
+            dlssnr_advanced_options_supported: dlssnr_availability
+                .manifest
+                .as_ref()
+                .is_some_and(|m| m.compatibility_tags.iter().any(|t| t == "eval-options-v2")),
             saved_aspect_correction: active_aspect_correction,
             saved_crop: active_crop,
             saved_capture_resolution: active_capture_resolution_baseline,
             chain,
             store,
             available,
+            glsl_param_paths,
+            glsl_param_editor: None,
             gpu_adapters,
             gpu_handoff_ready_path,
             gpu_handoff_signaled: false,
@@ -2923,6 +3138,68 @@ impl App {
 
         if !self.gpu_selection_verified {
             let requested = self.settings.gpu_adapter_luid;
+
+            // v674: TensorRT Auto no longer becomes unavailable merely because
+            // more than one NVIDIA adapter exists. Pre-render discovery maps all
+            // CUDA-capable NVIDIA devices by exact LUID and selects a deterministic
+            // candidate. Once the persistent OpenGL renderer identifies the actual
+            // presentation GPU, prefer that same NVIDIA GPU when possible so Auto
+            // gets the best same-GPU interop. If OpenGL is Intel/AMD, keep the
+            // already-proven NVIDIA TensorRT mapping instead of hiding TensorRT.
+            if requested.is_none()
+                && self.tensorrt_availability.manifest.is_some()
+                && let Some(actual) = status.render_gpu_luid
+                && gpu::adapter_for_luid(&self.gpu_adapters, Some(actual))
+                    .is_some_and(|adapter| adapter.vendor_id == 0x10de)
+                && (!self.tensorrt_availability.available
+                    || self.tensorrt_availability.gpu_luid != Some(actual))
+            {
+                let previous_luid = self.tensorrt_availability.gpu_luid;
+                let previous_device = self.tensorrt_availability.device_id;
+                log::info!(
+                    "tensorrt-auto-reprobe: phase=post-render-gpu requested=Auto actual_gl_luid={actual:016x} previous_trt_luid={} previous_cuda_device={:?} action=prefer-presentation-nvidia",
+                    previous_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    previous_device
+                );
+                let reprobe = detect_tensorrt_backend(&self.app_dir, Some(actual));
+                if reprobe.available {
+                    self.tensorrt_availability = reprobe;
+                    let cache_root =
+                        tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, None);
+                    chidescaler_neo::render::onnx_stage::maintain_tensorrt_cache(&cache_root);
+                    // Keep the render worker's provider factory synchronized as
+                    // well. This matters when TensorRT was already selected in
+                    // settings before startup and the pre-render Auto candidate
+                    // differs from the eventual OpenGL NVIDIA GPU.
+                    self.engine.send(Cmd::SetGpuSelection {
+                        gpu_adapter: gpu::device_id_for_luid(
+                            &self.gpu_adapters,
+                            status.render_gpu_luid,
+                        ),
+                        explicit_gpu_luid: None,
+                        force_vulkan_glsl: false,
+                        backend: self.onnx_backend_selected,
+                        trt_device_id: self.tensorrt_availability.device_id,
+                        cache_root,
+                    });
+                    log::info!(
+                        "tensorrt-auto-reprobe: result=available actual_gl_luid={actual:016x} cuda_device_id={:?} ui=enabled engine_mapping=updated",
+                        self.tensorrt_availability.device_id
+                    );
+                } else {
+                    log::warn!(
+                        "tensorrt-auto-reprobe: result=unavailable actual_gl_luid={actual:016x} reason='{}' previous_mapping_retained={}",
+                        reprobe
+                            .reason
+                            .as_deref()
+                            .unwrap_or("TensorRT exact-LUID reprobe failed"),
+                        self.tensorrt_availability.available
+                    );
+                }
+            }
+
             match (requested, status.render_gpu_luid) {
                 (Some(requested), Some(actual)) if requested == actual => {
                     let name = gpu::adapter_for_luid(&self.gpu_adapters, Some(requested))
@@ -3136,8 +3413,11 @@ impl App {
             self.settings.gpu_force_vulkan && self.settings.gpu_adapter_luid.is_some(),
         );
         let selected_text = match gpu::adapter_for_luid(&self.gpu_adapters, choice.0) {
-            Some(adapter) if choice.1 => format!("{} [Vulkan]", adapter.name),
-            Some(adapter) => adapter.name.clone(),
+            Some(adapter) if choice.1 => format!(
+                "{} [Vulkan]",
+                gpu::adapter_display_name(&self.gpu_adapters, adapter)
+            ),
+            Some(adapter) => gpu::adapter_display_name(&self.gpu_adapters, adapter),
             None => i18n::text(lang, "common.auto").to_string(),
         };
         let original_choice = choice;
@@ -3156,17 +3436,17 @@ impl App {
                         )
                         .changed();
                     for adapter in &self.gpu_adapters {
+                        let label = gpu::adapter_display_name(&self.gpu_adapters, adapter);
                         changed |= ui
-                            .selectable_value(
-                                &mut choice,
-                                (Some(adapter.luid), false),
-                                &adapter.name,
-                            )
+                            .selectable_value(&mut choice, (Some(adapter.luid), false), label)
                             .changed();
                     }
                     ui.separator();
                     for adapter in &self.gpu_adapters {
-                        let label = format!("{} [Vulkan]", adapter.name);
+                        let label = format!(
+                            "{} [Vulkan]",
+                            gpu::adapter_display_name(&self.gpu_adapters, adapter)
+                        );
                         changed |= ui
                             .selectable_value(&mut choice, (Some(adapter.luid), true), label)
                             .changed();
@@ -3187,10 +3467,11 @@ impl App {
             let gpu_adapter = gpu::device_id_for_luid(&self.gpu_adapters, effective_gpu_luid);
             let requested_name = gpu::adapter_for_luid(&self.gpu_adapters, requested)
                 .map(|adapter| {
+                    let name = gpu::adapter_display_name(&self.gpu_adapters, adapter);
                     if force_vulkan_glsl {
-                        format!("{} [Vulkan]", adapter.name)
+                        format!("{name} [Vulkan]")
                     } else {
-                        adapter.name.clone()
+                        name
                     }
                 })
                 .unwrap_or_else(|| "Auto".to_string());
@@ -3198,15 +3479,7 @@ impl App {
             // TensorRT's device id is CUDA-specific and cannot be reused after
             // a DXGI selection change. [Vulkan] changes only GLSL routing, so
             // ONNX/TensorRT identity remains the same physical selected GPU.
-            let auto_tensorrt_unambiguous = requested.is_some()
-                || self
-                    .gpu_adapters
-                    .iter()
-                    .filter(|adapter| adapter.vendor_id == 0x10de)
-                    .count()
-                    == 1;
             let same_tensorrt_gpu = self.tensorrt_availability.available
-                && auto_tensorrt_unambiguous
                 && self.tensorrt_availability.gpu_luid == effective_gpu_luid;
             let new_tensorrt = if same_tensorrt_gpu {
                 log::info!(
@@ -3221,7 +3494,29 @@ impl App {
                 );
                 self.tensorrt_availability.clone()
             } else {
-                detect_tensorrt_backend(&self.app_dir, requested)
+                // Explicit NVIDIA selection always maps that exact LUID. Auto
+                // prefers the actual OpenGL NVIDIA GPU when one exists; if the
+                // presentation GPU is Intel/AMD, pass None so TensorRT Auto can
+                // independently select a proven CUDA-capable NVIDIA adapter.
+                let tensorrt_probe_luid = requested.or_else(|| {
+                    render_gpu_luid.filter(|luid| {
+                        gpu::adapter_for_luid(&self.gpu_adapters, Some(*luid))
+                            .is_some_and(|adapter| adapter.vendor_id == 0x10de)
+                    })
+                });
+                log::info!(
+                    "tensorrt-gpu-selection-probe: requested_luid={} render_luid={} probe_luid={} policy=explicit-or-render-nvidia-else-auto-nvidia",
+                    requested
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    render_gpu_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "unavailable".to_string()),
+                    tensorrt_probe_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto-NVIDIA".to_string()),
+                );
+                detect_tensorrt_backend(&self.app_dir, tensorrt_probe_luid)
             };
             let mut backend = self.onnx_backend_selected;
             if backend == OnnxBackendPreference::TensorRT && !new_tensorrt.available {
@@ -3307,7 +3602,7 @@ impl App {
                 &self.tensorrt_availability,
                 self.settings.gpu_adapter_luid,
             ),
-            specs: self.chain.clone(),
+            specs: self.engine_specs(),
         });
     }
 
@@ -3540,7 +3835,11 @@ impl App {
 
     fn basic_stats_rows(&self) -> usize {
         let measured = self.engine.metrics.snapshot().display_stages().len();
-        let configured = self.chain.iter().filter(|stage| stage.enabled).count();
+        let configured = self
+            .engine_specs()
+            .iter()
+            .filter(|stage| stage.enabled)
+            .count();
         measured.max(configured)
     }
 
@@ -3770,13 +4069,16 @@ impl App {
         if tensorrt_option_visible(&self.tensorrt_availability) {
             cadence_labels.push(tr(lang, "TensorRT（準備中）", "TensorRT (preparing)"));
         }
+        if self.dlssnr_installed {
+            cadence_labels.push("DLSSNR");
+        }
         let row_cadence = cadence_labels
             .iter()
             .map(|text| bounded_checkbox_width(ui, text))
             .sum::<f32>()
             // FPS DragValue; reserve it even while the checkbox is off so
             // toggling the option cannot suddenly clip the row.
-            + 64.0
+            + 64.0 + if self.dlssnr_installed { 32.0 + item_gap } else { 0.0 }
             + (cadence_labels.len() as f32 + 1.0) * item_gap;
 
         let option_labels = [
@@ -4246,16 +4548,24 @@ impl App {
 
         let old = self.settings.hotkey_toggle.clone();
         self.hotkeys.stop();
-        let replacement =
-            HotkeyThread::start(Self::hotkey_bindings(&canonical), self.engine.stop_handle());
+        let wake_ctx = self.egui_ctx.clone();
+        let replacement = HotkeyThread::start(
+            Self::hotkey_bindings(&canonical),
+            self.engine.stop_handle(),
+            std::sync::Arc::new(move || wake_ctx.request_repaint()),
+        );
         if replacement
             .registration_failures
             .iter()
             .any(|(id, _)| *id == HK_TOGGLE)
         {
             drop(replacement);
-            self.hotkeys =
-                HotkeyThread::start(Self::hotkey_bindings(&old), self.engine.stop_handle());
+            let wake_ctx = self.egui_ctx.clone();
+            self.hotkeys = HotkeyThread::start(
+                Self::hotkey_bindings(&old),
+                self.engine.stop_handle(),
+                std::sync::Arc::new(move || wake_ctx.request_repaint()),
+            );
             return Err(tr(
                 lang,
                 "登録中に競合が発生しました。以前のショートカットへ戻しました。",
@@ -4892,7 +5202,7 @@ impl App {
             hwnd: self.target_hwnd,
             source_pid,
             source_was_topmost,
-            specs: self.chain.clone(),
+            specs: self.engine_specs(),
             mode: self.settings.scale_mode,
             ratio: self.settings.ratio,
             aspect_correction: self.settings.aspect_correction,
@@ -4992,6 +5302,114 @@ impl App {
         }
     }
 
+    fn sync_task_tray(&mut self, running: bool) {
+        if self.tray_exit_requested {
+            // Once the user has chosen tray Exit, never recreate the tray
+            // controller while the root viewport is completing shutdown.
+            if let Some(mut tray) = self.tray.take() {
+                tray.stop();
+            }
+            return;
+        }
+        let wanted = self.settings.start_in_tray;
+        let retry_ready = self
+            .tray_retry_after
+            .is_none_or(|deadline| Instant::now() >= deadline);
+        if wanted && self.tray.is_none() && retry_ready {
+            let wake_ctx = self.egui_ctx.clone();
+            self.tray = TrayThread::start(tray_labels(self.effective_language()), move || {
+                wake_ctx.request_repaint()
+            });
+            self.tray_running_applied = None;
+            self.tray_language_applied = None;
+            if self.tray.is_none() {
+                self.tray_retry_after = Some(Instant::now() + Duration::from_secs(5));
+                log::error!("task-tray-start-failed: notification icon could not be created");
+                if self.tray_hidden {
+                    self.tray_hidden = false;
+                    self.egui_ctx
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    let _ = win32::restore_own_window(self.gui_hwnd);
+                }
+            } else {
+                self.tray_retry_after = None;
+            }
+        } else if !wanted && let Some(mut tray) = self.tray.take() {
+            tray.stop();
+            self.tray_running_applied = None;
+            self.tray_language_applied = None;
+            log::info!("task-tray-disabled");
+        }
+        if !wanted {
+            self.tray_retry_after = None;
+        }
+
+        let lang = self.effective_language();
+        if let Some(tray) = self.tray.as_ref() {
+            if self.tray_running_applied != Some(running) {
+                tray.set_running(running);
+                self.tray_running_applied = Some(running);
+            }
+            if self.tray_language_applied != Some(lang) {
+                tray.set_labels(tray_labels(lang));
+                self.tray_language_applied = Some(lang);
+            }
+        }
+    }
+
+    fn process_task_tray(&mut self, ctx: &egui::Context, running: bool) {
+        self.sync_task_tray(running);
+        let mut toggle_gui = false;
+        let mut exit = false;
+        if let Some(tray) = self.tray.as_ref() {
+            while let Ok(event) = tray.rx.try_recv() {
+                match event {
+                    TrayEvent::ToggleGui => toggle_gui = true,
+                    TrayEvent::Exit => exit = true,
+                }
+            }
+        }
+        if toggle_gui {
+            let native_visible = self.gui_hwnd != 0
+                && win32::is_window_valid(self.gui_hwnd)
+                && win32::is_window_visible(self.gui_hwnd);
+            if native_visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                let _ = win32::hide_own_window(self.gui_hwnd);
+                self.tray_hidden = !win32::is_window_visible(self.gui_hwnd);
+                if self.tray_hidden {
+                    log::info!("task-tray-action: toggle-gui result=hidden");
+                } else {
+                    log::warn!("task-tray-action: toggle-gui result=hide-failed");
+                }
+            } else {
+                self.tray_hidden = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                let restored = win32::restore_own_window(self.gui_hwnd);
+                log::info!(
+                    "task-tray-action: toggle-gui result=shown restored={restored}"
+                );
+            }
+        }
+        if exit {
+            log::info!("task-tray-action: exit action=application-shutdown");
+            // Tray Exit means Exit Neo, not merely hide/close the tray UI. Keep
+            // the request on the main thread so eframe::App::on_exit performs
+            // the established bounded engine/input/provider cleanup. Stop the
+            // notification-area controller first so the icon disappears
+            // immediately and no further tray events can race shutdown.
+            self.tray_exit_requested = true;
+            chidescaler_neo::input::notify_cursor_janitor_quit_requested("task-tray-exit");
+            if let Some(mut tray) = self.tray.take() {
+                tray.stop();
+            }
+            self.tray_running_applied = None;
+            self.tray_language_applied = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
+    }
+
     fn dispatch_toggle_hotkey(&mut self, event: &HotkeyEvent) {
         let age_ms = event.received_at.elapsed().as_secs_f64() * 1000.0;
         let (starting, running, stopping, provider_preparing) = self.capture_busy_now();
@@ -5022,10 +5440,71 @@ impl App {
         }
     }
 
+    fn dlssnr_controls(&mut self, ui: &mut egui::Ui, lang: UiLanguage) {
+        if !self.dlssnr_installed {
+            return;
+        }
+        ui.horizontal(|ui| {
+            let mut enabled = self.dlssnr.as_ref().is_some_and(|s| s.enabled);
+            if ink_centered_checkbox(ui, &mut enabled, "DLSSNR")
+                .on_hover_text(i18n::text(lang, "dlssnr.help"))
+                .changed()
+            {
+                if enabled && self.dlssnr.is_none() {
+                    // A new manual DLSSNR session must start from the saved values
+                    // of its initial render-preset slot. Previously new_spec() had
+                    // empty params, so options() fell back to factory Preset 1
+                    // values even when dlssnr_presets.json stored a customized
+                    // Preset 1 (for example Cinematic). Slot switching then appeared
+                    // to "fix" the editor because that path explicitly loaded the
+                    // saved slot. Seed the first stage from the saved slot instead.
+                    let initial = self.dlssnr_saved_presets[1];
+                    let mut spec = chidescaler_neo::core::dlssnr::new_spec();
+                    chidescaler_neo::core::dlssnr::set_options(&mut spec, initial);
+                    spec.enabled = true;
+                    self.dlssnr = Some(spec);
+                    log::info!(
+                        "dlssnr-manual-enable: initial_slot=1 values={initial:?} source=saved-preset"
+                    );
+                } else if let Some(spec) = self.dlssnr.as_mut() {
+                    spec.enabled = enabled;
+                } else {
+                    let mut spec = chidescaler_neo::core::dlssnr::new_spec();
+                    spec.enabled = enabled;
+                    self.dlssnr = Some(spec);
+                }
+                self.apply_live();
+            }
+            if pen_edit_button(ui, i18n::text(lang, "glsl.params.edit")) {
+                self.dlssnr_editor = Some(
+                    self.dlssnr
+                        .as_ref()
+                        .map(chidescaler_neo::core::dlssnr::options)
+                        .unwrap_or(self.dlssnr_saved_presets[1]),
+                );
+            }
+        });
+    }
+
+    /// Ordinary Neo presets intentionally exclude experimental DLSSNR state.
+    /// Its ON/OFF state is manual-only and its tuning values live exclusively in
+    /// dlssnr_presets.json.
+    fn persisted_specs(&self) -> Vec<StageSpec> {
+        chidescaler_neo::core::dlssnr::ordinary_preset_specs(&self.chain)
+    }
+
+    fn engine_specs(&self) -> Vec<StageSpec> {
+        if self.dlssnr_installed {
+            chidescaler_neo::core::dlssnr::engine_specs(&self.chain, &self.dlssnr)
+        } else {
+            chidescaler_neo::core::dlssnr::ordinary_preset_specs(&self.chain)
+        }
+    }
+
     fn apply_live(&self) {
         if self.running() {
             self.engine.send(Cmd::ApplyChain {
-                specs: self.chain.clone(),
+                specs: self.engine_specs(),
                 aspect_correction: self.settings.aspect_correction,
                 aspect_correction_mode: self.settings.aspect_correction_mode,
                 aspect_width_scale: sanitize_aspect_correction_scale(
@@ -5048,6 +5527,21 @@ impl App {
             discovered.len(),
             previous
         );
+        self.glsl_param_paths = discover_glsl_param_paths(&self.app_dir, &discovered);
+        let nr = detect_dlssnr_backend_pack(&self.app_dir);
+        self.dlssnr_installed = nr.installed;
+        self.dlssnr_options_supported = nr
+            .manifest
+            .as_ref()
+            .is_some_and(|m| {
+                m.compatibility_tags
+                    .iter()
+                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+            });
+        self.dlssnr_advanced_options_supported = nr
+            .manifest
+            .as_ref()
+            .is_some_and(|m| m.compatibility_tags.iter().any(|t| t == "eval-options-v2"));
         self.available = discovered;
     }
 
@@ -5074,12 +5568,21 @@ impl App {
             // instead of forcing Auto, which keeps comparison runs at one resolution.
             let selected_capture_resolution =
                 preset_capture_resolution.or(self.settings.capture_resolution);
-            self.chain = chain
+            let (visible_chain, legacy_dlssnr) = chidescaler_neo::core::dlssnr::split(chain);
+            if legacy_dlssnr.is_some() {
+                log::info!(
+                    "dlssnr-preset-state-ignored: source=selection preset='{}' action=preserve-manual-state",
+                    name
+                );
+            }
+            // Keep the current manually controlled DLSSNR state and editor.
+            // Ordinary preset selection only owns the ordinary filter chain.
+            self.chain = visible_chain
                 .iter()
                 .filter(|stage| !is_frozen_neoflow_stage(stage))
                 .cloned()
                 .collect();
-            self.saved_chain = chain;
+            self.saved_chain = self.persisted_specs();
             aspect_correction.apply_to_settings(&mut self.settings);
             self.settings.capture_crop = crop;
             self.settings.capture_resolution = selected_capture_resolution;
@@ -5140,7 +5643,7 @@ impl App {
     }
 
     fn dirty(&self) -> bool {
-        self.chain != self.saved_chain
+        self.persisted_specs() != self.saved_chain
             || self.current_preset_aspect_correction() != self.saved_aspect_correction
             || self.current_preset_crop() != self.saved_crop
             || self.current_preset_capture_resolution() != self.saved_capture_resolution
@@ -6810,13 +7313,11 @@ impl App {
                                         (*completed + 1).min(*total),
                                         total
                                     ));
-                                    if *model_active {
-                                        ui.label(format!(
-                                            "{}: {:.1}s",
-                                            tr(lang, "このエンジンの経過時間", "Current engine elapsed"),
-                                            elapsed.as_secs_f64()
-                                        ));
-                                    }
+                                    ui.label(format!(
+                                        "{}: {:.1}s",
+                                        tr(lang, "エンジン作成経過時間", "Engine build elapsed"),
+                                        elapsed.as_secs_f64()
+                                    ));
                                     if chidescaler_neo::render::onnx_stage::tensorrt_cancel_requested() {
                                         ui.add_space(6.0);
                                         ui.label(tr(
@@ -7172,13 +7673,13 @@ impl App {
                     let capture_resolution = self.current_preset_capture_resolution();
                     match self.store.overwrite_active_as(
                         &self.save_as_name,
-                        &self.chain,
+                        &self.persisted_specs(),
                         aspect_correction,
                         crop,
                         capture_resolution,
                     ) {
                         Ok(name) => {
-                            self.saved_chain = self.chain.clone();
+                            self.saved_chain = self.persisted_specs();
                             self.saved_aspect_correction = aspect_correction;
                             self.saved_crop = crop;
                             self.saved_capture_resolution = capture_resolution;
@@ -7200,13 +7701,13 @@ impl App {
                     let capture_resolution = self.current_preset_capture_resolution();
                     match self.store.save_as_new(
                         &self.save_as_name,
-                        &self.chain,
+                        &self.persisted_specs(),
                         aspect_correction,
                         crop,
                         capture_resolution,
                     ) {
                         Ok(name) => {
-                            self.saved_chain = self.chain.clone();
+                            self.saved_chain = self.persisted_specs();
                             self.saved_aspect_correction = aspect_correction;
                             self.saved_crop = crop;
                             self.saved_capture_resolution = capture_resolution;
@@ -7283,6 +7784,29 @@ impl eframe::App for App {
                     win32::set_dark_title_bar(self.gui_hwnd);
                     win32::disable_native_maximize_button(self.gui_hwnd);
                     win32::install_main_gui_native_minimize(self.gui_hwnd);
+                    // ViewportBuilder::with_visible(false) is the first startup
+                    // guard, but Windows logon/startup restoration can still race
+                    // the first native HWND realization. When Start in tray is
+                    // enabled, commit the actual Win32 window to hidden once the
+                    // HWND exists as a second guard. Keep tray_hidden tied to the
+                    // real native visibility rather than ShowWindow's return value
+                    // (which reports the *previous* visibility, not success).
+                    if self.settings.start_in_tray && self.tray_hidden {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                        let _ = win32::hide_own_window(self.gui_hwnd);
+                        self.tray_hidden = !win32::is_window_visible(self.gui_hwnd);
+                        if self.tray_hidden {
+                            log::info!(
+                                "task-tray-startup: gui-hidden hwnd={:#x} source=start-in-tray",
+                                self.gui_hwnd
+                            );
+                        } else {
+                            log::warn!(
+                                "task-tray-startup: gui-hide-failed hwnd={:#x} source=start-in-tray",
+                                self.gui_hwnd
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7339,7 +7863,18 @@ impl eframe::App for App {
         // v348u: Start and Stop now share the same physical pointer-DOWN path.
         // This removes the v348t asymmetry where Stop fired on DOWN but Start
         // depended on a later egui release that could be swallowed or lost.
+        let suppress_main_control = self.main_control_overlay_open();
         let main_actions = chidescaler_neo::input::take_main_actions();
+        let main_actions = if suppress_main_control {
+            if main_actions != 0 {
+                log::warn!(
+                    "main-control-direct: queued-action-discarded reason=editor-overlay-open actions={main_actions:#x}"
+                );
+            }
+            0
+        } else {
+            main_actions
+        };
         if main_actions != 0 {
             let now = Instant::now();
             self.main_control_press_until = Some(now + Duration::from_millis(115));
@@ -7400,6 +7935,17 @@ impl eframe::App for App {
                     } else {
                         toggle_hotkey_handled = true;
                         self.dispatch_toggle_hotkey(&event);
+                        match event.background_gui {
+                            BackgroundGui::Hidden => {
+                                self.tray_hidden = win32::hide_own_window(self.gui_hwnd);
+                                let _ = win32::set_window_cloaked(self.gui_hwnd, false);
+                            }
+                            BackgroundGui::Minimized => {
+                                let _ = win32::minimize_own_window(self.gui_hwnd);
+                                let _ = win32::set_window_cloaked(self.gui_hwnd, false);
+                            }
+                            BackgroundGui::Foreground => {}
+                        }
                     }
                 }
                 HK_PANEL => {
@@ -7496,6 +8042,17 @@ impl eframe::App for App {
             }
         }
         let running = status.running;
+        self.process_task_tray(ctx, running);
+        if self.settings.start_in_tray
+            && self.gui_hwnd != 0
+            && win32::is_minimized(self.gui_hwnd)
+            && !self.tray_hidden
+        {
+            self.tray_hidden = win32::hide_own_window(self.gui_hwnd);
+            if self.tray_hidden {
+                log::info!("task-tray-action: minimize-to-notification-area");
+            }
+        }
         if !self.was_running && running {
             // The retained native panel host still has the previous session's
             // desktop position. Keep it hidden until control_panel commits
@@ -7683,13 +8240,11 @@ impl eframe::App for App {
                     (completed + 1).min(total),
                     total
                 ));
-                if model_active {
-                    ui.label(format!(
-                        "{}: {:.1}s",
-                        tr(lang, "このエンジンの経過時間", "Current engine elapsed"),
-                        elapsed.as_secs_f64()
-                    ));
-                }
+                ui.label(format!(
+                    "{}: {:.1}s",
+                    tr(lang, "エンジン作成経過時間", "Engine build elapsed"),
+                    elapsed.as_secs_f64()
+                ));
                 ui.add_space(6.0);
                 if cancel_requested {
                     ui.label(tr(
@@ -8073,7 +8628,7 @@ impl eframe::App for App {
                     // surface while the picker is open; egui then owns those
                     // clicks exclusively and the surface is republished on the
                     // first frame after the picker closes.
-                    let control_mode = if self.filter_picker_open || status.stopping {
+                    let control_mode = if self.main_control_overlay_open() || status.stopping {
                         chidescaler_neo::input::MAIN_CONTROL_DISABLED
                     } else if preparing || running {
                         chidescaler_neo::input::MAIN_CONTROL_STOP
@@ -8384,6 +8939,7 @@ impl eframe::App for App {
                     let aspect_correction = self.current_preset_aspect_correction();
                     let crop = self.current_preset_crop();
                     let capture_resolution = self.current_preset_capture_resolution();
+                    let persisted = self.persisted_specs();
                     if let Some(p) = self
                         .store
                         .data
@@ -8391,11 +8947,11 @@ impl eframe::App for App {
                         .iter_mut()
                         .find(|p| p.name == active)
                     {
-                        p.chain = self.chain.clone();
+                        p.chain = persisted.clone();
                         p.aspect_correction = Some(aspect_correction);
                         p.crop = Some(crop);
                         p.capture_resolution = capture_resolution;
-                        self.saved_chain = self.chain.clone();
+                        self.saved_chain = persisted;
                         self.saved_aspect_correction = aspect_correction;
                         self.saved_crop = crop;
                         self.saved_capture_resolution = capture_resolution;
@@ -8427,7 +8983,8 @@ impl eframe::App for App {
                         capture_resolution,
                     );
                     self.chain.clear();
-                    self.saved_chain.clear();
+                    self.dlssnr_editor = None;
+                    self.saved_chain = self.persisted_specs();
                     self.saved_aspect_correction = aspect_correction;
                     self.saved_crop = crop;
                     self.saved_capture_resolution = capture_resolution;
@@ -8617,6 +9174,7 @@ impl eframe::App for App {
                                 self.settings.duplicate_frame_reduction,
                             ));
                         }
+                        self.dlssnr_controls(ui, lang);
                     });
                     ui.add_space(5.0);
                     self.resource_meter(ui);
@@ -8650,10 +9208,12 @@ impl eframe::App for App {
                                 .family(locale_font_family(lang))
                                 .size(STATS_FONT_SIZE),
                         );
-                        let rows =
-                            stats_rows_in_filter_chain_order(&self.chain, snap.display_stages());
+                        let rows = stats_rows_in_filter_chain_order(
+                            &self.engine_specs(),
+                            snap.display_stages(),
+                        );
                         if rows.is_empty() {
-                            for stage in self.chain.iter().filter(|stage| stage.enabled) {
+                            for stage in self.engine_specs().iter().filter(|stage| stage.enabled) {
                                 let name = std::path::Path::new(&stage.path)
                                     .file_name()
                                     .and_then(|name| name.to_str())
@@ -8669,7 +9229,20 @@ impl eframe::App for App {
                             }
                         } else {
                             for (name, stage) in rows {
-                                let line = if stage.ms >= 0.0 {
+                                let line = if running && stage.kind == "dlssnr" && stage.ms < 0.0 {
+                                    format!(
+                                        "  {}  {}",
+                                        name,
+                                        i18n::text(
+                                            lang,
+                                            if stage.ms <= -2.0 {
+                                                "dlssnr.bypassed"
+                                            } else {
+                                                "dlssnr.preparing"
+                                            }
+                                        )
+                                    )
+                                } else if stage.ms >= 0.0 {
                                     format!("  {:>5.2}ms  [{}] {}", stage.ms, stage.kind, name)
                                 } else {
                                     format!("  --.--ms  [{}] {}", stage.kind, name)
@@ -8962,6 +9535,7 @@ impl eframe::App for App {
                         self.settings.duplicate_frame_reduction,
                     ));
                 }
+
                 if ink_centered_checkbox(
                     ui,
                     &mut self.settings.smooth_pacing,
@@ -9049,6 +9623,7 @@ impl eframe::App for App {
                         });
                     }
                 }
+                self.dlssnr_controls(ui, lang);
             });
             ui.add_space(2.0);
             // row 2: options (wrapped so a narrow window never clips items)
@@ -9238,6 +9813,32 @@ impl eframe::App for App {
                     if self.settings.run_as_admin && !win32::own_process_elevated() {
                         if win32::relaunch_as_admin() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+                let previous_start_in_tray = self.settings.start_in_tray;
+                if ink_centered_checkbox(
+                    ui,
+                    &mut self.settings.start_in_tray,
+                    i18n::text(lang, "settings.start_in_tray"),
+                )
+                .on_hover_text(i18n::text(lang, "settings.start_in_tray_help"))
+                .changed()
+                {
+                    match startup::set_enabled(self.settings.start_in_tray) {
+                        Ok(()) => {
+                            settings_changed = true;
+                            log::info!(
+                                "startup-registration-updated: enabled={}",
+                                self.settings.start_in_tray
+                            );
+                        }
+                        Err(error) => {
+                            self.settings.start_in_tray = previous_start_in_tray;
+                            self.engine.status.lock().unwrap().last_error = Some(format!(
+                                "Windows startup registration failed: {error}"
+                            ));
+                            log::error!("startup-registration-update-failed: {error}");
                         }
                     }
                 }
@@ -9437,9 +10038,9 @@ impl eframe::App for App {
                             .size(STATS_FONT_SIZE),
                     );
                 }
-                let rows = stats_rows_in_filter_chain_order(&self.chain, snap.display_stages());
+                let rows = stats_rows_in_filter_chain_order(&self.engine_specs(), snap.display_stages());
                 if rows.is_empty() {
-                    for stage in self.chain.iter().filter(|stage| stage.enabled) {
+                    for stage in self.engine_specs().iter().filter(|stage| stage.enabled) {
                         let name = std::path::Path::new(&stage.path)
                             .file_name()
                             .and_then(|name| name.to_str())
@@ -9455,7 +10056,9 @@ impl eframe::App for App {
                     }
                 } else {
                     for (name, st) in rows {
-                        let line = if st.ms >= 0.0 {
+                        let line = if running && st.kind == "dlssnr" && st.ms < 0.0 {
+                            format!("  {}  {}", name, i18n::text(lang, if st.ms <= -2.0 { "dlssnr.bypassed" } else { "dlssnr.preparing" }))
+                        } else if st.ms >= 0.0 {
                             format!("  {:>5.2}ms  [{}] {}", st.ms, st.kind, name)
                         } else {
                             format!("  --.--ms  [{}] {}", st.kind, name)
@@ -9569,6 +10172,7 @@ impl eframe::App for App {
                 let mut changed = false;
                 let mut remove: Option<usize> = None;
                 let mut edit_resize: Option<usize> = None;
+                let mut edit_glsl: Option<usize> = None;
                 let mut swap: Option<(usize, usize)> = None;
                 let mut dnd_move: Option<(usize, usize)> = None;
                 let len = self.chain.len();
@@ -9587,13 +10191,22 @@ impl eframe::App for App {
                                 }
                             })
                             .unwrap_or_else(|| {
-                                self.chain[i]
+                                let file = self.chain[i]
                                     .path
                                     .rsplit(['/', '\\'])
                                     .next()
-                                    .unwrap_or(&self.chain[i].path)
-                                    .to_string()
+                                    .unwrap_or(&self.chain[i].path);
+                                if spec_kind == StageKind::Slangp {
+                                    file.strip_suffix(".slangp")
+                                        .or_else(|| file.strip_suffix(".SLANGP"))
+                                        .unwrap_or(file)
+                                        .to_string()
+                                } else {
+                                    file.to_string()
+                                }
                             });
+                        let glsl_param_editable = spec_kind == StageKind::Glsl
+                            && self.glsl_param_paths.contains(&self.chain[i].path);
                         let dragging_this = matches!(self.drag, Some((2, di, _, true)) if di == i);
                         let row = ui.horizontal(|ui| {
                             ui.label(
@@ -9616,11 +10229,12 @@ impl eframe::App for App {
                             }
                             // grab zone: from the name up to just left of the
                             // buttons (long-press to start moving)
-                            let btn_zone = if is_resize_shader_path(&spec.path) {
-                                165.0
-                            } else {
-                                130.0
-                            };
+                            let btn_zone =
+                                if is_resize_shader_path(&spec.path) || glsl_param_editable {
+                                    165.0
+                                } else {
+                                    130.0
+                                };
                             let grab_w = (ui.available_width() - btn_zone).max(60.0);
                             let (rect, grab) = ui.allocate_exact_size(
                                 egui::vec2(grab_w, 24.0),
@@ -9650,35 +10264,13 @@ impl eframe::App for App {
                                         remove = Some(i);
                                     }
                                     if is_resize_shader_path(&spec.path) {
-                                        let response = ui
-                                            .add(
-                                                egui::Button::new("")
-                                                    .min_size(egui::vec2(28.0, 24.0))
-                                                    .corner_radius(egui::CornerRadius::same(8)),
-                                            )
-                                            .on_hover_text(i18n::text(lang, "resize.edit"));
-                                        let center = response.rect.center();
-                                        let color = ui.style().interact(&response).fg_stroke.color;
-                                        let stroke = egui::Stroke::new(1.7, color);
-                                        // Draw the pen ourselves: unlike a Unicode glyph this cannot
-                                        // become a missing-font square on another Windows install.
-                                        let tip = center + egui::vec2(-5.0, 5.0);
-                                        let upper = center + egui::vec2(3.2, -3.2);
-                                        let cap = center + egui::vec2(5.0, -5.0);
-                                        let side = egui::vec2(1.35, 1.35);
-                                        let painter = ui.painter();
-                                        painter.line_segment([tip - side, upper - side], stroke);
-                                        painter.line_segment([tip + side, upper + side], stroke);
-                                        painter.line_segment([upper - side, cap - side], stroke);
-                                        painter.line_segment([upper + side, cap + side], stroke);
-                                        painter.line_segment([cap - side, cap + side], stroke);
-                                        painter.line_segment([tip - side, tip + side], stroke);
-                                        painter.line_segment(
-                                            [tip, tip + egui::vec2(-1.4, 1.4)],
-                                            stroke,
-                                        );
-                                        if response.clicked() {
+                                        if pen_edit_button(ui, i18n::text(lang, "resize.edit")) {
                                             edit_resize = Some(i);
+                                        }
+                                    } else if glsl_param_editable {
+                                        if pen_edit_button(ui, i18n::text(lang, "glsl.params.edit"))
+                                        {
+                                            edit_glsl = Some(i);
                                         }
                                     }
                                     if Self::soft_button(ui, "∨", i + 1 < len)
@@ -9789,6 +10381,45 @@ impl eframe::App for App {
                         .unwrap_or(0.75)
                         .clamp(0.25, 4.0);
                     self.resize_scale_editor = Some((i, value));
+                }
+                if let Some(i) = edit_glsl
+                    && let Some(spec) = self.chain.get(i)
+                {
+                    let resolved = resolve_path(&self.app_dir, &spec.path);
+                    match UserShader::load(resolved.to_string_lossy().as_ref()) {
+                        Ok(mut shader) if !shader.params.is_empty() => {
+                            for param in &mut shader.params {
+                                if let Some(value) = spec.params.get(&param.name) {
+                                    param.value = value.clamp(param.min, param.max);
+                                }
+                            }
+                            let editor_title = shader.name();
+                            let editor_params = shader.params;
+                            log::info!(
+                                "glsl-param-editor-open: index={} path={} params={:?}",
+                                i,
+                                spec.path,
+                                editor_params
+                                    .iter()
+                                    .map(|param| (param.name.as_str(), param.value))
+                                    .collect::<Vec<_>>()
+                            );
+                            self.glsl_param_editor = Some(GlslParamEditor {
+                                index: i,
+                                title: editor_title,
+                                params: editor_params,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "glsl-param-editor-open-failed: index={} path={} error={}",
+                                i,
+                                spec.path,
+                                error
+                            );
+                        }
+                    }
                 }
                 if let Some((a, b)) = swap {
                     log::info!(
@@ -9983,6 +10614,329 @@ impl eframe::App for App {
                 self.resize_scale_editor = Some((index, value.clamp(0.25, 4.0)));
             }
         }
+        if self.settings.ui_mode != UiMode::Mini
+            && let Some(mut values) = self.dlssnr_editor.take()
+        {
+            let mut open = true;
+            let mut values_changed = false;
+            let mut save_requested = false;
+            let saved_presets = self.dlssnr_saved_presets;
+            // Basic's root viewport is intentionally compact. Keep the action row
+            // outside the scroll region so Reset/Save are always reachable. Reserve
+            // enough title/frame/action chrome for the tallest localized glyphs
+            // (notably Japanese) and leave visible breathing room below the buttons
+            // instead of letting their lower border touch the viewport edge.
+            let viewport_height = ctx
+                .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
+                .unwrap_or(BASIC_DEFAULT_SIZE[1]);
+            const DLSSNR_EDITOR_CHROME_RESERVE: f32 = 150.0;
+            let controls_max_height = (viewport_height - DLSSNR_EDITOR_CHROME_RESERVE).max(128.0);
+            egui::Window::new(i18n::text(lang, "dlssnr.edit_title"))
+                .id(egui::Id::new("dlssnr_options_editor"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    if self.dlssnr_options_supported {
+                        egui::ScrollArea::vertical()
+                            .id_salt("dlssnr_options_scroll")
+                            .max_height(controls_max_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.dlssnr_advanced_options_supported {
+                                    let old_preset = values.preset;
+                                    ui.horizontal(|ui| {
+                                        ui.label(i18n::text(lang, "dlssnr.preset"));
+                                        egui::ComboBox::from_id_salt("dlssnr_preset")
+                                            .selected_text(match values.preset {
+                                                0 => i18n::text(lang, "dlssnr.preset_default"),
+                                                1 => i18n::text(lang, "dlssnr.preset_1"),
+                                                2 => i18n::text(lang, "dlssnr.preset_2"),
+                                                _ => i18n::text(lang, "dlssnr.preset_3"),
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut values.preset, 0, i18n::text(lang, "dlssnr.preset_default"));
+                                                ui.selectable_value(&mut values.preset, 1, i18n::text(lang, "dlssnr.preset_1"));
+                                                ui.selectable_value(&mut values.preset, 2, i18n::text(lang, "dlssnr.preset_2"));
+                                                ui.selectable_value(&mut values.preset, 3, i18n::text(lang, "dlssnr.preset_3"));
+                                            });
+                                    });
+                                    if values.preset != old_preset {
+                                        let selected = values.preset.min(3) as usize;
+                                        values = saved_presets[selected];
+                                        values.preset = selected as u32;
+                                        values_changed = true;
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(i18n::text(lang, "dlssnr.style"));
+                                        let before = values.style;
+                                        egui::ComboBox::from_id_salt("dlssnr_style")
+                                            .selected_text(match values.style {
+                                                1 => i18n::text(lang, "dlssnr.style_natural"),
+                                                2 => i18n::text(lang, "dlssnr.style_cinematic"),
+                                                _ => i18n::text(lang, "dlssnr.style_default"),
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut values.style, 0, i18n::text(lang, "dlssnr.style_default"));
+                                                ui.selectable_value(&mut values.style, 1, i18n::text(lang, "dlssnr.style_natural"));
+                                                ui.selectable_value(&mut values.style, 2, i18n::text(lang, "dlssnr.style_cinematic"));
+                                            });
+                                        values_changed |= values.style != before;
+                                    });
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.intensity")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_tone")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_structure")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.skin_structure, -1.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.skin_structure")),
+                                    )
+                                    .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
+                                    .changed();
+                                    ui.horizontal(|ui| {
+                                        values_changed |= ink_centered_checkbox(
+                                            ui,
+                                            &mut values.auto_mask,
+                                            i18n::text(lang, "dlssnr.auto_mask"),
+                                        )
+                                        .on_hover_text(i18n::text(lang, "dlssnr.auto_mask_help"))
+                                        .changed();
+                                        values_changed |= ink_centered_checkbox(
+                                            ui,
+                                            &mut values.ui_correction,
+                                            i18n::text(lang, "dlssnr.ui_correction"),
+                                        )
+                                        .on_hover_text(i18n::text(lang, "dlssnr.ui_correction_help"))
+                                        .changed();
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(i18n::text(lang, "dlssnr.live_help"))
+                                            .size(10.5)
+                                            .weak(),
+                                    );
+                                } else {
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.intensity")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_tone")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_structure")),
+                                    ).changed();
+                                    ui.label(
+                                        egui::RichText::new(i18n::text(lang, "dlssnr.update_pack_advanced"))
+                                            .size(10.5)
+                                            .weak(),
+                                    );
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
+                                let preset = values.preset.min(3);
+                                values = chidescaler_neo::core::dlssnr::factory_presets()[preset as usize];
+                                values_changed = true;
+                            }
+                            if self.dlssnr_advanced_options_supported
+                                && control_row_button(ui, i18n::text(lang, "dlssnr.save")).clicked()
+                            {
+                                save_requested = true;
+                            }
+                        });
+                        // Explicit bottom safety padding keeps localized button ink
+                        // and the button frame comfortably inside the editor window.
+                        ui.add_space(10.0);
+                    } else {
+                        ui.label(i18n::text(lang, "dlssnr.update_pack"));
+                    }
+                });
+
+            let values = chidescaler_neo::core::dlssnr::sanitize_options(values);
+            if values_changed {
+                let spec = self
+                    .dlssnr
+                    .get_or_insert_with(chidescaler_neo::core::dlssnr::new_spec);
+                chidescaler_neo::core::dlssnr::set_options(spec, values);
+                self.apply_live();
+                log::info!(
+                    "dlssnr-gui-options-live: values={values:?} action=immediate-update"
+                );
+            }
+            if save_requested {
+                let index = values.preset.min(3) as usize;
+                self.dlssnr_saved_presets[index] = values;
+                match chidescaler_neo::core::dlssnr::save_user_presets(
+                    &self.app_dir,
+                    &self.dlssnr_saved_presets,
+                ) {
+                    Ok(()) => log::info!(
+                        "dlssnr-preset-save: slot={} values={values:?} result=success",
+                        index
+                    ),
+                    Err(error) => log::warn!(
+                        "dlssnr-preset-save: slot={} result=failed error={error}",
+                        index
+                    ),
+                }
+            }
+            if open {
+                self.dlssnr_editor = Some(values);
+            }
+        }
+        if self.settings.ui_mode != UiMode::Mini
+            && let Some(mut editor) = self.glsl_param_editor.take()
+        {
+            let mut keep_open = true;
+            let mut values_changed = false;
+            let mut reset_defaults = false;
+            let title = format!(
+                "{} - {}",
+                editor.title,
+                i18n::text(lang, "glsl.params.title_suffix")
+            );
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(430.0)
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(i18n::text(lang, "glsl.params.live_help"))
+                            .size(10.5)
+                            .weak(),
+                    );
+                    ui.add_space(6.0);
+                    for param in &mut editor.params {
+                        let label = if param.desc.trim().is_empty() {
+                            param.name.as_str()
+                        } else {
+                            param.desc.as_str()
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            let response = match param.ty {
+                                ParamTy::Int
+                                | ParamTy::Uint
+                                | ParamTy::Define
+                                | ParamTy::ConstInt
+                                | ParamTy::ConstUint => {
+                                    let min = if param.min.is_finite() {
+                                        param.min
+                                    } else {
+                                        -1_000_000.0
+                                    };
+                                    let max = if param.max.is_finite() {
+                                        param.max
+                                    } else {
+                                        1_000_000.0
+                                    };
+                                    ui.add(
+                                        egui::DragValue::new(&mut param.value)
+                                            .range(min..=max)
+                                            .speed(1.0)
+                                            .fixed_decimals(0),
+                                    )
+                                }
+                                ParamTy::Float | ParamTy::ConstFloat => {
+                                    if param.min.is_finite() && param.max.is_finite() {
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut param.value,
+                                                param.min..=param.max,
+                                            )
+                                            .show_value(true),
+                                        )
+                                    } else {
+                                        ui.add(
+                                            egui::DragValue::new(&mut param.value)
+                                                .speed(0.01)
+                                                .fixed_decimals(3),
+                                        )
+                                    }
+                                }
+                            };
+                            if response.changed() {
+                                match param.ty {
+                                    ParamTy::Int
+                                    | ParamTy::Uint
+                                    | ParamTy::Define
+                                    | ParamTy::ConstInt
+                                    | ParamTy::ConstUint => {
+                                        param.value = param.value.round();
+                                    }
+                                    ParamTy::Float | ParamTy::ConstFloat => {}
+                                }
+                                param.value = param.value.clamp(param.min, param.max);
+                                values_changed = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(&param.name)
+                                    .monospace()
+                                    .size(9.5)
+                                    .weak(),
+                            );
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
+                            reset_defaults = true;
+                        }
+                        if control_row_button(ui, i18n::text(lang, "common.close")).clicked() {
+                            keep_open = false;
+                        }
+                    });
+                });
+
+            if reset_defaults {
+                for param in &mut editor.params {
+                    param.value = param.default.clamp(param.min, param.max);
+                }
+                values_changed = true;
+            }
+            if values_changed && editor.index < self.chain.len() {
+                let running = self.running();
+                let (path, params) = {
+                    let spec = &mut self.chain[editor.index];
+                    for param in &editor.params {
+                        spec.params.insert(param.name.clone(), param.value);
+                    }
+                    (spec.path.clone(), spec.params.clone())
+                };
+                log::info!(
+                    "glsl-param-edit: index={} path={} params={:?} live={}",
+                    editor.index,
+                    path,
+                    params,
+                    running
+                );
+                self.apply_live();
+            }
+            if keep_open {
+                self.glsl_param_editor = Some(editor);
+            }
+        }
         if self.settings.ui_mode != UiMode::Mini && self.hotkey_editor_open {
             let mut open = true;
             let mut save = false;
@@ -10144,13 +11098,13 @@ impl eframe::App for App {
                             let capture_resolution = self.current_preset_capture_resolution();
                             match self.store.overwrite_active_as(
                                 &self.save_as_name,
-                                &self.chain,
+                                &self.persisted_specs(),
                                 aspect_correction,
                                 crop,
                                 capture_resolution,
                             ) {
                                 Ok(name) => {
-                                    self.saved_chain = self.chain.clone();
+                                    self.saved_chain = self.persisted_specs();
                                     self.saved_aspect_correction = aspect_correction;
                                     self.saved_crop = crop;
                                     self.saved_capture_resolution = capture_resolution;
@@ -10173,13 +11127,13 @@ impl eframe::App for App {
                             let capture_resolution = self.current_preset_capture_resolution();
                             match self.store.save_as_new(
                                 &self.save_as_name,
-                                &self.chain,
+                                &self.persisted_specs(),
                                 aspect_correction,
                                 crop,
                                 capture_resolution,
                             ) {
                                 Ok(name) => {
-                                    self.saved_chain = self.chain.clone();
+                                    self.saved_chain = self.persisted_specs();
                                     self.saved_aspect_correction = aspect_correction;
                                     self.saved_crop = crop;
                                     self.saved_capture_resolution = capture_resolution;
@@ -10324,6 +11278,9 @@ impl eframe::App for App {
             vulkan_onepass::record_route_once("engine-shutdown-returned", &line);
         }
         chidescaler_neo::input::emergency_release_all();
+        if let Some(mut tray) = self.tray.take() {
+            tray.stop();
+        }
         self.hotkeys.stop();
         if vulkan_onepass::production_one_pass_requested() {
             let line = format!(
@@ -10339,6 +11296,53 @@ impl eframe::App for App {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn every_root_editor_suppresses_native_start_stop_hit_testing() {
+        let source = include_str!("main.rs");
+        let helper = source
+            .split("fn main_control_overlay_open(&self) -> bool")
+            .nth(1)
+            .and_then(|tail| tail.split("fn hotkey_bindings").next())
+            .expect("main-control overlay guard");
+        for state in [
+            "filter_picker_open",
+            "hotkey_editor_open",
+            "resize_scale_editor",
+            "dlssnr_editor",
+            "glsl_param_editor",
+            "save_as_open",
+            "confirm_delete",
+            "elevated_target_notice",
+            "capture_resolution_fullscreen_notice_open",
+        ] {
+            assert!(helper.contains(state), "missing overlay guard for {state}");
+        }
+        assert!(source.contains("let suppress_main_control = self.main_control_overlay_open();"));
+        assert!(
+            source.contains(
+                "let control_mode = if self.main_control_overlay_open() || status.stopping"
+            )
+        );
+    }
+
+    #[test]
+    fn dlssnr_stats_are_hidden_when_off_and_retained_when_enabled() {
+        let row = (
+            "DLSS Neural Rendering [D3D12]".to_string(),
+            StageStat {
+                kind: "dlssnr".into(),
+                ms: 4.0,
+            },
+        );
+        assert!(stats_rows_in_filter_chain_order(&[], vec![row.clone()]).is_empty());
+        let mut spec = chidescaler_neo::core::dlssnr::new_spec();
+        assert!(stats_rows_in_filter_chain_order(&[spec.clone()], vec![row.clone()]).is_empty());
+        spec.enabled = true;
+        let result = stats_rows_in_filter_chain_order(&[spec], vec![row]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1.ms, 4.0);
+    }
 
     #[test]
     fn gpu_auto_follows_actual_render_adapter() {

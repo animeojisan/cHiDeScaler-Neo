@@ -161,6 +161,15 @@ impl PresetStore {
         }
         let mut migrated = false;
         for preset in &mut data.presets {
+            let before = preset.chain.len();
+            preset.chain.retain(|stage| stage.kind != StageKind::Dlssnr);
+            if preset.chain.len() != before {
+                migrated = true;
+                log::info!(
+                    "preset-migrate: preset='{}' removed=dlssnr reason=experimental-manual-state",
+                    preset.name
+                );
+            }
             for stage in &mut preset.chain {
                 if stage.path == "shaders/Deinterlace/NeoDeint_Anime_IVTC_HQ_RT.glsl" {
                     stage.path = "shaders/Deinterlace/NeoDeint.glsl".into();
@@ -342,9 +351,10 @@ pub fn save_settings(app_dir: &std::path::Path, s: &Settings) {
     }
 }
 
-/// Discover drop-in filters below shaders/ and models/. Both legacy files
-/// placed directly in those folders and files in arbitrarily deep user-made
-/// subfolders are supported. Returns app-dir-relative forward-slash paths.
+/// Discover drop-in filters below shaders/, models/, and the dedicated slangp/ root.
+/// `.slang` files are implementation passes and remain hidden; only `.slangp`
+/// preset entry points are exposed as one filter-chain stage. Returns
+/// app-dir-relative forward-slash paths.
 pub fn discover_filters(app_dir: &std::path::Path) -> Vec<(StageKind, String)> {
     let mut out = Vec::new();
     fn walk(
@@ -383,6 +393,9 @@ pub fn discover_filters(app_dir: &std::path::Path) -> Vec<(StageKind, String)> {
                 .unwrap_or_default();
             let kind = match ext.as_str() {
                 "glsl" => {
+                    // v692: CRT Beam Simulator-Neo is active again. The v682
+                    // Display-Hz cadence and isolated ONNX -> Beam worker remained
+                    // in the source while dormant; discovery is the only gate restored.
                     let is_external_neoflow =
                         std::fs::read_to_string(&p).ok().is_some_and(|source| {
                             (source.contains("NeoFlow external multi-pass shader source")
@@ -404,6 +417,7 @@ pub fn discover_filters(app_dir: &std::path::Path) -> Vec<(StageKind, String)> {
                     StageKind::Glsl
                 }
                 "onnx" => StageKind::Onnx,
+                "slangp" => StageKind::Slangp,
                 _ => continue,
             };
             let Ok(rel_path) = p.strip_prefix(root) else {
@@ -414,7 +428,7 @@ pub fn discover_filters(app_dir: &std::path::Path) -> Vec<(StageKind, String)> {
     }
 
     let mut visited = std::collections::HashSet::new();
-    for folder in ["shaders", "models"] {
+    for folder in ["shaders", "models", "slangp"] {
         walk(app_dir, &app_dir.join(folder), &mut visited, &mut out);
     }
     out

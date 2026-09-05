@@ -294,6 +294,12 @@ impl GlslEngine {
             if let Some(loc) = gl.get_uniform_location(prog, "frame") {
                 gl.uniform_1_i32(Some(&loc), current_frame());
             }
+            if let Some(loc) = gl.get_uniform_location(prog, "neo_display_frame") {
+                gl.uniform_1_i32(Some(&loc), current_display_frame());
+            }
+            if let Some(loc) = gl.get_uniform_location(prog, "neo_refresh_hz") {
+                gl.uniform_1_f32(Some(&loc), current_display_refresh_hz());
+            }
             for (name, v, ty) in params {
                 if let Some(loc) = gl.get_uniform_location(prog, name) {
                     match ty {
@@ -385,6 +391,12 @@ impl GlslEngine {
             }
             if let Some(loc) = gl.get_uniform_location(prog, "frame") {
                 gl.uniform_1_i32(Some(&loc), current_frame());
+            }
+            if let Some(loc) = gl.get_uniform_location(prog, "neo_display_frame") {
+                gl.uniform_1_i32(Some(&loc), current_display_frame());
+            }
+            if let Some(loc) = gl.get_uniform_location(prog, "neo_refresh_hz") {
+                gl.uniform_1_f32(Some(&loc), current_display_refresh_hz());
             }
             for (name, v, ty) in params {
                 if let Some(loc) = gl.get_uniform_location(prog, name) {
@@ -1337,6 +1349,15 @@ fn append_common_uniforms(
     if !params.iter().any(|(name, _, _)| name == "frame") {
         prelude.push_str("uniform int frame;\n");
     }
+    if !params
+        .iter()
+        .any(|(name, _, _)| name == "neo_display_frame")
+    {
+        prelude.push_str("uniform int neo_display_frame;\n");
+    }
+    if !params.iter().any(|(name, _, _)| name == "neo_refresh_hz") {
+        prelude.push_str("uniform float neo_refresh_hz;\n");
+    }
     for (name, v, ty) in params {
         match ty {
             ParamTy::Int => prelude.push_str(&format!("uniform int {name};\n")),
@@ -1560,6 +1581,25 @@ fn current_random() -> f32 {
 /// / interlacing effects in CRT shaders key odd/even off it). Advanced ONCE
 /// per processed frame by the chain, NOT per pass/shader.
 static FRAME_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static DISPLAY_FRAME_INDEX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static DISPLAY_REFRESH_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(60.0f32.to_bits());
+
+/// Update Neo's display-cadence uniforms without changing mpv's ordinary
+/// `frame` builtin. Display-Hz shaders can therefore animate per monitor
+/// refresh while every existing temporal shader retains source-frame semantics.
+pub fn set_display_clock(frame_index: u64, refresh_hz: f64) {
+    DISPLAY_FRAME_INDEX.store(
+        frame_index.min(i32::MAX as u64) as i32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let hz = if refresh_hz.is_finite() && refresh_hz > 1.0 {
+        refresh_hz as f32
+    } else {
+        60.0
+    };
+    DISPLAY_REFRESH_BITS.store(hz.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 
 pub fn advance_frame() {
     FRAME_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1575,6 +1615,14 @@ pub fn rewind_frame() {
 
 fn current_frame() -> i32 {
     FRAME_INDEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn current_display_frame() -> i32 {
+    DISPLAY_FRAME_INDEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn current_display_refresh_hz() -> f32 {
+    f32::from_bits(DISPLAY_REFRESH_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 pub(crate) fn compat_shader_code(p: &Pass, binds_comps: &[(String, u8, bool)]) -> String {

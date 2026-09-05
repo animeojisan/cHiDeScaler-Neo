@@ -5,7 +5,7 @@
 //! unavailable. Any NCHW image model (Compact/ESRGAN/CUGAN...) works drop-in;
 //! fp16 vs fp32 is detected from the model input.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use half::f16;
 use ort::{
     AsPointer,
@@ -60,13 +60,12 @@ use crate::render::{
     gl::{GlContext, GpuTex, InterpAuxPlane},
     onnx_accel::{
         Decision as NeoDecision, NeoAccelState, analyze_local_image_model, compare_output_patch,
-        crop_rgba8, extract_output_patch, write_output_patch,
+        crop_rgba8, extract_output_patch, neoaccel_enabled, write_output_patch,
     },
 };
 
 static ORT_READY: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 static DIRECT_OUTPUT_KEY: AtomicU64 = AtomicU64::new(1);
-static NEO_ACCEL_KEY: AtomicU64 = AtomicU64::new(1);
 static TENSORRT_PROFILE_KEY: AtomicU64 = AtomicU64::new(1);
 static TENSORRT_ACTIVE_CACHE_DIRS: OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
     OnceLock::new();
@@ -152,6 +151,11 @@ struct TensorRtBuildProgress {
     current: Option<String>,
     completed: std::collections::HashSet<String>,
     started: Option<Instant>,
+    // v681: time each model from the moment TensorRT engine preparation is
+    // registered. `model_started` is intentionally kept separate because it
+    // marks the first real inference, which can occur only after a long lazy
+    // provider/engine build has already completed.
+    model_build_started: std::collections::HashMap<String, Instant>,
     model_started: std::collections::HashMap<String, Instant>,
 }
 
@@ -180,6 +184,10 @@ fn begin_tensorrt_build(model: &Path) {
         if !progress.models.contains(&name) {
             progress.models.push(name.clone());
         }
+        progress
+            .model_build_started
+            .entry(name.clone())
+            .or_insert_with(Instant::now);
         log::info!(
             "tensorrt-engine-build: registered model={} total={}",
             name,
@@ -202,6 +210,7 @@ fn mark_tensorrt_model_failed(model: &Path, reason: &str) {
         let before = progress.models.len();
         progress.models.retain(|candidate| candidate != &name);
         progress.completed.remove(&name);
+        progress.model_build_started.remove(&name);
         progress.model_started.remove(&name);
         if progress.current.as_deref() == Some(name.as_str()) {
             progress.current = progress
@@ -408,7 +417,7 @@ pub fn mark_tensorrt_model_completed(name: &str) {
         }
         if progress.completed.insert(name.to_string()) {
             let model_elapsed = progress
-                .model_started
+                .model_build_started
                 .get(name)
                 .map(|started| started.elapsed())
                 .unwrap_or_default();
@@ -462,10 +471,12 @@ pub fn tensorrt_build_progress() -> Option<(String, Duration, usize, usize, bool
             .cloned()
     })?;
     let model_started = progress.model_started.get(&name).copied();
+    let model_build_started = progress.model_build_started.get(&name).copied();
     Some((
         name,
-        model_started
+        model_build_started
             .map(|started| started.elapsed())
+            .or_else(|| model_started.map(|started| started.elapsed()))
             .unwrap_or_default(),
         progress.completed.len(),
         progress.models.len(),
@@ -644,8 +655,17 @@ pub struct OnnxStage {
     pub provider: OnnxProvider,
     pub fallback_reason: Option<String>,
     tensorrt_cache_dir: Option<PathBuf>,
+    tensorrt_cache_root: Option<PathBuf>,
+    tensorrt_profile_shape: Option<(usize, i32, i32)>,
     tensorrt_engine_verified: bool,
     tensorrt_profiling_active: bool,
+    /// v691: TensorRT actually executes this model path. For normal sessions it
+    /// equals `source_path`; the NeoAccel Q/DQ experiment points at a bundled
+    /// sidecar while keeping `source_path` as the user's original FP16 model.
+    tensorrt_model_path: Option<PathBuf>,
+    /// True only for the explicit-Q/DQ INT8 sidecar experiment. The normal
+    /// TensorRT FP16 session never enables this flag.
+    tensorrt_explicit_qdq: bool,
     /// Frame-interpolation model (RIFE-style): two image inputs, or one
     /// 6-channel input (prev+cur concatenated). Optional scalar "timestep".
     pub interp: InterpKind,
@@ -662,6 +682,7 @@ impl Drop for OnnxStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnnxProvider {
     DirectML,
+    MigraphX,
     TensorRT,
     Cuda,
 }
@@ -798,12 +819,112 @@ impl OnnxStage {
         cache_root: &Path,
     ) -> Result<Self> {
         match preference {
-            OnnxBackendPreference::DirectML => Self::load_directml(path, dml_adapter_id),
+            OnnxBackendPreference::DirectML => {
+                let neo_image =
+                    neoaccel_enabled() && analyze_local_image_model(path).ok().flatten().is_some();
+                if neo_image {
+                    let amd_target = {
+                        let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+                        match dml_adapter_id {
+                            Some(device_id) => adapters
+                                .iter()
+                                .find(|adapter| adapter.device_id == device_id)
+                                .is_some_and(|adapter| adapter.vendor_id == 0x1002),
+                            None => adapters.len() == 1 && adapters[0].vendor_id == 0x1002,
+                        }
+                    };
+                    if amd_target && crate::render::winml_migraphx::available_runtime() {
+                        match Self::load_migraphx(path, dml_adapter_id) {
+                            Ok(stage) => return Ok(stage),
+                            Err(error) => {
+                                log::warn!(
+                                    "NeoAccel AMD provider probe rejected: model={} provider=MIGraphX reason={error:#}; action=DirectML-FP16",
+                                    path.display()
+                                );
+                            }
+                        }
+                    } else if amd_target {
+                        log::info!(
+                            "NeoAccel provider probe: model={} requested=DirectML low_precision=not-active reason=Windows-ML-MIGraphX-runtime-not-prepared fallback=DirectML-FP16",
+                            path.display()
+                        );
+                    } else {
+                        log::info!(
+                            "NeoAccel provider probe: model={} requested=DirectML provider=DirectML reason=selected-GPU-is-not-unambiguous-AMD",
+                            path.display()
+                        );
+                    }
+                } else if neoaccel_enabled() {
+                    log::info!(
+                        "NeoAccel provider probe skipped: model={} requested=DirectML reason=not-conservative-image-cnn",
+                        path.display()
+                    );
+                }
+                Self::load_directml(path, dml_adapter_id)
+            }
             OnnxBackendPreference::TensorRT => {
                 let device_id =
                     trt_device_id.ok_or_else(|| anyhow!("TensorRT CUDA device is unavailable"))?;
-                match Self::load_tensorrt(path, device_id, dml_adapter_id, cache_root) {
+                let qdq_sidecar = if neoaccel_enabled()
+                    && analyze_local_image_model(path).ok().flatten().is_some()
+                {
+                    neoaccel_tensorrt_qdq_sidecar(path)
+                } else {
+                    None
+                };
+                if neoaccel_enabled() && qdq_sidecar.is_none() {
+                    log::info!(
+                        "NeoAccel explicit-QDQ skipped: model={} reason=no-validated-sidecar-for-this-model fallback=TensorRT-FP16",
+                        path.display()
+                    );
+                }
+                let engine_model = qdq_sidecar.as_deref().unwrap_or(path);
+                let explicit_qdq = qdq_sidecar.is_some();
+                match Self::load_tensorrt(
+                    path,
+                    engine_model,
+                    device_id,
+                    dml_adapter_id,
+                    cache_root,
+                    explicit_qdq,
+                ) {
                     Ok(stage) => Ok(stage),
+                    Err(qdq_error) if explicit_qdq => {
+                        log::warn!(
+                            "NeoAccel explicit-QDQ session rejected: model={} reason={qdq_error:#}; action=retry-TensorRT-FP16",
+                            path.display()
+                        );
+                        match Self::load_tensorrt(
+                            path,
+                            path,
+                            device_id,
+                            dml_adapter_id,
+                            cache_root,
+                            false,
+                        ) {
+                            Ok(mut stage) => {
+                                stage.fallback_reason = Some(format!(
+                                    "NeoAccel explicit-QDQ INT8 rejected; TensorRT FP16 restored: {qdq_error:#}"
+                                ));
+                                log::info!(
+                                    "NeoAccel explicit-QDQ fallback complete: model={} provider=TensorRT-FP16 phase=session-create",
+                                    path.display()
+                                );
+                                Ok(stage)
+                            }
+                            Err(fp16_error) => {
+                                mark_tensorrt_model_failed(path, &format!("{fp16_error:#}"));
+                                log::warn!(
+                                    "onnx-backend-fallback: model={} TensorRT FP16 retry failed: {fp16_error:#}; using DirectML",
+                                    path.display()
+                                );
+                                let mut stage = Self::load_directml(path, dml_adapter_id)?;
+                                stage.fallback_reason = Some(format!("{fp16_error:#}"));
+                                stage.provider_desc.push_str(" fallback");
+                                Ok(stage)
+                            }
+                        }
+                    }
                     Err(trt_error) => {
                         mark_tensorrt_model_failed(path, &format!("{trt_error:#}"));
                         log::warn!(
@@ -860,23 +981,74 @@ impl OnnxStage {
         )
     }
 
+    fn load_migraphx(path: &Path, fallback_dml_adapter: Option<i32>) -> Result<Self> {
+        init_onnx().map_err(|e| anyhow!(e))?;
+        log::info!(
+            "NeoAccel provider probe: model={} requested=DirectML provider=MIGraphX precision=source-model-FP16 low_precision=calibration-pending cpu_fallback=false",
+            path.display()
+        );
+        let session = crate::render::winml_migraphx::create_session(path)?;
+        Self::from_session(
+            path,
+            session,
+            fallback_dml_adapter,
+            OnnxProvider::MigraphX,
+            "MIGraphX/WindowsML GPU".into(),
+            None,
+            None,
+            false,
+        )
+    }
+
     fn load_tensorrt(
-        path: &Path,
+        source_path: &Path,
+        engine_model_path: &Path,
         device_id: i32,
         fallback_dml_adapter: Option<i32>,
         cache_root: &Path,
+        explicit_qdq: bool,
+    ) -> Result<Self> {
+        Self::load_tensorrt_with_profile(
+            source_path,
+            engine_model_path,
+            device_id,
+            fallback_dml_adapter,
+            cache_root,
+            None,
+            explicit_qdq,
+        )
+    }
+
+    fn load_tensorrt_with_profile(
+        source_path: &Path,
+        engine_model_path: &Path,
+        device_id: i32,
+        fallback_dml_adapter: Option<i32>,
+        cache_root: &Path,
+        profile: Option<(&str, usize, i32, i32)>,
+        explicit_qdq: bool,
     ) -> Result<Self> {
         init_onnx().map_err(|e| anyhow!(e))?;
         let builder_level = tensorrt_builder_level();
         let workspace_mb = tensorrt_workspace_mb();
+        let profile_variant = profile
+            .map(|(_, channels, height, width)| format!("_profile-{channels}x{height}x{width}"))
+            .unwrap_or_default();
+        let precision_variant = if explicit_qdq { "_qdq-int8-v1" } else { "" };
         let cache_variant = format!(
-            "builder-{builder_level}_workspace-{}mb_fp16-1",
+            "builder-{builder_level}_workspace-{}mb_fp16-1{precision_variant}{profile_variant}",
             workspace_mb
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "default".into())
         );
-        let cache_dir = tensorrt_model_cache_dir(cache_root, path, cache_variant.as_bytes());
-        migrate_legacy_tensorrt_cache(cache_root, path, cache_variant.as_bytes(), &cache_dir);
+        let cache_dir =
+            tensorrt_model_cache_dir(cache_root, engine_model_path, cache_variant.as_bytes());
+        migrate_legacy_tensorrt_cache(
+            cache_root,
+            engine_model_path,
+            cache_variant.as_bytes(),
+            &cache_dir,
+        );
         maintain_tensorrt_cache_root(cache_root, Some(&cache_dir));
         let cache_enabled = match std::fs::create_dir_all(&cache_dir) {
             Ok(()) => {
@@ -886,37 +1058,72 @@ impl OnnxStage {
             Err(error) => {
                 log::warn!(
                     "tensorrt-cache: model={} disabled reason={error}",
-                    path.display()
+                    engine_model_path.display()
                 );
                 false
             }
         };
-        let cache_was_present = cache_enabled && Self::has_tensorrt_engine_files(&cache_dir);
+        let stale_incomplete = cache_enabled && cache_dir.join(TENSORRT_BUILD_MARKER).exists();
+        let cache_was_present =
+            cache_enabled && !stale_incomplete && Self::has_tensorrt_engine_files(&cache_dir);
         let provider_verification_cached =
             cache_was_present && tensorrt_provider_verification_ready(&cache_dir);
-        if !cache_was_present {
-            begin_tensorrt_build(path);
+        // A profile-less session is only used to inspect model metadata. The
+        // actual runtime session is rebuilt with an exact single-input NCHW
+        // profile before its first inference, so do not advertise or mark this
+        // provisional metadata session as an engine build.
+        if !cache_was_present && profile.is_some() {
+            begin_tensorrt_build(source_path);
         }
-        if cache_enabled {
+        if cache_enabled && profile.is_some() {
             prepare_tensorrt_cache_attempt(&cache_dir, cache_was_present)?;
         }
+        // Explicit Q/DQ controls INT8 placement inside the graph. Do not enable
+        // TensorRT's legacy implicit-INT8 flag here: it requires calibration
+        // metadata for non-Q/DQ models and was the reason the v688 probe failed.
         let mut tensorrt = ort::ep::TensorRT::default()
             .with_device_id(device_id)
             .with_fp16(true)
+            .with_int8(false)
+            .with_detailed_build_log(explicit_qdq)
             .with_force_sequential_engine_build(true)
             .with_builder_optimization_level(builder_level);
+        if let Some((input_name, channels, height, width)) = profile {
+            let shapes = format!("{input_name}:1x{channels}x{height}x{width}");
+            tensorrt = tensorrt
+                .with_profile_min_shapes(shapes.clone())
+                .with_profile_opt_shapes(shapes.clone())
+                .with_profile_max_shapes(shapes.clone());
+            log::info!(
+                "tensorrt-explicit-profile: model={} input={} shape=1x{}x{}x{} min=opt=max policy=runtime-padded-shape",
+                engine_model_path.display(),
+                input_name,
+                channels,
+                height,
+                width
+            );
+        }
         if let Some(workspace_mb) = workspace_mb {
             tensorrt = tensorrt
                 .with_max_workspace_size(workspace_mb.saturating_mul(1024).saturating_mul(1024));
         }
         log::info!(
-            "tensorrt-builder-config: model={} level={} workspace_mb={}",
-            path.display(),
+            "tensorrt-builder-config: model={} source_model={} level={} workspace_mb={} fp16=true int8=false explicit_qdq={}",
+            engine_model_path.display(),
+            source_path.display(),
             builder_level,
             workspace_mb
                 .map(|value| value.to_string())
-                .unwrap_or_else(|| "default".into())
+                .unwrap_or_else(|| "default".into()),
+            explicit_qdq
         );
+        if explicit_qdq {
+            log::info!(
+                "NeoAccel explicit-QDQ: model={} sidecar={} provider=TensorRT precision=FP16+INT8-QDQ quantized_convs=Conv_10,Conv_12,Conv_14,Conv_16,Conv_18,Conv_20,Conv_22,Conv_24 activation=INT8-per-tensor weight=INT8-per-channel high_precision_output=true fallback=TensorRT-FP16",
+                source_path.display(),
+                engine_model_path.display()
+            );
+        }
         if cache_enabled {
             let cache_path = tensorrt_compatible_path(&cache_dir)?
                 .to_string_lossy()
@@ -928,7 +1135,7 @@ impl OnnxStage {
                 .with_timing_cache_path(cache_path);
             log::info!(
                 "tensorrt-cache: model={} path={} enabled=true",
-                path.display(),
+                engine_model_path.display(),
                 cache_dir.display()
             );
         }
@@ -937,7 +1144,7 @@ impl OnnxStage {
         let profile_root = if provider_verification_cached {
             log::info!(
                 "tensorrt-cache: provider verification reused model={} path={}",
-                path.display(),
+                engine_model_path.display(),
                 cache_dir.display()
             );
             None
@@ -979,7 +1186,7 @@ impl OnnxStage {
         if let Some(profile_prefix) = &profile_prefix {
             builder = builder.with_profiling(profile_prefix).map_err(oerr)?;
         }
-        let staged_path = stage_tensorrt_model(path, &cache_dir)?;
+        let staged_path = stage_tensorrt_model(engine_model_path, &cache_dir)?;
         let session_path = tensorrt_compatible_path(&staged_path)?;
         let session = match builder.commit_from_file(&session_path).map_err(oerr) {
             Ok(session) => session,
@@ -991,11 +1198,15 @@ impl OnnxStage {
             }
         };
         Self::from_session(
-            path,
+            source_path,
             session,
             fallback_dml_adapter,
             OnnxProvider::TensorRT,
-            format!("TensorRT + CUDA device {device_id}"),
+            if explicit_qdq {
+                format!("TensorRT FP16 + explicit-QDQ INT8(8 Conv) + CUDA device {device_id}")
+            } else {
+                format!("TensorRT FP16 + CUDA device {device_id}")
+            },
             cache_enabled.then_some(cache_dir),
             diagnostic_guard,
             profile_prefix.is_some(),
@@ -1003,6 +1214,11 @@ impl OnnxStage {
         .map(|mut stage| {
             stage.tensorrt_device_id = Some(device_id);
             stage.tensorrt_engine_verified = provider_verification_cached;
+            stage.tensorrt_cache_root = Some(cache_root.to_path_buf());
+            stage.tensorrt_profile_shape =
+                profile.map(|(_, channels, height, width)| (channels, height, width));
+            stage.tensorrt_model_path = Some(engine_model_path.to_path_buf());
+            stage.tensorrt_explicit_qdq = explicit_qdq;
             stage
         })
     }
@@ -1085,41 +1301,11 @@ impl OnnxStage {
         let temporal_frames = input_channels
             .filter(|channels| *channels >= 9 && *channels % 3 == 0)
             .map(|channels| channels / 3);
-        let neo_accel = if interp == InterpKind::None && temporal_frames.is_none() {
-            match analyze_local_image_model(path) {
-                Ok(Some(plan)) => {
-                    log::info!(
-                        "NeoAccel eligible: model='{}' convs={} halo={}x{} scale_hint={} alignment={}",
-                        name,
-                        plan.conv_count,
-                        plan.halo_x,
-                        plan.halo_y,
-                        plan.scale_hint,
-                        plan.alignment
-                    );
-                    Some(NeoAccelState::new(
-                        plan,
-                        format!(
-                            "neo-onnx-accel:{}",
-                            NEO_ACCEL_KEY.fetch_add(1, Ordering::Relaxed)
-                        ),
-                    ))
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    log::warn!(
-                        "NeoAccel model analysis failed for '{}'; DirectML fallback retained: {error:#}",
-                        name
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if neo_accel.is_some() {
-            provider_desc.push_str(" + NeoAccel sparse-local");
-        }
+        // v687: the v684-v686 temporal reuse experiment is intentionally retired.
+        // NeoAccel now controls only TensorRT mixed precision at session-build
+        // time; no frame synthesis, motion warp, or temporal detail reuse is
+        // allowed in the active render path.
+        let neo_accel = None;
         if let Some(frames) = temporal_frames {
             provider_desc.push_str(&format!(" + temporal-{frames}f"));
         }
@@ -1174,8 +1360,12 @@ impl OnnxStage {
             provider,
             fallback_reason: None,
             tensorrt_cache_dir,
+            tensorrt_cache_root: None,
+            tensorrt_profile_shape: None,
             tensorrt_engine_verified: false,
             tensorrt_profiling_active,
+            tensorrt_model_path: None,
+            tensorrt_explicit_qdq: false,
             interp,
         };
         if let Some(cache_dir) = &stage.tensorrt_cache_dir {
@@ -1211,6 +1401,15 @@ impl OnnxStage {
         let Some(cache_dir) = &self.tensorrt_cache_dir else {
             return;
         };
+        if self.tensorrt_profile_shape.is_none() {
+            log::debug!(
+                "tensorrt-shape-cache: model={} input={}x{} action=defer-until-explicit-profile",
+                self.name,
+                width,
+                height
+            );
+            return;
+        }
         if !self.tensorrt_shape_cache_ready(cache_dir, width, height) {
             begin_tensorrt_build(&self.source_path);
             mark_tensorrt_model_started(&self.name);
@@ -1262,6 +1461,7 @@ impl OnnxStage {
                 "builder_level": tensorrt_builder_level(),
                 "workspace_mb": tensorrt_workspace_mb(),
                 "fp16": self.fp16,
+                "neoaccel_explicit_qdq": self.tensorrt_explicit_qdq,
                 "engine_files": engines,
                 "verified": true
             });
@@ -1384,6 +1584,22 @@ impl OnnxStage {
                 false
             }
         }
+    }
+
+    fn replace_migraphx_with_directml(&mut self, reason: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.provider == OnnxProvider::MigraphX,
+            "MIGraphX fallback requested for a non-MIGraphX session"
+        );
+        let mut replacement = Self::load_directml(&self.source_path, self.fallback_dml_adapter)?;
+        log::warn!(
+            "NeoAccel AMD provider runtime fallback: model={} provider=MIGraphX reason={} action=DirectML-FP16",
+            self.source_path.display(),
+            reason
+        );
+        replacement.provider_desc.push_str(" after MIGraphX probe");
+        *self = replacement;
+        Ok(())
     }
 
     fn cleanup_tensorrt_diagnostic_dir(&mut self) {
@@ -1703,7 +1919,7 @@ impl OnnxStage {
                     mode,
                 )
             }
-            OnnxProvider::Cuda => Ok(None),
+            OnnxProvider::MigraphX | OnnxProvider::Cuda => Ok(None),
         };
         match result {
             Ok(Some(fence)) => {
@@ -1910,7 +2126,9 @@ impl OnnxStage {
                 drop(provider_outputs);
                 bridge.padded_size
             }
-            OnnxProvider::Cuda => anyhow::bail!("unsupported interpolation backend"),
+            OnnxProvider::MigraphX | OnnxProvider::Cuda => {
+                anyhow::bail!("unsupported interpolation backend")
+            }
         };
         Ok((started.elapsed().as_secs_f64() * 1000.0, padded))
     }
@@ -1953,7 +2171,9 @@ impl OnnxStage {
                         .collect::<Vec<_>>(),
                 )
             }
-            OnnxProvider::Cuda => anyhow::bail!("unsupported interpolation backend"),
+            OnnxProvider::MigraphX | OnnxProvider::Cuda => {
+                anyhow::bail!("unsupported interpolation backend")
+            }
         };
         anyhow::ensure!(
             keys.len() == count,
@@ -2211,10 +2431,10 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
-        // Backend-switch warmup uses this CPU-visible interpolation path even
-        // when the provider is TensorRT. Announce the real RIFE/DRBA run here
-        // so stacked-model progress advances from "waiting" to a timed second
-        // engine instead of completing with a synthetic 0.0 ms duration.
+        // Backend-switch warmup can enter this CPU-visible path before the
+        // resident interpolation bridge. Build the same explicit profile here
+        // so TensorRT never sees a profile-less first inference.
+        self.ensure_tensorrt_interp_profile_for_size((w, h))?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
         let result = if let InterpKind::RifeV1 { channels } = self.interp.clone() {
@@ -2229,6 +2449,12 @@ impl OnnxStage {
         };
         if result.is_ok() {
             self.complete_successful_tensorrt_shape(w, h);
+            return result;
+        }
+        if let Err(error) = &result
+            && self.fallback_tensorrt_after_engine_creation_failure(error)?
+        {
+            return self.process_interp(w, h, frames, t);
         }
         result
     }
@@ -2243,6 +2469,7 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
+        self.ensure_tensorrt_interp_profile_for_size((w, h))?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
         let result = if let InterpKind::RifeV1 { channels } = self.interp.clone() {
@@ -2255,6 +2482,12 @@ impl OnnxStage {
         };
         if result.is_ok() {
             self.complete_successful_tensorrt_shape(w, h);
+            return result;
+        }
+        if let Err(error) = &result
+            && self.fallback_tensorrt_after_engine_creation_failure(error)?
+        {
+            return self.process_interp_rgba8(w, h, frames, t);
         }
         result
     }
@@ -2271,11 +2504,18 @@ impl OnnxStage {
         ts: &[f32],
     ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
         if self.interp == InterpKind::Drba && ts.len() > 1 {
+            self.ensure_tensorrt_interp_profile_for_size((w, h))?;
             self.prepare_tensorrt_input_shape(w, h);
             mark_tensorrt_model_started(&self.name);
             let result = self.drba_batch_strided(w, h, frames, ts, 4);
             if result.is_ok() {
                 self.complete_successful_tensorrt_shape(w, h);
+                return result;
+            }
+            if let Err(error) = &result
+                && self.fallback_tensorrt_after_engine_creation_failure(error)?
+            {
+                return self.process_interp_many_rgba8(w, h, frames, ts);
             }
             return result;
         }
@@ -2632,9 +2872,9 @@ impl OnnxStage {
         self.process_u8_strided(w, h, rgba, 4, 4)
     }
 
-    /// NeoAccel fast path for the first ordinary image model. It returns
-    /// `None` whenever the frame is unsuitable, so the caller can immediately
-    /// execute the unchanged GPU-direct DirectML path.
+    /// v687 compatibility hook. Temporal reconstruction is retired; active
+    /// NeoAccel acceleration is selected only while a TensorRT session is built.
+    /// This function deliberately never changes the current frame.
     pub fn try_process_rgba8_neo_texture(
         &mut self,
         gc: &mut GlContext,
@@ -2642,25 +2882,176 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Result<Option<(i32, i32, GpuTex)>> {
-        let Some(mut accel) = self.neo_accel.take() else {
-            return Ok(None);
-        };
-        let result = self.try_process_rgba8_neo_texture_inner(gc, w, h, rgba, &mut accel);
-        if let Err(error) = &result {
-            log::warn!(
-                "NeoAccel disabled for '{}'; stable DirectML path restored: {error:#}",
-                self.name
-            );
-            gc.remove_persistent_texture(&accel.texture_key);
-            accel.disable_permanently();
-        }
-        self.neo_accel = Some(accel);
-        match result {
-            Ok(output) => Ok(output),
-            Err(_) => Ok(None),
-        }
+        // v687: temporal reconstruction was rejected for image quality.
+        // Keep the call site as a compatibility no-op so NeoAccel OFF and ON
+        // both use the exact current frame; acceleration is now exclusively
+        // selected when the TensorRT session itself is built.
+        let _ = (gc, w, h, rgba);
+        Ok(None)
     }
 
+    #[allow(dead_code)]
+    fn neoaccel_run_full_rgba8_texture(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> Result<(i32, i32, GpuTex)> {
+        // Preserve the same provider-specific fast routes as the ordinary
+        // chain. DirectML prefers raw RGBA -> shared output (no GL input
+        // upload); TensorRT prefers its GPU texture bridge.
+        if self.provider == OnnxProvider::TensorRT && self.should_try_tensorrt_gpu_texture(w, h) {
+            let source = gc.upload_rgba8(w, h, rgba);
+            if let Some(texture) = self.process_gpu_texture(gc, source)? {
+                return Ok((texture.w(), texture.h(), texture));
+            }
+        }
+        if let Some((ow, oh, texture)) = self.process_rgba8_gpu_output(gc, w, h, rgba) {
+            return Ok((ow, oh, texture));
+        }
+        let (ow, oh, out) = self.process_rgba8_native_output(w, h, rgba)?;
+        Ok((ow, oh, gc.upload_rgba8(ow, oh, &out)))
+    }
+
+    #[allow(dead_code)]
+    fn try_process_rgba8_neo_temporal_inner(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        accel: &mut NeoAccelState,
+    ) -> Result<Option<(i32, i32, GpuTex)>> {
+        let width = usize::try_from(w)?;
+        let height = usize::try_from(h)?;
+        let expected = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow!("NeoAccel temporal input size overflow"))?;
+        anyhow::ensure!(
+            rgba.len() >= expected,
+            "NeoAccel temporal RGBA input too small"
+        );
+
+        if accel.input_size.is_some() && accel.input_size != Some((width, height)) {
+            gc.remove_persistent_texture(&accel.temporal_ai_key);
+            gc.remove_persistent_texture(&accel.temporal_base_key);
+            gc.remove_persistent_texture(&accel.temporal_flow_key);
+            accel.reset_for_size(width, height);
+        }
+
+        // Only the frame immediately following a real ONNX result may attempt
+        // reuse. Motion/scene uncertainty falls through to a real model run.
+        if accel.temporal_can_attempt(width, height, expected) {
+            let flow_started = Instant::now();
+            if let Some(flow) = accel.temporal_flow_plan(width, height, &rgba[..expected]) {
+                let flow_ms = flow_started.elapsed().as_secs_f64() * 1000.0;
+                let reconstruct_started = Instant::now();
+                let previous_ai = gc.persistent_texture_by_key(&accel.temporal_ai_key);
+                let previous_base = gc.persistent_texture_by_key(&accel.temporal_base_key);
+                if let (Some(previous_ai), Some(previous_base), Some((ow, oh))) =
+                    (previous_ai, previous_base, accel.output_size)
+                {
+                    let flow_tex = gc
+                        .update_persistent_rgba8(
+                            &accel.temporal_flow_key,
+                            i32::try_from(flow.grid_w)?,
+                            i32::try_from(flow.grid_h)?,
+                            &flow.rgba,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    let source = gc.upload_rgba8(w, h, &rgba[..expected]);
+                    let current_base = crate::render::scaler::resample(
+                        gc,
+                        source,
+                        i32::try_from(ow)?,
+                        i32::try_from(oh)?,
+                        crate::render::scaler::Kernel::Spline36,
+                    )?;
+                    let composed = gc
+                        .neoaccel_temporal_detail_compose(
+                            current_base,
+                            previous_ai,
+                            previous_base,
+                            flow_tex,
+                            w,
+                            h,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    accel.temporal_commit_reuse();
+                    if accel.temporal_reused_frames <= 4 || accel.temporal_reused_frames % 120 == 0
+                    {
+                        log::info!(
+                            "NeoAccel temporal-reuse: model='{}' frame={} input={}x{} output={}x{} flow={}x{} confidence={:.1}% mae={:.2} flow_ms={:.3} reconstruct_ms={:.3} next=full-onnx",
+                            self.name,
+                            accel.temporal_reused_frames,
+                            w,
+                            h,
+                            ow,
+                            oh,
+                            flow.grid_w,
+                            flow.grid_h,
+                            flow.confident_ratio * 100.0,
+                            flow.mean_error,
+                            flow_ms,
+                            reconstruct_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    return Ok(Some((i32::try_from(ow)?, i32::try_from(oh)?, composed)));
+                }
+            }
+        }
+
+        // Exact frame: run the unmodified model and return its original texture
+        // untouched. Persistent copies are only references for the next frame.
+        let exact_started = Instant::now();
+        let (ow, oh, exact) = self.neoaccel_run_full_rgba8_texture(gc, w, h, &rgba[..expected])?;
+        let exact_ms = exact_started.elapsed().as_secs_f64() * 1000.0;
+        let reference_started = Instant::now();
+        let scale_x = ow as f32 / w.max(1) as f32;
+        let scale_y = oh as f32 / h.max(1) as f32;
+        anyhow::ensure!(
+            scale_x.is_finite() && scale_y.is_finite() && ow > 0 && oh > 0,
+            "NeoAccel temporal invalid ONNX output geometry"
+        );
+        let source = gc.upload_rgba8(w, h, &rgba[..expected]);
+        let base = crate::render::scaler::resample(
+            gc,
+            source,
+            ow,
+            oh,
+            crate::render::scaler::Kernel::Spline36,
+        )?;
+        gc.copy_to_persistent_rgba8(&accel.temporal_ai_key, exact)
+            .map_err(anyhow::Error::msg)?;
+        gc.copy_to_persistent_rgba8(&accel.temporal_base_key, base)
+            .map_err(anyhow::Error::msg)?;
+        accel.temporal_commit_full(
+            width,
+            height,
+            &rgba[..expected],
+            (usize::try_from(ow)?, usize::try_from(oh)?),
+        );
+        if accel.temporal_full_frames <= 4 || accel.temporal_full_frames % 120 == 0 {
+            log::info!(
+                "NeoAccel exact-reference: model='{}' frame={} input={}x{} output={}x{} scale={:.3}x{:.3} onnx_ms={:.3} reference_ms={:.3} next=reuse-candidate",
+                self.name,
+                accel.temporal_full_frames,
+                w,
+                h,
+                ow,
+                oh,
+                scale_x,
+                scale_y,
+                exact_ms,
+                reference_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(Some((ow, oh, exact)))
+    }
+
+    #[allow(dead_code)]
     fn try_process_rgba8_neo_texture_inner(
         &mut self,
         gc: &mut GlContext,
@@ -2897,7 +3288,7 @@ impl OnnxStage {
                 self.process_dml_gpu_texture(gc, input_texture, after_interpolation)
             }
             OnnxProvider::TensorRT => self.process_tensorrt_gpu_texture(gc, input_texture),
-            OnnxProvider::Cuda => Ok(None),
+            OnnxProvider::MigraphX | OnnxProvider::Cuda => Ok(None),
         }
     }
 
@@ -3249,6 +3640,9 @@ impl OnnxStage {
     ) -> Result<Option<u64>> {
         let size = (frames[0].w(), frames[0].h());
         let (channels, frame_count, padded) = self.interp_gpu_layout(size)?;
+        self.ensure_tensorrt_single_input_profile(channels, padded, "interpolation-padded")?;
+        self.prepare_tensorrt_input_shape(size.0, size.1);
+        mark_tensorrt_model_started(&self.name);
         let slot_count = Self::interp_slot_count(capacity_factor.max(timesteps.len() + 1));
         if self.tensorrt_interp_bridge.as_ref().is_some_and(|bridge| {
             bridge.size != size
@@ -3466,6 +3860,234 @@ impl OnnxStage {
         }
         let fence = gc.submit_commands_fence().map_err(anyhow::Error::msg)?;
         Ok(Some(fence))
+    }
+
+    fn ensure_tensorrt_single_input_profile(
+        &mut self,
+        channels: usize,
+        size: (i32, i32),
+        policy: &str,
+    ) -> Result<()> {
+        let requested = (channels, size.1, size.0);
+        if self.provider != OnnxProvider::TensorRT || self.tensorrt_profile_shape == Some(requested)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.tensorrt_interp_bridge.is_none()
+                && self.tensorrt_gpu_bridge.is_none()
+                && self.tensorrt_temporal_bridge.is_none(),
+            "TensorRT profile cannot change while a shared GPU bridge is active"
+        );
+        let device_id = self
+            .tensorrt_device_id
+            .ok_or_else(|| anyhow!("TensorRT CUDA device unavailable for explicit profile"))?;
+        let cache_root = self
+            .tensorrt_cache_root
+            .clone()
+            .ok_or_else(|| anyhow!("TensorRT cache root unavailable for explicit profile"))?;
+        let input_name = self.in_name.clone();
+        let source_path = self.source_path.clone();
+        let fallback_dml_adapter = self.fallback_dml_adapter;
+        let expected_interp = self.interp.clone();
+        let expected_temporal_frames = self.temporal_frames;
+        log::info!(
+            "tensorrt-profile-rebuild: model={} input={} shape=1x{}x{}x{} policy={} action=rebuild-before-first-inference",
+            self.name,
+            input_name,
+            channels,
+            size.1,
+            size.0,
+            policy
+        );
+        let old_cache_dir = self.tensorrt_cache_dir.clone();
+        let engine_model_path = self
+            .tensorrt_model_path
+            .clone()
+            .unwrap_or_else(|| source_path.clone());
+        let explicit_qdq = self.tensorrt_explicit_qdq;
+        let qdq_attempt = Self::load_tensorrt_with_profile(
+            &source_path,
+            &engine_model_path,
+            device_id,
+            fallback_dml_adapter,
+            &cache_root,
+            Some((input_name.as_str(), channels, size.1, size.0)),
+            explicit_qdq,
+        );
+        let replacement = match qdq_attempt {
+            Ok(stage) => stage,
+            Err(qdq_error) if explicit_qdq => {
+                log::warn!(
+                    "NeoAccel explicit-QDQ profile rejected: model={} shape=1x{}x{}x{} reason={qdq_error:#}; action=retry-TensorRT-FP16",
+                    self.name,
+                    channels,
+                    size.1,
+                    size.0
+                );
+                let mut stage = Self::load_tensorrt_with_profile(
+                    &source_path,
+                    &source_path,
+                    device_id,
+                    fallback_dml_adapter,
+                    &cache_root,
+                    Some((input_name.as_str(), channels, size.1, size.0)),
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "TensorRT FP16 explicit-profile retry failed for 1x{channels}x{}x{} after NeoAccel explicit-QDQ rejection: {qdq_error:#}",
+                        size.1, size.0
+                    )
+                })?;
+                stage.fallback_reason = Some(format!(
+                    "NeoAccel explicit-QDQ INT8 profile rejected; TensorRT FP16 restored: {qdq_error:#}"
+                ));
+                log::info!(
+                    "NeoAccel explicit-QDQ fallback complete: model={} provider=TensorRT-FP16 phase=profile-create",
+                    self.name
+                );
+                stage
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "TensorRT explicit-profile session creation failed for 1x{channels}x{}x{}",
+                        size.1, size.0
+                    )
+                });
+            }
+        };
+        anyhow::ensure!(
+            replacement.interp == expected_interp,
+            "TensorRT explicit-profile session changed interpolation model classification"
+        );
+        anyhow::ensure!(
+            replacement.temporal_frames == expected_temporal_frames,
+            "TensorRT explicit-profile session changed temporal model classification"
+        );
+        let replacement_cache_dir = replacement.tensorrt_cache_dir.clone();
+        *self = replacement;
+        // The profile-less session is metadata-only. If its distinct cache key
+        // contains no engine, remove it after ORT has released that session.
+        if let Some(old_cache_dir) = old_cache_dir.filter(|old| {
+            replacement_cache_dir.as_ref() != Some(old) && !Self::has_tensorrt_engine_files(old)
+        }) {
+            cleanup_incomplete_tensorrt_cache(&old_cache_dir);
+        }
+        log::info!(
+            "tensorrt-profile-rebuild: model={} shape=1x{}x{}x{} policy={} result=ready",
+            self.name,
+            channels,
+            size.1,
+            size.0,
+            policy
+        );
+        Ok(())
+    }
+
+    fn ensure_tensorrt_interp_profile_for_size(&mut self, size: (i32, i32)) -> Result<()> {
+        if self.provider != OnnxProvider::TensorRT {
+            return Ok(());
+        }
+        match self.interp_gpu_layout(size) {
+            Ok((channels, _, padded)) => {
+                self.ensure_tensorrt_single_input_profile(channels, padded, "interpolation-padded")
+            }
+            // Legacy two-input interpolation models need a multi-input profile,
+            // so retain their previous provider behavior rather than inventing
+            // an incomplete single-input profile.
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn is_tensorrt_engine_creation_failure(error: &anyhow::Error) -> bool {
+        let message = format!("{error:#}").to_ascii_lowercase();
+        message.contains("tensorrt ep failed to create engine from network")
+            || message.contains("no engine is found")
+            || message.contains("failed to create engine from network")
+            || message.contains("tensorrt explicit-profile session creation failed")
+    }
+
+    fn fallback_tensorrt_after_engine_creation_failure(
+        &mut self,
+        error: &anyhow::Error,
+    ) -> Result<bool> {
+        if self.provider != OnnxProvider::TensorRT {
+            return Ok(false);
+        }
+        // v691 explicit-Q/DQ experiment: any runtime/engine failure from the
+        // sidecar must retry the user's original FP16 model with TensorRT first.
+        // Preserve the narrower historical engine-build filter for normal FP16
+        // sessions so NeoAccel OFF keeps the established behavior.
+        if !self.tensorrt_explicit_qdq && !Self::is_tensorrt_engine_creation_failure(error) {
+            return Ok(false);
+        }
+        let reason = format!("{error:#}");
+        let source_path = self.source_path.clone();
+        let fallback_dml_adapter = self.fallback_dml_adapter;
+        let failed_cache = self.tensorrt_cache_dir.clone();
+        if self.tensorrt_explicit_qdq {
+            let Some(device_id) = self.tensorrt_device_id else {
+                return Ok(false);
+            };
+            let Some(cache_root) = self.tensorrt_cache_root.clone() else {
+                return Ok(false);
+            };
+            let profile = self
+                .tensorrt_profile_shape
+                .map(|(channels, height, width)| (self.in_name.clone(), channels, height, width));
+            log::warn!(
+                "NeoAccel explicit-QDQ engine rejected: model={} reason={}; action=retry-TensorRT-FP16",
+                self.name,
+                reason
+            );
+            let replacement = Self::load_tensorrt_with_profile(
+                &source_path,
+                &source_path,
+                device_id,
+                fallback_dml_adapter,
+                &cache_root,
+                profile.as_ref().map(|(name, channels, height, width)| {
+                    (name.as_str(), *channels, *height, *width)
+                }),
+                false,
+            );
+            if let Ok(mut replacement) = replacement {
+                replacement.fallback_reason = Some(format!(
+                    "NeoAccel explicit-QDQ INT8 rejected; TensorRT FP16 restored: {reason}"
+                ));
+                *self = replacement;
+                if let Some(cache_dir) = failed_cache {
+                    cleanup_incomplete_tensorrt_cache(&cache_dir);
+                }
+                log::info!(
+                    "NeoAccel explicit-QDQ fallback complete: model={} provider=TensorRT-FP16",
+                    self.name
+                );
+                return Ok(true);
+            }
+            log::warn!(
+                "NeoAccel explicit-QDQ fallback: TensorRT FP16 retry also failed; continuing final DirectML safety fallback"
+            );
+        }
+        mark_tensorrt_model_failed(&source_path, &reason);
+        log::error!(
+            "tensorrt-engine-build-failed: model={} profile={:?} reason={}; action=discard-cache-and-final-directml-safety-fallback",
+            self.name,
+            self.tensorrt_profile_shape,
+            reason
+        );
+        let mut replacement = Self::load_directml(&source_path, fallback_dml_adapter)?;
+        replacement.fallback_reason = Some(reason);
+        replacement
+            .provider_desc
+            .push_str(" fallback-after-trt-engine-build-failure");
+        *self = replacement;
+        if let Some(cache_dir) = failed_cache {
+            cleanup_incomplete_tensorrt_cache(&cache_dir);
+        }
+        Ok(true)
     }
 
     fn retire_tensorrt_interp_gpu_bridge(&mut self, gc: &mut GlContext) {
@@ -3974,6 +4596,9 @@ impl OnnxStage {
         {
             self.retire_tensorrt_temporal_gpu_bridge(gc);
         }
+        self.ensure_tensorrt_single_input_profile(frames * 3, size, "temporal-runtime")?;
+        self.prepare_tensorrt_input_shape(size.0, size.1);
+        mark_tensorrt_model_started(&self.name);
         let device_id = self
             .tensorrt_device_id
             .ok_or_else(|| anyhow!("TensorRT CUDA device unavailable"))?;
@@ -4145,6 +4770,7 @@ impl OnnxStage {
             out_ms,
             total_start.elapsed().as_secs_f64() * 1000.0,
         );
+        self.complete_successful_tensorrt_shape(size.0, size.1);
         Ok(texture)
     }
 
@@ -4856,6 +5482,24 @@ impl OnnxStage {
         Ok((ow, oh, texture))
     }
 
+    /// Release NeoAccel persistent textures before a chain/session transition.
+    /// They intentionally live outside the transient pool, so explicit cleanup
+    /// prevents VRAM growth when presets or ONNX models are switched repeatedly.
+    pub(crate) fn retire_neoaccel_textures(&mut self, gc: &mut GlContext) {
+        if let Some(accel) = self.neo_accel.as_mut() {
+            gc.remove_persistent_texture(&accel.texture_key);
+            gc.remove_persistent_texture(&accel.temporal_ai_key);
+            gc.remove_persistent_texture(&accel.temporal_base_key);
+            gc.remove_persistent_texture(&accel.temporal_flow_key);
+            accel.temporal_ready = false;
+            accel.temporal_skip_allowed = false;
+            accel.cached_output.clear();
+            accel.previous_input.clear();
+            accel.output_size = None;
+            accel.input_size = None;
+        }
+    }
+
     /// Detach OpenGL from the shared D3D12 allocation before DirectML frees it.
     /// The ordering matters on source resizes: freeing the allocation first can
     /// leave the GL memory object pointing at released driver memory.
@@ -4900,6 +5544,9 @@ impl OnnxStage {
             output_stride == 3 || output_stride == 4,
             "invalid output stride"
         );
+        self.ensure_tensorrt_single_input_profile(frames * 3, (w, h), "temporal-runtime")?;
+        self.prepare_tensorrt_input_shape(w, h);
+        mark_tensorrt_model_started(&self.name);
         if self.temporal_size != Some((w, h)) {
             self.temporal_history.clear();
             self.temporal_size = Some((w, h));
@@ -5008,6 +5655,7 @@ impl OnnxStage {
                 });
             (ow, oh, data)
         };
+        drop(outputs);
         self.last_upscale_profile = Some(UpscaleProfile {
             pack_ms,
             run_ms,
@@ -5015,6 +5663,7 @@ impl OnnxStage {
             output_size: (ow, oh),
         });
         self.last_upscale_input_size = Some((w, h));
+        self.complete_successful_tensorrt_shape(w, h);
         Ok((ow as i32, oh as i32, data))
     }
 
@@ -5026,9 +5675,34 @@ impl OnnxStage {
         stride: usize,
         output_stride: usize,
     ) -> Result<(i32, i32, Vec<u8>)> {
+        let result = self.process_u8_strided_once(w, h, pixels, stride, output_stride);
+        if let Err(error) = &result {
+            if self.provider == OnnxProvider::MigraphX {
+                let reason = format!("{error:#}");
+                self.replace_migraphx_with_directml(&reason)?;
+                return self.process_u8_strided_once(w, h, pixels, stride, output_stride);
+            }
+            if self.fallback_tensorrt_after_engine_creation_failure(error)? {
+                return self.process_u8_strided_once(w, h, pixels, stride, output_stride);
+            }
+        }
+        result
+    }
+
+    fn process_u8_strided_once(
+        &mut self,
+        w: i32,
+        h: i32,
+        pixels: &[u8],
+        stride: usize,
+        output_stride: usize,
+    ) -> Result<(i32, i32, Vec<u8>)> {
         if let Some(frames) = self.temporal_frames {
             return self.process_temporal_u8_strided(w, h, pixels, stride, output_stride, frames);
         }
+        self.ensure_tensorrt_single_input_profile(3, (w, h), "image-runtime")?;
+        self.prepare_tensorrt_input_shape(w, h);
+        mark_tensorrt_model_started(&self.name);
         let (w, h) = (w as usize, h as usize);
         let n = w * h;
         anyhow::ensure!(
@@ -5168,6 +5842,7 @@ fn temporal_history_slot_order(frames: usize, valid: usize, next_write: usize) -
         .collect()
 }
 
+#[allow(dead_code)]
 fn exact_integer_scale(
     input_w: usize,
     input_h: usize,
@@ -6716,6 +7391,67 @@ fn unit_to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
+const NEOACCEL_QDQ_SOURCE_NAME: &str = "2x_AnimeJaNai_SD_V1beta34_Compact_93k-fp16.onnx";
+const NEOACCEL_QDQ_SIDECAR_NAME: &str = "2x_AnimeJaNai_SD_V1beta34_Compact_93k-neo-int8qdq.onnx";
+const NEOACCEL_QDQ_SOURCE_SHA256: &str =
+    "2806934124e583a74936c492f2863c772aad4562bd428ac166ba79198c941528";
+const NEOACCEL_QDQ_SIDECAR_SHA256: &str =
+    "03e77016b6d85e27825e20327a097bd289f768e0408ce8ac6500639733bc3c5f";
+
+fn file_sha256_hex(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let digest = Sha256::digest(&bytes);
+    Some(
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+}
+
+fn neoaccel_tensorrt_qdq_sidecar(source_path: &Path) -> Option<PathBuf> {
+    if source_path.file_name().and_then(|name| name.to_str()) != Some(NEOACCEL_QDQ_SOURCE_NAME) {
+        return None;
+    }
+    let source_hash = file_sha256_hex(source_path)?;
+    if source_hash != NEOACCEL_QDQ_SOURCE_SHA256 {
+        log::warn!(
+            "NeoAccel explicit-QDQ skipped: model={} reason=source-hash-mismatch expected={} actual={}",
+            source_path.display(),
+            NEOACCEL_QDQ_SOURCE_SHA256,
+            source_hash
+        );
+        return None;
+    }
+    let models_dir = source_path
+        .ancestors()
+        .find(|candidate| candidate.file_name().and_then(|name| name.to_str()) == Some("models"))?;
+    let app_root = models_dir.parent().unwrap_or_else(|| Path::new(""));
+    let sidecar_path = app_root
+        .join("backends")
+        .join("NeoAccel")
+        .join(NEOACCEL_QDQ_SIDECAR_NAME);
+    let Some(sidecar_hash) = file_sha256_hex(&sidecar_path) else {
+        log::warn!(
+            "NeoAccel explicit-QDQ skipped: model={} reason=sidecar-missing path={}",
+            source_path.display(),
+            sidecar_path.display()
+        );
+        return None;
+    };
+    if sidecar_hash != NEOACCEL_QDQ_SIDECAR_SHA256 {
+        log::warn!(
+            "NeoAccel explicit-QDQ skipped: model={} reason=sidecar-hash-mismatch path={} expected={} actual={}",
+            source_path.display(),
+            sidecar_path.display(),
+            NEOACCEL_QDQ_SIDECAR_SHA256,
+            sidecar_hash
+        );
+        return None;
+    }
+    Some(sidecar_path)
+}
+
 fn tensorrt_model_cache_dir(cache_root: &Path, model: &Path, cache_variant: &[u8]) -> PathBuf {
     // Cache identity is content-based. Repacking or moving the portable app must
     // not create another engine folder when the ONNX bytes and builder settings
@@ -7392,19 +8128,22 @@ fn mark_tensorrt_provider_verification_ready(cache_dir: &Path) {
 }
 
 fn prepare_tensorrt_cache_attempt(cache_dir: &Path, cache_was_present: bool) -> Result<()> {
-    // Cache maintenance must never be able to invalidate the path between the
-    // initial probe and marker creation.
+    // The in-progress marker is the authoritative completion contract. Engine,
+    // timing, or cache files may already be non-zero when a build is cancelled
+    // or the process exits, so their mere presence must never convert an
+    // unfinished build into a reusable cache.
     std::fs::create_dir_all(cache_dir)?;
     let marker = cache_dir.join(TENSORRT_BUILD_MARKER);
-    if marker.exists() && !cache_was_present {
+    let stale_incomplete = marker.exists();
+    if stale_incomplete {
         log::warn!(
-            "tensorrt-cache: stale incomplete build detected path={}; removing incomplete cache",
+            "tensorrt-cache: stale incomplete build detected path={}; removing incomplete cache even if engine artifacts exist",
             cache_dir.display()
         );
         cleanup_incomplete_tensorrt_cache(cache_dir);
         std::fs::create_dir_all(cache_dir)?;
     }
-    if !cache_was_present {
+    if stale_incomplete || !cache_was_present {
         std::fs::write(marker, format!("pid={}\n", std::process::id()))?;
     }
     Ok(())
