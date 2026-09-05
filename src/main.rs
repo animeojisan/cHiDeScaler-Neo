@@ -89,7 +89,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20260905-v0.99.2-public";
+const BUILD_ID: &str = "20260906-v0.99.2-public-tray-resident";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -2490,6 +2490,7 @@ struct App {
     egui_ctx: egui::Context,
     tray_hidden: bool,
     tray_exit_requested: bool,
+    tray_hidden_stop_close_guard_until: Option<Instant>,
     tray_retry_after: Option<Instant>,
     tray_running_applied: Option<bool>,
     tray_language_applied: Option<UiLanguage>,
@@ -2878,9 +2879,7 @@ impl App {
             .unwrap_or_default();
         let (chain, legacy_dlssnr) = chidescaler_neo::core::dlssnr::split(chain);
         if legacy_dlssnr.is_some() {
-            log::info!(
-                "dlssnr-preset-state-ignored: source=startup action=manual-enable-required"
-            );
+            log::info!("dlssnr-preset-state-ignored: source=startup action=manual-enable-required");
         }
         // DLSSNR remains experimental: ordinary Neo presets never restore its
         // ON/OFF state. Every app session starts with DLSSNR disabled and the
@@ -3005,6 +3004,7 @@ impl App {
             egui_ctx: cc.egui_ctx.clone(),
             tray_hidden: settings.start_in_tray,
             tray_exit_requested: false,
+            tray_hidden_stop_close_guard_until: None,
             tray_retry_after: None,
             tray_running_applied: None,
             tray_language_applied: None,
@@ -3015,14 +3015,11 @@ impl App {
             dlssnr_installed: dlssnr_availability.installed,
             dlssnr_editor: None,
             dlssnr_saved_presets,
-            dlssnr_options_supported: dlssnr_availability
-                .manifest
-                .as_ref()
-                .is_some_and(|m| {
-                    m.compatibility_tags
-                        .iter()
-                        .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-                }),
+            dlssnr_options_supported: dlssnr_availability.manifest.as_ref().is_some_and(|m| {
+                m.compatibility_tags
+                    .iter()
+                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+            }),
             dlssnr_advanced_options_supported: dlssnr_availability
                 .manifest
                 .as_ref()
@@ -5386,9 +5383,7 @@ impl App {
                 self.tray_hidden = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 let restored = win32::restore_own_window(self.gui_hwnd);
-                log::info!(
-                    "task-tray-action: toggle-gui result=shown restored={restored}"
-                );
+                log::info!("task-tray-action: toggle-gui result=shown restored={restored}");
             }
         }
         if exit {
@@ -5530,14 +5525,11 @@ impl App {
         self.glsl_param_paths = discover_glsl_param_paths(&self.app_dir, &discovered);
         let nr = detect_dlssnr_backend_pack(&self.app_dir);
         self.dlssnr_installed = nr.installed;
-        self.dlssnr_options_supported = nr
-            .manifest
-            .as_ref()
-            .is_some_and(|m| {
-                m.compatibility_tags
-                    .iter()
-                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-            });
+        self.dlssnr_options_supported = nr.manifest.as_ref().is_some_and(|m| {
+            m.compatibility_tags
+                .iter()
+                .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+        });
         self.dlssnr_advanced_options_supported = nr
             .manifest
             .as_ref()
@@ -7934,6 +7926,22 @@ impl eframe::App for App {
                         );
                     } else {
                         toggle_hotkey_handled = true;
+                        // The tray-hidden root is briefly shown under a DWM cloak so
+                        // egui can dispatch the same Start/Stop path used in the
+                        // foreground. If this keypress is a Stop, protect the root
+                        // viewport from any close event coupled to teardown of the
+                        // overlay/panel viewports. Explicit Exit/quit still wins.
+                        if event.background_gui == BackgroundGui::Hidden {
+                            let (starting, running, stopping, provider_preparing) =
+                                self.capture_busy_now();
+                            if starting || running || stopping || provider_preparing {
+                                self.tray_hidden_stop_close_guard_until =
+                                    Some(Instant::now() + Duration::from_secs(5));
+                                log::debug!(
+                                    "task-tray-resident-guard: armed source=hidden-toggle-stop ttl_ms=5000"
+                                );
+                            }
+                        }
                         self.dispatch_toggle_hotkey(&event);
                         match event.background_gui {
                             BackgroundGui::Hidden => {
@@ -7965,6 +7973,8 @@ impl eframe::App for App {
                 }
                 HK_QUIT => {
                     log::info!("hotkey-dispatch: binding='{}' action=quit", event.binding);
+                    // An explicit quit must bypass the tray-resident close guard.
+                    self.tray_exit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 _ => log::warn!(
@@ -7974,6 +7984,32 @@ impl eframe::App for App {
                 ),
             }
         }
+
+        // A capture Stop is not an application Exit. On some Windows/driver
+        // combinations the tray-hidden root can receive a close request while
+        // the capture-owned overlay/panel viewports are being torn down. Cancel
+        // only that short, explicitly armed window. Tray Exit and the global
+        // quit hotkey set tray_exit_requested and therefore remain authoritative.
+        let now = Instant::now();
+        if self
+            .tray_hidden_stop_close_guard_until
+            .is_some_and(|deadline| now > deadline)
+        {
+            self.tray_hidden_stop_close_guard_until = None;
+        }
+        let root_close_requested = ctx.input(|input| input.viewport().close_requested());
+        if root_close_requested
+            && self.settings.start_in_tray
+            && self.tray_hidden
+            && !self.tray_exit_requested
+            && self
+                .tray_hidden_stop_close_guard_until
+                .is_some_and(|deadline| now <= deadline)
+        {
+            log::warn!("task-tray-resident-guard: root-close-cancelled source=hidden-capture-stop");
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
         // remember the window placement for the next launch.
         // NOTE: viewport rects are in egui (zoomed) points; ViewportBuilder
         // wants OS-logical points — convert with the zoom factor, otherwise
@@ -10656,10 +10692,26 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.preset_3"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut values.preset, 0, i18n::text(lang, "dlssnr.preset_default"));
-                                                ui.selectable_value(&mut values.preset, 1, i18n::text(lang, "dlssnr.preset_1"));
-                                                ui.selectable_value(&mut values.preset, 2, i18n::text(lang, "dlssnr.preset_2"));
-                                                ui.selectable_value(&mut values.preset, 3, i18n::text(lang, "dlssnr.preset_3"));
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    0,
+                                                    i18n::text(lang, "dlssnr.preset_default"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    1,
+                                                    i18n::text(lang, "dlssnr.preset_1"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    2,
+                                                    i18n::text(lang, "dlssnr.preset_2"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    3,
+                                                    i18n::text(lang, "dlssnr.preset_3"),
+                                                );
                                             });
                                     });
                                     if values.preset != old_preset {
@@ -10678,34 +10730,59 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.style_default"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut values.style, 0, i18n::text(lang, "dlssnr.style_default"));
-                                                ui.selectable_value(&mut values.style, 1, i18n::text(lang, "dlssnr.style_natural"));
-                                                ui.selectable_value(&mut values.style, 2, i18n::text(lang, "dlssnr.style_cinematic"));
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    0,
+                                                    i18n::text(lang, "dlssnr.style_default"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    1,
+                                                    i18n::text(lang, "dlssnr.style_natural"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    2,
+                                                    i18n::text(lang, "dlssnr.style_cinematic"),
+                                                );
                                             });
                                         values_changed |= values.style != before;
                                     });
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.intensity")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.local_tone")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.intensity")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.local_tone")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.local_structure,
+                                                0.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.skin_structure, -1.0..=1.0)
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.skin_structure,
+                                                -1.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.skin_structure")),
-                                    )
-                                    .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
-                                    .changed();
+                                        )
+                                        .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
+                                        .changed();
                                     ui.horizontal(|ui| {
                                         values_changed |= ink_centered_checkbox(
                                             ui,
@@ -10719,7 +10796,10 @@ impl eframe::App for App {
                                             &mut values.ui_correction,
                                             i18n::text(lang, "dlssnr.ui_correction"),
                                         )
-                                        .on_hover_text(i18n::text(lang, "dlssnr.ui_correction_help"))
+                                        .on_hover_text(i18n::text(
+                                            lang,
+                                            "dlssnr.ui_correction_help",
+                                        ))
                                         .changed();
                                     });
                                     ui.label(
@@ -10728,25 +10808,37 @@ impl eframe::App for App {
                                             .weak(),
                                     );
                                 } else {
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.intensity")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.local_tone")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.intensity")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.local_tone")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.local_structure,
+                                                0.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                    ).changed();
+                                        )
+                                        .changed();
                                     ui.label(
-                                        egui::RichText::new(i18n::text(lang, "dlssnr.update_pack_advanced"))
-                                            .size(10.5)
-                                            .weak(),
+                                        egui::RichText::new(i18n::text(
+                                            lang,
+                                            "dlssnr.update_pack_advanced",
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
                                     );
                                 }
                             });
@@ -10754,9 +10846,12 @@ impl eframe::App for App {
                         ui.separator();
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
+                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset"))
+                                .clicked()
+                            {
                                 let preset = values.preset.min(3);
-                                values = chidescaler_neo::core::dlssnr::factory_presets()[preset as usize];
+                                values = chidescaler_neo::core::dlssnr::factory_presets()
+                                    [preset as usize];
                                 values_changed = true;
                             }
                             if self.dlssnr_advanced_options_supported
@@ -10780,9 +10875,7 @@ impl eframe::App for App {
                     .get_or_insert_with(chidescaler_neo::core::dlssnr::new_spec);
                 chidescaler_neo::core::dlssnr::set_options(spec, values);
                 self.apply_live();
-                log::info!(
-                    "dlssnr-gui-options-live: values={values:?} action=immediate-update"
-                );
+                log::info!("dlssnr-gui-options-live: values={values:?} action=immediate-update");
             }
             if save_requested {
                 let index = values.preset.min(3) as usize;
@@ -11842,6 +11935,17 @@ mod app_tests {
         assert!(!warning.contains("ui.label("));
         assert!(!warning.contains("egui::Frame::new()"));
         assert!(warning.contains("glsl_overload.auto_stop"));
+    }
+
+    #[test]
+    fn tray_hidden_hotkey_stop_keeps_the_root_application_resident() {
+        let main = include_str!("main.rs");
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        assert!(hotkeys.contains("capture_active && background_gui == BackgroundGui::Minimized"));
+        assert!(main.contains("task-tray-resident-guard: armed source=hidden-toggle-stop"));
+        assert!(main.contains("ViewportCommand::CancelClose"));
+        assert!(main.contains("root-close-cancelled source=hidden-capture-stop"));
+        assert!(main.contains("self.tray_exit_requested = true;"));
     }
 
     #[test]
