@@ -89,7 +89,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20260906-v0.99.2-public-tray-resident";
+const BUILD_ID: &str = "20260906-v0.99.2-public";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -902,8 +902,9 @@ fn main() -> eframe::Result {
     // WGPU/WGL as presentation devices and switches compute backends directly,
     // so a manual GPU change while capture is stopped requires no Neo restart.
     log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
-    // Public releases keep the native title stable and user-facing.
-    // Detailed build identification remains available in the diagnostic log.
+    // Show the build tag in the title so a still-running older instance is
+    // immediately distinguishable from the executable currently on disk.
+    let build_tag = BUILD_ID.split('-').nth(1).unwrap_or("dev");
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -918,7 +919,7 @@ fn main() -> eframe::Result {
         .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title("cHiDeScaler-Neo")
+        .with_title(format!("cHiDeScaler-Neo [{build_tag}]"))
         .with_visible(!saved.3);
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
@@ -2483,6 +2484,55 @@ struct PendingUiModeTransition {
     cloak_applied: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackgroundWakeGoal {
+    Generic,
+    StartPanel,
+    StopCleanup,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BackgroundHotkeyWake {
+    restore_to: BackgroundGui,
+    armed_at: Instant,
+    deadline: Instant,
+    goal: BackgroundWakeGoal,
+    saw_capture_busy: bool,
+}
+
+fn generic_background_wake_ready(
+    elapsed: Duration,
+    gui_topmost_off_pending: bool,
+    screenshot_feedback_until: Option<Instant>,
+) -> bool {
+    elapsed >= Duration::from_millis(48)
+        && !gui_topmost_off_pending
+        && screenshot_feedback_until.is_none()
+}
+
+fn update_panel_screenshot_feedback(
+    feedback_until: &mut Option<Instant>,
+    take_screenshot: bool,
+    now: Instant,
+) -> bool {
+    if feedback_until.is_some_and(|until| now >= until) {
+        *feedback_until = None;
+    }
+    if take_screenshot {
+        *feedback_until = Some(now + Duration::from_millis(900));
+    }
+    feedback_until.is_some()
+}
+
+fn gui_control_should_restore(
+    background_intent: u8,
+    minimized: bool,
+    visible: bool,
+    cloaked: bool,
+) -> bool {
+    background_intent != 0 || minimized || !visible || cloaked
+}
+
 struct App {
     engine: EngineHandle,
     hotkeys: HotkeyThread,
@@ -2491,6 +2541,7 @@ struct App {
     tray_hidden: bool,
     tray_exit_requested: bool,
     tray_hidden_stop_close_guard_until: Option<Instant>,
+    background_hotkey_wake: Option<BackgroundHotkeyWake>,
     tray_retry_after: Option<Instant>,
     tray_running_applied: Option<bool>,
     tray_language_applied: Option<UiLanguage>,
@@ -2571,6 +2622,13 @@ struct App {
     /// the expensive first anchor Present can expose the old GUI for one frame
     /// immediately before it is demoted behind the fullscreen overlay.
     gui_topmost_off_cloak_applied: bool,
+    /// v735/v736: a panel/hotkey restore can race the DWM cloak used only to pump a
+    /// minimized/hidden root. Keep retrying the explicit reveal until DWM reports
+    /// the root composed again, then require a short cloak-free stability window.
+    /// DWM can acknowledge the first uncloak and still commit the older wake-cloak
+    /// a few milliseconds later; one immediate false sample is therefore not final.
+    gui_restore_reveal_retry_until: Option<Instant>,
+    gui_restore_reveal_confirm_after: Option<Instant>,
     gui_mouse_passthrough_applied: Option<bool>,
     gui_priority_sent: Option<(isize, bool)>,
     panel_visible: bool,
@@ -2593,6 +2651,7 @@ struct App {
     mini_dialog_hwnd: isize,
     panel_metrics_sent: Option<bool>,
     panel_screenshot_feedback_until: Option<Instant>,
+    panel_gui_action_seq_seen: u32,
     panel_chip_lurking: bool,
     panel_bar_shown: bool,
     panel_leave_at: Option<Instant>,
@@ -3005,6 +3064,7 @@ impl App {
             tray_hidden: settings.start_in_tray,
             tray_exit_requested: false,
             tray_hidden_stop_close_guard_until: None,
+            background_hotkey_wake: None,
             tray_retry_after: None,
             tray_running_applied: None,
             tray_language_applied: None,
@@ -3069,6 +3129,8 @@ impl App {
             gui_topmost_applied: None,
             gui_topmost_off_pending: false,
             gui_topmost_off_cloak_applied: false,
+            gui_restore_reveal_retry_until: None,
+            gui_restore_reveal_confirm_after: None,
             gui_mouse_passthrough_applied: None,
             gui_priority_sent: None,
             panel_visible: true,
@@ -3082,6 +3144,7 @@ impl App {
             mini_dialog_hwnd: 0,
             panel_metrics_sent: None,
             panel_screenshot_feedback_until: None,
+            panel_gui_action_seq_seen: chidescaler_neo::input::panel_gui_action_seq(),
             panel_chip_lurking: false,
             panel_bar_shown: true,
             panel_leave_at: None,
@@ -4977,7 +5040,43 @@ impl App {
         // unrelated foreground window (most often Task Manager) silently
         // replaced target_hwnd while capture was running, so the next Start
         // targeted that window and appeared to have lost its filter.
+        // A temporarily pumped background GUI is not a target-selection event.
+        // Stable minimized/tray operation may still select an external window;
+        // only the short wake transaction itself is excluded here.
+        if self.background_hotkey_wake_active() {
+            return;
+        }
         let foreground = win32::foreground_window();
+        if win32::main_gui_background_intent() == 0 {
+            self.follow_foreground_target(foreground, running, "poll");
+        } else {
+            let (cursor_x, cursor_y) = win32::cursor_pos();
+            let cursor_target = win32::external_top_level_window_at_point(cursor_x, cursor_y);
+            self.follow_background_foreground_target(
+                foreground,
+                cursor_target,
+                running,
+                "background-poll",
+            );
+        }
+    }
+
+    fn follow_background_foreground_target(
+        &mut self,
+        foreground: isize,
+        cursor_target: isize,
+        running: bool,
+        reason: &str,
+    ) -> bool {
+        let foreground = win32::normalize_capture_target(foreground);
+        let cursor_target = win32::normalize_capture_target(cursor_target);
+        if foreground == 0 || cursor_target == 0 || foreground != cursor_target {
+            return false;
+        }
+        self.follow_foreground_target(foreground, running, reason)
+    }
+
+    fn follow_foreground_target(&mut self, foreground: isize, running: bool, reason: &str) -> bool {
         let own_elevated = win32::own_process_elevated();
         let candidate_elevated = win32::process_elevated(win32::window_pid(foreground));
         if may_follow_foreground_target(running, own_elevated, candidate_elevated) {
@@ -4990,15 +5089,27 @@ impl App {
             {
                 let title = win32::window_title(fg);
                 if !title.is_empty() {
+                    let changed = self.target_hwnd != fg || self.target_title != title;
                     self.target_hwnd = fg;
                     self.target_title = title;
+                    if changed {
+                        log::info!(
+                            "target-selection: reason={reason} hwnd={:#x} title='{}' background_intent={}",
+                            fg,
+                            self.target_title,
+                            win32::main_gui_background_intent()
+                        );
+                    }
+                    return changed;
                 }
             }
         }
+        false
     }
 
     fn start(&mut self) {
         if self.target_hwnd == 0 {
+            log::warn!("capture-start-rejected: reason=no-selected-target");
             return;
         }
         // A large owned presentation helper may become foreground after the
@@ -5267,8 +5378,17 @@ impl App {
             return false;
         }
         if starting || running || provider_preparing {
+            let panel = win32::quiesce_panel_for_capture_stop();
+            self.panel_gdi_reveal_pending = false;
+            self.panel_state_sent = None;
+            self.panel_metrics_sent = None;
+            self.engine.metrics.set_panel_enabled(false);
+            self.engine.send(Cmd::SetPanelState {
+                visible: false,
+                chip: false,
+            });
             log::info!(
-                "capture-stop-request: source={source} result=dispatched starting={starting} running={running} preparing={provider_preparing}"
+                "capture-stop-request: source={source} result=dispatched starting={starting} running={running} preparing={provider_preparing} panel_quiesced={panel:#x}"
             );
             self.engine.send(Cmd::Stop);
             true
@@ -5388,21 +5508,190 @@ impl App {
         }
         if exit {
             log::info!("task-tray-action: exit action=application-shutdown");
-            // Tray Exit means Exit Neo, not merely hide/close the tray UI. Keep
-            // the request on the main thread so eframe::App::on_exit performs
-            // the established bounded engine/input/provider cleanup. Stop the
-            // notification-area controller first so the icon disappears
-            // immediately and no further tray events can race shutdown.
-            self.tray_exit_requested = true;
-            chidescaler_neo::input::notify_cursor_janitor_quit_requested("task-tray-exit");
-            if let Some(mut tray) = self.tray.take() {
-                tray.stop();
-            }
-            self.tray_running_applied = None;
-            self.tray_language_applied = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            ctx.request_repaint();
+            self.begin_explicit_application_exit(ctx, "task-tray-exit");
         }
+    }
+
+    fn begin_explicit_application_exit(&mut self, ctx: &egui::Context, source: &str) {
+        if self.tray_exit_requested {
+            return;
+        }
+        // Tray Exit and the global quit hotkey use the exact same native root-
+        // window close path as clicking the caption X. Stop/remove the tray icon
+        // immediately, then let WM_CLOSE -> eframe -> on_exit perform the ordinary
+        // cleanup. v740 deliberately has no process-exit watchdog or forced
+        // process::exit path: the hotkey thread now has a deterministic cooperative
+        // stop signal, so normal teardown is expected to return all the way to main.
+        self.tray_exit_requested = true;
+        self.background_hotkey_wake = None;
+        self.gui_restore_reveal_retry_until = None;
+        self.gui_restore_reveal_confirm_after = None;
+        chidescaler_neo::input::notify_cursor_janitor_quit_requested(source);
+        if let Some(mut tray) = self.tray.take() {
+            tray.stop();
+        }
+        self.tray_running_applied = None;
+        self.tray_language_applied = None;
+
+        let native_close_posted = win32::request_main_gui_close(self.gui_hwnd);
+        log::info!(
+            "application-exit-dispatch: source={source} gui={:#x} tray_stopped=true route=native-wm-close posted={native_close_posted}",
+            self.gui_hwnd
+        );
+        if !native_close_posted {
+            // The root HWND can only be missing during an abnormal/late teardown.
+            // Preserve a bounded fallback instead of leaving the process resident.
+            log::warn!(
+                "application-exit-dispatch: source={source} route=native-wm-close result=unavailable fallback=eframe-close"
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint();
+    }
+
+    fn background_hotkey_wake_active(&self) -> bool {
+        self.background_hotkey_wake.is_some()
+    }
+
+    fn arm_background_hotkey_wake(
+        &mut self,
+        background_gui: BackgroundGui,
+        goal: BackgroundWakeGoal,
+        ctx: &egui::Context,
+    ) {
+        if background_gui == BackgroundGui::Foreground {
+            return;
+        }
+        let now = Instant::now();
+        let deadline = now
+            + match goal {
+                // Screenshot feedback remains active for 900ms. The fallback
+                // deadline must outlive it or a minimized root can time out
+                // before repainting the camera button back to its idle color.
+                BackgroundWakeGoal::Generic => Duration::from_millis(1500),
+                BackgroundWakeGoal::StopCleanup => Duration::from_secs(3),
+                // Initial model/provider startup can legitimately take longer.
+                BackgroundWakeGoal::StartPanel => Duration::from_secs(60),
+            };
+        match self.background_hotkey_wake.as_mut() {
+            Some(wake) => {
+                // Stop cleanup is authoritative and deliberately bounded: if a
+                // long StartPanel wake is interrupted by Stop, do not inherit
+                // its 60-second deadline. Otherwise StartPanel remains stronger
+                // than a generic action and repeated actions may extend the pump.
+                match (wake.goal, goal) {
+                    (_, BackgroundWakeGoal::StopCleanup) => {
+                        wake.goal = BackgroundWakeGoal::StopCleanup;
+                        wake.deadline = deadline;
+                    }
+                    (BackgroundWakeGoal::StopCleanup, _) => {}
+                    (_, BackgroundWakeGoal::StartPanel) => {
+                        wake.goal = BackgroundWakeGoal::StartPanel;
+                        wake.deadline = wake.deadline.max(deadline);
+                    }
+                    (BackgroundWakeGoal::StartPanel, _) => {
+                        wake.deadline = wake.deadline.max(deadline);
+                    }
+                    _ => {
+                        wake.goal = BackgroundWakeGoal::Generic;
+                        wake.deadline = wake.deadline.max(deadline);
+                    }
+                }
+            }
+            None => {
+                self.background_hotkey_wake = Some(BackgroundHotkeyWake {
+                    restore_to: background_gui,
+                    armed_at: now,
+                    deadline,
+                    goal,
+                    saw_capture_busy: false,
+                });
+            }
+        }
+        ctx.request_repaint();
+        ctx.request_repaint_after(Duration::from_millis(16));
+        log::debug!("background-hotkey-wake: armed restore_to={background_gui:?} goal={goal:?}");
+    }
+
+    fn settle_background_hotkey_wake(&mut self, ctx: &egui::Context) {
+        let Some(wake) = self.background_hotkey_wake else {
+            return;
+        };
+        let now = Instant::now();
+        let status = self
+            .engine
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let panel_expected = self.panel_visible && self.settings.panel_show;
+        let panel_ready = !panel_expected
+            || (self.panel_hwnd != 0
+                && win32::is_window_valid(self.panel_hwnd)
+                && win32::is_own_window(self.panel_hwnd)
+                && self.panel_placed_for_run
+                && win32::is_window_visible(self.panel_hwnd));
+        let capture_busy = status.starting
+            || status.running
+            || status.stopping
+            || chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
+        let mut wake = wake;
+        wake.saw_capture_busy |= capture_busy;
+        let (mirror_valid, mirror_visible) = if self.panel_hwnd != 0 {
+            win32::panel_gdi_mirror_status(self.panel_hwnd)
+        } else {
+            (false, false)
+        };
+        let panel_quiescent = (self.panel_hwnd == 0 || !win32::is_window_visible(self.panel_hwnd))
+            && !mirror_visible
+            && !self.panel_gdi_reveal_pending;
+        let ready = match wake.goal {
+            BackgroundWakeGoal::StartPanel => {
+                let start_ready = status.running && !status.stopping && panel_ready;
+                let stopped_ready = wake.saw_capture_busy && !capture_busy;
+                let rejected_ready = !wake.saw_capture_busy
+                    && !capture_busy
+                    && now.duration_since(wake.armed_at) >= Duration::from_millis(300);
+                start_ready || stopped_ready || rejected_ready
+            }
+            BackgroundWakeGoal::StopCleanup => !capture_busy && panel_quiescent,
+            BackgroundWakeGoal::Generic => generic_background_wake_ready(
+                now.duration_since(wake.armed_at),
+                self.gui_topmost_off_pending,
+                self.panel_screenshot_feedback_until,
+            ),
+        };
+        let timed_out = now >= wake.deadline;
+        if !ready && !timed_out {
+            self.background_hotkey_wake = Some(wake);
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return;
+        }
+
+        match wake.restore_to {
+            BackgroundGui::Hidden => {
+                let _ = win32::hide_own_window(self.gui_hwnd);
+                self.tray_hidden = !win32::is_window_visible(self.gui_hwnd);
+            }
+            BackgroundGui::Minimized => {
+                let _ = win32::minimize_own_window(self.gui_hwnd);
+            }
+            BackgroundGui::Foreground => {}
+        }
+        let _ = win32::set_window_cloaked(self.gui_hwnd, false);
+        win32::finish_background_gui_wake();
+        self.background_hotkey_wake = None;
+        log::info!(
+            "background-hotkey-wake: settled restore_to={:?} goal={:?} running={} panel_expected={} panel_ready={} panel_quiescent={} mirror_valid={} timed_out={}",
+            wake.restore_to,
+            wake.goal,
+            status.running,
+            panel_expected,
+            panel_ready,
+            panel_quiescent,
+            mirror_valid,
+            timed_out
+        );
     }
 
     fn dispatch_toggle_hotkey(&mut self, event: &HotkeyEvent) {
@@ -5419,13 +5708,22 @@ impl App {
                 provider_preparing
             );
             let _ = self.request_capture_stop("hotkey-toggle");
-        } else if event.received_at <= self.capture_idle_since {
+        } else if event.received_at <= self.capture_idle_since
+            && event.received_at.elapsed() > Duration::from_millis(250)
+        {
             log::info!(
                 "hotkey-toggle-stale-ignored: binding='{}' age_ms={:.1} reason=received-before-current-idle-epoch",
                 event.binding,
                 age_ms
             );
         } else {
+            if event.received_at <= self.capture_idle_since {
+                log::debug!(
+                    "hotkey-toggle-fresh-after-stop-race: binding='{}' age_ms={:.1} action=accept-start grace_ms=250",
+                    event.binding,
+                    age_ms
+                );
+            }
             log::info!(
                 "hotkey-toggle-dispatch: binding='{}' action=start age_ms={:.1}",
                 event.binding,
@@ -5678,6 +5976,7 @@ impl App {
         self.panel_chip_lurking = false;
         self.panel_bar_shown = true;
         self.panel_leave_at = None;
+        win32::set_panel_lurk_hover_active(false);
         self.panel_state_sent = None;
         self.panel_layout_sent = None;
         // Commit native panel hit-testing/visibility immediately in the hotkey
@@ -5857,13 +6156,19 @@ impl App {
         }
 
         if self.settings.gui_topmost {
+            // A deliberate TOPMOST-OFF click owns visibility from this point.
+            // Cancel the short post-restore uncloak guard so it cannot fight
+            // the intentional OFF transition.
+            self.gui_restore_reveal_retry_until = None;
+            self.gui_restore_reveal_confirm_after = None;
             let status = self
                 .engine
                 .status
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            let anchor_needed = status.running
+            let anchor_needed = !self.background_hotkey_wake_active()
+                && status.running
                 && !status.stopping
                 && status.overlay_hwnd != 0
                 && win32::is_window_valid(status.overlay_hwnd)
@@ -5948,7 +6253,9 @@ impl App {
                     );
                 }
             }
-            win32::activate_window(self.gui_hwnd);
+            if !self.background_hotkey_wake_active() {
+                win32::activate_window(self.gui_hwnd);
+            }
             win32::raise_topmost(self.gui_hwnd);
         }
         self.gui_topmost_applied = Some(true);
@@ -5957,14 +6264,192 @@ impl App {
         log::info!("GUI topmost toggled: true");
     }
 
+    fn drive_gui_restore_reveal(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.gui_restore_reveal_retry_until else {
+            return;
+        };
+        if self.gui_hwnd == 0
+            || !win32::is_window_valid(self.gui_hwnd)
+            || !win32::is_own_window(self.gui_hwnd)
+        {
+            self.gui_restore_reveal_retry_until = None;
+            self.gui_restore_reveal_confirm_after = None;
+            return;
+        }
+
+        // A real user minimize/hide after the restore request wins. Never make a
+        // background root visible merely because an old DWM reveal retry exists.
+        if win32::main_gui_background_intent() != 0
+            || win32::is_minimized(self.gui_hwnd)
+            || !win32::is_window_visible(self.gui_hwnd)
+        {
+            self.gui_restore_reveal_retry_until = None;
+            self.gui_restore_reveal_confirm_after = None;
+            return;
+        }
+
+        let now = Instant::now();
+        // RedrawWindow(RDW_UPDATENOW) in the native background wake can
+        // synchronously re-enter the root event loop. If this restore is being
+        // handled inside that re-entry, the wake thread has not finished its
+        // cloak transaction yet. Keep the root cloaked and retry after the
+        // native wake returns; this removes the visible-then-disappear race at
+        // its source instead of merely correcting it on the next frame.
+        if win32::background_gui_wake_in_flight() {
+            ctx.request_repaint_after(Duration::from_millis(8));
+            return;
+        }
+        if self.settings.gui_topmost {
+            win32::set_own_topmost(self.gui_hwnd, true);
+            win32::raise_topmost(self.gui_hwnd);
+        }
+        // Reassert uncloak throughout the confirmation window.  The background
+        // wake and the restore run on different Win32/DWM timelines: DWM can
+        // return cloak=false here and then apply the wake's older cloak commit
+        // on the next composition boundary.  v735 stopped on that first false
+        // sample, producing a one-frame GUI flash followed by disappearance.
+        let request_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+        let still_cloaked = win32::is_cloaked(self.gui_hwnd);
+        if still_cloaked {
+            // Once a delayed cloak is observed, require another short stable
+            // interval after this frame before declaring the restore complete.
+            self.gui_restore_reveal_confirm_after = Some(now + Duration::from_millis(160));
+        }
+        let confirm_after = self
+            .gui_restore_reveal_confirm_after
+            .unwrap_or(now + Duration::from_millis(160));
+        if !still_cloaked && now >= confirm_after {
+            self.gui_restore_reveal_retry_until = None;
+            self.gui_restore_reveal_confirm_after = None;
+            if self.settings.gui_topmost {
+                win32::activate_window(self.gui_hwnd);
+                win32::raise_topmost(self.gui_hwnd);
+            }
+            log::debug!(
+                "GUI control: reveal-stable-complete gui={:#x} request_ok={} stable=true",
+                self.gui_hwnd,
+                request_ok
+            );
+            return;
+        }
+
+        if now < deadline {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            self.gui_restore_reveal_retry_until = None;
+            self.gui_restore_reveal_confirm_after = None;
+            log::warn!(
+                "GUI control: reveal-retry-timeout gui={:#x} request_ok={} still_cloaked={}",
+                self.gui_hwnd,
+                request_ok,
+                still_cloaked
+            );
+        }
+    }
+
+    fn handle_gui_control_request(&mut self, ctx: &egui::Context, source: &str) {
+        let background_intent = win32::main_gui_background_intent();
+        let minimized = self.gui_hwnd != 0 && win32::is_minimized(self.gui_hwnd);
+        let visible = self.gui_hwnd != 0 && win32::is_window_visible(self.gui_hwnd);
+        let cloaked = self.gui_hwnd != 0 && win32::is_cloaked(self.gui_hwnd);
+        if !gui_control_should_restore(background_intent, minimized, visible, cloaked) {
+            self.toggle_gui_topmost();
+            return;
+        }
+
+        // A panel/hotkey action first wakes a hidden root under a DWM cloak.
+        // Cancel that temporary wake transaction before restoring, otherwise
+        // settle_background_hotkey_wake() immediately returns the GUI to its
+        // old Hidden/Minimized state after this request appears to do nothing.
+        self.background_hotkey_wake = None;
+        win32::finish_background_gui_wake();
+        self.tray_hidden = false;
+        self.gui_topmost_off_pending = false;
+        self.gui_topmost_off_cloak_applied = false;
+        self.gui_restore_reveal_retry_until = None;
+        self.gui_restore_reveal_confirm_after = None;
+        self.settings.gui_topmost = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        let restored = win32::restore_own_window(self.gui_hwnd);
+        let mut reveal_ok = false;
+        let mut still_cloaked = false;
+        if self.gui_hwnd != 0 && win32::is_window_valid(self.gui_hwnd) {
+            win32::set_own_topmost(self.gui_hwnd, true);
+            win32::raise_topmost(self.gui_hwnd);
+            let status = self
+                .engine
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if status.overlay_hwnd != 0 && win32::is_window_valid(status.overlay_hwnd) {
+                win32::normalize_neo_topmost_stack(
+                    self.gui_hwnd,
+                    true,
+                    self.panel_hwnd,
+                    status.overlay_hwnd,
+                );
+                chidescaler_neo::input::keep_cursor_sprite_on_top();
+            }
+
+            // The panel action woke this HWND with DWMWA_CLOAK=1 only so eframe
+            // could drain the request. Show/restore and DWM uncloak are separate
+            // asynchronous transitions on Windows. Commit one DWM boundary here,
+            // then re-issue the reveal after that boundary. This prevents the
+            // first restored frame from remaining logically visible but cloaked.
+            let wake_in_flight = win32::background_gui_wake_in_flight();
+            if wake_in_flight {
+                // The low-level hook is still inside wake_background_gui().
+                // Do not expose the root until that older cloak transaction
+                // has returned; drive_gui_restore_reveal() will complete it.
+                still_cloaked = true;
+            } else {
+                reveal_ok = win32::set_window_cloaked(self.gui_hwnd, false);
+                win32::sync_gui_transition_with_dwm();
+                reveal_ok |= win32::set_window_cloaked(self.gui_hwnd, false);
+                still_cloaked = win32::is_cloaked(self.gui_hwnd);
+            }
+            // Do not trust the first cloak=false sample. DWM can still commit
+            // the background wake's older cloak on the next composition pass.
+            // Keep a short fail-visible guard alive even when this immediate
+            // sample is already clear.
+            let reveal_now = Instant::now();
+            self.gui_restore_reveal_retry_until = Some(reveal_now + Duration::from_secs(2));
+            self.gui_restore_reveal_confirm_after = Some(reveal_now + Duration::from_millis(240));
+            ctx.request_repaint_after(Duration::from_millis(16));
+            if !still_cloaked {
+                win32::activate_window(self.gui_hwnd);
+                win32::raise_topmost(self.gui_hwnd);
+            }
+        }
+        self.gui_topmost_applied = Some(true);
+        self.gui_priority_sent = None;
+        save_settings(&self.app_dir, &self.settings);
+        ctx.request_repaint();
+        log::info!(
+            "GUI control: action=restore source={source} previous_intent={} minimized={} visible={} cloaked={} restored={} reveal_ok={} still_cloaked={} wake_in_flight={}",
+            background_intent,
+            minimized,
+            visible,
+            cloaked,
+            restored,
+            reveal_ok,
+            still_cloaked,
+            win32::background_gui_wake_in_flight()
+        );
+    }
+
     // ------------- control panel (old cHiDeScaler port) -------------
     // The panel is a native GDI window; the engine owns its position and moves
     // it every tick in lockstep with the overlay. The main WGPU GUI never has
     // to repaint a second panel swapchain.
     fn control_panel(&mut self, ctx: &egui::Context, status: &Status) {
         let lang = self.effective_language();
-        let show =
-            status.running && !status.stopping && self.panel_visible && self.settings.panel_show;
+        let show = status.running
+            && !status.stopping
+            && !win32::panel_capture_stop_quiesced()
+            && self.panel_visible
+            && self.settings.panel_show;
         let effective_show = show && self.panel_placed_for_run;
         // v465 has no hidden WGPU keep-alive panel. Physical visibility follows
         // the logical/native GDI panel visibility exactly.
@@ -6003,6 +6488,7 @@ impl App {
             self.panel_metrics_sent = Some(show);
         }
         if !status.running {
+            win32::set_panel_lurk_hover_active(false);
             win32::hide_panel_gdi_mirror();
             if self.panel_hwnd != 0 && win32::is_panel_gdi_host(self.panel_hwnd) {
                 // Ownership is a running-session ordering aid only. Clear it
@@ -6062,6 +6548,9 @@ impl App {
         let mut toggle_gui_topmost = false;
         let mut hovered_any = false;
         let panel_actions = chidescaler_neo::input::take_panel_actions();
+        if panel_actions != 0 {
+            log::debug!("panel-actions-consumed: bits={panel_actions:#010x}");
+        }
         if panel_actions & chidescaler_neo::input::PANEL_ACTION_STOP != 0 {
             panel_stop_requested = true;
         }
@@ -6074,20 +6563,22 @@ impl App {
         if panel_actions & chidescaler_neo::input::PANEL_ACTION_SCREENSHOT != 0 {
             take_screenshot = true;
         }
-        if panel_actions & chidescaler_neo::input::PANEL_ACTION_GUI_TOPMOST != 0 {
+        let panel_gui_action_seq = chidescaler_neo::input::panel_gui_action_seq();
+        let panel_gui_action_pending = panel_gui_action_seq != self.panel_gui_action_seq_seen;
+        if panel_gui_action_pending {
+            self.panel_gui_action_seq_seen = panel_gui_action_seq;
+        }
+        if panel_actions & chidescaler_neo::input::PANEL_ACTION_GUI_TOPMOST != 0
+            || panel_gui_action_pending
+        {
             toggle_gui_topmost = true;
         }
         let now = Instant::now();
-        if self
-            .panel_screenshot_feedback_until
-            .is_some_and(|until| now >= until)
-        {
-            self.panel_screenshot_feedback_until = None;
-        }
-        if take_screenshot {
-            self.panel_screenshot_feedback_until = Some(now + Duration::from_millis(900));
-        }
-        let screenshot_feedback = self.panel_screenshot_feedback_until.is_some();
+        let screenshot_feedback = update_panel_screenshot_feedback(
+            &mut self.panel_screenshot_feedback_until,
+            take_screenshot,
+            now,
+        );
         if screenshot_feedback {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -6262,6 +6753,12 @@ impl App {
         }
         let final_lurk = self.panel_chip_lurking && !self.panel_bar_shown;
         let final_show = show && self.panel_placed_for_run;
+        // The lurk chip is intentionally alpha=0. Windows may therefore skip its
+        // HWND in WindowFromPoint even though the transparent rediscovery region is
+        // exactly where the user is hovering with Neo's virtual cursor. Publish the
+        // logical lurk state lock-free so input.rs can wake an event-starved hidden/
+        // minimized root on the first virtual-cursor entry into that exact live rect.
+        win32::set_panel_lurk_hover_active(final_show && final_lurk);
         let restoring_from_lurk = final_show
             && !final_lurk
             && self
@@ -6399,9 +6896,22 @@ impl App {
             mirror_hover_slot,
             screenshot_feedback,
         );
+        // v726: the optional WGPU composition anchor is intentionally suppressed
+        // while the root GUI is minimized or tray-hidden (v722 safety contract).
+        // Do not make the native GDI panel wait for an anchor that cannot exist in
+        // that background state.  Otherwise a background Start with GUI-topmost
+        // OFF leaves panel_gdi_reveal_pending set forever and the operation panel
+        // remains hidden even though capture/overlay are already running.
+        // Normal visible-GUI behavior is unchanged: when GUI-topmost is OFF the
+        // established AMD composition anchor is still required before reveal.
+        let gui_background = self.background_hotkey_wake_active()
+            || (self.gui_hwnd != 0
+                && (win32::is_minimized(self.gui_hwnd)
+                    || !win32::is_window_visible(self.gui_hwnd)));
         let anchor_required_for_reveal = final_show
             && !final_lurk
             && !self.settings.gui_topmost
+            && !gui_background
             && status.overlay_hwnd != 0
             && win32::is_window_valid(status.overlay_hwnd);
         let anchor_ready_for_reveal = !anchor_required_for_reveal
@@ -6411,6 +6921,14 @@ impl App {
                 && win32::is_window_visible(self.compositor_anchor_hwnd)
                 && win32::window_is_above(self.compositor_anchor_hwnd, status.overlay_hwnd));
         if self.panel_gdi_reveal_pending && panel_geometry_ready && anchor_ready_for_reveal {
+            if gui_background && !self.settings.gui_topmost {
+                log::debug!(
+                    "panel-background-reveal: hwnd={:#x} action=gdi-direct anchor=not-required root_minimized={} root_visible={}",
+                    self.panel_hwnd,
+                    win32::is_minimized(self.gui_hwnd),
+                    win32::is_window_visible(self.gui_hwnd)
+                );
+            }
             // Reveal only after every visible layer is ready.  This is one
             // Show/alpha commit, not host-then-child or panel-then-anchor.
             win32::set_window_opaque_unlayered(self.panel_hwnd);
@@ -6621,8 +7139,7 @@ impl App {
             self.request_filtered_screenshot();
         }
         if toggle_gui_topmost {
-            // Deliberately share the exact same implementation as Ctrl+Alt+G.
-            self.toggle_gui_topmost();
+            self.handle_gui_control_request(ctx, "floating-panel");
         }
     }
 
@@ -6648,12 +7165,20 @@ impl App {
         let panel_valid = self.panel_hwnd != 0
             && win32::is_window_valid(self.panel_hwnd)
             && win32::is_own_window(self.panel_hwnd);
+        // The panel itself is the native GDI host. Creating its optional WGPU
+        // composition anchor while the root is minimized or tray-hidden can
+        // close the root viewport during a repeated background Start.
+        let gui_background = self.background_hotkey_wake_active()
+            || (self.gui_hwnd != 0
+                && (win32::is_minimized(self.gui_hwnd)
+                    || !win32::is_window_visible(self.gui_hwnd)));
         // v459-proven contract: the extra WGPU top-level surface exists only
         // while the ordinary floating panel is physically present and the main
         // GUI is not itself topmost.  Do not create a tiny always-on fallback
         // when the panel is disabled: that was a v505 experiment, not part of
         // the known-good pre-v465 behavior.
         let active = status.running
+            && !gui_background
             && (!self.settings.gui_topmost || self.gui_topmost_off_pending)
             && overlay_valid
             && panel_valid
@@ -7828,6 +8353,11 @@ impl eframe::App for App {
             win32::set_own_topmost(self.gui_hwnd, self.settings.gui_topmost);
             self.gui_topmost_applied = Some(self.settings.gui_topmost);
         }
+        // v735/v736 fail-visible handshake for a GUI restored from the panel/hotkey
+        // background wake. A restored HWND can report visible/non-iconic before
+        // DWM has actually released the temporary cloak. Keep retrying without
+        // requiring another user click.
+        self.drive_gui_restore_reveal(ctx);
         // Global hotkeys. Capture the complete configured binding and reception
         // time on the RegisterHotKey thread so even a badly stalled GUI can
         // distinguish a fresh Start request from a Stop keypress that sat in
@@ -7851,6 +8381,27 @@ impl eframe::App for App {
             );
         }
         self.was_capture_busy = capture_busy_now;
+
+        // Drain this independently from control_panel(). The render thread may
+        // consume Stop first, after which control_panel() exits early because
+        // Running is already false. Leaving this token behind keeps the root
+        // temporarily awake/cloaked and corrupts later background commands.
+        let panel_background_wake = match win32::take_panel_action_background_wake() {
+            1 => Some(BackgroundGui::Minimized),
+            2 => Some(BackgroundGui::Hidden),
+            _ => None,
+        };
+        if let Some(background_gui) = panel_background_wake {
+            let goal = if win32::panel_capture_stop_quiesced() {
+                BackgroundWakeGoal::StopCleanup
+            } else {
+                BackgroundWakeGoal::Generic
+            };
+            self.arm_background_hotkey_wake(background_gui, goal, ctx);
+            log::debug!(
+                "panel-background-action-wake: origin={background_gui:?} goal={goal:?} token=consumed-globally"
+            );
+        }
 
         // v348u: Start and Stop now share the same physical pointer-DOWN path.
         // This removes the v348t asymmetry where Stop fired on DOWN but Start
@@ -7901,6 +8452,13 @@ impl eframe::App for App {
         let mut toggle_hotkey_handled = false;
         while let Ok(event) = self.hotkeys.rx.try_recv() {
             if event.handled_directly {
+                if event.background_gui != BackgroundGui::Foreground {
+                    self.arm_background_hotkey_wake(
+                        event.background_gui,
+                        BackgroundWakeGoal::StopCleanup,
+                        ctx,
+                    );
+                }
                 log::info!(
                     "hotkey-dispatch-ignored: id={} binding='{}' reason=already-handled-on-hotkey-thread",
                     event.id,
@@ -7915,6 +8473,28 @@ impl eframe::App for App {
                     event.binding
                 );
                 continue;
+            }
+            if event.id == HK_TOGGLE && event.background_gui != BackgroundGui::Foreground {
+                let (starting, running, stopping, provider_preparing) = self.capture_busy_now();
+                if !starting && !running && !stopping && !provider_preparing {
+                    self.follow_background_foreground_target(
+                        event.foreground_hwnd,
+                        event.cursor_target_hwnd,
+                        false,
+                        "background-toggle-hotkey",
+                    );
+                }
+            }
+            if event.background_gui != BackgroundGui::Foreground {
+                self.arm_background_hotkey_wake(
+                    event.background_gui,
+                    if event.id == HK_TOGGLE {
+                        BackgroundWakeGoal::StartPanel
+                    } else {
+                        BackgroundWakeGoal::Generic
+                    },
+                    ctx,
+                );
             }
             match event.id {
                 HK_TOGGLE => {
@@ -7943,17 +8523,12 @@ impl eframe::App for App {
                             }
                         }
                         self.dispatch_toggle_hotkey(&event);
-                        match event.background_gui {
-                            BackgroundGui::Hidden => {
-                                self.tray_hidden = win32::hide_own_window(self.gui_hwnd);
-                                let _ = win32::set_window_cloaked(self.gui_hwnd, false);
-                            }
-                            BackgroundGui::Minimized => {
-                                let _ = win32::minimize_own_window(self.gui_hwnd);
-                                let _ = win32::set_window_cloaked(self.gui_hwnd, false);
-                            }
-                            BackgroundGui::Foreground => {}
-                        }
+                        // Do not immediately restore a background root here. Start
+                        // is asynchronous; restoring in this same frame prevents
+                        // control_panel() from ever observing running=true and the
+                        // native GDI panel is never created. The cloaked root is
+                        // restored by settle_background_hotkey_wake() after the
+                        // capture/panel transition has actually committed.
                     }
                 }
                 HK_PANEL => {
@@ -7966,16 +8541,17 @@ impl eframe::App for App {
                 }
                 HK_GUI_TOPMOST => {
                     log::info!(
-                        "hotkey-dispatch: binding='{}' action=gui-topmost-toggle",
+                        "hotkey-dispatch: binding='{}' action=gui-control",
                         event.binding
                     );
-                    self.toggle_gui_topmost();
+                    self.handle_gui_control_request(ctx, "hotkey");
                 }
                 HK_QUIT => {
                     log::info!("hotkey-dispatch: binding='{}' action=quit", event.binding);
-                    // An explicit quit must bypass the tray-resident close guard.
-                    self.tray_exit_requested = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Tray Exit and the quit hotkey both post WM_CLOSE to the real
+                    // root HWND, so caption X / tray Exit / quit hotkey converge on
+                    // one native close -> eframe on_exit sequence.
+                    self.begin_explicit_application_exit(ctx, "quit-hotkey");
                 }
                 _ => log::warn!(
                     "hotkey-dispatch-ignored: id={} binding='{}' reason=unknown-id",
@@ -8002,6 +8578,7 @@ impl eframe::App for App {
             && self.settings.start_in_tray
             && self.tray_hidden
             && !self.tray_exit_requested
+            && !win32::main_gui_explicit_exiting()
             && self
                 .tray_hidden_stop_close_guard_until
                 .is_some_and(|deadline| now <= deadline)
@@ -8084,12 +8661,17 @@ impl eframe::App for App {
             && win32::is_minimized(self.gui_hwnd)
             && !self.tray_hidden
         {
-            self.tray_hidden = win32::hide_own_window(self.gui_hwnd);
+            let _ = win32::hide_own_window(self.gui_hwnd);
+            self.tray_hidden = !win32::is_window_visible(self.gui_hwnd);
             if self.tray_hidden {
                 log::info!("task-tray-action: minimize-to-notification-area");
             }
         }
         if !self.was_running && running {
+            // A new running session owns the retained native panel again. Clear
+            // the Stop visual latch only on this confirmed idle->running edge,
+            // never merely because an old running snapshot was repainted.
+            win32::clear_panel_capture_stop_quiesce();
             // The retained native panel host still has the previous session's
             // desktop position. Keep it hidden until control_panel commits
             // the new overlay-relative rectangle with its final pixel size.
@@ -10485,6 +11067,11 @@ impl eframe::App for App {
         // The native GDI panel and the existing independent cursor sprite remain
         // authoritative for visuals/input; this viewport is only a DWM anchor.
         self.compositor_keepalive_anchor(ctx, &panel_status);
+        // A minimized/tray-hidden hotkey wake stays DWM-cloaked only long enough
+        // for the requested GUI-owned work to commit. In particular, background
+        // Start must reach Running and create/reveal the native GDI operation panel
+        // before the root is returned to its original background state.
+        self.settle_background_hotkey_wake(ctx);
 
         // ---------- modals ----------
         if self.settings.ui_mode != UiMode::Mini && self.capture_resolution_fullscreen_notice_open {
@@ -11383,6 +11970,16 @@ impl eframe::App for App {
             );
             vulkan_onepass::record_route_once("on-exit-complete", &line);
         }
+        if self.tray_exit_requested {
+            // All explicit-exit cleanup is complete. Return normally to eframe/
+            // winit so Rust/Win32 destructors run in their ordinary order. The
+            // hotkey thread no longer has an unbounded GetMessage dependency, so
+            // no forced process termination is needed here.
+            log::info!(
+                "application-explicit-exit-complete: pid={} cleanup=complete action=normal-return",
+                std::process::id()
+            );
+        }
     }
 }
 
@@ -11941,11 +12538,290 @@ mod app_tests {
     fn tray_hidden_hotkey_stop_keeps_the_root_application_resident() {
         let main = include_str!("main.rs");
         let hotkeys = include_str!("platform/hotkeys.rs");
-        assert!(hotkeys.contains("capture_active && background_gui == BackgroundGui::Minimized"));
+        assert!(hotkeys.contains("capture_active && background_gui != BackgroundGui::Foreground"));
+        assert!(hotkeys.contains("request_stop(\"background-global-hotkey\")"));
+        assert!(hotkeys.contains("quiesce_panel_for_capture_stop"));
+        assert!(hotkeys.contains("wake_background_gui(gui_hwnd)"));
+        assert!(hotkeys.contains("if handled_directly"));
+        assert!(hotkeys.contains("else if background_gui != BackgroundGui::Foreground"));
         assert!(main.contains("task-tray-resident-guard: armed source=hidden-toggle-stop"));
         assert!(main.contains("ViewportCommand::CancelClose"));
         assert!(main.contains("root-close-cancelled source=hidden-capture-stop"));
         assert!(main.contains("self.tray_exit_requested = true;"));
+    }
+
+    #[test]
+    fn explicit_exit_converges_on_native_root_close_after_tray_removal() {
+        let main = include_str!("main.rs");
+        let win32 = include_str!("platform/win32.rs");
+        let exit = main
+            .split("fn begin_explicit_application_exit")
+            .nth(1)
+            .expect("explicit exit helper")
+            .split("fn background_hotkey_wake_active")
+            .next()
+            .expect("explicit exit helper end");
+        assert!(exit.contains("tray.stop()"));
+        assert!(exit.contains("win32::request_main_gui_close(self.gui_hwnd)"));
+        assert!(!exit.contains("ViewportCommand::Visible(false)"));
+        assert!(win32.contains("PostMessageW("));
+        assert!(win32.contains("WM_CLOSE"));
+        assert!(win32.contains("main-gui-close-visual-hide"));
+    }
+
+    #[test]
+    fn tray_exit_posts_close_without_waiting_for_hidden_egui_root() {
+        let tray = include_str!("platform/tray.rs");
+        let exit = tray
+            .split("MENU_EXIT =>")
+            .nth(1)
+            .and_then(|tail| tail.split("_ => {}").next())
+            .expect("tray exit command");
+        let native_close = exit
+            .find("request_main_gui_close(root)")
+            .expect("native close dispatch");
+        let notification = exit
+            .find("notify(TrayEvent::Exit)")
+            .expect("main-thread notification");
+        assert!(native_close < notification);
+        assert!(tray.contains("task-tray-native-exit-dispatch"));
+        assert!(include_str!("main.rs").contains("!win32::main_gui_explicit_exiting()"));
+    }
+
+    #[test]
+    fn explicit_exit_returns_normally_after_cleanup_without_watchdog() {
+        let source = include_str!("main.rs");
+        let on_exit = source
+            .split("fn on_exit(&mut self")
+            .nth(1)
+            .expect("on_exit body");
+        assert!(on_exit.contains("self.engine.shutdown();"));
+        assert!(on_exit.contains("self.hotkeys.stop();"));
+        assert!(on_exit.contains("if self.tray_exit_requested"));
+        assert!(on_exit.contains("application-explicit-exit-complete"));
+        assert!(on_exit.contains("action=normal-return"));
+        let explicit = source
+            .split("fn begin_explicit_application_exit")
+            .nth(1)
+            .and_then(|tail| tail.split("fn background_hotkey_wake_active").next())
+            .expect("explicit exit body");
+        assert!(!explicit.contains("explicit-exit-watchdog"));
+        assert!(!explicit.contains("timeout_ms=5000"));
+        assert!(!explicit.contains("std::process::exit(0)"));
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        assert!(hotkeys.contains("stop_requested.store(true, Ordering::Release)"));
+        assert!(hotkeys.contains("PeekMessageW"));
+        assert!(hotkeys.contains("hotkey-thread-stop-complete"));
+    }
+
+    #[test]
+    fn background_capture_never_creates_the_eframe_panel_anchor() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("let gui_background = self.background_hotkey_wake_active()"));
+        assert!(main.contains("&& !gui_background"));
+        assert!(main.contains("NeoCompositorKeepalivePanel"));
+    }
+
+    #[test]
+    fn background_panel_reveal_does_not_wait_for_the_suppressed_anchor() {
+        let main = include_str!("main.rs");
+        let reveal = main
+            .split("let anchor_required_for_reveal = final_show")
+            .nth(1)
+            .expect("panel reveal anchor condition");
+        let reveal = reveal
+            .split("let anchor_ready_for_reveal")
+            .next()
+            .expect("panel reveal condition end");
+        assert!(reveal.contains("&& !gui_background"));
+        assert!(main.contains("panel-background-reveal:"));
+        assert!(main.contains("action=gdi-direct anchor=not-required"));
+    }
+
+    #[test]
+    fn background_hotkey_start_keeps_cloaked_gui_alive_until_panel_is_created() {
+        let main = include_str!("main.rs");
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        assert!(hotkeys.contains("else if background_gui != BackgroundGui::Foreground"));
+        assert!(main.contains("arm_background_hotkey_wake("));
+        assert!(main.contains("BackgroundWakeGoal::StartPanel"));
+        assert!(main.contains("status.running && !status.stopping && panel_ready"));
+        assert!(main.contains("wake.saw_capture_busy |= capture_busy"));
+        assert!(main.contains("self.settle_background_hotkey_wake(ctx);"));
+        assert!(main.contains("background-hotkey-wake: settled"));
+        assert!(!main.contains("self.dispatch_toggle_hotkey(&event);\n                        match event.background_gui"));
+    }
+
+    #[test]
+    fn background_panel_and_topmost_hotkeys_share_the_gui_wake_lane() {
+        let main = include_str!("main.rs");
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        assert!(hotkeys.contains("Every non-direct global command is owned by the GUI"));
+        assert!(main.contains("event.id == HK_TOGGLE"));
+        assert!(main.contains("HK_PANEL =>"));
+        assert!(main.contains("HK_GUI_TOPMOST =>"));
+        assert!(main.contains("!self.background_hotkey_wake_active()"));
+    }
+
+    #[test]
+    fn background_stop_pumps_gui_until_panel_cleanup_is_committed() {
+        let main = include_str!("main.rs");
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        let win32 = include_str!("platform/win32.rs");
+        assert!(main.contains("BackgroundWakeGoal::StopCleanup"));
+        assert!(main.contains("!capture_busy && panel_quiescent"));
+        assert!(hotkeys.contains("quiesce_panel_for_capture_stop"));
+        assert!(hotkeys.contains("wake_background_gui(gui_hwnd)"));
+        assert!(win32.contains("pub fn quiesce_panel_for_capture_stop"));
+        assert!(win32.contains("PANEL_CAPTURE_STOP_QUIESCED"));
+        assert!(main.contains("panel_capture_stop_quiesced"));
+        assert!(main.contains("clear_panel_capture_stop_quiesce"));
+    }
+
+    #[test]
+    fn minimized_panel_actions_use_the_same_bounded_background_pump() {
+        let main = include_str!("main.rs");
+        let input = include_str!("input.rs");
+        let win32 = include_str!("platform/win32.rs");
+        assert!(input.contains("wake_main_gui_for_panel_action(false)"));
+        assert!(win32.contains("PANEL_ACTION_BACKGROUND_WAKE"));
+        assert!(win32.contains("take_panel_action_background_wake"));
+        assert!(main.contains("panel-background-action-wake:"));
+    }
+
+    #[test]
+    fn background_state_is_logical_and_panel_wake_is_drained_outside_panel_rendering() {
+        let main = include_str!("main.rs");
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        let win32 = include_str!("platform/win32.rs");
+        assert!(win32.contains("MAIN_GUI_BACKGROUND_INTENT"));
+        assert!(win32.contains("MAIN_GUI_BACKGROUND_WAKE_ACTIVE"));
+        assert!(hotkeys.contains("main_gui_background_intent()"));
+        assert!(main.contains("if self.background_hotkey_wake_active()"));
+        let wake_drain = main
+            .find("let panel_background_wake = match win32::take_panel_action_background_wake()")
+            .expect("global panel wake drain");
+        let panel_render = main.find("fn control_panel(").expect("control panel");
+        assert!(wake_drain > panel_render, "drain remains in App::update");
+        assert!(!main[..panel_render].contains("take_panel_action_background_wake()"));
+    }
+
+    #[test]
+    fn background_screenshot_feedback_keeps_the_gui_pump_alive_until_cleared() {
+        let now = Instant::now();
+        assert!(!generic_background_wake_ready(
+            Duration::from_secs(1),
+            false,
+            Some(now + Duration::from_millis(1)),
+        ));
+        assert!(generic_background_wake_ready(
+            Duration::from_millis(48),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn screenshot_button_feedback_turns_green_once_and_returns_to_idle() {
+        let started = Instant::now();
+        let mut feedback_until = None;
+        assert!(update_panel_screenshot_feedback(
+            &mut feedback_until,
+            true,
+            started,
+        ));
+        assert!(update_panel_screenshot_feedback(
+            &mut feedback_until,
+            false,
+            started + Duration::from_millis(899),
+        ));
+        assert!(!update_panel_screenshot_feedback(
+            &mut feedback_until,
+            false,
+            started + Duration::from_millis(900),
+        ));
+        assert_eq!(feedback_until, None);
+    }
+
+    #[test]
+    fn minimized_lurk_hover_wakes_the_regular_expand_state_machine() {
+        let win32 = include_str!("platform/win32.rs");
+        let wndproc = win32
+            .split("unsafe extern \"system\" fn panel_gdi_host_wndproc")
+            .nth(1)
+            .expect("panel host wndproc");
+        assert!(wndproc.contains("WM_MOUSEMOVE"));
+        assert!(wndproc.contains("state.snapshot.chip"));
+        assert!(wndproc.contains("wake_main_gui_for_panel_action(false)"));
+    }
+
+    #[test]
+    fn gui_control_restores_background_nonvisible_or_cloaked_roots() {
+        assert!(gui_control_should_restore(2, false, true, false));
+        assert!(gui_control_should_restore(1, true, true, false));
+        assert!(gui_control_should_restore(0, true, true, false));
+        assert!(gui_control_should_restore(0, false, false, false));
+        assert!(gui_control_should_restore(0, false, true, true));
+        assert!(!gui_control_should_restore(0, false, true, false));
+    }
+
+    #[test]
+    fn panel_and_hotkey_share_the_background_aware_gui_control() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("self.handle_gui_control_request(ctx, \"floating-panel\")"));
+        assert!(main.contains("self.handle_gui_control_request(ctx, \"hotkey\")"));
+        assert!(main.contains("self.background_hotkey_wake = None;"));
+        assert!(main.contains("win32::restore_own_window(self.gui_hwnd)"));
+    }
+
+    #[test]
+    fn restored_panel_gui_waits_for_dwm_uncloak_instead_of_toggling_again() {
+        let main = include_str!("main.rs");
+        assert!(main.contains("gui_restore_reveal_retry_until"));
+        assert!(main.contains("gui_restore_reveal_confirm_after"));
+        assert!(main.contains(
+            "gui_control_should_restore(background_intent, minimized, visible, cloaked)"
+        ));
+        assert!(main.contains("win32::sync_gui_transition_with_dwm();"));
+        assert!(main.contains("self.drive_gui_restore_reveal(ctx);"));
+        assert!(main.contains("GUI control: reveal-stable-complete"));
+        assert!(main.contains("Duration::from_millis(240)"));
+        assert!(main.contains("Duration::from_millis(160)"));
+        assert!(main.contains("win32::background_gui_wake_in_flight()"));
+    }
+
+    #[test]
+    fn native_background_wake_exposes_an_inflight_barrier_for_restore() {
+        let win32 = include_str!("platform/win32.rs");
+        assert!(win32.contains("MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT.fetch_add(1"));
+        assert!(win32.contains("MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT.fetch_sub(1"));
+        assert!(win32.contains("pub fn background_gui_wake_in_flight()"));
+    }
+
+    #[test]
+    fn restored_panel_click_forces_a_real_gui_paint_and_keeps_a_sequence() {
+        let win32 = include_str!("platform/win32.rs");
+        let input = include_str!("input.rs");
+        assert!(win32.contains("RDW_INVALIDATE | RDW_UPDATENOW"));
+        assert!(win32.contains("PostMessageW(Some(h), WM_PAINT"));
+        assert!(input.contains("PANEL_GUI_ACTION_SEQ.fetch_add(1"));
+        assert!(input.contains("pub fn panel_gui_action_seq()"));
+    }
+
+    #[test]
+    fn background_toggle_samples_target_before_waking_the_gui() {
+        let hotkeys = include_str!("platform/hotkeys.rs");
+        let sample = hotkeys
+            .find("let foreground_hwnd = super::win32::foreground_window();")
+            .expect("foreground sampled");
+        let wake = hotkeys[sample..]
+            .find("wake_background_gui(gui_hwnd)")
+            .map(|offset| sample + offset)
+            .expect("background wake");
+        assert!(sample < wake);
+        let main = include_str!("main.rs");
+        assert!(main.contains("event.foreground_hwnd"));
+        assert!(main.contains("\"background-toggle-hotkey\""));
     }
 
     #[test]
@@ -12380,6 +13256,7 @@ mod app_tests {
         let source = include_str!("main.rs");
         assert!(source.contains("event.binding"));
         assert!(source.contains("event.received_at <= self.capture_idle_since"));
+        assert!(source.contains("Duration::from_millis(250)"));
         assert!(source.contains("hotkey-toggle-stale-ignored"));
         assert!(source.contains("hotkey-toggle-coalesced"));
     }

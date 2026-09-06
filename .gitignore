@@ -22,13 +22,11 @@ _diagnostics/
 /backends/tensorrt/cache/
 /backends/tensorrt/_diagnostics/
 
-# DLSS Neural Rendering local build/runtime files
-# The public bridge DLL and backend.json are intentionally kept in the source package.
+# DLSS Neural Rendering local backend pack/runtime
+/backends/dlssnr/backend.json
 /backends/dlssnr/*.dll
-!/backends/dlssnr/neo_dlssnr_backend.dll
 /backends/dlssnr/*.lib
-/backends/dlssnr/runtime/*
-!/backends/dlssnr/runtime/README.txt
+/backends/dlssnr/runtime/
 /backends/dlssnr/_diagnostics/
 
 # Editor / OS
@@ -37,28 +35,3 @@ _diagnostics/
 .idea/
 .DS_Store
 Thumbs.db
-# Local/private development artifacts
-*.user
-*.suo
-*.tmp
-*.bak
-*.old
-*.dmp
-*.etl
-*.trace
-*.zip
-*.7z
-*.rar
-*.engine
-*.profile
-*.cache
-/.cargo/
-/_audit/
-/_scratch/
-/build/
-/external/
-
-# User-supplied Slang shader packs (keep only bundled instructions)
-/slangp/*
-!/slangp/README_en.txt
-!/slangp/README_ja.txt

@@ -141,12 +141,14 @@ unsafe extern "system" fn wnd_proc(
                 notify(TrayEvent::ToggleGui);
             }
             MENU_EXIT => {
-                // Route tray Exit through the application's normal shutdown path.
-                // Do not post WM_CLOSE directly from the tray thread: the native
-                // GUI subclass hides the root window immediately on WM_CLOSE, and
-                // that can race the egui-side Exit event while the app is already
-                // tray-hidden. The main thread owns shutdown so on_exit always gets
-                // a chance to restore input/source state and stop render workers.
+                // A minimized/hidden eframe root can remain event-starved even
+                // after request_repaint(), so waiting for the main thread to
+                // drain TrayEvent::Exit leaves the process in the taskbar until
+                // the user activates it. Post WM_CLOSE directly to the real root;
+                // its normal eframe on_exit path still owns every cleanup step.
+                let root = super::win32::main_gui_hwnd();
+                let posted = super::win32::request_main_gui_close(root);
+                log::info!("task-tray-native-exit-dispatch: gui={root:#x} posted={posted}");
                 notify(TrayEvent::Exit);
             }
             _ => {}

@@ -59,6 +59,7 @@ pub const PANEL_ACTION_EXPAND: u32 = 1 << 2;
 pub const PANEL_ACTION_SCREENSHOT: u32 = 1 << 3;
 pub const PANEL_ACTION_GUI_TOPMOST: u32 = 1 << 4;
 static PANEL_ACTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PANEL_GUI_ACTION_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Lock-free snapshot of the currently visible floating panel. The LL mouse
 /// hook must never lose a panel click merely because the main cursor state
 /// mutex is momentarily busy on another thread.
@@ -981,6 +982,9 @@ fn queue_panel_action(hover: UiHover, bit: u8) {
     let rel_x = hover.pos.0 - land.x;
     let action = panel_action_for_relative_x(land.w, land.h, rel_x);
     let Some(action) = action else { return };
+    if action == PANEL_ACTION_GUI_TOPMOST {
+        PANEL_GUI_ACTION_SEQ.fetch_add(1, Ordering::Release);
+    }
     PANEL_ACTIONS.fetch_or(action, Ordering::Release);
     // Same logical action as Ctrl+Alt+G: wake the GUI event loop only. Do not
     // minimize, restore, or otherwise alter GUI visibility from the panel.
@@ -1038,6 +1042,10 @@ pub fn panel_action_for_relative_x(width: i32, height: i32, relative_x: i32) -> 
 
 pub fn take_panel_actions() -> u32 {
     PANEL_ACTIONS.swap(0, Ordering::AcqRel)
+}
+
+pub fn panel_gui_action_seq() -> u32 {
+    PANEL_GUI_ACTION_SEQ.load(Ordering::Acquire)
 }
 
 /// Consume only the emergency Stop bit. The render thread uses this while the
@@ -1201,6 +1209,9 @@ fn try_panel_direct_lockfree(msg: u32, px: i32, py: i32) -> bool {
                 // the old title-bar point saved when minimization began.
                 record_gui_minimize_cursor();
             }
+        }
+        if action == PANEL_ACTION_GUI_TOPMOST {
+            PANEL_GUI_ACTION_SEQ.fetch_add(1, Ordering::Release);
         }
         PANEL_ACTIONS.fetch_or(action, Ordering::Release);
         // Keep the GUI button identical to Ctrl+Alt+G. It only requests the
@@ -6405,6 +6416,12 @@ fn plan_engaged(
     // priority over edge-release; there is no halo, timer or hidden margin.
     let vx = g.virt.0.round() as i32;
     let vy = g.virt.1.round() as i32;
+    // A collapsed panel is a deliberately alpha=0 rediscovery region. A fully
+    // transparent layered HWND can be omitted by WindowFromPoint, so the normal
+    // native ownership classifier cannot be the wake source for this one state.
+    // Publish the exact virtual-cursor point to the Win32 lurk-hover bridge; it
+    // wakes the root only on an outside->inside transition, never per mouse event.
+    crate::platform::win32::update_panel_lurk_virtual_hover(vx, vy);
     if let Some(hit) = ui_target_at(g, vx, vy, 0, now).filter(|h| is_panel_hit(h.hit)) {
         g.last_ui_hover = Some(hit);
         g.ui_hover_active = true;

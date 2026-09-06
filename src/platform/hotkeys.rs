@@ -1,12 +1,17 @@
-//! Global hotkeys on a dedicated thread (RegisterHotKey + GetMessage loop).
+//! Global hotkeys on a dedicated thread (RegisterHotKey + cooperative message pump).
 //! Fired ids are pushed into an mpsc channel polled by the GUI.
 
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Instant;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, Sender, channel},
+};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, WM_HOTKEY, WM_QUIT,
+    DispatchMessageW, MSG, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW, WM_HOTKEY,
+    WM_QUIT,
 };
 
 pub const HK_TOGGLE: i32 = 1;
@@ -170,6 +175,11 @@ pub struct HotkeyEvent {
     pub received_at: Instant,
     pub handled_directly: bool,
     pub background_gui: BackgroundGui,
+    /// Foreground window sampled before a minimized/hidden GUI is temporarily
+    /// pumped. This preserves the user's intended next capture target even if
+    /// the wake transaction changes desktop foreground ordering afterwards.
+    pub foreground_hwnd: isize,
+    pub cursor_target_hwnd: isize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,18 +190,19 @@ pub enum BackgroundGui {
 }
 
 fn direct_background_stop_allowed(background_gui: BackgroundGui, capture_active: bool) -> bool {
-    // Keep the proven minimized-window fast Stop path, but never use it while
-    // the root GUI is hidden in the notification area. Tray-hidden Start and
-    // Stop must both wake the root viewport and run through the same GUI-side
-    // toggle dispatcher so ending a capture cannot collapse application
-    // lifetime together with the temporary overlay/panel viewports.
-    capture_active && background_gui == BackgroundGui::Minimized
+    // Stop never needs the root GUI. Keeping both minimized and tray-hidden
+    // stops on the engine's dedicated resident lane avoids briefly showing the
+    // hidden eframe root while the capture overlay is being destroyed. That
+    // show/teardown race could deliver CloseRequested to the root viewport and
+    // terminate Neo after the first background stop.
+    capture_active && background_gui != BackgroundGui::Foreground
 }
 
 pub struct HotkeyThread {
     pub rx: Receiver<HotkeyEvent>,
     pub registration_failures: Vec<(i32, String)>,
     thread_id: u32,
+    stop_requested: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -205,10 +216,17 @@ impl HotkeyThread {
         let (tx, rx): (Sender<HotkeyEvent>, Receiver<HotkeyEvent>) = channel();
         let (id_tx, id_rx) = channel();
         let (ready_tx, ready_rx) = channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
         let handle = std::thread::Builder::new()
             .name("hotkeys".into())
             .spawn(move || unsafe {
                 let tid = windows::Win32::System::Threading::GetCurrentThreadId();
+                // Create the thread message queue before publishing the TID. This
+                // keeps PostThreadMessage usable, while the independent atomic stop
+                // flag below guarantees shutdown even if a posted WM_QUIT is lost.
+                let mut bootstrap = MSG::default();
+                let _ = PeekMessageW(&mut bootstrap, None, 0, 0, PM_NOREMOVE);
                 let _ = id_tx.send(tid);
                 let mut failures = Vec::new();
                 for (id, s) in &keys {
@@ -225,8 +243,18 @@ impl HotkeyThread {
                 }
                 let _ = ready_tx.send(failures);
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    if msg.message == WM_HOTKEY {
+                loop {
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut drained_message = false;
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        drained_message = true;
+                        if msg.message == WM_QUIT {
+                            worker_stop_requested.store(true, Ordering::Release);
+                            break;
+                        }
+                        if msg.message == WM_HOTKEY {
                         let id = msg.wParam.0 as i32;
                         let binding = keys
                             .iter()
@@ -234,17 +262,29 @@ impl HotkeyThread {
                             .map(|(_, binding)| binding.clone())
                             .unwrap_or_else(|| format!("id:{id}"));
                         let received_at = Instant::now();
-                        // Ordinary Stop keeps the proven direct path only for a
-                        // genuinely minimized native window. A tray-hidden root is
-                        // different: Start and Stop are both routed through egui so
-                        // the resident root viewport outlives the capture session.
+                        let foreground_hwnd = super::win32::foreground_window();
+                        let (cursor_x, cursor_y) = super::win32::cursor_pos();
+                        let cursor_target_hwnd =
+                            super::win32::external_top_level_window_at_point(cursor_x, cursor_y);
+                        // Background Stop goes straight to the resident engine.
+                        // Every other command is GUI-owned and therefore wakes the
+                        // hidden/minimized eframe root under a DWM cloak so the
+                        // event is consumed without presenting the GUI.
                         let gui_hwnd = super::win32::main_gui_hwnd();
-                        let background_gui = if gui_hwnd != 0
-                            && !super::win32::is_window_visible(gui_hwnd)
-                        {
-                            BackgroundGui::Hidden
-                        } else if gui_hwnd != 0 && super::win32::is_minimized(gui_hwnd) {
+                        // An iconic window can also report as not visible.
+                        // Preserve Minimized before applying the broader Hidden
+                        // classification so Start restores the exact state.
+                        let background_intent = super::win32::main_gui_background_intent();
+                        let background_gui = if background_intent == 1 {
                             BackgroundGui::Minimized
+                        } else if background_intent == 2 {
+                            BackgroundGui::Hidden
+                        } else if gui_hwnd != 0
+                            && super::win32::is_minimized(gui_hwnd)
+                        {
+                            BackgroundGui::Minimized
+                        } else if gui_hwnd != 0 && !super::win32::is_window_visible(gui_hwnd) {
+                            BackgroundGui::Hidden
                         } else {
                             BackgroundGui::Foreground
                         };
@@ -254,13 +294,27 @@ impl HotkeyThread {
                                 minimized_stop.is_active(),
                             );
                         if handled_directly {
+                            // End the floating panel's visual/input lifetime at
+                            // the same instant as the resident Stop request. Do
+                            // not wait for a minimized eframe root to repaint.
+                            let panel = super::win32::quiesce_panel_for_capture_stop();
                             log::info!(
-                                "hotkey-minimized-direct-dispatch: id={id} binding='{binding}' action=stop"
+                                "hotkey-background-direct-dispatch: id={id} binding='{binding}' gui={background_gui:?} action=stop resident=true panel_quiesced={panel:#x}"
                             );
-                            minimized_stop.request_stop("minimized-global-hotkey");
-                        } else if id == HK_TOGGLE
-                            && background_gui != BackgroundGui::Foreground
-                        {
+                            minimized_stop.request_stop("background-global-hotkey");
+                            // The engine stop lane is independent from eframe,
+                            // but final GUI bookkeeping (idle epoch, anchor
+                            // withdrawal, panel state) still needs one bounded
+                            // background pump. Wake without activation; main.rs
+                            // restores the exact previous state after cleanup.
+                            let _ = super::win32::wake_background_gui(gui_hwnd);
+                        } else if background_gui != BackgroundGui::Foreground {
+                            // Every non-direct global command is owned by the GUI
+                            // state machine (Start, panel toggle, GUI-topmost, Quit).
+                            // A minimized/hidden eframe root otherwise receives no
+                            // update frame, so the event can sit in rx indefinitely.
+                            // Wake it DWM-cloaked; main.rs restores the exact previous
+                            // background state after the command has committed.
                             let _ = super::win32::wake_background_gui(gui_hwnd);
                         }
                         if id == HK_QUIT {
@@ -279,14 +333,29 @@ impl HotkeyThread {
                             received_at,
                             handled_directly,
                             background_gui,
+                            foreground_hwnd,
+                            cursor_target_hwnd,
                         });
-                        wake_gui();
+                            wake_gui();
+                        }
+                        DispatchMessageW(&msg);
                     }
-                    DispatchMessageW(&msg);
+                    if worker_stop_requested.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // Global hotkeys do not need a permanently blocking GetMessage
+                    // wait. A short idle sleep keeps CPU use negligible and, more
+                    // importantly, lets the shared stop flag terminate this thread
+                    // deterministically even if PostThreadMessage fails during GUI
+                    // teardown. Maximum idle shutdown/hotkey polling latency is 4 ms.
+                    if !drained_message {
+                        std::thread::sleep(Duration::from_millis(4));
+                    }
                 }
                 for (id, _) in &keys {
                     let _ = UnregisterHotKey(None, *id);
                 }
+                log::info!("hotkey-thread-stopped: tid={tid} registrations_released=true");
             })
             .expect("hotkey thread");
         let thread_id = id_rx.recv().unwrap_or(0);
@@ -295,17 +364,24 @@ impl HotkeyThread {
             rx,
             registration_failures,
             thread_id,
+            stop_requested,
             handle: Some(handle),
         }
     }
 
     pub fn stop(&mut self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+        self.stop_requested.store(true, Ordering::Release);
+        let post_quit_ok =
+            unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok() };
+        log::debug!(
+            "hotkey-thread-stop-requested: tid={} post_quit_ok={} atomic_stop=true",
+            self.thread_id,
+            post_quit_ok
+        );
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        log::debug!("hotkey-thread-stop-complete: tid={}", self.thread_id);
     }
 }
 
@@ -335,8 +411,8 @@ mod tests {
     }
 
     #[test]
-    fn tray_hidden_toggle_never_uses_the_direct_engine_stop_lane() {
-        assert!(!direct_background_stop_allowed(BackgroundGui::Hidden, true));
+    fn every_background_stop_uses_the_resident_engine_lane() {
+        assert!(direct_background_stop_allowed(BackgroundGui::Hidden, true));
         assert!(direct_background_stop_allowed(
             BackgroundGui::Minimized,
             true
@@ -346,9 +422,20 @@ mod tests {
             true
         ));
         assert!(!direct_background_stop_allowed(
+            BackgroundGui::Hidden,
+            false
+        ));
+        assert!(!direct_background_stop_allowed(
             BackgroundGui::Minimized,
             false
         ));
+    }
+
+    #[test]
+    fn repeated_tray_hidden_stops_never_fall_back_to_the_gui_wake_lane() {
+        for _ in 0..10_000 {
+            assert!(direct_background_stop_allowed(BackgroundGui::Hidden, true));
+        }
     }
 
     #[test]
@@ -357,7 +444,9 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert!(!production.contains("request_stop_lockfree(\"global-hotkey-direct\""));
         assert!(!production.contains("request_emergency_input_release(\"global-quit-hotkey\""));
-        assert!(production.contains("request_stop(\"minimized-global-hotkey\""));
+        assert!(production.contains("if id == HK_QUIT"));
+        assert!(production.contains("wake_background_gui(gui_hwnd)"));
+        assert!(production.contains("request_stop(\"background-global-hotkey\""));
         assert!(production.contains("notify_cursor_janitor_quit_requested"));
     }
 

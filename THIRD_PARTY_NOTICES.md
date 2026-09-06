@@ -80,6 +80,10 @@ this repository. Optional DLSSNR support is isolated behind the external
 placed there remains subject to its own applicable license, authorization, and
 redistribution terms.
 
+The developer-only pass-through bridge under
+`backends/dlssnr/reference_stub/` contains no NVIDIA code and performs no
+neural rendering.
+
 Public implementation research used to validate the initial same-resolution,
 zero-guidance architecture includes the MIT-licensed experimental project:
 
@@ -95,7 +99,7 @@ zero-guidance architecture includes the MIT-licensed experimental project:
 
 ## External SLANGP shader packs
 
-cHiDeScaler-Neo includes only its generic `.slangp/.slang` loader.
+v695 includes only cHiDeScaler-Neo's clean-room generic `.slangp/.slang` loader.
 No RetroCrisis, Guest Advanced, libretro Slang preset, shader source, or LUT
 asset is bundled in this source package. Users may place separately obtained
 shader packs below the portable `slangp/` directory. Those external files remain
@@ -111,11 +115,11 @@ license/redistribution terms. The Neo bridge DLL itself remains hash-pinned.
 
 ### Resolve DLSS5 Experimental implementation reference
 
-The `backends/dlssnr/feature18_backend/` implementation uses an independent
+The v701 `backends/dlssnr/feature18_backend/` implementation uses an independent
 Neo ABI wrapper and adapts Feature 18 D3D12 initialization/compatibility
 techniques from the MIT-licensed `SAOG0721/DaVinci-Resolve-DLSS5` project.
 The retained MIT terms are in:
 
 `backends/dlssnr/feature18_backend/LICENSE.resolve-dlss5.txt`
 
-No NVIDIA SDK library, header, or DLSSNR runtime binary is bundled in this source package.
+No NVIDIA SDK library, header, or DLSSNR runtime binary is bundled by v701.

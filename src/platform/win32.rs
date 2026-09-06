@@ -2,7 +2,7 @@
 
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicIsize, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, Ordering},
 };
 use windows::Win32::Foundation::{
     COLORREF, CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -50,6 +50,35 @@ struct PanelGdiMirrorState {
 
 static PANEL_GDI_MIRROR: OnceLock<Mutex<PanelGdiMirrorState>> = OnceLock::new();
 static PANEL_GDI_HOST: OnceLock<Mutex<isize>> = OnceLock::new();
+// 0 = foreground/no background wake, 1 = minimized, 2 = hidden.
+// Native panel actions can originate while eframe is event-starved in the
+// background. Preserve the state that existed before the temporary wake so
+// main.rs can restore it after the action has actually committed.
+static PANEL_ACTION_BACKGROUND_WAKE: AtomicU8 = AtomicU8::new(0);
+// The physical HWND briefly becomes visible/non-iconic while a background
+// command is pumped. Preserve the user's intended presentation separately.
+// 0 = foreground, 1 = minimized, 2 = tray-hidden.
+static MAIN_GUI_BACKGROUND_INTENT: AtomicU8 = AtomicU8::new(0);
+static MAIN_GUI_BACKGROUND_WAKE_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Number of native wake_background_gui() calls that have not returned yet.
+// RedrawWindow(RDW_UPDATENOW) can synchronously wake/re-enter the root event
+// loop before the caller has completed its Win32/DWM wake sequence. A GUI
+// restore must not release the temporary cloak until every such wake call has
+// returned, otherwise DWM can commit the older cloak one frame later.
+static MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+// Native Stop can complete while the root GUI is minimized and event-starved.
+// Keep a process-wide visual latch so a stale running snapshot in the next GUI
+// pass cannot accidentally reveal the retained panel host again.
+static PANEL_CAPTURE_STOP_QUIESCED: AtomicBool = AtomicBool::new(false);
+// The collapsed operation panel is intentionally a fully transparent layered
+// HWND. Windows can omit alpha=0 windows from WindowFromPoint, so virtual-cursor
+// rediscovery needs one explicit geometric wake bridge. These atomics are only
+// presentation/wake state; panel actions and input ownership remain unchanged.
+static PANEL_LURK_HOVER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANEL_LURK_VIRTUAL_HOVER_INSIDE: AtomicBool = AtomicBool::new(false);
+// Explicit tray/quit shutdown posts WM_CLOSE to the real root HWND.
+// Block any late background wake while that normal native close path runs.
+static MAIN_GUI_EXPLICIT_EXITING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct OverloadNoticeGdiSnapshot {
@@ -120,11 +149,18 @@ unsafe extern "system" fn main_gui_caption_wndproc(
     // panel has its own lifetime and must never be shown/hidden from this WNDPROC.
     // Only preserve the cursor fail-visible contract here.
     if msg == WM_SYSCOMMAND && (wparam.0 & 0xfff0) == SC_MINIMIZE as usize {
+        MAIN_GUI_BACKGROUND_INTENT.store(1, Ordering::Release);
         crate::input::handle_main_gui_minimize_begin();
     }
     if msg == WM_SIZE && wparam.0 == SIZE_MINIMIZED as usize {
+        MAIN_GUI_BACKGROUND_INTENT.store(1, Ordering::Release);
         // WM_SYSCOMMAND is not guaranteed for every shell/taskbar route.
         crate::input::handle_main_gui_minimize_begin();
+    } else if msg == WM_SIZE
+        && wparam.0 != SIZE_MINIMIZED as usize
+        && !MAIN_GUI_BACKGROUND_WAKE_ACTIVE.load(Ordering::Acquire)
+    {
+        MAIN_GUI_BACKGROUND_INTENT.store(0, Ordering::Release);
     }
     let old = MAIN_GUI_OLD_WNDPROC.load(Ordering::Acquire);
     if old != 0 {
@@ -160,20 +196,138 @@ pub fn main_gui_hwnd() -> isize {
     MAIN_GUI_SUBCLASS_HWND.load(Ordering::Acquire)
 }
 
+pub fn main_gui_background_intent() -> u8 {
+    MAIN_GUI_BACKGROUND_INTENT.load(Ordering::Acquire)
+}
+
+pub fn finish_background_gui_wake() {
+    MAIN_GUI_BACKGROUND_WAKE_ACTIVE.store(false, Ordering::Release);
+}
+
+pub fn background_gui_wake_in_flight() -> bool {
+    MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT.load(Ordering::Acquire) != 0
+}
+
 /// Wake the root GUI as soon as a native panel action is queued.
 ///
-/// The panel GUI button is intentionally just another entry point for the
-/// existing Ctrl+Alt+G TOPMOST toggle. Waking must never minimize/restore the
-/// root HWND or alter cursor/panel ownership by itself.
+/// Wake the root event loop for a native panel interaction.
+/// Foreground roots use a cheap WM_NULL. Minimized/hidden roots temporarily
+/// enter the same non-activating background pump used by global hotkeys; App
+/// restores the exact prior state after the queued interaction has committed.
 pub fn wake_main_gui_for_panel_action(_restore_if_minimized: bool) {
+    if MAIN_GUI_EXPLICIT_EXITING.load(Ordering::Acquire) {
+        return;
+    }
     let hwnd = main_gui_hwnd();
     if hwnd == 0 || !is_window_valid(hwnd) {
         return;
     }
-    unsafe {
-        let h = HWND(hwnd as *mut _);
-        let _ = PostMessageW(Some(h), WM_NULL, WPARAM(0), LPARAM(0));
+    // WM_NULL wakes an ordinary visible root, but a minimized/hidden eframe
+    // root may stay event-starved indefinitely. Use the same non-activating
+    // background wake as global hotkeys and remember the exact original state
+    // so App can restore it after the queued panel action is consumed.
+    let intent = main_gui_background_intent();
+    let background = if intent != 0 {
+        intent
+    } else if is_minimized(hwnd) {
+        1
+    } else if !is_window_visible(hwnd) {
+        2
+    } else {
+        0
+    };
+    if background != 0 {
+        let _ = PANEL_ACTION_BACKGROUND_WAKE.compare_exchange(
+            0,
+            background,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let _ = wake_background_gui(hwnd);
+    } else {
+        unsafe {
+            let h = HWND(hwnd as *mut _);
+            // A click can arrive a few milliseconds after a background root
+            // was restored. WM_NULL alone does not always schedule another
+            // eframe pass at that boundary, leaving the queued action dormant
+            // until the user's next click. Force one ordinary paint without
+            // changing visibility, activation, ownership, or Z-order.
+            let _ = RedrawWindow(Some(h), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+            let _ = PostMessageW(Some(h), WM_PAINT, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(h), WM_NULL, WPARAM(0), LPARAM(0));
+        }
     }
+}
+
+/// Take the original root-window state recorded by a native panel action.
+/// Returns 0 for foreground/no wake, 1 for minimized and 2 for hidden.
+pub fn take_panel_action_background_wake() -> u8 {
+    PANEL_ACTION_BACKGROUND_WAKE.swap(0, Ordering::AcqRel)
+}
+
+/// Immediately make the retained native operation panel non-visible when a
+/// capture Stop is requested. The HWND is intentionally retained for reuse on
+/// the next Start, but visual/input ownership must end with the capture even if
+/// the minimized root GUI does not receive another eframe pass for a while.
+pub fn quiesce_panel_for_capture_stop() -> isize {
+    PANEL_CAPTURE_STOP_QUIESCED.store(true, Ordering::Release);
+    set_panel_lurk_hover_active(false);
+    let hwnd = panel_gdi_host_hwnd();
+    hide_panel_gdi_mirror();
+    if hwnd != 0 && is_panel_gdi_host(hwnd) {
+        set_window_alpha(hwnd, 0);
+        set_window_input_passthrough(hwnd, true);
+        set_panel_gdi_host_visible(hwnd, false);
+    }
+    hwnd
+}
+
+pub fn panel_capture_stop_quiesced() -> bool {
+    PANEL_CAPTURE_STOP_QUIESCED.load(Ordering::Acquire)
+}
+
+/// Publish whether the native panel is currently the fully transparent lurk
+/// chip. Reset the outside/inside edge detector only when that semantic state
+/// changes, so ordinary mouse motion inside the chip never floods the GUI pump.
+pub fn set_panel_lurk_hover_active(active: bool) {
+    let previous = PANEL_LURK_HOVER_ACTIVE.swap(active, Ordering::AcqRel);
+    if previous != active {
+        PANEL_LURK_VIRTUAL_HOVER_INSIDE.store(false, Ordering::Release);
+    }
+}
+
+/// Wake an event-starved root when Neo's visible *virtual* cursor enters the
+/// exact live rectangle of the alpha=0 lurk chip. This is intentionally a
+/// geometric exception only for the transparent rediscovery state; the visible
+/// bar continues to use normal Win32 top-level ownership and hit-testing.
+pub fn update_panel_lurk_virtual_hover(x: i32, y: i32) {
+    if !PANEL_LURK_HOVER_ACTIVE.load(Ordering::Acquire)
+        || MAIN_GUI_EXPLICIT_EXITING.load(Ordering::Acquire)
+    {
+        PANEL_LURK_VIRTUAL_HOVER_INSIDE.store(false, Ordering::Release);
+        return;
+    }
+    let hwnd = panel_gdi_host_hwnd();
+    let inside = hwnd != 0
+        && is_window_valid(hwnd)
+        && is_own_window(hwnd)
+        && is_window_visible(hwnd)
+        && window_rect(hwnd).is_some_and(|(rx, ry, rw, rh)| {
+            rw > 0 && rh > 0 && x >= rx && x < rx + rw && y >= ry && y < ry + rh
+        });
+    let was_inside = PANEL_LURK_VIRTUAL_HOVER_INSIDE.swap(inside, Ordering::AcqRel);
+    if inside && !was_inside {
+        if crate::logging::diagnostics_enabled() {
+            log::debug!(
+                "panel-lurk-virtual-hover-enter: hwnd={hwnd:#x} point=({x},{y}) action=wake-root"
+            );
+        }
+        wake_main_gui_for_panel_action(false);
+    }
+}
+
+pub fn clear_panel_capture_stop_quiesce() {
+    PANEL_CAPTURE_STOP_QUIESCED.store(false, Ordering::Release);
 }
 
 fn gui_transition_snapshot_state() -> &'static Mutex<GuiTransitionSnapshotState> {
@@ -1235,6 +1389,20 @@ unsafe extern "system" fn panel_gdi_host_wndproc(
         // the click still belongs to this panel, but never activate/focus it.
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_MOUSEMOVE => {
+            // A minimized/tray-hidden eframe root has no regular repaint
+            // cadence. Wake it when the pointer reaches the transparent lurk
+            // hit area so the ordinary hover-expand state machine can run.
+            if main_gui_background_intent() != 0 {
+                let lurking = panel_gdi_mirror_state()
+                    .try_lock()
+                    .is_ok_and(|state| state.snapshot.chip);
+                if lurking {
+                    wake_main_gui_for_panel_action(false);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => unsafe {
             // The child GDI mirror covers the full client area. Validate the
@@ -2127,6 +2295,7 @@ pub fn republish_panel_gdi_mirror_full(parent_hwnd: isize) -> bool {
 }
 
 pub fn hide_panel_gdi_mirror() {
+    set_panel_lurk_hover_active(false);
     let child_hwnd = panel_gdi_mirror_state()
         .lock()
         .ok()
@@ -3567,17 +3736,42 @@ pub fn activate_window(hwnd: isize) {
     }
 }
 
+/// Route an explicit application Exit through the exact same native close path
+/// as clicking the root window's caption X. The root WNDPROC receives WM_CLOSE,
+/// performs its immediate visual hide, then forwards the message unchanged to
+/// eframe so the normal close_requested -> on_exit cleanup sequence owns teardown.
+pub fn request_main_gui_close(hwnd: isize) -> bool {
+    MAIN_GUI_EXPLICIT_EXITING.store(true, Ordering::Release);
+    MAIN_GUI_BACKGROUND_WAKE_ACTIVE.store(false, Ordering::Release);
+    PANEL_ACTION_BACKGROUND_WAKE.store(0, Ordering::Release);
+    set_panel_lurk_hover_active(false);
+    if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
+        return false;
+    }
+    unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
+pub fn main_gui_explicit_exiting() -> bool {
+    MAIN_GUI_EXPLICIT_EXITING.load(Ordering::Acquire)
+}
+
 pub fn hide_own_window(hwnd: isize) -> bool {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
     }
+    MAIN_GUI_BACKGROUND_INTENT.store(2, Ordering::Release);
     unsafe { ShowWindow(HWND(hwnd as *mut _), SW_HIDE).as_bool() }
 }
 
 pub fn restore_own_window(hwnd: isize) -> bool {
+    if MAIN_GUI_EXPLICIT_EXITING.load(Ordering::Acquire) {
+        return false;
+    }
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
     }
+    MAIN_GUI_BACKGROUND_WAKE_ACTIVE.store(false, Ordering::Release);
+    MAIN_GUI_BACKGROUND_INTENT.store(0, Ordering::Release);
     unsafe {
         let window = HWND(hwnd as *mut _);
         let _ = ShowWindow(
@@ -3597,6 +3791,7 @@ pub fn minimize_own_window(hwnd: isize) -> bool {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
     }
+    MAIN_GUI_BACKGROUND_INTENT.store(1, Ordering::Release);
     unsafe { ShowWindow(HWND(hwnd as *mut _), SW_MINIMIZE).as_bool() }
 }
 
@@ -3604,16 +3799,26 @@ pub fn minimize_own_window(hwnd: isize) -> bool {
 /// minimized, without presenting that GUI to the user. The caller restores the
 /// previous background state immediately after dispatch on the GUI thread.
 pub fn wake_background_gui(hwnd: isize) -> bool {
+    if MAIN_GUI_EXPLICIT_EXITING.load(Ordering::Acquire) {
+        return false;
+    }
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
     }
+    MAIN_GUI_BACKGROUND_WAKE_ACTIVE.store(true, Ordering::Release);
+    MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
     unsafe {
         let window = HWND(hwnd as *mut _);
+        // Cloak both before and after ShowWindow. Some Windows/DWM paths clear
+        // a pre-existing cloak while restoring an iconic window; the second
+        // commit keeps the temporary event-pump root genuinely invisible.
         let _ = set_window_cloaked(hwnd, true);
         let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+        let _ = set_window_cloaked(hwnd, true);
         let _ = RedrawWindow(Some(window), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
         let _ = PostMessageW(Some(window), WM_PAINT, WPARAM(0), LPARAM(0));
     }
+    MAIN_GUI_BACKGROUND_WAKE_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
     true
 }
 
