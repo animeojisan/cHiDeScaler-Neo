@@ -470,6 +470,18 @@ pub struct NeoDlssNrFrameDesc {
     pub reserved: [u32; 6],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeoDlssNrGpuTiming {
+    pub struct_size: u32,
+    pub valid: u32,
+    pub frame_index: u64,
+    pub input_copy_gpu_us: u64,
+    pub evaluate_gpu_us: u64,
+    pub output_copy_gpu_us: u64,
+    pub gpu_total_us: u64,
+}
+
 impl NeoDlssNrFrameDesc {
     pub fn new(width: u32, height: u32, reset_history: bool, frame_index: u64) -> Self {
         Self {
@@ -499,6 +511,9 @@ type LastErrorFn = unsafe extern "C" fn(*mut c_void, *mut c_char, u32) -> u32;
 type GetCapabilitiesFn = unsafe extern "C" fn() -> u64;
 type DescribeBackendFn = unsafe extern "C" fn(*mut c_char, u32) -> u32;
 type SetOptionsFn = unsafe extern "C" fn(*mut c_void, *const NeoDlssNrEvalOptions) -> i32;
+type AttachSharedRgba8Fn = unsafe extern "C" fn(*mut c_void, u64, u64) -> i32;
+type ProcessSharedRgba8Fn = unsafe extern "C" fn(*mut c_void, *const NeoDlssNrFrameDesc) -> i32;
+type GetLastGpuTimingFn = unsafe extern "C" fn(*mut c_void, *mut NeoDlssNrGpuTiming) -> i32;
 
 #[repr(C)]
 pub struct NeoDlssNrEvalOptions {
@@ -522,6 +537,7 @@ pub const DLSSNR_CAP_D3D12_SHARED_TEXTURE: u64 = 1 << 3;
 pub const DLSSNR_CAP_USER_RUNTIME_SELECTION: u64 = 1 << 4;
 pub const DLSSNR_CAP_EVAL_OPTIONS: u64 = 1 << 5;
 pub const DLSSNR_CAP_ADVANCED_OPTIONS: u64 = 1 << 6;
+pub const DLSSNR_CAP_GPU_TIMING: u64 = 1 << 7;
 
 unsafe fn symbol<T: Copy>(module: HMODULE, name: &str) -> Result<T, String> {
     let export_name = name.to_string();
@@ -558,6 +574,9 @@ pub struct DlssNrBackend {
     get_capabilities: Option<GetCapabilitiesFn>,
     describe_backend: Option<DescribeBackendFn>,
     set_options: Option<SetOptionsFn>,
+    attach_shared_rgba8: Option<AttachSharedRgba8Fn>,
+    process_shared_rgba8: Option<ProcessSharedRgba8Fn>,
+    get_last_gpu_timing: Option<GetLastGpuTimingFn>,
 }
 
 impl DlssNrBackend {
@@ -617,6 +636,9 @@ impl DlssNrBackend {
                 get_capabilities: optional_symbol(module, "neo_dlssnr_get_capabilities"),
                 describe_backend: optional_symbol(module, "neo_dlssnr_describe_backend"),
                 set_options: optional_symbol(module, "neo_dlssnr_set_options"),
+                attach_shared_rgba8: optional_symbol(module, "neo_dlssnr_attach_shared_rgba8"),
+                process_shared_rgba8: optional_symbol(module, "neo_dlssnr_process_shared_rgba8"),
+                get_last_gpu_timing: optional_symbol(module, "neo_dlssnr_get_last_gpu_timing"),
             })
         })();
 
@@ -795,15 +817,74 @@ impl DlssNrSession<'_> {
         }
     }
 
-    /// Evaluate one tightly-packed or explicitly-strided RGBA8 frame.
-    /// On error, no output is returned; the render caller must present
-    /// the original input unchanged (fail-open policy).
-    pub fn process_rgba8(
+    pub fn shared_rgba8_available(&self) -> bool {
+        self.backend.capabilities() & DLSSNR_CAP_D3D12_SHARED_TEXTURE != 0
+            && self.backend.attach_shared_rgba8.is_some()
+            && self.backend.process_shared_rgba8.is_some()
+    }
+
+    /// Attach one process-local duplicate of Neo's D3D12 shared RGBA8 buffer.
+    /// The bridge consumes/closes the HANDLE value after OpenSharedHandle.
+    pub fn attach_shared_rgba8(&mut self, child_handle: u64, byte_len: u64) -> Result<(), String> {
+        if self.backend.capabilities() & DLSSNR_CAP_D3D12_SHARED_TEXTURE == 0 {
+            return Err("DLSSNR bridge does not advertise shared D3D12 RGBA8".into());
+        }
+        let Some(attach) = self.backend.attach_shared_rgba8 else {
+            return Err("DLSSNR shared attach export is unavailable".into());
+        };
+        let status = unsafe { attach(self.context, child_handle, byte_len) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(self.backend.error_string(self.context, status, "attach-shared-rgba8"))
+        }
+    }
+
+    /// Evaluate Feature 18 entirely through the attached shared D3D12 buffer.
+    /// No full-frame CPU pointer crosses the bridge on this path.
+    pub fn process_shared_rgba8(&mut self, reset_history: bool) -> Result<(), String> {
+        let Some(process) = self.backend.process_shared_rgba8 else {
+            return Err("DLSSNR shared process export is unavailable".into());
+        };
+        let desc = NeoDlssNrFrameDesc::new(
+            self.width,
+            self.height,
+            reset_history,
+            self.next_frame_index,
+        );
+        let status = unsafe { process(self.context, &desc) };
+        if status != 0 {
+            return Err(self.backend.error_string(self.context, status, "evaluate-shared"));
+        }
+        self.next_frame_index = self.next_frame_index.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Return the bridge's sampled GPU timestamp breakdown, when supported.
+    pub fn last_gpu_timing(&self) -> Option<NeoDlssNrGpuTiming> {
+        if self.backend.capabilities() & DLSSNR_CAP_GPU_TIMING == 0 {
+            return None;
+        }
+        let function = self.backend.get_last_gpu_timing?;
+        let mut timing = NeoDlssNrGpuTiming {
+            struct_size: std::mem::size_of::<NeoDlssNrGpuTiming>() as u32,
+            ..NeoDlssNrGpuTiming::default()
+        };
+        let status = unsafe { function(self.context, &mut timing) };
+        (status == 0 && timing.valid != 0).then_some(timing)
+    }
+
+    /// Evaluate one tightly-packed or explicitly-strided RGBA8 frame into
+    /// caller-owned storage. Keeping this allocation alive is important for
+    /// 1440p/4K DLSSNR where a fresh multi-megabyte Vec per frame is avoidable.
+    pub fn process_rgba8_into(
         &mut self,
         input: &[u8],
         input_stride: u32,
         reset_history: bool,
-    ) -> Result<Vec<u8>, String> {
+        output: &mut [u8],
+        output_stride: u32,
+    ) -> Result<(), String> {
         let min_stride = self
             .width
             .checked_mul(4)
@@ -811,6 +892,11 @@ impl DlssNrSession<'_> {
         if input_stride < min_stride {
             return Err(format!(
                 "DLSSNR input stride {input_stride} is smaller than {min_stride}"
+            ));
+        }
+        if output_stride < min_stride {
+            return Err(format!(
+                "DLSSNR output stride {output_stride} is smaller than {min_stride}"
             ));
         }
         let input_bytes = (input_stride as usize)
@@ -823,12 +909,16 @@ impl DlssNrSession<'_> {
                 input_bytes
             ));
         }
-
-        let output_stride = min_stride;
         let output_bytes = (output_stride as usize)
             .checked_mul(self.height as usize)
             .ok_or_else(|| "DLSSNR output size overflow".to_string())?;
-        let mut output = vec![0u8; output_bytes];
+        if output.len() < output_bytes {
+            return Err(format!(
+                "DLSSNR output buffer is too small: {} < {}",
+                output.len(),
+                output_bytes
+            ));
+        }
         let desc = NeoDlssNrFrameDesc::new(
             self.width,
             self.height,
@@ -849,6 +939,32 @@ impl DlssNrSession<'_> {
             return Err(self.backend.error_string(self.context, status, "evaluate"));
         }
         self.next_frame_index = self.next_frame_index.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Allocating compatibility wrapper used by probes and callers that do not
+    /// maintain a persistent output buffer.
+    pub fn process_rgba8(
+        &mut self,
+        input: &[u8],
+        input_stride: u32,
+        reset_history: bool,
+    ) -> Result<Vec<u8>, String> {
+        let output_stride = self
+            .width
+            .checked_mul(4)
+            .ok_or_else(|| "DLSSNR row size overflow".to_string())?;
+        let output_bytes = (output_stride as usize)
+            .checked_mul(self.height as usize)
+            .ok_or_else(|| "DLSSNR output size overflow".to_string())?;
+        let mut output = vec![0u8; output_bytes];
+        self.process_rgba8_into(
+            input,
+            input_stride,
+            reset_history,
+            &mut output,
+            output_stride,
+        )?;
         Ok(output)
     }
 }

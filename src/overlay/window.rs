@@ -128,6 +128,38 @@ impl OverlayWindow {
         self.staged_hidden = false;
     }
 
+    /// While the layered window is fully transparent, overwrite both WGL
+    /// back buffers with black.  A persistent AMD/DWM redirection surface can
+    /// otherwise resurrect the previous capture session's last frame after a
+    /// hard Stop -> Start even though all GL/DML resources were retired.
+    pub fn blank_hidden_buffers(&mut self, gc: &GlContext, reason: &str) {
+        unsafe {
+            let _ = SetLayeredWindowAttributes(
+                self.win.hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                0,
+                LWA_ALPHA,
+            );
+            let gl = &gc.gl;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.viewport(0, 0, self.width.max(1), self.height.max(1));
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            self.win.swap_buffers();
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            self.win.swap_buffers();
+            self.win.pump_messages();
+            let _ = DwmFlush();
+        }
+        log::info!(
+            "overlay-hidden-buffer-reset: hwnd={:#x} reason={} size={}x{} buffers=2 alpha=0",
+            self.win.hwnd.0 as isize,
+            reason,
+            self.width.max(1),
+            self.height.max(1)
+        );
+    }
+
     pub fn hide(&mut self) {
         unsafe {
             // Logical hide for ordinary in-session transitions: retain the

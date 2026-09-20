@@ -157,6 +157,7 @@ impl Stage {
                     OnnxProvider::DirectML => "DirectML",
                     OnnxProvider::MigraphX => "MIGraphX",
                     OnnxProvider::Cuda => "CUDA",
+                    OnnxProvider::NeoAMD => "NeoAMD",
                 };
                 format!("{name} [{provider}]")
             }
@@ -176,6 +177,7 @@ struct OnnxCacheKey {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OnnxBackendUsage {
+    pub neoamd: usize,
     pub tensorrt: usize,
     pub cuda: usize,
     pub directml: usize,
@@ -258,6 +260,20 @@ impl StageFactory {
         if !same_trt_identity {
             onnx.retain(|key, _| key.preference != OnnxBackendPreference::TensorRT);
         }
+        // v826: DirectML remains generation-fresh across live provider
+        // transitions, but NeoAMD now follows the same model-session policy as
+        // Capture Stop -> Start. Real-world v825/v066 logs showed a repeatable
+        // asymmetry: Stop/Start kept the NeoAMD Arc session and immediately
+        // returned RTMoSR to ~6 ms, while DirectML <-> NeoAMD live switching
+        // discarded that same session (`kept_neoamd=0`) and often settled near
+        // ~10-11 ms until another Stop/Start. The expensive NeoAMD model / packed
+        // weights / HIP runtime session are therefore retained, while every
+        // per-capture shared-IO bridge is still retired by prepare_gpu_transition
+        // at the provider boundary. DirectML is still rebuilt so ORT/DML command
+        // allocator/provider state never crosses a backend transition.
+        if preference != self.onnx_preference {
+            onnx.retain(|key, _| key.preference != OnnxBackendPreference::DirectML);
+        }
         let remaining: HashSet<OnnxCacheKey> = onnx.keys().cloned().collect();
         let mut onnx_lru = self.onnx_lru.clone();
         onnx_lru.retain(|key| remaining.contains(key));
@@ -265,10 +281,24 @@ impl StageFactory {
             .keys()
             .filter(|key| key.preference == OnnxBackendPreference::TensorRT)
             .count();
-        if carried_tensorrt > 0 {
+        let carried_neoamd = onnx
+            .keys()
+            .filter(|key| key.preference == OnnxBackendPreference::NeoAMD)
+            .count();
+        if carried_tensorrt > 0 || carried_neoamd > 0 {
             log::info!(
-                "onnx-session-backend-carry: target={preference:?} kept_tensorrt={} policy=same-gpu-runtime",
-                carried_tensorrt
+                "onnx-session-backend-carry: target={preference:?} kept_tensorrt={} kept_neoamd={} policy={}",
+                carried_tensorrt,
+                carried_neoamd,
+                if preference != self.onnx_preference {
+                    "fresh-directml-retain-neoamd-model-session"
+                } else {
+                    "same-provider-warm-restart"
+                }
+            );
+        } else if preference != self.onnx_preference {
+            log::info!(
+                "onnx-session-backend-carry: target={preference:?} kept_tensorrt=0 kept_neoamd=0 policy=fresh-directml-retain-neoamd-model-session"
             );
         }
         Self {
@@ -407,6 +437,7 @@ impl StageFactory {
                             self.gpu_adapter,
                             self.trt_device_id,
                             &self.trt_cache_root,
+                            &self.base_dir,
                         )?));
                         let (is_interp, provider, fallback_reason) = {
                             let stage = s.lock().unwrap();
@@ -453,14 +484,16 @@ impl StageFactory {
             .collect();
 
         // DirectML sessions are cheap to recreate and keep the historical
-        // single-chain cache policy. TensorRT is different: the serialized
-        // engine may already exist on disk while recreating the ORT/TRT
-        // execution session still makes the first live invocation visibly
-        // cold. Keep a very small MRU set so preset A -> B -> A does not throw
-        // away the already-warm TensorRT session. The bound prevents long-run
-        // VRAM/process growth when users browse many presets.
-        const MAX_TENSORRT_WARM_SESSIONS: usize = 3;
-        if self.onnx_preference != OnnxBackendPreference::TensorRT {
+        // single-chain cache policy. Optional native backends are different:
+        // TensorRT can have a cold provider-session attach even with a cached
+        // engine, while NeoAMD may have already parsed/packed model weights.
+        // Keep a tiny MRU set for the currently selected optional backend so
+        // preset A -> B -> A stays immediate without unbounded VRAM growth.
+        const MAX_OPTIONAL_BACKEND_WARM_SESSIONS: usize = 3;
+        if !matches!(
+            self.onnx_preference,
+            OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+        ) {
             self.onnx
                 .retain(|key, _| active_paths.contains(key.path.as_str()));
         } else {
@@ -470,13 +503,12 @@ impl StageFactory {
                 .filter(|key| active_paths.contains(key.path.as_str()))
                 .cloned()
                 .collect();
-            let target = MAX_TENSORRT_WARM_SESSIONS.max(keep.len());
+            let target = MAX_OPTIONAL_BACKEND_WARM_SESSIONS.max(keep.len());
             for key in self.onnx_lru.iter().rev() {
                 if keep.len() >= target {
                     break;
                 }
-                if key.preference == OnnxBackendPreference::TensorRT && self.onnx.contains_key(key)
-                {
+                if key.preference == self.onnx_preference && self.onnx.contains_key(key) {
                     keep.insert(key.clone());
                 }
             }
@@ -485,10 +517,11 @@ impl StageFactory {
             let dropped = before.saturating_sub(self.onnx.len());
             if dropped > 0 {
                 log::info!(
-                    "onnx-session-preset-cache: kept={} dropped={} limit={} policy=tensorrt-mru",
+                    "onnx-session-preset-cache: backend={:?} kept={} dropped={} limit={} policy=optional-backend-mru",
+                    self.onnx_preference,
                     self.onnx.len(),
                     dropped,
-                    MAX_TENSORRT_WARM_SESSIONS
+                    MAX_OPTIONAL_BACKEND_WARM_SESSIONS
                 );
             }
         }
@@ -509,9 +542,32 @@ impl StageFactory {
         self.onnx_lru.clear();
     }
 
+    /// A real source-size change must recreate shape-sensitive DirectML /
+    /// TensorRT sessions, but NeoAMD ABI 1 is explicitly dynamic-resolution.
+    /// Preserve a live native NeoAMD model/packed-weight session so changing
+    /// HxW never turns into an implicit per-resolution engine/session build.
+    pub fn drop_geometry_sensitive_onnx_sessions(&mut self) -> usize {
+        let before = self.onnx.len();
+        self.onnx.retain(|_key, (stage, _)| {
+            let provider = stage
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    log::error!(
+                        "onnx-stage-lock-poisoned: action=recover-for-geometry-cache-retain"
+                    );
+                    poisoned.into_inner()
+                })
+                .provider;
+            provider == OnnxProvider::NeoAMD
+        });
+        let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
+        self.onnx_lru.retain(|key| remaining.contains(key));
+        before.saturating_sub(self.onnx.len())
+    }
+
     /// Explicit-GPU live interpolation replacement must be able to emulate the
-    /// DirectML part of Stop -> Start without throwing away warm TensorRT
-    /// Sessions. Drop every cached DirectML stage so the replacement chain gets
+    /// DirectML part of Stop -> Start without throwing away warm optional
+    /// backend sessions. Drop every cached DirectML stage so the replacement chain gets
     /// a fresh ORT/DML provider after the old worker and bridges are retired.
     pub fn drop_directml_sessions(&mut self) -> usize {
         let before = self.onnx.len();
@@ -532,7 +588,7 @@ impl StageFactory {
         let dropped = before.saturating_sub(self.onnx.len());
         if dropped > 0 {
             log::info!(
-                "onnx-session-explicit-gpu-handoff: dropped_directml={} kept_non_directml={} policy=fresh-dml-preserve-tensorrt",
+                "onnx-session-explicit-gpu-handoff: dropped_directml={} kept_non_directml={} policy=fresh-dml-preserve-optional-backends",
                 dropped,
                 self.onnx.len()
             );
@@ -540,21 +596,36 @@ impl StageFactory {
         dropped
     }
 
-    /// Capture Stop must release per-capture GL/CUDA/DML bridges, but a TensorRT
-    /// ORT session is intentionally kept warm across Stop -> Start. Preset
-    /// changes keep only a bounded recent TensorRT MRU set via `prune_onnx_to`,
-    /// while real backend/GPU/geometry changes continue to clear everything.
-    pub fn retain_tensorrt_sessions_for_capture_restart(&mut self) -> usize {
+    /// Capture Stop releases per-capture graphics bridges, while heavyweight
+    /// optional backend model sessions remain warm. TensorRT keeps its ORT/TRT
+    /// session; NeoAMD keeps only its model/packed-weight session (never a
+    /// resolution-specific engine). Real backend/GPU changes still clear all.
+    pub fn retain_optional_backend_sessions_for_capture_restart(&mut self) -> usize {
         let before = self.onnx.len();
-        self.onnx
-            .retain(|key, _| key.preference == OnnxBackendPreference::TensorRT);
+        self.onnx.retain(|key, _| {
+            matches!(
+                key.preference,
+                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+            )
+        });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
         let kept = self.onnx.len();
         if before != kept || kept > 0 {
+            let kept_trt = self
+                .onnx
+                .keys()
+                .filter(|key| key.preference == OnnxBackendPreference::TensorRT)
+                .count();
+            let kept_neoamd = self
+                .onnx
+                .keys()
+                .filter(|key| key.preference == OnnxBackendPreference::NeoAMD)
+                .count();
             log::info!(
-                "onnx-session-restart-cache: kept_tensorrt={} dropped_non_tensorrt={} policy=warm-restart",
-                kept,
+                "onnx-session-restart-cache: kept_tensorrt={} kept_neoamd={} dropped_other={} policy=warm-restart",
+                kept_trt,
+                kept_neoamd,
                 before.saturating_sub(kept)
             );
         }
@@ -829,9 +900,39 @@ impl FilterChain {
                 stage.retire_dml_temporal_gpu_bridge(gc);
                 stage.retire_interp_gpu_bridges(gc);
                 stage.retire_neoaccel_textures(gc);
+                stage.retire_neoamd_shared_output(gc);
                 stage.retire_direct_output(gc);
             }
         }
+    }
+
+    /// Provider-switch warmup first exercises the generic OpenGL-texture path,
+    /// which can leave NeoAMD's bidirectional shared-FP16 input/output bridge
+    /// attached to an otherwise fully warmed session.  A normal Stop/Start
+    /// retires those per-capture bridge resources before the fused live RGBA8
+    /// path resumes, and field logs show that this distinction can be several
+    /// milliseconds on Compact models.  Reproduce only that bridge boundary
+    /// here while preserving the model session and packed weights.
+    pub fn rearm_neoamd_live_ingress_after_generic_warmup(&mut self, gc: &mut GlContext) -> usize {
+        gc.finish();
+        let mut retired = 0usize;
+        for stage in &mut self.stages {
+            let Stage::Onnx { stage, .. } = stage else {
+                continue;
+            };
+            let mut stage = stage.lock().unwrap_or_else(|poisoned| {
+                log::error!(
+                    "onnx-stage-lock-poisoned: action=recover-for-neoamd-live-ingress-rearm"
+                );
+                poisoned.into_inner()
+            });
+            if stage.provider != OnnxProvider::NeoAMD {
+                continue;
+            }
+            stage.retire_neoamd_shared_output(gc);
+            retired += 1;
+        }
+        retired
     }
 
     /// Recreate only ONNX sessions after a real source-dimension change.
@@ -850,15 +951,24 @@ impl FilterChain {
             .iter()
             .enumerate()
             .filter_map(|(index, stage)| match stage {
-                Stage::Onnx { key, .. } => Some((
-                    index,
-                    StageSpec {
-                        kind: StageKind::Onnx,
-                        path: key.clone(),
-                        enabled: true,
-                        params: Default::default(),
-                    },
-                )),
+                Stage::Onnx { key, stage, .. }
+                    if stage
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .provider
+                        != OnnxProvider::NeoAMD =>
+                {
+                    Some((
+                        index,
+                        StageSpec {
+                            kind: StageKind::Onnx,
+                            path: key.clone(),
+                            enabled: true,
+                            params: Default::default(),
+                        },
+                    ))
+                }
+                Stage::Onnx { .. } => None,
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -866,9 +976,10 @@ impl FilterChain {
             return Ok(0);
         }
 
-        // The factory cache owns Arc references to the old shape-specialized
-        // sessions. Drop those references before loading replacements.
-        factory.clear_onnx_cache();
+        // The factory cache owns Arc references to old shape-specialized
+        // sessions. Drop those before loading replacements, but retain native
+        // NeoAMD sessions: width/height are runtime inputs in that ABI.
+        factory.drop_geometry_sensitive_onnx_sessions();
         let mut replacements = Vec::with_capacity(onnx_specs.len());
         for (index, spec) in onnx_specs {
             let replacement = factory.build(&spec).with_context(|| {
@@ -885,6 +996,24 @@ impl FilterChain {
             self.stages[index] = replacement;
         }
         Ok(count)
+    }
+
+    /// Fail-safe used only when a provider switch committed but no new frame
+    /// reached presentation.  Keep NeoAMD inference active while dropping the
+    /// fragile shared-output optimization for this generation.
+    pub fn disable_neoamd_shared_output_for_recovery(
+        &mut self,
+        gc: &mut GlContext,
+        reason: &str,
+    ) {
+        for stage in &mut self.stages {
+            if let Stage::Onnx { stage, .. } = stage {
+                stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .disable_neoamd_shared_output_for_recovery(gc, reason);
+            }
+        }
     }
 
     pub fn reset_backend_runtime_state(&mut self) {
@@ -937,6 +1066,7 @@ impl FilterChain {
                         OnnxProvider::DirectML => "DirectML",
                         OnnxProvider::MigraphX => "MIGraphX",
                         OnnxProvider::Cuda => "CUDA",
+                        OnnxProvider::NeoAMD => "NeoAMD",
                     };
                     format!("{name} [{provider}]")
                 },
@@ -1077,6 +1207,116 @@ impl FilterChain {
         })
     }
 
+    /// Whether the current chain contains an ordinary DirectML temporal
+    /// restoration stage (TemporalFix-style, not frame interpolation).
+    /// These ORT/DML sessions are shape-sensitive even though the ONNX model
+    /// itself accepts dynamic HxW.
+    pub fn has_directml_temporal_filter(&self) -> bool {
+        self.stages.iter().any(|stage| match stage {
+            Stage::Onnx {
+                stage,
+                is_interp: false,
+                ..
+            } => stage
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    log::error!(
+                        "onnx-stage-lock-poisoned: action=recover-for-directml-temporal-detect"
+                    );
+                    poisoned.into_inner()
+                })
+                .is_directml_temporal_filter(),
+            _ => false,
+        })
+    }
+
+    /// Recreate ordinary DirectML temporal-restoration sessions after a live
+    /// chain edit.  A TemporalFix stage can be appended after an upscaler, run
+    /// once at that large geometry, then be moved before the upscaler.  The
+    /// StageFactory cache is keyed by model/backend rather than effective input
+    /// geometry, so reusing that ORT/DML session can leave the 640x480 route
+    /// executing with the much slower state first established at 1440x1080.
+    /// Stop/Start fixes the issue because DirectML sessions are dropped.
+    ///
+    /// Retire the old chain bridge first (the caller does that), then replace
+    /// only DirectML temporal filters.  Ordinary image ONNX, interpolation,
+    /// TensorRT and NeoAMD sessions are intentionally untouched.
+    pub fn rebuild_directml_temporal_filter_sessions(
+        &mut self,
+        factory: &mut StageFactory,
+    ) -> Result<usize> {
+        let targets = self
+            .stages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stage)| match stage {
+                Stage::Onnx {
+                    key,
+                    stage,
+                    is_interp: false,
+                    ..
+                } => {
+                    let is_temporal = stage
+                        .lock()
+                        .unwrap_or_else(|poisoned| {
+                            log::error!(
+                                "onnx-stage-lock-poisoned: action=recover-for-directml-temporal-rebuild-detect"
+                            );
+                            poisoned.into_inner()
+                        })
+                        .is_directml_temporal_filter();
+                    is_temporal.then(|| (index, key.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut rebuilt = 0usize;
+        for (index, key) in targets {
+            let evicted = factory.evict_onnx_path(&key);
+            let spec = StageSpec {
+                kind: StageKind::Onnx,
+                path: key.clone(),
+                enabled: true,
+                params: Default::default(),
+            };
+            let replacement = factory.build(&spec).with_context(|| {
+                format!(
+                    "rebuild DirectML temporal session after live chain route change: {}",
+                    spec.path
+                )
+            })?;
+            let valid = match &replacement {
+                Stage::Onnx {
+                    stage,
+                    is_interp: false,
+                    ..
+                } => stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| {
+                        log::error!(
+                            "onnx-stage-lock-poisoned: action=recover-for-directml-temporal-rebuild-verify"
+                        );
+                        poisoned.into_inner()
+                    })
+                    .is_directml_temporal_filter(),
+                _ => false,
+            };
+            anyhow::ensure!(
+                valid,
+                "DirectML temporal rebuild returned a non-temporal/non-DirectML stage"
+            );
+            self.stages[index] = replacement;
+            rebuilt += 1;
+            log::info!(
+                "directml-temporal-session-rebuild: model={} cache_evicted={} result=recreated reason=live-chain-route-generation",
+                key,
+                evicted
+            );
+        }
+        Ok(rebuilt)
+    }
+
     /// Recreate only the active DirectML interpolation session after a live
     /// chain edit changes the stages that feed it. DirectML/ORT can retain
     /// shape-specialized execution state even after the per-capture GPU bridge
@@ -1198,6 +1438,7 @@ impl FilterChain {
             };
             let stage = stage.lock().unwrap();
             match stage.provider {
+                OnnxProvider::NeoAMD => usage.neoamd += 1,
                 OnnxProvider::TensorRT => usage.tensorrt += 1,
                 OnnxProvider::Cuda => usage.cuda += 1,
                 OnnxProvider::DirectML | OnnxProvider::MigraphX => usage.directml += 1,
@@ -1207,6 +1448,69 @@ impl FilterChain {
             }
         }
         usage
+    }
+
+    /// Prime the exact first-stage NeoAMD ingress used by live WGC capture.
+    /// `warmup_candidate()` starts from an OpenGL texture and therefore does
+    /// not exercise the same entry path as `process_first_onnx_rgba8()`:
+    /// ordinary image models use the fused raw-RGBA ingress, while the shared
+    /// TemporalFix contract uploads once and enters through its GPU history
+    /// surface. Keep this helper on the same dispatch path as the first live
+    /// frame so provider caches and GPU clocks are already warm at commit.
+    pub fn warmup_neoamd_live_rgba8(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+        out_size: (i32, i32),
+    ) -> Result<bool> {
+        if self.has_interp() {
+            return Ok(false);
+        }
+        let first_is_neoamd = match self.stages.first() {
+            Some(Stage::Onnx {
+                stage,
+                is_interp: false,
+                ..
+            }) => {
+                stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .provider
+                    == OnnxProvider::NeoAMD
+            }
+            _ => false,
+        };
+        if !first_is_neoamd {
+            return Ok(false);
+        }
+
+        let Some((texture, _metrics_name, _elapsed_ms)) =
+            self.process_first_onnx_rgba8(gc, w, h, rgba)?
+        else {
+            return Ok(false);
+        };
+        // Continue through the exact remaining live chain as well. The generic
+        // warmup already primes these stages, but running them after the fused
+        // first-stage ingress reproduces the same resource ownership and GPU
+        // load sequence that the first real WGC frame will see. `false` keeps
+        // shader frame counters from advancing on synthetic warmup frames.
+        let final_tex = self.process_from_with_frame_tick(gc, texture, out_size, 1, None, false)?;
+        // Complete the exact cross-API ownership cycle before the next prime.
+        // Provider sessions/Graphs stay alive; only the disposable final
+        // texture is returned to Neo's pool.
+        gc.finish();
+        gc.recycle(final_tex);
+        for stage in &mut self.stages {
+            if let Stage::Onnx { stage, .. } = stage {
+                stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .finalize_provider_after_warmup();
+            }
+        }
+        Ok(true)
     }
 
     pub fn warmup_candidate(
@@ -1466,6 +1770,91 @@ impl FilterChain {
         }
     }
 
+    /// v792/v056: run two or more consecutive NeoAMD image/temporal ONNX
+    /// stages as one Backend-Pack-resident NCHW FP16 chain. Intermediate model
+    /// outputs never become RGBA/OpenGL textures, removing the expensive
+    /// NCHW->RGBA->NCHW round trip that kept integrated Neo below the standalone
+    /// Backend Pack throughput.
+    pub fn process_first_neoamd_peer_chain_rgba8(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> Result<Option<(GpuTex, Vec<(String, f64)>, usize)>> {
+        if self.stages.len() < 2 || w <= 0 || h <= 0 {
+            return Ok(None);
+        }
+        let mut count = 0usize;
+        for stage in &self.stages {
+            let Stage::Onnx { stage, is_interp: false, .. } = stage else { break };
+            let guard = stage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.supports_neoamd_peer_chain() {
+                break;
+            }
+            count += 1;
+        }
+        if count < 2 {
+            return Ok(None);
+        }
+        let first_temporal = match &self.stages[0] {
+            Stage::Onnx { stage, .. } => stage.lock().unwrap_or_else(|p| p.into_inner()).is_neoamd_temporal_shared_filter(),
+            _ => true,
+        };
+        if first_temporal {
+            return Ok(None);
+        }
+
+        let (mut tensor, first_ms, first_name) = match &self.stages[0] {
+            Stage::Onnx { name, stage, .. } => {
+                let mut guard = stage.lock().unwrap_or_else(|p| p.into_inner());
+                let Some((tensor, ms)) = guard.process_neoamd_peer_chain_rgba8(gc, w, h, rgba)? else {
+                    return Ok(None);
+                };
+                (tensor, ms, format!("{name} [NeoAMD]"))
+            }
+            _ => return Ok(None),
+        };
+        let mut timings = vec![(first_name, first_ms)];
+        for index in 1..count {
+            let Stage::Onnx { name, stage, .. } = &self.stages[index] else { unreachable!() };
+            let mut guard = stage.lock().unwrap_or_else(|p| p.into_inner());
+            match guard.process_neoamd_peer_chain_input(gc, tensor) {
+                Ok(Some((next, ms))) => {
+                    tensor = next;
+                    timings.push((format!("{name} [NeoAMD]"), ms));
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    // A temporal stage may have consumed the current picture
+                    // before an unexpected downstream failure. Clear only its
+                    // warm/live history so the ordinary fallback cannot append
+                    // the same frame twice.
+                    guard.finalize_provider_after_warmup();
+                    return Err(error);
+                }
+            }
+        }
+        let final_stage = match &self.stages[count - 1] {
+            Stage::Onnx { stage, .. } => stage,
+            _ => unreachable!(),
+        };
+        let texture = final_stage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .neoamd_peer_chain_to_texture(gc, tensor)?;
+        log::debug!(
+            "neoamd-peer-chain: stages={} input={}x{} output={}x{} path=rgba8->peer-nchw{}->rgba8",
+            count,
+            w,
+            h,
+            tensor.width,
+            tensor.height,
+            count.saturating_sub(1)
+        );
+        Ok(Some((texture, timings, count)))
+    }
+
     /// Fast capture path for a non-interpolation ONNX stage at chain index 0.
     /// Returns the first stage's GPU output and measured time. Call
     /// `process_from(..., 1, ...)` for the remaining stages.
@@ -1492,6 +1881,7 @@ impl FilterChain {
             OnnxProvider::DirectML => format!("{name} [DirectML]"),
             OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
             OnnxProvider::Cuda => format!("{name} [CUDA]"),
+            OnnxProvider::NeoAMD => format!("{name} [NeoAMD]"),
         };
         // Let the ordinary GPU chain own over-limit DirectML temporal input so
         // its Spline36 1080p safety cap is applied before this first stage.
@@ -1508,6 +1898,26 @@ impl FilterChain {
             stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
         {
             texture
+        } else if stage.provider == OnnxProvider::NeoAMD {
+            // Ordinary image models keep the source-aware fused RGBA8 ingress.
+            // TemporalFix v054 is different: its high-throughput contract keeps
+            // TRUE-7 history on the Backend Pack GPU, so even a leading WGC
+            // source must enter through the shared NCHW3 surface instead of
+            // falling back to the CPU-visible seven-frame history path.
+            if stage.is_neoamd_temporal_shared_filter() {
+                let source = gc.upload_rgba8(w, h, rgba);
+                if let Some(texture) = stage.process_gpu_texture(gc, source)? {
+                    texture
+                } else {
+                    let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                    gc.upload_rgba8(ow, oh, &out)
+                }
+            } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba) {
+                texture
+            } else {
+                let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                gc.upload_rgba8(ow, oh, &out)
+            }
         } else if stage.should_try_tensorrt_gpu_texture(w, h) {
             let source = gc.upload_rgba8(w, h, rgba);
             if let Some(texture) = stage.process_gpu_texture(gc, source)? {

@@ -133,6 +133,18 @@ struct Inner {
     captures: u32,
     window_start: Option<std::time::Instant>,
     frame_stage_max_ms: f64,
+    /// Short backend-transition settle window. After a bounded cold-sample
+    /// skip, use a faster EWMA so the accepted provider timing converges quickly
+    /// without exposing every one-frame clock/scheduling spike. The ordinary
+    /// steadier EWMA resumes afterward.
+    fast_settle_remaining: HashMap<String, u8>,
+    /// Ignore the first few stage probes after a live chain generation changes.
+    /// Those probes include provider/session creation, graph compilation and
+    /// one-shot reprocess work and are not representative steady-state frame
+    /// timings. A clean Stop/Start appears correct precisely because those
+    /// resources are already warm by the time the first displayed statistic is
+    /// sampled.
+    cold_skip_remaining: HashMap<String, u8>,
 }
 
 impl Metrics {
@@ -206,6 +218,47 @@ impl Metrics {
         self.inner.lock().unwrap().gui_enabled
     }
 
+    /// Arm a short per-stage convergence window after an ONNX backend switch.
+    /// This affects display smoothing only; raw provider timing and scheduling
+    /// are unchanged.
+
+    /// Ignore a bounded number of cold probes for every configured stage.
+    /// Call this only at a real chain-generation boundary (preset/filter edit),
+    /// never during steady playback.
+    pub fn arm_stage_cold_skip(&self, samples: u8) {
+        let mut g = self.inner.lock().unwrap();
+        g.cold_skip_remaining.clear();
+        if samples == 0 {
+            return;
+        }
+        for name in g.configured_stage_order.clone() {
+            g.cold_skip_remaining.insert(name, samples);
+        }
+    }
+
+    pub fn arm_stage_fast_settle(&self, samples: u8) {
+        let mut g = self.inner.lock().unwrap();
+        g.fast_settle_remaining.clear();
+        if samples == 0 {
+            return;
+        }
+        for name in g.configured_stage_order.clone() {
+            g.fast_settle_remaining.insert(name, samples);
+        }
+    }
+
+    /// True only while at least one configured stage still owns a bounded
+    /// transition settle sample.  The engine uses this to temporarily sample
+    /// already-available per-stage timings every processed frame instead of
+    /// waiting for the ordinary 1/30 diagnostic cadence.  No provider timing,
+    /// GPU synchronization, or steady-state sampling policy is changed.
+    pub fn stage_fast_settle_active(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.fast_settle_remaining
+            .values()
+            .any(|remaining| *remaining > 0)
+    }
+
     pub fn probe(&self, name: &str, kind: &str, ms: f64) {
         let mut g = self.inner.lock().unwrap();
         if !g.gui_enabled {
@@ -232,11 +285,42 @@ impl Metrics {
         {
             g.snap.stage_order.push(name.to_string());
         }
+        let skip_cold = if let Some(remaining) = g.cold_skip_remaining.get_mut(name) {
+            let active = *remaining > 0;
+            if active {
+                *remaining = (*remaining).saturating_sub(1);
+            }
+            active
+        } else {
+            false
+        };
+        if skip_cold {
+            return;
+        }
+        let settling = if let Some(remaining) = g.fast_settle_remaining.get_mut(name) {
+            let active = *remaining > 0;
+            if active {
+                *remaining = (*remaining).saturating_sub(1);
+            }
+            active
+        } else {
+            false
+        };
         let stage_ms = {
             let e = g.snap.stages.entry(name.to_string()).or_default();
             e.kind = kind.to_string();
             e.ms = if e.ms == 0.0 || (kind == "dlssnr" && (ms < 0.0 || e.ms < 0.0)) {
                 ms
+            } else if settling {
+                // v813: a provider/start transition is a measurement boundary,
+                // but showing the *single latest frame* made normal AMD clock /
+                // scheduling variance (roughly 6..10 ms in the field log) look
+                // like a backend regression.  Use a deliberately fast EWMA
+                // instead: it forgets a cold first sample in a few frames while
+                // still reporting the representative provider cost.  The
+                // ordinary steadier 0.9/0.1 EWMA resumes after this bounded
+                // settle window.
+                e.ms * 0.5 + ms * 0.5
             } else {
                 e.ms * 0.9 + ms * 0.1
             };
@@ -514,6 +598,22 @@ mod tests {
     }
 
     #[test]
+    fn display_stages_preserves_neoamd_interpolation_provider_and_gpu_time() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+
+        metrics.probe("Frame interpolation", "cpu", 0.9);
+        metrics.probe("Frame interpolation run", "onnx", 10.4);
+        metrics.probe("rife_v4.22_lite_fp16.onnx [NeoAMD]", "onnx", 10.4);
+
+        let rows = metrics.snapshot().display_stages();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "rife_v4.22_lite_fp16.onnx [NeoAMD]");
+        assert_eq!(rows[0].1.kind, "onnx");
+        assert!((rows[0].1.ms - 10.4).abs() < 0.001);
+    }
+
+    #[test]
     fn display_stages_collapse_frame_interpolation_details_to_one_row() {
         let metrics = Metrics::default();
         metrics.set_enabled(true);
@@ -604,6 +704,41 @@ mod tests {
         let rows = metrics.snapshot().display_stages_in_order(&live_order);
         assert_eq!(rows[0].0, "rife_v4.22_lite_fp16.onnx [DirectML]");
         assert_eq!(rows[1].0, "2x_AnimeJaNai.onnx [DirectML]");
+    }
+
+    #[test]
+    fn backend_fast_settle_activity_ends_after_bounded_samples() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        let name = "compact.onnx [NeoAMD]".to_string();
+        metrics.set_stage_order(vec![name.clone()]);
+        metrics.arm_stage_fast_settle(2);
+        assert!(metrics.stage_fast_settle_active());
+        metrics.probe(&name, "onnx", 6.0);
+        assert!(metrics.stage_fast_settle_active());
+        metrics.probe(&name, "onnx", 5.8);
+        assert!(!metrics.stage_fast_settle_active());
+    }
+
+    #[test]
+    fn backend_fast_settle_converges_quickly_without_single_frame_noise() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        let name = "compact.onnx [NeoAMD]".to_string();
+        metrics.set_stage_order(vec![name.clone()]);
+        metrics.arm_stage_fast_settle(3);
+
+        metrics.probe(&name, "onnx", 8.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 8.0).abs() < 0.001);
+        metrics.probe(&name, "onnx", 6.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 7.0).abs() < 0.001);
+        metrics.probe(&name, "onnx", 9.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 8.0).abs() < 0.001);
+
+        // After the bounded provider-settle window, ordinary steady-state EWMA
+        // resumes instead of permanently making the statistics noisy.
+        metrics.probe(&name, "onnx", 6.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 7.8).abs() < 0.001);
     }
 
     #[test]

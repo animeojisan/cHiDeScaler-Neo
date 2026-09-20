@@ -371,8 +371,9 @@ impl HotkeyThread {
 
     pub fn stop(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
-        let post_quit_ok =
-            unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok() };
+        let post_quit_ok = unsafe {
+            PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok()
+        };
         log::debug!(
             "hotkey-thread-stop-requested: tid={} post_quit_ok={} atomic_stop=true",
             self.thread_id,
@@ -417,18 +418,9 @@ mod tests {
             BackgroundGui::Minimized,
             true
         ));
-        assert!(!direct_background_stop_allowed(
-            BackgroundGui::Foreground,
-            true
-        ));
-        assert!(!direct_background_stop_allowed(
-            BackgroundGui::Hidden,
-            false
-        ));
-        assert!(!direct_background_stop_allowed(
-            BackgroundGui::Minimized,
-            false
-        ));
+        assert!(!direct_background_stop_allowed(BackgroundGui::Foreground, true));
+        assert!(!direct_background_stop_allowed(BackgroundGui::Hidden, false));
+        assert!(!direct_background_stop_allowed(BackgroundGui::Minimized, false));
     }
 
     #[test]

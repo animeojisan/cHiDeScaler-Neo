@@ -6,7 +6,7 @@
       "chain": [],
       "aspect_correction": {
         "enabled": false,
-        "mode": "auto_16_9",
+        "mode": "manual",
         "width_scale": 1.0,
         "height_scale": 1.0
       },
@@ -15,7 +15,7 @@
         "left": 0,
         "top": 0,
         "right": 0,
-        "bottom": 23
+        "bottom": 0
       }
     },
     {
@@ -343,12 +343,12 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/ToHeart_35mm/ToHeart_35mm_Compact_V1_1_fp16.onnx",
+          "path": "models/TemporalFix/temporalfix_s2_v1_op18_fp16.onnx",
           "enabled": true
         },
         {
           "kind": "onnx",
-          "path": "models/TemporalFix/temporalfix_s2_v1_op18_fp16.onnx",
+          "path": "models/ToHeart_35mm/ToHeart_35mm_Compact_V1_1_fp16.onnx",
           "enabled": true
         },
         {
@@ -356,7 +356,20 @@
           "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
       "name": "LosOdy360  [720p]  @X360/PS3",
@@ -492,10 +505,6 @@
         "top": 0,
         "right": 0,
         "bottom": 0
-      },
-      "capture_resolution": {
-        "w": 1280,
-        "h": 720
       }
     },
     {
@@ -554,10 +563,6 @@
         "top": 0,
         "right": 0,
         "bottom": 0
-      },
-      "capture_resolution": {
-        "w": 1280,
-        "h": 720
       }
     },
     {
@@ -629,10 +634,6 @@
         "top": 0,
         "right": 0,
         "bottom": 0
-      },
-      "capture_resolution": {
-        "w": 1280,
-        "h": 720
       }
     },
     {
@@ -734,10 +735,6 @@
         "top": 0,
         "right": 0,
         "bottom": 0
-      },
-      "capture_resolution": {
-        "w": 1280,
-        "h": 720
       }
     },
     {

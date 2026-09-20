@@ -72,6 +72,18 @@ TensorRT and CUDA runtime binaries are not included in this repository. They
 are installed separately as the optional Neo TensorRT Backend Pack and remain
 subject to NVIDIA's applicable licenses and redistribution terms.
 
+
+## NeoAMD / AMD HIP
+
+NeoAMD is an optional separately distributed backend for supported AMD GPUs.
+The public NeoAMD Backend Pack does not bundle AMD's HIP runtime DLL; it uses
+the HIP runtime provided by the installed AMD GPU driver. AMD HIP / ROCm
+components remain subject to AMD's applicable component licenses.
+
+NeoAMD model-pack files are generated from compatible ONNX models. Those packed
+weights remain subject to the terms applicable to the corresponding source
+models; generating a backend-specific representation does not relicense them.
+
 ## DLSS Neural Rendering / NVIDIA NGX
 
 DLSS Neural Rendering and NVIDIA NGX runtime/SDK binaries are not included in
@@ -79,10 +91,6 @@ this repository. Optional DLSSNR support is isolated behind the external
 `backends/dlssnr/` Backend Pack ABI. Any NVIDIA or community-modified runtime
 placed there remains subject to its own applicable license, authorization, and
 redistribution terms.
-
-The developer-only pass-through bridge under
-`backends/dlssnr/reference_stub/` contains no NVIDIA code and performs no
-neural rendering.
 
 Public implementation research used to validate the initial same-resolution,
 zero-guidance architecture includes the MIT-licensed experimental project:
@@ -99,7 +107,7 @@ zero-guidance architecture includes the MIT-licensed experimental project:
 
 ## External SLANGP shader packs
 
-v695 includes only cHiDeScaler-Neo's clean-room generic `.slangp/.slang` loader.
+cHiDeScaler-Neo includes only its generic `.slangp/.slang` loader.
 No RetroCrisis, Guest Advanced, libretro Slang preset, shader source, or LUT
 asset is bundled in this source package. Users may place separately obtained
 shader packs below the portable `slangp/` directory. Those external files remain
@@ -115,11 +123,11 @@ license/redistribution terms. The Neo bridge DLL itself remains hash-pinned.
 
 ### Resolve DLSS5 Experimental implementation reference
 
-The v701 `backends/dlssnr/feature18_backend/` implementation uses an independent
+The `backends/dlssnr/feature18_backend/` implementation uses an independent
 Neo ABI wrapper and adapts Feature 18 D3D12 initialization/compatibility
 techniques from the MIT-licensed `SAOG0721/DaVinci-Resolve-DLSS5` project.
 The retained MIT terms are in:
 
 `backends/dlssnr/feature18_backend/LICENSE.resolve-dlss5.txt`
 
-No NVIDIA SDK library, header, or DLSSNR runtime binary is bundled by v701.
+No NVIDIA SDK library, header, or DLSSNR runtime binary is bundled in this source package.

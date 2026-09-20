@@ -58,6 +58,13 @@ use crate::core::config::OnnxBackendPreference;
 use crate::render::{
     cuda_interop::{CudaSharedBuffer, cuda_shared_stats},
     gl::{GlContext, GpuTex, InterpAuxPlane},
+    neoamd_backend::{
+        NEOAMD_CAP_D3D12_SHARED_BUFFER, NEOAMD_CAP_DYNAMIC_RESOLUTION, NEOAMD_CAP_FP16_NATIVE,
+        NEOAMD_CAP_GFX12_WMMA, NEOAMD_CAP_STRUCTURAL_ROUTING, NEOAMD_RUN_ROUTE_DIRECT,
+        NEOAMD_RUN_ROUTE_GRAPH_COMPUTE, NEOAMD_RUN_ROUTE_GRAPH_FULL, NEOAMD_RUN_ROUTE_RTMOSR_FP16,
+        NEOAMD_RUN_ROUTE_RTMOSR_U8_FUSED, NEOAMD_SESSION_IMAGE, NEOAMD_SESSION_INTERPOLATION,
+        NEOAMD_SESSION_TEMPORAL, NEOAMD_VENDOR_AMD, NeoAmdBackend, NeoAmdSession,
+    },
     onnx_accel::{
         Decision as NeoDecision, NeoAccelState, analyze_local_image_model, compare_output_patch,
         crop_rgba8, extract_output_patch, neoaccel_enabled, write_output_patch,
@@ -73,10 +80,41 @@ static TENSORRT_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ONNX_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_ONNX_RUN_OPTIONS: OnceLock<Mutex<Vec<Weak<CancelableRunOptions>>>> = OnceLock::new();
 static INTERP_GPU_INPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
+static NEOAMD_STREAM_PREP_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static NEOAMD_STREAM_PHASE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static NEOAMD_PROFILE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static INTERP_GPU_OUTPUT_FRAMES: AtomicU64 = AtomicU64::new(0);
 static INTERP_CPU_FRAME_READBACKS: AtomicU64 = AtomicU64::new(0);
 static INTERP_CPU_FRAME_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static INTERP_CPU_PACK_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn should_log_neoamd_profile() -> bool {
+    let n = NEOAMD_PROFILE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    n <= 32 || n % 120 == 0
+}
+
+fn neoamd_run_route_label(flags: Option<u32>) -> String {
+    let Some(flags) = flags else { return "unreported".to_string(); };
+    let graph = if flags & NEOAMD_RUN_ROUTE_GRAPH_FULL != 0 {
+        "graph-full"
+    } else if flags & NEOAMD_RUN_ROUTE_GRAPH_COMPUTE != 0 {
+        "graph-compute"
+    } else if flags & NEOAMD_RUN_ROUTE_DIRECT != 0 {
+        "direct"
+    } else {
+        "unknown"
+    };
+    let ingress = if flags & NEOAMD_RUN_ROUTE_RTMOSR_FP16 != 0 {
+        "+rtmosr-staged-fp16"
+    } else if flags & NEOAMD_RUN_ROUTE_RTMOSR_U8_FUSED != 0 {
+        "+rtmosr-u8-fused"
+    } else {
+        ""
+    };
+    format!("{graph}{ingress}")
+}
+
 static INTERP_CPU_OUTPUT_CONVERSIONS: AtomicU64 = AtomicU64::new(0);
 static INTERP_CPU_FALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
 static INTERP_RESIDENCY_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
@@ -628,7 +666,12 @@ pub struct OnnxStage {
     direct_input: Option<DmlDirectInput>,
     dml_temporal_bridge: Option<DmlTemporalGpuBridge>,
     direct_output_disabled: bool,
+    neoamd_shared_disabled: bool,
+    neoamd_shared_key: Option<u64>,
+    neoamd_shared_input_key: Option<u64>,
+    neoamd_shared_input_size: Option<(i32, i32)>,
     tensorrt_device_id: Option<i32>,
+    neoamd_session: Option<NeoAmdSession>,
     tensorrt_gpu_bridge: Option<TensorRtGpuBridge>,
     tensorrt_temporal_bridge: Option<TensorRtTemporalGpuBridge>,
     tensorrt_interp_bridge: Option<TensorRtInterpGpuBridge>,
@@ -638,6 +681,11 @@ pub struct OnnxStage {
     /// same selected GPU can hand them directly to Vulkan without a CPU readback.
     dml_cpu_interp_shared_outputs: [Vec<DmlDirectOutput>; 2],
     dml_cpu_interp_shared_disabled: bool,
+    /// Consecutive native NeoAMD DRBA intervals that exceed the practical
+    /// DirectML-class throughput budget. Used only as a safety valve while the
+    /// native DRBA kernels are tuned; a transient graph-capture/cold-start spike
+    /// must not trigger fallback by itself.
+    neoamd_drba_slow_streak: u8,
     interp_gpu_path_disabled: bool,
     tensorrt_gpu_path_disabled: bool,
     tensorrt_gpu_unsupported_logged: bool,
@@ -650,7 +698,16 @@ pub struct OnnxStage {
     /// axis (for example 15ch=5 frames, 21ch=7 frames).
     temporal_frames: Option<usize>,
     temporal_history: VecDeque<Vec<u8>>,
+    /// Pixel stride stored in temporal_history (3=RGB, 4=RGBA). NeoAMD accepts
+    /// both, so production no longer repacks every live RGBA frame to a newly
+    /// allocated RGB Vec before crossing the Backend Pack ABI.
+    temporal_history_stride: usize,
     temporal_size: Option<(i32, i32)>,
+    /// Keep a NeoAMD TemporalFix runtime failure local to the current W/H
+    /// instead of mutating the cached stage's provider to DirectML. This covers
+    /// allocation/runtime failures on the v052 dynamic path and lets a later
+    /// geometry retry NeoAMD without contaminating OFF -> ON cache reuse.
+    neoamd_temporal_rejected_size: Option<(i32, i32)>,
     pub provider_desc: String,
     pub provider: OnnxProvider,
     pub fallback_reason: Option<String>,
@@ -685,6 +742,7 @@ pub enum OnnxProvider {
     MigraphX,
     TensorRT,
     Cuda,
+    NeoAMD,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -725,6 +783,10 @@ pub(crate) struct PreparedInterpGpuOutput {
     pub(crate) size: (i32, i32),
     pub(crate) padded: (i32, i32),
     pub(crate) fp16: bool,
+    /// v807: this output is a DirectML DRBA synthetic slot and may use the
+    /// local-GL snapshot lane if this exact imported resource entered the
+    /// bound-storage fallback. Other providers/interpolators remain unchanged.
+    pub(crate) directml_drba_snapshot_candidate: bool,
     /// Keep DirectML interpolation in floating point when a shader/image
     /// stage follows it. Quantizing RIFE/DRBA to RGBA8 before a CNN
     /// upscaler can turn tiny provider-specific errors into visible
@@ -762,12 +824,53 @@ impl Drop for PreparedDmlSharedOutput {
     }
 }
 
+/// v816: one completed NeoAMD RIFE midpoint left in the Backend Pack's shared
+/// RGBA8 D3D12 buffer.  The handle is a fresh duplicate owned by this wrapper
+/// until the render thread transfers it to GlContext.
+pub(crate) struct PreparedNeoAmdSharedOutput {
+    pub(crate) key: u64,
+    pub(crate) handle: HANDLE,
+    pub(crate) byte_len: usize,
+    pub(crate) heap_byte_len: u64,
+    pub(crate) luid: [u8; 8],
+    pub(crate) size: (i32, i32),
+}
+
+unsafe impl Send for PreparedNeoAmdSharedOutput {}
+
+impl PreparedNeoAmdSharedOutput {
+    pub(crate) fn take_handle(&mut self) -> HANDLE {
+        std::mem::take(&mut self.handle)
+    }
+}
+
+impl Drop for PreparedNeoAmdSharedOutput {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+            self.handle = HANDLE::default();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UpscaleProfile {
     pub pack_ms: f64,
     pub run_ms: f64,
     pub out_ms: f64,
     pub output_size: (usize, usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NeoAmdPeerTensor {
+    pub(crate) key: u64,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) byte_len: usize,
+    pub(crate) allocation_byte_len: u64,
+    pub(crate) adapter_luid: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -817,6 +920,7 @@ impl OnnxStage {
         dml_adapter_id: Option<i32>,
         trt_device_id: Option<i32>,
         cache_root: &Path,
+        app_dir: &Path,
     ) -> Result<Self> {
         match preference {
             OnnxBackendPreference::DirectML => {
@@ -862,6 +966,7 @@ impl OnnxStage {
                 }
                 Self::load_directml(path, dml_adapter_id)
             }
+            OnnxBackendPreference::NeoAMD => Self::load_neoamd(path, dml_adapter_id, app_dir),
             OnnxBackendPreference::TensorRT => {
                 let device_id =
                     trt_device_id.ok_or_else(|| anyhow!("TensorRT CUDA device is unavailable"))?;
@@ -979,6 +1084,1217 @@ impl OnnxStage {
             None,
             false,
         )
+    }
+
+    fn load_neoamd(path: &Path, dml_adapter_id: Option<i32>, app_dir: &Path) -> Result<Self> {
+        // Resolve the AMD adapter before creating DirectML metadata/fallback so
+        // an Auto configuration with one AMD GPU plus another vendor does not
+        // accidentally bind the fallback ORT session to a different device.
+        // NeoAMD inference itself is still owned entirely by the external pack.
+        let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+        let target = match dml_adapter_id {
+            Some(device_id) => adapters.iter().find(|adapter| adapter.device_id == device_id),
+            None => {
+                let mut amd = adapters
+                    .iter()
+                    .filter(|adapter| adapter.vendor_id == NEOAMD_VENDOR_AMD);
+                let first = amd.next();
+                if amd.next().is_some() {
+                    None
+                } else {
+                    first
+                }
+            }
+        };
+
+        // A ready DirectML stage is retained as the immediate fail-safe. If a
+        // valid AMD target is known, bind that fallback to the same adapter.
+        let fallback_adapter = target
+            .filter(|adapter| adapter.vendor_id == NEOAMD_VENDOR_AMD)
+            .map(|adapter| adapter.device_id)
+            .or(dml_adapter_id);
+        let mut stage = Self::load_directml(path, fallback_adapter)?;
+
+        let Some(target) = target else {
+            stage.fallback_reason = Some(
+                "NeoAMD could not resolve one unambiguous AMD compute adapter; DirectML retained"
+                    .to_string(),
+            );
+            return Ok(stage);
+        };
+        if target.vendor_id != NEOAMD_VENDOR_AMD {
+            stage.fallback_reason = Some(format!(
+                "NeoAMD requires AMD RDNA4; selected GPU '{}' is not AMD",
+                target.name
+            ));
+            return Ok(stage);
+        }
+        let backend = match NeoAmdBackend::load_from_app_dir(app_dir) {
+            Ok(backend) => backend,
+            Err(error) => {
+                stage.fallback_reason = Some(format!(
+                    "NeoAMD Backend Pack unavailable; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let adapter = match backend.query_adapter(target.luid) {
+            Ok(info) => info,
+            Err(error) => {
+                stage.fallback_reason = Some(format!(
+                    "NeoAMD rejected selected GPU; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let architecture = adapter.architecture_string();
+        let required_caps = NEOAMD_CAP_DYNAMIC_RESOLUTION
+            | NEOAMD_CAP_FP16_NATIVE
+            | NEOAMD_CAP_GFX12_WMMA
+            | NEOAMD_CAP_STRUCTURAL_ROUTING;
+        if adapter.vendor_id != NEOAMD_VENDOR_AMD
+            || !matches!(architecture.as_str(), "gfx1200" | "gfx1201")
+            || adapter.capabilities & required_caps != required_caps
+        {
+            stage.fallback_reason = Some(format!(
+                "NeoAMD unsupported GPU/backend capabilities (arch='{architecture}', caps=0x{:x}); DirectML retained",
+                adapter.capabilities
+            ));
+            return Ok(stage);
+        }
+        let session = match backend.create_session(path, target.luid) {
+            Ok(session) => session,
+            Err(error) => {
+                // Unsupported/ambiguous graphs deliberately land here. The
+                // pack performs structural routing; Neo does not special-case
+                // model names, file hashes or node names.
+                stage.fallback_reason = Some(format!(
+                    "NeoAMD graph not accepted; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let info = session.info();
+        let host_kind = if stage.interp != InterpKind::None {
+            NEOAMD_SESSION_INTERPOLATION
+        } else if stage.temporal_frames.is_some() {
+            NEOAMD_SESSION_TEMPORAL
+        } else {
+            NEOAMD_SESSION_IMAGE
+        };
+        if info.kind != host_kind {
+            stage.fallback_reason = Some(format!(
+                "NeoAMD session contract mismatch (pack kind {}, host kind {}); DirectML retained",
+                info.kind, host_kind
+            ));
+            return Ok(stage);
+        }
+        if host_kind == NEOAMD_SESSION_TEMPORAL
+            && stage.temporal_frames != Some(info.temporal_frames as usize)
+        {
+            stage.fallback_reason = Some(format!(
+                "NeoAMD temporal-frame contract mismatch (pack {}, model {:?}); DirectML retained",
+                info.temporal_frames, stage.temporal_frames
+            ));
+            return Ok(stage);
+        }
+        stage.provider = OnnxProvider::NeoAMD;
+        stage.provider_desc = format!(
+            "NeoAMD {}{}",
+            architecture,
+            backend
+                .description()
+                .map(|value| format!(" / {value}"))
+                .unwrap_or_default()
+        );
+        stage.fallback_reason = None;
+        stage.neoamd_session = Some(session);
+        log::info!(
+            "neoamd-session-ready: model={} gpu='{}' luid={:016x} arch={} kind={} dynamic_resolution=true engine_cache=false",
+            path.display(),
+            target.name,
+            target.luid,
+            architecture,
+            info.kind
+        );
+        Ok(stage)
+    }
+
+    fn disable_neoamd_after_runtime_failure(&mut self, reason: &str) {
+        if self.provider != OnnxProvider::NeoAMD {
+            return;
+        }
+        log::warn!(
+            "neoamd-runtime-fallback: model={} reason={} action=DirectML",
+            self.source_path.display(),
+            reason
+        );
+        self.neoamd_session = None;
+        // A TemporalFix session can reject a runtime geometry that the first
+        // NeoAMD production gate does not yet support (v049: only 1280x720).
+        // Do not immediately promote that same live texture chain into the
+        // DirectML temporal shared-buffer bridge: on stacked ONNX -> Temporal
+        // chains the provider transition can otherwise reuse cross-API temporal
+        // state created under a different ownership contract and present black.
+        // The ordinary CPU-visible DirectML retry is slower but authoritative
+        // and remains enabled. A newly built DirectML session starts clean.
+        if self.temporal_frames.is_some() {
+            self.direct_output_disabled = true;
+            log::warn!(
+                "neoamd-temporal-fallback-safety: model={} directml_temporal_gpu_path=disabled_for_session fallback=cpu-visible-directml",
+                self.name
+            );
+        }
+        self.provider = OnnxProvider::DirectML;
+        self.provider_desc = self
+            .fallback_dml_adapter
+            .map(|id| format!("DirectML device {id}"))
+            .unwrap_or_else(|| "DirectML auto/high-performance".to_string());
+        self.fallback_reason = Some(format!("NeoAMD runtime fallback: {reason}"));
+    }
+
+    fn run_neoamd_u8(
+        &mut self,
+        w: i32,
+        h: i32,
+        inputs: &[&[u8]],
+        input_pixel_stride: usize,
+        output_pixel_stride: usize,
+        phase: f32,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        // NeoAMD interpolation uses the same run_u8 ABI as image/temporal
+        // sessions, but its timing belongs to last_interp_profile. v757 stored
+        // every NeoAMD run in last_upscale_profile, so the asynchronous RIFE
+        // worker returned profile=None and the GUI fell back to the tiny CPU
+        // handoff timing ("Frame interpolation" ~0-1ms) even while HIP was
+        // doing ~10ms of real interpolation work. Keep the provider timing in
+        // the profile family that the engine consumes for the active session.
+        let is_interp = self.interp != InterpKind::None;
+        if is_interp {
+            self.last_interp_profile = None;
+        } else {
+            self.last_upscale_profile = None;
+        }
+
+        let run_started = Instant::now();
+        let result = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .run_u8(
+                w,
+                h,
+                inputs,
+                input_pixel_stride,
+                output_pixel_stride,
+                phase,
+            )
+            .map_err(anyhow::Error::msg);
+        match result {
+            Ok((ow, oh, bytes)) => {
+                let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+                if is_interp {
+                    self.last_interp_profile = Some(InterpProfile {
+                        pack_ms: 0.0,
+                        run_ms,
+                        out_ms: 0.0,
+                        // Backend Pack v017 is runtime-W/H safe and does not
+                        // expose a host-visible padded shape. The logical input
+                        // size is therefore the correct profile geometry.
+                        padded_size: (w.max(0) as usize, h.max(0) as usize),
+                    });
+                    log::debug!(
+                        "neoamd-interp-profile: model='{}' run_ms={:.3} total_ms={:.3} input={}x{} output={}x{} phase={:.4}",
+                        self.name,
+                        run_ms,
+                        run_ms,
+                        w,
+                        h,
+                        ow,
+                        oh,
+                        phase
+                    );
+                } else {
+                    self.last_upscale_profile = Some(UpscaleProfile {
+                        pack_ms: 0.0,
+                        run_ms,
+                        out_ms: 0.0,
+                        output_size: (ow.max(0) as usize, oh.max(0) as usize),
+                    });
+                    self.last_upscale_input_size = Some((w, h));
+                }
+                Ok((ow, oh, bytes))
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if self.temporal_frames.is_some() {
+                    // TemporalFix runtime geometry rejection is a per-W/H
+                    // fail-closed decision, not a provider transition. v782
+                    // changed the cached stage itself to DirectML here; after
+                    // OFF -> ON, reset_backend_runtime_state cleared the safety
+                    // latch and resurrected the unstable DML temporal GPU bridge.
+                    // Preserve the NeoAMD session/provider and remember only the
+                    // rejected geometry. The caller retries authoritative DML
+                    // CPU-visible inference for this frame/size.
+                    self.neoamd_temporal_rejected_size = Some((w, h));
+                    self.direct_output_disabled = true;
+                    log::warn!(
+                        "neoamd-temporal-runtime-failclosed: model={} size={}x{} reason={} provider=NeoAMD-preserved fallback=DirectML-cpu-visible",
+                        self.name,
+                        w,
+                        h,
+                        reason
+                    );
+                } else {
+                    self.disable_neoamd_after_runtime_failure(&reason);
+                }
+                Err(error)
+            }
+        }
+    }
+
+
+    fn run_neoamd_many_u8(
+        &mut self,
+        w: i32,
+        h: i32,
+        inputs: &[&[u8]],
+        input_pixel_stride: usize,
+        output_pixel_stride: usize,
+        phases: &[f32],
+    ) -> Result<Option<Vec<(i32, i32, Vec<u8>)>>> {
+        if phases.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        self.last_interp_profile = None;
+        let run_started = Instant::now();
+        let result = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .run_interp_many_u8(
+                w,
+                h,
+                inputs,
+                input_pixel_stride,
+                output_pixel_stride,
+                phases,
+            )
+            .map_err(anyhow::Error::msg);
+        match result {
+            Ok(Some(results)) => {
+                let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+                self.last_interp_profile = Some(InterpProfile {
+                    pack_ms: 0.0,
+                    run_ms,
+                    out_ms: 0.0,
+                    padded_size: (w.max(0) as usize, h.max(0) as usize),
+                });
+                log::debug!(
+                    "neoamd-interp-many-profile: model='{}' outputs={} phases={:?} run_ms={:.3} per_output_ms={:.3} input={}x{}",
+                    self.name,
+                    results.len(),
+                    phases,
+                    run_ms,
+                    run_ms / results.len().max(1) as f64,
+                    w,
+                    h
+                );
+
+                // v765/v023 native DRBA performance diagnostic. Earlier hosts treated
+                // three slow Native intervals as a runtime failure and silently switched
+                // the stage to DirectML. That made it impossible to validate the restored
+                // v107-style NeoAMD path. Performance is now diagnostic only; only a real
+                // runtime/ABI failure may change provider.
+                if self.interp == InterpKind::Drba {
+                    let pixels = (w.max(1) as f64) * (h.max(1) as f64);
+                    let scale = (pixels / (1280.0 * 720.0)).clamp(0.25, 8.0);
+                    let per_output_budget_ms = (12.0 * scale).clamp(5.0, 60.0);
+                    let total_budget_ms = per_output_budget_ms * results.len().max(1) as f64;
+                    if run_ms > total_budget_ms {
+                        self.neoamd_drba_slow_streak =
+                            self.neoamd_drba_slow_streak.saturating_add(1);
+                        log::warn!(
+                            "neoamd-drba-performance-guard: model={} streak={} run_ms={:.2} budget_ms={:.2} outputs={} action={}",
+                            self.name,
+                            self.neoamd_drba_slow_streak,
+                            run_ms,
+                            total_budget_ms,
+                            results.len(),
+                            if self.neoamd_drba_slow_streak >= 3 {
+                                "native-stays-active"
+                            } else {
+                                "observe"
+                            }
+                        );
+                        if self.neoamd_drba_slow_streak >= 3 {
+                            // v765/v023: performance is diagnostic only. Runtime/ABI
+                            // failures still fail safe to DirectML, but a slow Native
+                            // DRBA interval must remain on NeoAMD so the optimized
+                            // production path can be measured instead of silently
+                            // changing providers underneath the user.
+                            log::warn!(
+                                "neoamd-drba-performance-guard: model={} streak={} action=native-stays-active diagnostic=1",
+                                self.name,
+                                self.neoamd_drba_slow_streak
+                            );
+                            self.neoamd_drba_slow_streak = 0;
+                        }
+                    } else {
+                        self.neoamd_drba_slow_streak = 0;
+                    }
+                } else {
+                    self.neoamd_drba_slow_streak = 0;
+                }
+                Ok(Some(results))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.disable_neoamd_after_runtime_failure(&reason);
+                Err(error)
+            }
+        }
+    }
+
+
+    pub(crate) fn supports_neoamd_interp_shared_rgba8(&self) -> bool {
+        self.provider == OnnxProvider::NeoAMD
+            && matches!(&self.interp, InterpKind::RifeV1 { .. } | InterpKind::Drba)
+            && !self.neoamd_shared_disabled
+            && self
+                .neoamd_session
+                .as_ref()
+                .is_some_and(|session| session.supports_interp_stream_shared_rgba8())
+    }
+
+    pub(crate) fn prepare_neoamd_interp_stream_shared_rgba8(
+        &mut self,
+        w: i32,
+        h: i32,
+        frames: &[&[u8]],
+    ) -> Result<Option<crate::render::neoamd_backend::NeoAmdSharedOutput>> {
+        if !self.supports_neoamd_interp_shared_rgba8() {
+            return Ok(None);
+        }
+        self.last_interp_profile = None;
+        let started = Instant::now();
+        let result = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .prepare_interp_stream_shared_rgba8(w, h, frames)
+            .map_err(anyhow::Error::msg);
+        match result {
+            Ok(Some(shared)) => {
+                let previous_key = self.neoamd_shared_key;
+                self.neoamd_shared_key = Some(shared.resource_key);
+                self.neoamd_shared_input_key = None;
+                self.neoamd_shared_input_size = Some((w, h));
+                let common_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let log_index = NEOAMD_STREAM_PREP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if previous_key != Some(shared.resource_key) {
+                    log::info!(
+                        "neoamd-interp-shared-output-ready: model='{}' size={}x{} key={} bytes={} allocation_bytes={} common_ms={:.3}",
+                        self.name,
+                        w,
+                        h,
+                        shared.resource_key,
+                        shared.byte_len,
+                        shared.allocation_byte_len,
+                        common_ms
+                    );
+                } else if log_index < 8 || log_index % 120 == 0 {
+                    log::debug!(
+                        "neoamd-interp-shared-prepare: model='{}' input={}x{} frames={} common_ms={:.3} sampled_index={}",
+                        self.name,
+                        w,
+                        h,
+                        frames.len(),
+                        common_ms,
+                        log_index
+                    );
+                }
+                Ok(Some(shared))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.neoamd_shared_disabled = true;
+                log::warn!(
+                    "neoamd-interp-shared-output-disabled: model='{}' reason={error:#} fallback=cpu-visible-cooperative-stream",
+                    self.name
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn run_neoamd_interp_stream_phase_shared_rgba8(
+        &mut self,
+        w: i32,
+        h: i32,
+        input_count: usize,
+        phase: f32,
+        shared: crate::render::neoamd_backend::NeoAmdSharedOutput,
+    ) -> Result<PreparedNeoAmdSharedOutput> {
+        anyhow::ensure!(
+            self.supports_neoamd_interp_shared_rgba8(),
+            "NeoAMD shared interpolation route is unavailable"
+        );
+        let run_started = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .run_interp_stream_phase_shared_rgba8(w, h, input_count, phase, shared.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+        self.last_interp_profile = Some(InterpProfile {
+            pack_ms: 0.0,
+            run_ms,
+            out_ms: 0.0,
+            padded_size: (w.max(0) as usize, h.max(0) as usize),
+        });
+        let handle = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .shared_output_handle(shared.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let log_index = NEOAMD_STREAM_PHASE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if log_index < 16 || log_index % 240 == 0 {
+            log::debug!(
+                "neoamd-interp-shared-phase: model='{}' phase={:.6} run_ms={:.3} input={}x{} output={}x{} key={} sampled_index={}",
+                self.name, phase, run_ms, w, h, shared.width, shared.height, shared.resource_key, log_index
+            );
+        }
+        Ok(PreparedNeoAmdSharedOutput {
+            key: shared.resource_key,
+            handle,
+            byte_len: shared.byte_len,
+            heap_byte_len: shared.allocation_byte_len,
+            luid: self
+                .neoamd_session
+                .as_ref()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .adapter_luid()
+                .to_le_bytes(),
+            size: (shared.width, shared.height),
+        })
+    }
+
+    pub(crate) fn supports_neoamd_interp_stream(&self) -> bool {
+        self.provider == OnnxProvider::NeoAMD
+            && matches!(&self.interp, InterpKind::RifeV1 { .. } | InterpKind::Drba)
+            && self
+                .neoamd_session
+                .as_ref()
+                .is_some_and(|session| session.supports_interp_stream_u8())
+    }
+
+    pub(crate) fn prepare_neoamd_interp_stream_rgba8(
+        &mut self,
+        w: i32,
+        h: i32,
+        frames: &[&[u8]],
+    ) -> Result<bool> {
+        if !self.supports_neoamd_interp_stream() {
+            return Ok(false);
+        }
+        self.last_interp_profile = None;
+        let started = Instant::now();
+        let result = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .prepare_interp_stream_u8(w, h, frames, 4, 3)
+            .map_err(anyhow::Error::msg);
+        match result {
+            Ok(prepared) => {
+                if prepared {
+                    let log_index =
+                        NEOAMD_STREAM_PREP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if log_index < 8 || log_index % 120 == 0 {
+                        log::debug!(
+                            "neoamd-interp-stream-prepare: model='{}' input={}x{} frames={} common_ms={:.3} sampled_index={}",
+                            self.name,
+                            w,
+                            h,
+                            frames.len(),
+                            started.elapsed().as_secs_f64() * 1000.0,
+                            log_index
+                        );
+                    }
+                }
+                Ok(prepared)
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.disable_neoamd_after_runtime_failure(&reason);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn run_neoamd_interp_stream_phase_rgba8(
+        &mut self,
+        w: i32,
+        h: i32,
+        input_count: usize,
+        phase: f32,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        anyhow::ensure!(
+            self.provider == OnnxProvider::NeoAMD,
+            "NeoAMD interpolation stream provider is no longer active"
+        );
+        let started = Instant::now();
+        let result = self
+            .neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
+            .run_interp_stream_phase_u8(w, h, input_count, 4, 3, phase)
+            .map_err(anyhow::Error::msg);
+        match result {
+            Ok((ow, oh, bytes)) => {
+                let run_ms = started.elapsed().as_secs_f64() * 1000.0;
+                self.last_interp_profile = Some(InterpProfile {
+                    pack_ms: 0.0,
+                    run_ms,
+                    out_ms: 0.0,
+                    padded_size: (w.max(0) as usize, h.max(0) as usize),
+                });
+                let log_index =
+                    NEOAMD_STREAM_PHASE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if log_index < 16 || log_index % 240 == 0 {
+                    log::debug!(
+                        "neoamd-interp-stream-phase: model='{}' phase={:.6} run_ms={:.3} input={}x{} output={}x{} sampled_index={}",
+                        self.name,
+                        phase,
+                        run_ms,
+                        w,
+                        h,
+                        ow,
+                        oh,
+                        log_index
+                    );
+                }
+                Ok((ow, oh, bytes))
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.disable_neoamd_after_runtime_failure(&reason);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn is_neoamd_temporal_shared_filter(&self) -> bool {
+        self.provider == OnnxProvider::NeoAMD
+            && self.temporal_frames.is_some()
+            && self.should_try_neoamd_gpu_texture()
+    }
+
+    pub(crate) fn should_try_neoamd_gpu_texture(&self) -> bool {
+        self.provider == OnnxProvider::NeoAMD
+            && !self.neoamd_shared_disabled
+            && self.fp16
+            && self.interp == InterpKind::None
+            && self.neoamd_session.as_ref().is_some_and(|session| {
+                if self.temporal_frames.is_some() {
+                    session.supports_temporal_shared_io_fp16()
+                } else {
+                    session.supports_shared_io_fp16()
+                }
+            })
+    }
+
+    fn process_neoamd_temporal_gpu_texture(
+        &mut self,
+        gc: &mut GlContext,
+        input_texture: GpuTex,
+    ) -> Result<Option<GpuTex>> {
+        let (w, h) = (input_texture.w(), input_texture.h());
+        if self.neoamd_shared_input_size != Some((w, h)) {
+            self.retire_neoamd_shared_output(gc);
+        }
+        let (adapter_luid, io) = {
+            let session = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            let adapter_luid = session.adapter_luid();
+            if gc.external_device_luid() != Some(adapter_luid.to_le_bytes()) {
+                return Ok(None);
+            }
+            let io = session
+                .prepare_temporal_shared_io_fp16(w, h)
+                .map_err(anyhow::Error::msg)?;
+            (adapter_luid, io)
+        };
+
+        for old_key in [self.neoamd_shared_input_key, self.neoamd_shared_key]
+            .into_iter()
+            .flatten()
+        {
+            if old_key != io.input.resource_key && old_key != io.output.resource_key {
+                let _ = gc.wait_external_buffer_idle(old_key);
+                gc.clear_external_buffer_key(old_key);
+            }
+        }
+        self.neoamd_shared_input_key = Some(io.input.resource_key);
+        self.neoamd_shared_key = Some(io.output.resource_key);
+        self.neoamd_shared_input_size = Some((w, h));
+
+        let input_imported = gc.has_external_import(io.input.resource_key);
+        if !input_imported {
+            let handle = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_input_handle(io.input.resource_key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                io.input.resource_key,
+                handle,
+                io.input.byte_len,
+                io.input.allocation_byte_len,
+                adapter_luid.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        let output_imported = gc.has_external_import(io.output.resource_key);
+        if !output_imported {
+            let handle = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_output_handle(io.output.resource_key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                io.output.resource_key,
+                handle,
+                io.output.byte_len,
+                io.output.allocation_byte_len,
+                adapter_luid.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+
+        // The previous OpenGL consumer must release the shared output before HIP
+        // overwrites it. rgba_texture_to_external_nchw_f16 finishes the current
+        // frame's GL write before the Backend Pack reads the shared input.
+        gc.wait_external_buffer_idle(io.output.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let pack_started = Instant::now();
+        gc.rgba_texture_to_external_nchw_f16(io.input.resource_key, input_texture, w, h)
+            .map_err(anyhow::Error::msg)?;
+        let pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+
+        let run_started = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .run_temporal_shared_io_fp16(w, h, io.input.resource_key, io.output.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+
+        let out_started = Instant::now();
+        let texture = gc
+            .external_nchw_f16_to_rgba8(io.output.resource_key, w, h)
+            .map_err(anyhow::Error::msg)?;
+        let out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms,
+            run_ms,
+            out_ms,
+            output_size: (w as usize, h as usize),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        if should_log_neoamd_profile() {
+            log::debug!(
+                "neoamd-temporal-profile: model='{}' ingress=shared-fp16-gpu-ring pack_ms={:.3} run_ms={:.3} out_ms={:.3} total_ms={:.3} input={}x{}",
+                self.name,
+                pack_ms,
+                run_ms,
+                out_ms,
+                pack_ms + run_ms + out_ms,
+                w,
+                h
+            );
+        }
+        if !input_imported || !output_imported {
+            log::info!(
+                "NeoAMD TemporalFix GPU-resident IO ready: model='{}' size={}x{} input_key={} output_key={} LUID={:016x} path=OpenGL->D3D12-current-NCHW3->HIP-GPU-TRUE7-ring->D3D12-NCHW3->OpenGL",
+                self.name,
+                w,
+                h,
+                io.input.resource_key,
+                io.output.resource_key,
+                adapter_luid
+            );
+        }
+        Ok(Some(texture))
+    }
+
+    fn process_neoamd_gpu_texture(
+        &mut self,
+        gc: &mut GlContext,
+        input_texture: GpuTex,
+    ) -> Result<Option<GpuTex>> {
+        if !self.should_try_neoamd_gpu_texture() {
+            return Ok(None);
+        }
+        if self.temporal_frames.is_some() {
+            return self.process_neoamd_temporal_gpu_texture(gc, input_texture);
+        }
+        let (w, h) = (input_texture.w(), input_texture.h());
+
+        if self.neoamd_shared_input_size != Some((w, h)) {
+            self.retire_neoamd_shared_output(gc);
+        }
+
+        let (adapter_luid, io) = {
+            let session = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            let adapter_luid = session.adapter_luid();
+            if gc.external_device_luid() != Some(adapter_luid.to_le_bytes()) {
+                return Ok(None);
+            }
+            let io = session
+                .prepare_shared_io_fp16(w, h, 0.5)
+                .map_err(anyhow::Error::msg)?;
+            (adapter_luid, io)
+        };
+
+        for old_key in [self.neoamd_shared_input_key, self.neoamd_shared_key]
+            .into_iter()
+            .flatten()
+        {
+            if old_key != io.input.resource_key && old_key != io.output.resource_key {
+                let _ = gc.wait_external_buffer_idle(old_key);
+                gc.clear_external_buffer_key(old_key);
+            }
+        }
+        self.neoamd_shared_input_key = Some(io.input.resource_key);
+        self.neoamd_shared_key = Some(io.output.resource_key);
+        self.neoamd_shared_input_size = Some((w, h));
+
+        let input_imported = gc.has_external_import(io.input.resource_key);
+        if !input_imported {
+            let handle = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_input_handle(io.input.resource_key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                io.input.resource_key,
+                handle,
+                io.input.byte_len,
+                io.input.allocation_byte_len,
+                adapter_luid.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        let output_imported = gc.has_external_import(io.output.resource_key);
+        if !output_imported {
+            let handle = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_output_handle(io.output.resource_key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                io.output.resource_key,
+                handle,
+                io.output.byte_len,
+                io.output.allocation_byte_len,
+                adapter_luid.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+
+        // Previous frame's OpenGL read must complete before HIP overwrites the
+        // output. The input is safe because the preceding HIP run synchronizes
+        // before returning and the pack call below glFinish-es its write.
+        gc.wait_external_buffer_idle(io.output.resource_key)
+            .map_err(anyhow::Error::msg)?;
+
+        let pack_started = Instant::now();
+        gc.rgba_texture_to_external_nchw_f16(io.input.resource_key, input_texture, w, h)
+            .map_err(anyhow::Error::msg)?;
+        let pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+
+        let run_started = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .run_shared_io_fp16(
+                w,
+                h,
+                0.5,
+                io.input.resource_key,
+                io.output.resource_key,
+            )
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+
+        let out_started = Instant::now();
+        let texture = gc
+            .external_nchw_f16_to_rgba8(io.output.resource_key, io.output.width, io.output.height)
+            .map_err(anyhow::Error::msg)?;
+        let out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
+
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms,
+            run_ms,
+            out_ms,
+            output_size: (io.output.width as usize, io.output.height as usize),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        if should_log_neoamd_profile() {
+            log::debug!(
+                "neoamd-profile: model='{}' ingress=shared-fp16 pack_ms={:.3} run_ms={:.3} out_ms={:.3} total_ms={:.3} input={}x{} output={}x{}",
+                self.name,
+                pack_ms,
+                run_ms,
+                out_ms,
+                pack_ms + run_ms + out_ms,
+                w,
+                h,
+                io.output.width,
+                io.output.height
+            );
+        }
+        if !input_imported || !output_imported {
+            log::info!(
+                "NeoAMD full GPU-resident IO ready: model='{}' input={}x{} output={}x{} input_key={} output_key={} LUID={:016x} path=OpenGL->D3D12-shared-FP16->HIP-WMMA->D3D12-shared-FP16->OpenGL",
+                self.name,
+                w,
+                h,
+                io.output.width,
+                io.output.height,
+                io.input.resource_key,
+                io.output.resource_key,
+                adapter_luid
+            );
+        }
+        Ok(Some(texture))
+    }
+
+    pub(crate) fn supports_neoamd_peer_chain(&self) -> bool {
+        self.provider == OnnxProvider::NeoAMD
+            && !self.neoamd_shared_disabled
+            && self.fp16
+            && self.interp == InterpKind::None
+            && self.neoamd_session.as_ref().is_some_and(|session| {
+                session.supports_peer_shared_io_fp16()
+                    && if self.temporal_frames.is_some() {
+                        session.supports_temporal_shared_io_fp16()
+                    } else {
+                        session.supports_shared_io_fp16()
+                    }
+            })
+    }
+
+    /// First stage of a consecutive NeoAMD chain. Keep the model output as the
+    /// Backend-Pack-owned NCHW FP16 tensor; do not convert it to RGBA/OpenGL.
+    pub(crate) fn process_neoamd_peer_chain_rgba8(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> Result<Option<(NeoAmdPeerTensor, f64)>> {
+        if !self.supports_neoamd_peer_chain() || self.temporal_frames.is_some() {
+            return Ok(None);
+        }
+        let pixels = usize::try_from(w)?
+            .checked_mul(usize::try_from(h)?)
+            .ok_or_else(|| anyhow!("NeoAMD peer-chain input size overflow"))?;
+        anyhow::ensure!(rgba.len() >= pixels * 4, "NeoAMD peer-chain RGBA input buffer too small");
+        let (adapter_luid, shared) = {
+            let session = self.neoamd_session.as_mut().ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            let adapter_luid = session.adapter_luid();
+            let shared = session.prepare_shared_fp16(w, h, 1, 4, 0.5).map_err(anyhow::Error::msg)?;
+            (adapter_luid, shared)
+        };
+        self.neoamd_shared_key = Some(shared.resource_key);
+        self.neoamd_shared_input_size = Some((w, h));
+        if gc.has_external_import(shared.resource_key) {
+            gc.wait_external_buffer_idle(shared.resource_key).map_err(anyhow::Error::msg)?;
+        }
+        let started = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .run_u8_shared_fp16(w, h, &[rgba], 4, 0.5, shared.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms: 0.0,
+            run_ms,
+            out_ms: 0.0,
+            output_size: (shared.width as usize, shared.height as usize),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        Ok(Some((NeoAmdPeerTensor {
+            key: shared.resource_key,
+            width: shared.width,
+            height: shared.height,
+            byte_len: shared.byte_len,
+            allocation_byte_len: shared.allocation_byte_len,
+            adapter_luid,
+        }, run_ms)))
+    }
+
+    /// Consume another NeoAMD session's resident NCHW FP16 output directly in
+    /// HIP. v056 Backend Pack resolves the resource key to the producer's GPU
+    /// pointer, avoiding NCHW->RGBA8->NCHW between stages.
+    pub(crate) fn process_neoamd_peer_chain_input(
+        &mut self,
+        gc: &mut GlContext,
+        input: NeoAmdPeerTensor,
+    ) -> Result<Option<(NeoAmdPeerTensor, f64)>> {
+        if !self.supports_neoamd_peer_chain() {
+            return Ok(None);
+        }
+        let (w, h) = (input.width, input.height);
+        let (adapter_luid, output) = {
+            let session = self.neoamd_session.as_mut().ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            if session.adapter_luid() != input.adapter_luid {
+                return Ok(None);
+            }
+            let adapter_luid = session.adapter_luid();
+            let output = if self.temporal_frames.is_some() {
+                session.prepare_temporal_shared_io_fp16(w, h).map_err(anyhow::Error::msg)?.output
+            } else {
+                session.prepare_shared_io_fp16(w, h, 0.5).map_err(anyhow::Error::msg)?.output
+            };
+            (adapter_luid, output)
+        };
+        self.neoamd_shared_key = Some(output.resource_key);
+        self.neoamd_shared_input_size = Some((w, h));
+        if gc.has_external_import(output.resource_key) {
+            gc.wait_external_buffer_idle(output.resource_key).map_err(anyhow::Error::msg)?;
+        }
+        let started = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .run_peer_shared_io_fp16(w, h, input.key, output.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms: 0.0,
+            run_ms,
+            out_ms: 0.0,
+            output_size: (output.width as usize, output.height as usize),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        Ok(Some((NeoAmdPeerTensor {
+            key: output.resource_key,
+            width: output.width,
+            height: output.height,
+            byte_len: output.byte_len,
+            allocation_byte_len: output.allocation_byte_len,
+            adapter_luid,
+        }, run_ms)))
+    }
+
+    pub(crate) fn neoamd_peer_chain_to_texture(
+        &mut self,
+        gc: &mut GlContext,
+        tensor: NeoAmdPeerTensor,
+    ) -> Result<GpuTex> {
+        anyhow::ensure!(self.neoamd_shared_key == Some(tensor.key), "NeoAMD peer-chain owner mismatch");
+        if gc.external_device_luid() != Some(tensor.adapter_luid.to_le_bytes()) {
+            return Err(anyhow!("NeoAMD peer-chain presentation LUID mismatch"));
+        }
+        if !gc.has_external_import(tensor.key) {
+            let handle = self.neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_output_handle(tensor.key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                tensor.key,
+                handle,
+                tensor.byte_len,
+                tensor.allocation_byte_len,
+                tensor.adapter_luid.to_le_bytes(),
+            ).map_err(anyhow::Error::msg)?;
+        }
+        let out_started = Instant::now();
+        let texture = gc.external_nchw_f16_to_rgba8(tensor.key, tensor.width, tensor.height)
+            .map_err(anyhow::Error::msg)?;
+        let out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(profile) = self.last_upscale_profile.as_mut() {
+            profile.out_ms = out_ms;
+        }
+        Ok(texture)
+    }
+
+    fn process_neoamd_rgba8_gpu_output(
+        &mut self,
+        gc: &mut GlContext,
+        w: i32,
+        h: i32,
+        rgba: &[u8],
+    ) -> Result<Option<(i32, i32, GpuTex)>> {
+        if self.provider != OnnxProvider::NeoAMD
+            || self.neoamd_shared_disabled
+            || !self.fp16
+            || self.interp != InterpKind::None
+            || self.temporal_frames.is_some()
+        {
+            return Ok(None);
+        }
+        let pixels = usize::try_from(w)?
+            .checked_mul(usize::try_from(h)?)
+            .ok_or_else(|| anyhow!("NeoAMD shared input size overflow"))?;
+        anyhow::ensure!(rgba.len() >= pixels * 4, "NeoAMD RGBA input buffer too small");
+
+        // A geometry change can make the Backend Pack replace its shareable
+        // D3D12 resource. Retire the old GL import only after its read fence has
+        // completed, before asking HIP to replace the backing resource.
+        if self.neoamd_shared_input_size != Some((w, h)) {
+            self.retire_neoamd_shared_output(gc);
+        }
+
+        let (adapter_luid, shared) = {
+            let session = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            if !session.supports_shared_fp16()
+                || session.info().capabilities & NEOAMD_CAP_D3D12_SHARED_BUFFER == 0
+            {
+                return Ok(None);
+            }
+            let adapter_luid = session.adapter_luid();
+            if gc.external_device_luid() != Some(adapter_luid.to_le_bytes()) {
+                return Ok(None);
+            }
+            let shared = session
+                .prepare_shared_fp16(w, h, 1, 4, 0.5)
+                .map_err(anyhow::Error::msg)?;
+            (adapter_luid, shared)
+        };
+
+        if let Some(old_key) = self.neoamd_shared_key {
+            if old_key != shared.resource_key {
+                gc.wait_external_buffer_idle(old_key)
+                    .map_err(anyhow::Error::msg)?;
+                gc.clear_external_buffer_key(old_key);
+            }
+        }
+        self.neoamd_shared_key = Some(shared.resource_key);
+        self.neoamd_shared_input_size = Some((w, h));
+
+        let imported = gc.has_external_import(shared.resource_key);
+        if !imported {
+            let handle = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+                .shared_output_handle(shared.resource_key)
+                .map_err(anyhow::Error::msg)?;
+            gc.import_external_d3d12_buffer(
+                shared.resource_key,
+                handle,
+                shared.byte_len,
+                shared.allocation_byte_len,
+                adapter_luid.to_le_bytes(),
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        // The GL read fence protects the resource from the next HIP overwrite.
+        // Keep this timing separate from Backend execution so a live capture
+        // slowdown cannot be incorrectly attributed to the HIP kernels.
+        let reuse_wait_start = Instant::now();
+        gc.wait_external_buffer_idle(shared.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let reuse_wait_ms = reuse_wait_start.elapsed().as_secs_f64() * 1000.0;
+
+        let run_start = Instant::now();
+        self.neoamd_session
+            .as_mut()
+            .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
+            .run_u8_shared_fp16(w, h, &[rgba], 4, 0.5, shared.resource_key)
+            .map_err(anyhow::Error::msg)?;
+        let run_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+        let run_route = neoamd_run_route_label(
+            self.neoamd_session.as_ref().and_then(|session| session.last_run_route())
+        );
+        let gpu_ms = self
+            .neoamd_session
+            .as_ref()
+            .and_then(|session| session.last_image_gpu_ms())
+            .map(f64::from);
+        let copy_gpu_ms = self
+            .neoamd_session
+            .as_ref()
+            .and_then(|session| session.last_image_copy_gpu_ms())
+            .map(f64::from);
+        let compute_gpu_ms = self
+            .neoamd_session
+            .as_ref()
+            .and_then(|session| session.last_image_compute_gpu_ms())
+            .map(f64::from);
+        let host_sync_ms = gpu_ms.map(|gpu| (run_ms - gpu).max(0.0));
+
+        let output_start = Instant::now();
+        let texture = gc
+            .external_nchw_f16_to_rgba8(shared.resource_key, shared.width, shared.height)
+            .map_err(anyhow::Error::msg)?;
+        let out_ms = output_start.elapsed().as_secs_f64() * 1000.0;
+        self.last_upscale_profile = Some(UpscaleProfile {
+            pack_ms: 0.0,
+            run_ms,
+            out_ms,
+            output_size: (shared.width as usize, shared.height as usize),
+        });
+        self.last_upscale_input_size = Some((w, h));
+        // v791: the fused live path used to emit a DEBUG line every frame,
+        // unlike the already-sampled shared-FP16 paths. With diagnostic file
+        // logging enabled this adds avoidable CPU/file-I/O pressure precisely
+        // to the hot NeoAMD lane we are measuring. Keep the same profile
+        // content but use the common sampled cadence.
+        if should_log_neoamd_profile() {
+            log::debug!(
+                "neoamd-profile: model='{}' ingress=rgba8-fused route={} run_ms={:.3} gpu_ms={} copy_gpu_ms={} compute_gpu_ms={} host_sync_ms={} reuse_wait_ms={:.3} out_ms={:.3} total_ms={:.3} input={}x{} output={}x{}",
+                self.name,
+                run_route,
+                run_ms,
+                gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+                copy_gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+                compute_gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+                host_sync_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+                reuse_wait_ms,
+                out_ms,
+                reuse_wait_ms + run_ms + out_ms,
+                w,
+                h,
+                shared.width,
+                shared.height
+            );
+        }
+        if !imported {
+            log::info!(
+                "NeoAMD GPU-resident output ready: model='{}' input={}x{} output={}x{} bytes={} key={} LUID={:016x} path=HIP->D3D12-shared->OpenGL",
+                self.name,
+                w,
+                h,
+                shared.width,
+                shared.height,
+                shared.byte_len,
+                shared.resource_key,
+                adapter_luid
+            );
+        }
+        Ok(Some((shared.width, shared.height, texture)))
     }
 
     fn load_migraphx(path: &Path, fallback_dml_adapter: Option<i32>) -> Result<Self> {
@@ -1340,13 +2656,19 @@ impl OnnxStage {
             direct_input: None,
             dml_temporal_bridge: None,
             direct_output_disabled: false,
+            neoamd_shared_disabled: false,
+            neoamd_shared_key: None,
+            neoamd_shared_input_key: None,
+            neoamd_shared_input_size: None,
             tensorrt_device_id: None,
+            neoamd_session: None,
             tensorrt_gpu_bridge: None,
             tensorrt_temporal_bridge: None,
             tensorrt_interp_bridge: None,
             dml_interp_bridge: None,
             dml_cpu_interp_shared_outputs: [Vec::new(), Vec::new()],
             dml_cpu_interp_shared_disabled: false,
+            neoamd_drba_slow_streak: 0,
             interp_gpu_path_disabled: false,
             tensorrt_gpu_path_disabled: false,
             tensorrt_gpu_unsupported_logged: false,
@@ -1355,7 +2677,9 @@ impl OnnxStage {
             neo_accel,
             temporal_frames,
             temporal_history: VecDeque::new(),
+            temporal_history_stride: 0,
             temporal_size: None,
+            neoamd_temporal_rejected_size: None,
             provider_desc,
             provider,
             fallback_reason: None,
@@ -1609,6 +2933,30 @@ impl OnnxStage {
     }
 
     pub fn finalize_provider_after_warmup(&mut self) {
+        // Warm-up frames are synthetic provider priming, not live temporal
+        // history. Stop/Start begins with an empty TRUE-N window; live provider
+        // switching must do the same while retaining warmed sessions/Graphs.
+        if self.temporal_frames.is_some() {
+            self.temporal_history.clear();
+            self.temporal_history_stride = 0;
+            self.temporal_size = None;
+            if self.provider == OnnxProvider::NeoAMD {
+                if let Some(session) = self.neoamd_session.as_mut() {
+                    if let Err(error) = session.reset_temporal_history() {
+                        log::warn!(
+                            "neoamd-temporal-warmup-history-reset-failed: model={} reason={} action=continue-cpu-history-cleared",
+                            self.name,
+                            error
+                        );
+                    } else {
+                        log::debug!(
+                            "neoamd-temporal-warmup-history-reset: model={} provider-state=warm history=empty",
+                            self.name
+                        );
+                    }
+                }
+            }
+        }
         if self.provider != OnnxProvider::TensorRT {
             return;
         }
@@ -1710,12 +3058,22 @@ impl OnnxStage {
         self.last_upscale_profile = None;
         self.last_upscale_input_size = None;
         self.temporal_history.clear();
+        self.temporal_history_stride = 0;
         self.temporal_size = None;
-        self.direct_output_disabled = false;
+        // Keep a TemporalFix runtime rejection scoped to its W/H across a
+        // filter OFF -> ON cache reuse. Do not resurrect the experimental DML
+        // temporal shared bridge merely because the chain generation changed.
+        self.direct_output_disabled = self.temporal_frames.is_some();
+        // An interop error is a per-generation condition. Explicit backend/model
+        // transitions retire the old shared resource first, so allow the next
+        // generation to probe GPU-resident NeoAMD again instead of permanently
+        // poisoning the cached session.
+        self.neoamd_shared_disabled = false;
         for bank in &mut self.dml_cpu_interp_shared_outputs {
             bank.clear();
         }
         self.dml_cpu_interp_shared_disabled = false;
+        self.neoamd_drba_slow_streak = 0;
         self.tensorrt_gpu_path_disabled = false;
         self.tensorrt_gpu_unsupported_logged = false;
     }
@@ -1919,7 +3277,7 @@ impl OnnxStage {
                     mode,
                 )
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda => Ok(None),
+            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => Ok(None),
         };
         match result {
             Ok(Some(fence)) => {
@@ -2126,7 +3484,7 @@ impl OnnxStage {
                 drop(provider_outputs);
                 bridge.padded_size
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda => {
+            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => {
                 anyhow::bail!("unsupported interpolation backend")
             }
         };
@@ -2171,7 +3529,7 @@ impl OnnxStage {
                         .collect::<Vec<_>>(),
                 )
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda => {
+            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => {
                 anyhow::bail!("unsupported interpolation backend")
             }
         };
@@ -2186,6 +3544,8 @@ impl OnnxStage {
                 size,
                 padded,
                 fp16: self.fp16,
+                directml_drba_snapshot_candidate: matches!(self.provider, OnnxProvider::DirectML)
+                    && self.interp == InterpKind::Drba,
                 preserve_float: preserve_float_after_dml
                     && matches!(self.provider, OnnxProvider::DirectML),
             })
@@ -2248,35 +3608,49 @@ impl OnnxStage {
         gc: &mut GlContext,
         output: PreparedInterpGpuOutput,
     ) -> Result<GpuTex> {
-        let texture = match (output.fp16, output.preserve_float) {
-            (true, true) => gc.external_nchw_f16_to_rgba16f_crop(
+        let use_drba_local_snapshot = output.directml_drba_snapshot_candidate
+            && output.fp16
+            && !output.preserve_float
+            && gc.external_import_uses_bound_storage_fallback(output.key);
+        let texture = if use_drba_local_snapshot {
+            gc.external_nchw_f16_to_rgba8_crop_local_snapshot(
                 output.key,
                 output.size.0,
                 output.size.1,
                 output.padded.0,
                 output.padded.1,
-            ),
-            (false, true) => gc.external_nchw_f32_to_rgba16f_crop(
-                output.key,
-                output.size.0,
-                output.size.1,
-                output.padded.0,
-                output.padded.1,
-            ),
-            (true, false) => gc.external_nchw_f16_to_rgba8_crop(
-                output.key,
-                output.size.0,
-                output.size.1,
-                output.padded.0,
-                output.padded.1,
-            ),
-            (false, false) => gc.external_nchw_f32_to_rgba8_crop(
-                output.key,
-                output.size.0,
-                output.size.1,
-                output.padded.0,
-                output.padded.1,
-            ),
+            )
+        } else {
+            match (output.fp16, output.preserve_float) {
+                (true, true) => gc.external_nchw_f16_to_rgba16f_crop(
+                    output.key,
+                    output.size.0,
+                    output.size.1,
+                    output.padded.0,
+                    output.padded.1,
+                ),
+                (false, true) => gc.external_nchw_f32_to_rgba16f_crop(
+                    output.key,
+                    output.size.0,
+                    output.size.1,
+                    output.padded.0,
+                    output.padded.1,
+                ),
+                (true, false) => gc.external_nchw_f16_to_rgba8_crop(
+                    output.key,
+                    output.size.0,
+                    output.size.1,
+                    output.padded.0,
+                    output.padded.1,
+                ),
+                (false, false) => gc.external_nchw_f32_to_rgba8_crop(
+                    output.key,
+                    output.size.0,
+                    output.size.1,
+                    output.padded.0,
+                    output.padded.1,
+                ),
+            }
         }
         .map_err(anyhow::Error::msg)?;
         INTERP_GPU_OUTPUT_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -2431,6 +3805,17 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
+        if self.provider == OnnxProvider::NeoAMD {
+            match self.run_neoamd_u8(w, h, frames, 3, 3, t) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!(
+                        "neoamd-interp-retry-directml: model={} reason={error:#}",
+                        self.name
+                    );
+                }
+            }
+        }
         // Backend-switch warmup can enter this CPU-visible path before the
         // resident interpolation bridge. Build the same explicit profile here
         // so TensorRT never sees a profile-less first inference.
@@ -2469,6 +3854,17 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
+        if self.provider == OnnxProvider::NeoAMD {
+            match self.run_neoamd_u8(w, h, frames, 4, 3, t) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!(
+                        "neoamd-interp-rgba-retry-directml: model={} reason={error:#}",
+                        self.name
+                    );
+                }
+            }
+        }
         self.ensure_tensorrt_interp_profile_for_size((w, h))?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
@@ -2503,6 +3899,29 @@ impl OnnxStage {
         frames: &[&[u8]],
         ts: &[f32],
     ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        if self.provider == OnnxProvider::NeoAMD {
+            match self.run_neoamd_many_u8(w, h, frames, 4, 3, ts) {
+                Ok(Some(results)) => return Ok(results),
+                Ok(None) => {
+                    // Older ABI-1 packs do not expose the optional multi-phase
+                    // entry point. Preserve their validated sequential route.
+                    return ts
+                        .iter()
+                        .map(|t| self.process_interp_rgba8(w, h, frames, *t))
+                        .collect();
+                }
+                Err(error) => {
+                    log::warn!(
+                        "neoamd-interp-many-retry-directml: model={} outputs={} reason={error:#}",
+                        self.name,
+                        ts.len()
+                    );
+                    // run_neoamd_many_u8 atomically switched this stage to its
+                    // DirectML fallback. Continue below with the established
+                    // provider path instead of losing the entire source pair.
+                }
+            }
+        }
         if self.interp == InterpKind::Drba && ts.len() > 1 {
             self.ensure_tensorrt_interp_profile_for_size((w, h))?;
             self.prepare_tensorrt_input_shape(w, h);
@@ -2639,6 +4058,7 @@ impl OnnxStage {
                         size: (w, h),
                         padded,
                         fp16: true,
+                        directml_drba_snapshot_candidate: false,
                         preserve_float: true,
                     });
                 }
@@ -2704,6 +4124,7 @@ impl OnnxStage {
                         size: (w, h),
                         padded,
                         fp16: false,
+                        directml_drba_snapshot_candidate: false,
                         preserve_float: true,
                     });
                 }
@@ -3288,6 +4709,18 @@ impl OnnxStage {
                 self.process_dml_gpu_texture(gc, input_texture, after_interpolation)
             }
             OnnxProvider::TensorRT => self.process_tensorrt_gpu_texture(gc, input_texture),
+            OnnxProvider::NeoAMD => match self.process_neoamd_gpu_texture(gc, input_texture) {
+                Ok(output) => Ok(output),
+                Err(error) => {
+                    self.retire_neoamd_shared_output(gc);
+                    self.neoamd_shared_disabled = true;
+                    log::warn!(
+                        "NeoAMD full GPU-resident IO disabled for '{}'; CPU-visible NeoAMD path retained: {error:#}",
+                        self.name
+                    );
+                    Ok(None)
+                }
+            },
             OnnxProvider::MigraphX | OnnxProvider::Cuda => Ok(None),
         }
     }
@@ -3298,24 +4731,37 @@ impl OnnxStage {
         input_texture: GpuTex,
         after_interpolation: bool,
     ) -> Result<Option<GpuTex>> {
-        if self.temporal_frames.is_some()
-            && self.interp == InterpKind::None
-            && self.fp16
-            && !self.direct_output_disabled
-            && gc.external_device_luid().is_some()
-        {
-            return match self.process_dml_temporal_gpu_texture(gc, input_texture) {
-                Ok(texture) => Ok(Some(texture)),
-                Err(error) => {
-                    self.retire_dml_temporal_gpu_bridge(gc);
-                    self.direct_output_disabled = true;
-                    log::warn!(
-                        "dml-temporal-gpu-path disabled for '{}'; CPU temporal fallback restored: {error:#}",
-                        self.name
-                    );
-                    Ok(None)
-                }
-            };
+        let dml_temporal_gpu_opt_in = matches!(
+            std::env::var("CHIDESCALER_DML_TEMPORAL_GPU").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
+        );
+        if self.temporal_frames.is_some() && self.interp == InterpKind::None {
+            // TemporalFix has a 21-channel / seven-frame input contract. It must
+            // never fall through into the ordinary one-image DirectML GPU path.
+            // v782 only gated the dedicated temporal bridge; when that bridge was
+            // disabled for safety the function continued below and treated the
+            // temporal model like a 3-channel image model. That invalid route is
+            // the primary cause of the intermittent all-black TemporalFix output,
+            // especially after OFF -> ON cache reuse.
+            if self.fp16
+                && dml_temporal_gpu_opt_in
+                && !self.direct_output_disabled
+                && gc.external_device_luid().is_some()
+            {
+                return match self.process_dml_temporal_gpu_texture(gc, input_texture) {
+                    Ok(texture) => Ok(Some(texture)),
+                    Err(error) => {
+                        self.retire_dml_temporal_gpu_bridge(gc);
+                        self.direct_output_disabled = true;
+                        log::warn!(
+                            "dml-temporal-gpu-path disabled for '{}'; CPU temporal fallback restored: {error:#}",
+                            self.name
+                        );
+                        Ok(None)
+                    }
+                };
+            }
+            return Ok(None);
         }
         // The shared-input route stays opt-in for ordinary chains.  For the
         // specific interpolation -> ONNX case, v441 can automatically use the
@@ -5204,6 +6650,20 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Option<(i32, i32, GpuTex)> {
+        if self.provider == OnnxProvider::NeoAMD {
+            return match self.process_neoamd_rgba8_gpu_output(gc, w, h, rgba) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.retire_neoamd_shared_output(gc);
+                    self.neoamd_shared_disabled = true;
+                    log::warn!(
+                        "NeoAMD GPU-resident output disabled for '{}'; CPU-visible NeoAMD path retained: {error:#}",
+                        self.name
+                    );
+                    None
+                }
+            };
+        }
         if !self.supports_dml_gl_bridge()
             || !self.fp16
             || self.interp != InterpKind::None
@@ -5422,8 +6882,10 @@ impl OnnxStage {
             )
             .map_err(|error| anyhow!(error))?;
         }
+        let reuse_wait_start = Instant::now();
         gc.wait_external_buffer_idle(state.key)
             .map_err(|error| anyhow!(error))?;
+        let reuse_wait_ms = reuse_wait_start.elapsed().as_secs_f64() * 1000.0;
 
         let output = unsafe {
             TensorRefMut::<f16>::from_raw(
@@ -5472,13 +6934,29 @@ impl OnnxStage {
         let texture = gc
             .external_nchw_f16_to_rgba8(state.key, ow, oh)
             .map_err(|error| anyhow!(error))?;
+        let out_ms = output_start.elapsed().as_secs_f64() * 1000.0;
         self.last_upscale_profile = Some(UpscaleProfile {
             pack_ms,
             run_ms,
-            out_ms: output_start.elapsed().as_secs_f64() * 1000.0,
+            out_ms,
             output_size: (ow as usize, oh as usize),
         });
         self.last_upscale_input_size = Some((w, h));
+        if should_log_neoamd_profile() {
+            log::debug!(
+                "directml-profile: model='{}' ingress=cpu-fp16 pack_ms={:.3} run_ms={:.3} reuse_wait_ms={:.3} out_ms={:.3} total_ms={:.3} input={}x{} output={}x{}",
+                self.name,
+                pack_ms,
+                run_ms,
+                reuse_wait_ms,
+                out_ms,
+                pack_ms + reuse_wait_ms + run_ms + out_ms,
+                w,
+                h,
+                ow,
+                oh
+            );
+        }
         Ok((ow, oh, texture))
     }
 
@@ -5503,6 +6981,58 @@ impl OnnxStage {
     /// Detach OpenGL from the shared D3D12 allocation before DirectML frees it.
     /// The ordering matters on source resizes: freeing the allocation first can
     /// leave the GL memory object pointing at released driver memory.
+    /// Detach OpenGL from the NeoAMD D3D12 shared output before a backend/model
+    /// transition can drop or unload the owning Backend Pack session.  v750
+    /// kept this import alive while DirectML did the equivalent retirement, so
+    /// a later DLL reload could reuse the same process-local resource key and GL
+    /// would silently keep sampling the old allocation.
+    pub(crate) fn retire_neoamd_shared_output(&mut self, gc: &mut GlContext) {
+        let output_key = self.neoamd_shared_key.take();
+        let input_key = self.neoamd_shared_input_key.take();
+        if output_key.is_none() && input_key.is_none() {
+            if let Some(session) = self.neoamd_session.as_mut() {
+                session.release_shared_output();
+            }
+            self.neoamd_shared_input_size = None;
+            return;
+        }
+        // Provider/model transitions are rare. Finish GL before releasing
+        // either imported D3D12 surface so HIP/GL never retain a stale view.
+        gc.finish();
+        if let Some(key) = output_key {
+            gc.clear_external_buffer_key(key);
+        }
+        if let Some(key) = input_key {
+            gc.clear_external_buffer_key(key);
+        }
+        if let Some(session) = self.neoamd_session.as_mut() {
+            session.release_shared_output();
+        }
+        self.neoamd_shared_input_size = None;
+        log::info!(
+            "NeoAMD shared IO retired: model='{}' input_key={:?} output_key={:?} reason=gpu-transition",
+            self.name,
+            input_key,
+            output_key
+        );
+    }
+
+    pub(crate) fn disable_neoamd_shared_output_for_recovery(
+        &mut self,
+        gc: &mut GlContext,
+        reason: &str,
+    ) {
+        self.retire_neoamd_shared_output(gc);
+        if self.provider == OnnxProvider::NeoAMD {
+            self.neoamd_shared_disabled = true;
+            log::warn!(
+                "NeoAMD GPU-resident output disabled for transition recovery: model='{}' reason={} fallback=cpu-visible-neoamd",
+                self.name,
+                reason
+            );
+        }
+    }
+
     pub(crate) fn retire_direct_output(&mut self, gc: &mut GlContext) {
         if self.direct_output.is_none() && self.direct_input.is_none() {
             return;
@@ -5547,39 +7077,102 @@ impl OnnxStage {
         self.ensure_tensorrt_single_input_profile(frames * 3, (w, h), "temporal-runtime")?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
-        if self.temporal_size != Some((w, h)) {
+        if self.temporal_size != Some((w, h)) || self.temporal_history_stride != stride {
             self.temporal_history.clear();
+            self.temporal_history_stride = stride;
             self.temporal_size = Some((w, h));
+            if self.neoamd_temporal_rejected_size != Some((w, h)) {
+                self.neoamd_temporal_rejected_size = None;
+            }
         }
-        let mut rgb = vec![0u8; n * 3];
-        rgb.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
-            px.copy_from_slice(&pixels[i * stride..i * stride + 3]);
-        });
-        self.temporal_history.push_back(rgb);
-        while self.temporal_history.len() > frames {
-            self.temporal_history.pop_front();
+        // Reuse the oldest history allocation once the TRUE-N ring is full.
+        // NeoAMD accepts RGB/RGBA strides directly, so retain the source bytes
+        // instead of allocating and repacking RGBA -> RGB on every frame.
+        let mut current = if self.temporal_history.len() >= frames {
+            self.temporal_history.pop_front().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        current.resize(n * stride, 0);
+        current.copy_from_slice(&pixels[..n * stride]);
+        self.temporal_history.push_back(current);
+        // Native NeoAMD used to clone/repack the complete 7-frame window here.
+        // The history now retains the live RGB/RGBA stride and reuses its ring
+        // buffers; Backend Pack receives stable references without another Host
+        // color-layout conversion. Temporarily move the
+        // history deque out of `self` so we can borrow its stable frame buffers
+        // across the mutable provider call without duplicating pixel data.
+        // `run_neoamd_u8` does not own/modify temporal_history; restore it before
+        // handling success/fallback. The DirectML retry below still materializes
+        // an owned snapshot only when NeoAMD actually fails.
+        if self.provider == OnnxProvider::NeoAMD
+            && self.neoamd_temporal_rejected_size != Some((w, h))
+        {
+            let history_store = std::mem::take(&mut self.temporal_history);
+            let first_ref = history_store.front().map(Vec::as_slice).unwrap_or(&[]);
+            let history_refs: Vec<&[u8]> = std::iter::repeat_n(
+                first_ref,
+                frames.saturating_sub(history_store.len()),
+            )
+            .chain(history_store.iter().map(Vec::as_slice))
+            .collect();
+            let native_result = self.run_neoamd_u8(
+                w,
+                h,
+                &history_refs,
+                self.temporal_history_stride,
+                output_stride,
+                0.5,
+            );
+            self.temporal_history = history_store;
+            match native_result {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!(
+                        "neoamd-temporal-retry-directml: model={} reason={error:#}",
+                        self.name
+                    );
+                }
+            }
         }
-        let first = self.temporal_history.front().cloned().unwrap_or_default();
-        let history: Vec<&[u8]> =
-            std::iter::repeat_n(first.as_slice(), frames - self.temporal_history.len())
-                .chain(self.temporal_history.iter().map(Vec::as_slice))
-                .collect();
+        // DirectML needs a read-only snapshot of the logical TRUE-N window,
+        // not ownership of N full RGB frames. v782 cloned the complete history
+        // every frame (about 19 MiB at 1280x720 and 25.8 MiB at 1280x960).
+        // Borrow the stable VecDeque storage through packing instead; the ORT
+        // tensor owns the packed scratch, so these references can be dropped
+        // before provider execution.
+        let first = self.temporal_history.front().map(Vec::as_slice).unwrap_or(&[]);
+        let history: Vec<&[u8]> = std::iter::repeat_n(
+            first,
+            frames.saturating_sub(self.temporal_history.len()),
+        )
+        .chain(self.temporal_history.iter().map(Vec::as_slice))
+        .collect();
         let channels = frames * 3;
         let shape = vec![1i64, channels as i64, h as i64, w as i64];
         let pack_start = Instant::now();
         let (outputs, pack_ms, run_ms) = if self.fp16 {
             prepare_len_f16(&mut self.scratch_f16, n * channels);
             let lut = u8_to_f16_lut();
+            // Pack one complete RGB frame per Rayon task. The old channel-wise
+            // loop reread every RGB history frame three times and created 21
+            // independent tasks. A seven-frame task layout reads each source
+            // pixel once and writes the same NCHW21 tensor/FP16 LUT bits.
             self.scratch_f16
-                .par_chunks_mut(n)
+                .par_chunks_mut(n * 3)
                 .enumerate()
-                .for_each(|(channel, plane)| {
-                    let frame = history[channel / 3];
-                    let component = channel % 3;
+                .for_each(|(frame_index, dst)| {
+                    let frame = history[frame_index];
+                    let (r, gb) = dst.split_at_mut(n);
+                    let (g, b) = gb.split_at_mut(n);
                     for i in 0..n {
-                        plane[i] = lut[frame[i * 3 + component] as usize];
+                        let src = i * self.temporal_history_stride;
+                        r[i] = lut[frame[src] as usize];
+                        g[i] = lut[frame[src + 1] as usize];
+                        b[i] = lut[frame[src + 2] as usize];
                     }
                 });
+            drop(history);
             let input = TensorRef::from_array_view((shape, &*self.scratch_f16)).map_err(oerr)?;
             let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
             let run_start = Instant::now();
@@ -5594,15 +7187,20 @@ impl OnnxStage {
         } else {
             prepare_len_f32(&mut self.scratch_f32, n * channels);
             self.scratch_f32
-                .par_chunks_mut(n)
+                .par_chunks_mut(n * 3)
                 .enumerate()
-                .for_each(|(channel, plane)| {
-                    let frame = history[channel / 3];
-                    let component = channel % 3;
+                .for_each(|(frame_index, dst)| {
+                    let frame = history[frame_index];
+                    let (r, gb) = dst.split_at_mut(n);
+                    let (g, b) = gb.split_at_mut(n);
                     for i in 0..n {
-                        plane[i] = frame[i * 3 + component] as f32 * (1.0 / 255.0);
+                        let src = i * self.temporal_history_stride;
+                        r[i] = frame[src] as f32 * (1.0 / 255.0);
+                        g[i] = frame[src + 1] as f32 * (1.0 / 255.0);
+                        b[i] = frame[src + 2] as f32 * (1.0 / 255.0);
                     }
                 });
+            drop(history);
             let input = TensorRef::from_array_view((shape, &*self.scratch_f32)).map_err(oerr)?;
             let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
             let run_start = Instant::now();
@@ -5663,6 +7261,22 @@ impl OnnxStage {
             output_size: (ow, oh),
         });
         self.last_upscale_input_size = Some((w, h));
+        if self.provider == OnnxProvider::DirectML {
+            if let Some(profile) = self.last_upscale_profile {
+                log::debug!(
+                    "dml-temporal-profile: model='{}' pack_ms={:.3} run_ms={:.3} out_ms={:.3} total_ms={:.3} input={}x{} output={}x{}",
+                    self.name,
+                    profile.pack_ms,
+                    profile.run_ms,
+                    profile.out_ms,
+                    profile.pack_ms + profile.run_ms + profile.out_ms,
+                    w,
+                    h,
+                    profile.output_size.0,
+                    profile.output_size.1
+                );
+            }
+        }
         self.complete_successful_tensorrt_shape(w, h);
         Ok((ow as i32, oh as i32, data))
     }
@@ -5699,6 +7313,19 @@ impl OnnxStage {
     ) -> Result<(i32, i32, Vec<u8>)> {
         if let Some(frames) = self.temporal_frames {
             return self.process_temporal_u8_strided(w, h, pixels, stride, output_stride, frames);
+        }
+        if self.provider == OnnxProvider::NeoAMD {
+            match self.run_neoamd_u8(w, h, &[pixels], stride, output_stride, 0.5) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    // run_neoamd_u8 has already atomically retired the native
+                    // session and restored the pre-created DirectML session.
+                    log::warn!(
+                        "neoamd-image-retry-directml: model={} reason={error:#}",
+                        self.name
+                    );
+                }
+            }
         }
         self.ensure_tensorrt_single_input_profile(3, (w, h), "image-runtime")?;
         self.prepare_tensorrt_input_shape(w, h);

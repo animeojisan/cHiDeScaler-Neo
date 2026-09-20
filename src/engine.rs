@@ -14,7 +14,9 @@ use crate::overlay::window::OverlayWindow;
 use crate::platform::win32;
 use crate::render::chain::{FilterChain, Stage, StageFactory};
 use crate::render::gl::{GlContext, GpuTex};
-use crate::render::onnx_stage::{PreparedDmlSharedOutput, PreparedInterpGpuOutput};
+use crate::render::onnx_stage::{
+    PreparedDmlSharedOutput, PreparedInterpGpuOutput, PreparedNeoAmdSharedOutput,
+};
 use crate::render::vulkan_gpu::{self, GlslBackendRoute};
 use anyhow::Result;
 use glow::HasContext;
@@ -48,6 +50,12 @@ fn metrics_kind_label(kind: StageKind) -> &'static str {
 
 const NEOFLOW_QUEUE_MAX: usize = 1;
 const ONNX_INTERP_QUEUE_MAX: usize = 3;
+// DirectML DRBA is a delayed four-real-frame model. At 1080p x5 the provider
+// can run only a few milliseconds slower than a 24p source period; dropping the
+// oldest frame at depth 3 then turns B->C into a multi-frame temporal jump. Use
+// the full WGC bounded queue for this lane so startup/provider jitter is absorbed
+// without changing RIFE/other ONNX latency behavior.
+const DIRECTML_DRBA_QUEUE_MAX: usize = 8;
 const SMOOTH_PACING_QUEUE_MAX: usize = 1;
 const LOAD_REDUCTION_QUEUE_MAX: usize = 2;
 // Smooth pacing does not need adjacent source pairs. Keep only the newest
@@ -461,6 +469,7 @@ pub struct Status {
     pub onnx_backend_switching: bool,
     pub onnx_backend_error: Option<String>,
     pub onnx_backend_revision: u64,
+    pub onnx_neoamd_stages: usize,
     pub onnx_tensorrt_stages: usize,
     pub onnx_cuda_stages: usize,
     pub onnx_directml_fallbacks: usize,
@@ -2212,21 +2221,54 @@ struct Session {
     /// submits the provider job only after the shared buffers are ready.
     gpu_interp_pack_pending: Option<PendingGpuPack>,
     gpu_interp_pending: Option<PendingGpuInterp>,
+    /// Legacy v782 DRBA compatibility storage. v803 DirectML DRBA no longer
+    /// routes through this FIFO; it remains for non-baseline code/state cleanup
+    /// compatibility and is expected to stay empty on the DirectML DRBA lane.
+    drba_present_queue: std::collections::VecDeque<DrbaQueuedPresent>,
+    drba_present_deadline: Option<Instant>,
+    /// DRBA needs four real frames [A,B,C,D] before it can interpolate B->C.
+    /// Keep the first anchor visible while filling/rebuilding history so the
+    /// first completed B->C interval can never move the picture backwards.
+    drba_lookahead_needs_anchor: bool,
+    /// Diagnostic-only semantic presentation timeline for DirectML DRBA.
+    /// This never changes admission or provider work; it proves whether an
+    /// output would move backwards relative to the last semantic presentation.
+    drba_diag_present_seq: u64,
+    drba_diag_last_semantic_ts_100ns: Option<i64>,
+    /// Capture queue policy hint for DirectML DRBA. This is initialized from the
+    /// active chain before capture begins and refreshed whenever the live ONNX
+    /// interpolation path is inspected. It only changes source-frame retention.
+    directml_drba_capture_queue: bool,
     /// Results received during a short deadline-driven wait are staged here
     /// and consumed by the ordinary validation/import path on the next drain.
     gpu_interp_result_stash: std::collections::VecDeque<GpuInterpResult>,
-    /// x4/x5 scheduling handshake: release the next provider timestep only
+    /// Cooperative scheduling handshake: release the next provider timestep only
     /// after the current output's GL post-chain has been submitted. This
     /// prioritizes the frame that is about to be presented without waiting
     /// through SwapBuffers before the next unique RIFE/DRBA invocation starts.
     gpu_interp_permit_after_post_submit: Option<(u64, u64)>,
     gpu_interp_pair_id: u64,
     gpu_interp_active_logged: bool,
+    /// DRBA real-time admission controller. The GUI multiplier is never
+    /// rewritten: x5 always keeps the x5 phase grid (0.2/0.4/0.6/0.8). If the
+    /// provider cannot execute every requested midpoint before the next source
+    /// frame, only individual synthetic slots are actually dropped. Present FPS
+    /// therefore falls naturally (for example ~94fps instead of a fake 120fps)
+    /// while source frames and temporal order remain authoritative.
+    drba_midpoint_ema_ms: f64,
+    drba_perf_samples: u32,
+    drba_compute_credit_ms: f64,
+    drba_phase_rotation: usize,
+    drba_dropped_midpoints: u64,
     /// Cursor mapping stays released while a newly-selected interpolation
     /// provider performs its first real inference. This avoids treating a
     /// legitimate cold TensorRT build as a render-heartbeat failure.
     provider_transition_input_suspended: bool,
     provider_transition_input_suspended_since: Option<Instant>,
+    /// v751: staged self-recovery while waiting for the first actually
+    /// presented frame after a provider switch. 0=normal, 1=reimport retry,
+    /// 2=CPU-visible NeoAMD safety lane.
+    provider_transition_recovery_attempts: u8,
     /// diagnostics: previous pipelined-tick start (tick-to-tick gap)
     interp_last_tick: Option<Instant>,
     /// diagnostics: end of the previous pipelined tick (wait+take cost)
@@ -3004,6 +3046,22 @@ impl CadenceEstimator {
             return None;
         }
         let mut samples: Vec<i64> = self.intervals.iter().copied().collect();
+        // A fresh capture can miss one or two source pictures while the first
+        // ONNX invocation/interop surface is being initialized.  In several
+        // field logs that produced a startup mix such as 41.7/83.3 ms for a
+        // real 24p source.  Averaging those samples can falsely lock the source
+        // to 15-20fps even though subsequent WGC dequeue is already ~24fps.
+        //
+        // Recover only when there is direct evidence of a standard video
+        // period *and* most other samples are small integer multiples of it.
+        // Requiring at least three direct hits means a genuine 12/15fps source
+        // (which has only the long interval) is never promoted to 24/30fps.
+        // Browser/content-aware cadence keeps its existing multimodal model.
+        if !self.content_aware {
+            if let Some(period) = dominant_video_period_with_missed_pictures(&samples) {
+                return Some(period);
+            }
+        }
         samples.sort_unstable();
         let trim = if self.content_aware {
             0
@@ -3106,6 +3164,65 @@ impl CadenceEstimator {
     }
 }
 
+fn dominant_video_period_with_missed_pictures(samples: &[i64]) -> Option<f64> {
+    if samples.len() < 8 {
+        return None;
+    }
+    // Keep this intentionally to ordinary fixed-rate video clocks. High-rate
+    // game/desktop capture is better served by the existing rolling estimator.
+    const VIDEO_PERIODS_100NS: &[(f64, i64)] = &[
+        (23.976, 417_084),
+        (24.0, 416_667),
+        (25.0, 400_000),
+        (29.97, 333_667),
+        (30.0, 333_333),
+        (50.0, 200_000),
+        (59.94, 166_834),
+        (60.0, 166_667),
+    ];
+    let mut best: Option<(usize, usize, f64, f64)> = None; // matched, direct, error, period_s
+    for &(fps, period) in VIDEO_PERIODS_100NS {
+        let mut matched = 0usize;
+        let mut direct = 0usize;
+        let mut error_sum = 0.0f64;
+        for &sample in samples {
+            if sample <= 0 {
+                continue;
+            }
+            let ratio = sample as f64 / period as f64;
+            let multiple = ratio.round().clamp(1.0, 3.0);
+            let rel = (ratio - multiple).abs() / multiple;
+            if rel <= 0.10 {
+                matched += 1;
+                error_sum += rel;
+                if multiple == 1.0 {
+                    direct += 1;
+                }
+            }
+        }
+        // Require both a real one-period cluster and broad support from direct
+        // frames or small missed-picture multiples. This keeps a genuine 12/15p
+        // source from being promoted to 24/30p, while still recovering a 24p
+        // source when WGC occasionally delivers an 83.3ms gap. Apply this to
+        // the complete rolling window, not only startup, so the estimator cannot
+        // fall back to the old arithmetic mean after sample 24.
+        let enough_direct = direct >= 3 && direct * 5 >= samples.len();
+        let enough_matched = matched * 20 >= samples.len() * 13;
+        if enough_direct && enough_matched {
+            let mean_error = error_sum / matched.max(1) as f64;
+            let candidate = (matched, direct, mean_error, 1.0 / fps);
+            let better = best.as_ref().is_none_or(|&(bm, bd, be, _)| {
+                (matched, direct) > (bm, bd)
+                    || ((matched, direct) == (bm, bd) && mean_error < be)
+            });
+            if better {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, _, _, period)| period)
+}
+
 fn normalized_frame_span_s(
     prev_time_100ns: Option<i64>,
     cur_time_100ns: Option<i64>,
@@ -3188,42 +3305,19 @@ fn refresh_limited_output_ratio(
     // 48fps). Expanding x2 to 2.5x made the same RIFE chain alternate between
     // 60fps and a 42-50fps overload state depending on downstream cost.
     // Refresh-limited callers such as NeoFlow may still use 2.5x on a
-    // 60Hz monitor. ONNX x3 reaches this helper only through its explicit
-    // onnx_x3_60hz_mode() branch; every other refresh stays strict integer.
+    // 60Hz monitor. ONNX interpolation no longer uses this helper: x2-x5 are
+    // strict processing multipliers regardless of display refresh.
     let display_ratio = refresh * period;
     display_ratio.clamp(1.0, requested as f64)
 }
 
-/// Return true only for a monitor that is genuinely operating in the 60 Hz
-/// family. Windows commonly reports 59.94 or 60.00 Hz, so keep a narrow
-/// tolerance around 60 while deliberately excluding 59/61/75/120 Hz modes.
-///
-/// This predicate is the hard boundary for ONNX x3's 60fps adaptation. No
-/// fractional x3 state is allowed to leak into any other refresh rate.
-fn onnx_x3_60hz_mode(refresh_hz: Option<f64>) -> bool {
-    refresh_hz.is_some_and(|refresh| refresh.is_finite() && (refresh - 60.0).abs() <= 0.75)
-}
-
-/// ONNX x3 has two explicitly separated contracts.
-///
-/// * 59.94/60.00 Hz monitor: keep the established refresh-limited path so a
-///   24p source targets 60fps (2.5x), 25p targets 60fps (2.4x), and 30p
-///   targets 60fps (2.0x).
-/// * Every other monitor refresh: strict integer x3, always 1/3, 2/3,
-///   endpoint. The 60 Hz fractional accumulator is never consulted.
-///
-/// The explicit refresh predicate prevents startup/source-cadence noise from
-/// accidentally selecting the 60 Hz path on 75/120/144/165/240 Hz displays.
-fn onnx_output_ratio(requested: u32, source_period_s: Option<f64>, refresh_hz: Option<f64>) -> f64 {
-    if requested == 3 {
-        if onnx_x3_60hz_mode(refresh_hz) {
-            refresh_limited_output_ratio(requested, source_period_s, refresh_hz)
-        } else {
-            3.0
-        }
-    } else {
-        refresh_limited_output_ratio(requested, source_period_s, refresh_hz)
-    }
+/// ONNX interpolation multiplier is a processing contract.  x2/x3/x4/x5
+/// always means exactly 2/3/4/5 output frames per source interval, regardless
+/// of monitor refresh or a transient source-period estimate.  Presentation may
+/// naturally drop/hold frames when the selected multiplier exceeds the display
+/// refresh, but inference cadence must not silently change the user's setting.
+fn onnx_output_ratio(requested: u32, _source_period_s: Option<f64>, _refresh_hz: Option<f64>) -> f64 {
+    requested.clamp(2, 5) as f64
 }
 
 #[derive(Default)]
@@ -3245,6 +3339,8 @@ struct FlowOutputCadence {
 /// same cooperative scheduling rule; x3's direct-output detach is synchronized
 /// before this release so provider work does not race the copy.
 fn gpu_interp_slot_policy(factor: u32, timestep_count: usize) -> (bool, bool) {
+    // v803 DirectML DRBA baseline: restore the exact v782 cooperative provider
+    // ownership contract. x3 needs both midpoints; x4/x5 need at least three.
     if factor == 3 && timestep_count >= 2 {
         (true, true)
     } else if factor >= 4 && timestep_count >= 3 {
@@ -3252,6 +3348,21 @@ fn gpu_interp_slot_policy(factor: u32, timestep_count: usize) -> (bool, bool) {
     } else {
         (false, false)
     }
+}
+
+/// Provider-slot ownership policy for the live interpolation path.
+/// DirectML DRBA owns one persistent GPU output resource per requested phase,
+/// so its provider may compute the complete x2..x5 batch without waiting for
+/// render-thread presentation permits. Other providers/models retain the
+/// established cooperative policy.
+fn gpu_interp_slot_policy_for_path(
+    _directml_drba: bool,
+    factor: u32,
+    timestep_count: usize,
+) -> (bool, bool) {
+    // v803: DirectML DRBA is deliberately back on the v782 generic cooperative
+    // lane. Do not bypass provider permits for x4/x5.
+    gpu_interp_slot_policy(factor, timestep_count)
 }
 
 impl FlowOutputCadence {
@@ -3289,6 +3400,21 @@ impl FlowOutputCadence {
         smooth: bool,
     ) {
         self.wait_for_present_with_lead(overlay, period_s, vsync_on, smooth, 0.0);
+    }
+
+    /// Advance the absolute output clock for synthetic slots that were
+    /// intentionally dropped by the real-time DRBA admission controller. This
+    /// creates a real longer present interval (ordinary frame drop) instead of
+    /// compressing surviving x5 phases together or pretending the missing slot
+    /// was displayed.
+    fn skip_present_slots(&mut self, now: Instant, period_s: f64, count: usize) {
+        if count == 0 || !period_s.is_finite() || period_s <= 0.0 {
+            return;
+        }
+        let period = Duration::from_secs_f64(period_s);
+        let base = self.next_present.unwrap_or(now);
+        self.next_present = Some(base + period.mul_f64(count as f64));
+        self.present_period_s = period_s;
     }
 
     /// Reserve one output slot on an absolute interpolation clock.
@@ -3449,63 +3575,159 @@ impl FlowOutputCadence {
 /// endpoint. A fractional/stale cadence accumulator must never turn it into
 /// two synthetic frames. That doubled RIFE inference after a preset-loaded
 /// pre-ONNX stage, while toggling the same stage rebuilt a clean 1-mid route.
-/// x3 uses fractional cadence only behind the explicit 59.94/60.00Hz mode;
-/// on every other refresh it is a strict integer grid. x4-x5 keep the existing
-/// exact-grid / refresh-limited behavior.
+/// x2-x5 use strict integer phase grids on every monitor refresh so the
+/// selected multiplier is never reduced by startup/source cadence estimation.
 fn onnx_interpolation_phases(
     factor: u32,
-    output_ratio: f64,
-    x3_60hz_mode: bool,
+    _output_ratio: f64,
+    _x3_60hz_mode: bool,
     cadence: &mut FlowOutputCadence,
 ) -> Vec<f32> {
     let factor = factor.clamp(2, 5);
-    if factor == 3 {
-        if x3_60hz_mode {
-            // 60 Hz is the one intentional exception: use the refresh-limited
-            // cadence so 24p -> 60fps can alternate 3,2,3,2... outputs. This
-            // state is reachable only behind onnx_x3_60hz_mode().
-            return cadence.phases(output_ratio);
+
+    // v761 multiplier contract: x2/x3/x4/x5 means exactly 1/2/3/4 synthetic
+    // midpoints followed by the real endpoint. Provider switches and startup
+    // cadence estimation must never temporarily reduce x4/x5 to another
+    // ratio (the old refresh-limited branch produced shifted startup phases
+    // such as 0.0625/0.3125/... on a requested x5 route). Clearing the
+    // fractional accumulator also prevents a 60-Hz x3 state from leaking
+    // into a later integer multiplier.
+    cadence.next_phase = None;
+    cadence.phase_step = 0.0;
+    (1..=factor)
+        .map(|index| index as f32 / factor as f32)
+        .collect()
+}
+
+/// Choose the synthetic DRBA slots that can actually be computed in real time
+/// without changing the user's multiplier or retiming the surviving outputs.
+///
+/// Example: x5 always owns the phase grid 0.2/0.4/0.6/0.8/1.0. If current
+/// hardware can sustain only about three synthetic inferences per 24p source
+/// interval, one of the four midpoint phases is omitted and the missing phase
+/// rotates across pairs. The real endpoint remains 1.0. This is ordinary frame
+/// dropping: measured Present FPS falls below 120 instead of reporting a
+/// synthetic target that the machine did not actually display.
+fn drba_admit_timesteps(
+    requested: &[f32],
+    source_period_s: f64,
+    midpoint_ema_ms: f64,
+    perf_samples: u32,
+    compute_credit_ms: &mut f64,
+    phase_rotation: &mut usize,
+) -> Vec<f32> {
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    if !source_period_s.is_finite() || source_period_s <= 0.0 {
+        return requested.to_vec();
+    }
+    if perf_samples == 0 || !midpoint_ema_ms.is_finite() || midpoint_ema_ms <= 0.0 {
+        // Unknown hardware/provider cost: probe exactly one slot instead of
+        // launching all x5 midpoints blindly. One real inference is enough to
+        // seed the controller and bounds startup damage even on a GPU that
+        // cannot sustain x2 in real time. Use the rotating original phase grid
+        // so the probe is never retimed to a different multiplier.
+        let index = *phase_rotation % requested.len();
+        *phase_rotation = (*phase_rotation).wrapping_add(1);
+        return vec![requested[index]];
+    }
+
+    let source_budget_ms = (source_period_s * 1000.0).clamp(1.0, 200.0);
+    // Leave a small amount of the source interval for input handoff/post work.
+    // This is intentionally close to 100%: the controller should expose the
+    // hardware's real throughput, not impose an arbitrary conservative cap.
+    let compute_budget_ms = source_budget_ms * 0.98;
+    let slot_cost_ms = midpoint_ema_ms.max(0.01);
+    let wanted = requested.len();
+
+    let wanted_cost_ms = slot_cost_ms * wanted as f64;
+    if wanted_cost_ms <= compute_budget_ms {
+        *compute_credit_ms = 0.0;
+        return requested.to_vec();
+    }
+
+    // Time-domain token bucket. Fractional capacity is carried across source
+    // pairs, so a GPU capable of (for example) 2.9 midpoint evaluations per
+    // pair naturally alternates between two and three actual mids rather than
+    // snapping the whole filter to a different multiplier. Keep at most one
+    // extra-slot worth of credit so a transient idle period cannot cause a
+    // burst that immediately starves capture again.
+    // This also covers a midpoint that individually costs more than one source
+    // interval. Credit then accumulates across source pairs and the midpoint is
+    // produced only when enough real compute time has accrued (for example one
+    // synthetic every two pairs), rather than permanently disabling DRBA. The
+    // average provider work therefore stays inside the measured source budget.
+    let credit_cap = compute_budget_ms + slot_cost_ms;
+    *compute_credit_ms = (*compute_credit_ms + compute_budget_ms).min(credit_cap);
+    let keep = ((*compute_credit_ms + 1e-6) / slot_cost_ms)
+        .floor()
+        .max(0.0) as usize;
+    let keep = keep.min(wanted);
+    *compute_credit_ms = (*compute_credit_ms - slot_cost_ms * keep as f64).max(0.0);
+
+    if keep == 0 {
+        *phase_rotation = (*phase_rotation).wrapping_add(1);
+        return Vec::new();
+    }
+    if keep >= wanted {
+        return requested.to_vec();
+    }
+
+    // There are at most four synthetic slots (x5). Select an evenly-spaced
+    // subset and rotate it every pair, so processing drops are distributed
+    // across the original phase grid instead of always deleting the same part
+    // of motion. Sorting restores strict temporal order before inference.
+    let rotation = *phase_rotation % wanted;
+    *phase_rotation = (*phase_rotation).wrapping_add(1);
+    let mut indices = Vec::with_capacity(keep);
+    for rank in 0..keep {
+        indices.push(((rank * wanted) / keep + rotation) % wanted);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.len() != keep {
+        // Defensive fallback for any future multiplier > x5. Current x2..x5
+        // never reaches this branch.
+        indices.clear();
+        for index in 0..wanted {
+            if indices.len() >= keep {
+                break;
+            }
+            indices.push(index);
         }
-        // Every non-60Hz monitor is strict integer x3. Clear any previous
-        // fractional phase state (for example after moving the source window
-        // from a 60Hz monitor to a 120Hz monitor) before producing the fixed
-        // 1/3, 2/3, endpoint timeline.
-        cadence.next_phase = None;
-        cadence.phase_step = 0.0;
-        return vec![1.0 / 3.0, 2.0 / 3.0, 1.0];
     }
-    // When the monitor can display the complete integer multiplier, use an
-    // exact fixed phase grid. Carrying a fractional cadence accumulator into
-    // 24p/120Hz x5 produced shifted phases such as 0.026/0.276/... and could
-    // omit the real endpoint for several pairs. Besides uneven motion, that
-    // wasted provider work and prevented the presentation queue from settling.
-    if output_ratio >= factor as f64 - 0.02 {
-        // Clear only the fractional phase accumulator. The presentation clock
-        // must remain continuous across source pairs or every pair would begin
-        // with an immediate burst.
-        cadence.next_phase = None;
-        cadence.phase_step = 0.0;
-        return (1..=factor)
-            .map(|index| index as f32 / factor as f32)
-            .collect();
+    indices.into_iter().map(|index| requested[index]).collect()
+}
+
+fn observe_drba_midpoint_cost(
+    midpoint_ema_ms: &mut f64,
+    perf_samples: &mut u32,
+    pair_run_ms: f64,
+    midpoint_count: usize,
+) {
+    if midpoint_count == 0 || !pair_run_ms.is_finite() || pair_run_ms <= 0.0 {
+        return;
     }
-    if factor == 2 && output_ratio >= 1.5 {
-        vec![0.5, 1.0]
+    let sample = pair_run_ms / midpoint_count as f64;
+    if !sample.is_finite() || sample <= 0.0 {
+        return;
+    }
+    if *perf_samples == 0 || !midpoint_ema_ms.is_finite() || *midpoint_ema_ms <= 0.0 {
+        *midpoint_ema_ms = sample;
     } else {
-        let mut phases = cadence.phases(output_ratio);
-        // Never spend a fifth model invocation on an x5 startup sample. Until
-        // cadence locks, a fractional estimate can temporarily produce five
-        // synthetic phases with no real endpoint. They are all real model
-        // frames, but the fifth exceeds the requested x5 generation budget
-        // and only steals GPU time from the following source pair.
-        if factor >= 4
-            && phases.last().is_some_and(|phase| *phase < 1.0 - 1e-5)
-            && phases.len() > factor.saturating_sub(1) as usize
-        {
-            phases.truncate(factor.saturating_sub(1) as usize);
-        }
-        phases
+        // React quickly when the provider gets slower so synthetic frames are
+        // shed before the capture queue is starved. Recover more gradually when
+        // cost falls; this prevents an oscillation between full x5 and overload.
+        let alpha = if sample > *midpoint_ema_ms { 0.55 } else { 0.15 };
+        *midpoint_ema_ms = *midpoint_ema_ms * (1.0 - alpha) + sample * alpha;
     }
+    *perf_samples = perf_samples.saturating_add(1);
+}
+
+fn drba_phase_slot(t: f32, factor: u32) -> usize {
+    ((t as f64 * factor.max(2) as f64).round() as usize)
+        .clamp(1, factor.saturating_sub(1).max(1) as usize)
 }
 
 struct SmoothPacer {
@@ -3712,6 +3934,45 @@ fn wait_until_with_pump(overlay: &mut OverlayWindow, deadline: Instant) {
     }
 }
 
+/// v781: NeoAMD cooperative interpolation owns short 20.83/13.89/10.42/8.33ms
+/// output slots. The generic GUI-friendly waiter above pumps on every pass and
+/// deliberately leaves only a 0.6ms scheduling guard. That is harmless at
+/// ordinary frame rates but Windows can overshoot a 120Hz slot by ~1ms, and the
+/// error repeats for every x4/x5 output. Pump once, keep a 2ms coarse-sleep
+/// guard, then busy-wait only the short tail. This is scoped to NeoAMD's
+/// cooperative slots; DirectML/TensorRT and the ordinary render loop retain the
+/// existing waiter unchanged.
+fn wait_until_interp_slot_precise(overlay: &mut OverlayWindow, deadline: Instant) -> f64 {
+    if Instant::now() >= deadline {
+        return 0.0;
+    }
+    overlay.win.pump_messages();
+    const SPIN_GUARD: Duration = Duration::from_micros(2_000);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return now.duration_since(deadline).as_secs_f64() * 1000.0;
+        }
+        let left = deadline.saturating_duration_since(now);
+        if left > SPIN_GUARD {
+            std::thread::sleep(
+                left.saturating_sub(SPIN_GUARD)
+                    .min(Duration::from_millis(1)),
+            );
+        } else {
+            while Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            let done = Instant::now();
+            return done
+                .checked_duration_since(deadline)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0;
+        }
+    }
+}
+
 #[derive(Default)]
 struct PresentCadence {
     last: Option<Instant>,
@@ -3816,7 +4077,7 @@ struct HistFrame {
     data: Arc<Vec<u8>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GpuInterpFrame {
     tex: GpuTex,
     seq: u64,
@@ -3833,6 +4094,26 @@ enum GpuInterpContinuity {
     Broken,
 }
 
+/// DRBA consumes [A, B, C, D] but synthesizes only the central B -> C
+/// interval.  Its output clock must therefore be derived from B/C themselves,
+/// not from a transient WGC/cadence estimator that also sees startup repeats,
+/// queue gaps or compositor notifications.
+fn drba_central_source_period(
+    history: &std::collections::VecDeque<GpuInterpFrame>,
+) -> Option<f64> {
+    if history.len() < 4 {
+        return None;
+    }
+    let b = history.get(history.len() - 3)?.source_time_100ns?;
+    let c = history.get(history.len() - 2)?.source_time_100ns?;
+    let delta = c.checked_sub(b)?;
+    if delta <= 0 {
+        return None;
+    }
+    let period = delta as f64 / 10_000_000.0;
+    (period.is_finite() && (1.0 / 240.0..=0.5).contains(&period)).then_some(period)
+}
+
 fn classify_gpu_interp_continuity(
     previous_seq: u64,
     previous_received_at: Option<Instant>,
@@ -3840,6 +4121,7 @@ fn classify_gpu_interp_continuity(
     current: &FrameBuf,
     cadence_period: Option<f64>,
     arrival_interval: f64,
+    directml_drba_preserve_forward_gaps: bool,
 ) -> GpuInterpContinuity {
     if current.seq <= previous_seq {
         return GpuInterpContinuity::Broken;
@@ -3851,11 +4133,16 @@ fn classify_gpu_interp_continuity(
                 .then_some(arrival_interval)
         })
         .unwrap_or(1.0 / 24.0);
-    // WGC sequence numbers count compositor deliveries, not unique video
-    // pictures. take_next_queued may legitimately skip many sequence values
-    // after a resize or while x4/x5 output is being paced. Time continuity is
-    // the reliable signal; a raw seq gap must not reset history every frame.
-    let max_gap_s = (baseline * 4.5).clamp(0.12, 0.5);
+    // Sequence numbers are compositor deliveries, so they are never used as a
+    // contiguity oracle. Source timestamps are. Do not tighten this window just
+    // because the model is DRBA: v783 proved that a protection rule which turns
+    // ordinary delayed/queued 24p delivery into a history reset can destroy FPS
+    // on both DirectML and NeoAMD. v785 handles GPU/CPU overload independently
+    // by admitting only the synthetic slots that fit the measured source budget.
+    // History is rebuilt only for a genuinely large source-time discontinuity
+    // (seek/resize/provider transition class), not for ordinary processing lag.
+    let source_max_gap_s = (baseline * 4.5).clamp(0.12, 0.5);
+    let arrival_max_gap_s = source_max_gap_s;
     if let (Some(a), Some(b)) = (previous_source_time_100ns, current.source_time_100ns) {
         if b < a {
             return GpuInterpContinuity::Broken;
@@ -3863,7 +4150,17 @@ fn classify_gpu_interp_continuity(
         if b == a {
             return GpuInterpContinuity::Duplicate;
         }
-        return if (b - a) as f64 / 10_000_000.0 > max_gap_s {
+        let gap = (b - a) as f64 / 10_000_000.0;
+        // v795: a forward gap on DirectML DRBA is commonly caused by the render
+        // thread/driver missing one WGC delivery while the 4-frame model is busy.
+        // Resetting the entire DRBA history then creates three more real-only
+        // intervals. Preserve the four-frame window for ordinary sub-0.5s forward
+        // gaps and interpolate the surviving endpoints. Backward time and truly
+        // large jumps remain discontinuities.
+        if directml_drba_preserve_forward_gaps && gap <= 0.5 {
+            return GpuInterpContinuity::Continuous;
+        }
+        return if gap > source_max_gap_s {
             GpuInterpContinuity::Broken
         } else {
             GpuInterpContinuity::Continuous
@@ -3871,7 +4168,10 @@ fn classify_gpu_interp_continuity(
     }
     if let (Some(a), Some(b)) = (previous_received_at, current.received_at) {
         let gap = b.saturating_duration_since(a).as_secs_f64();
-        return if gap > max_gap_s {
+        if directml_drba_preserve_forward_gaps && gap <= 0.5 {
+            return GpuInterpContinuity::Continuous;
+        }
+        return if gap > arrival_max_gap_s {
             GpuInterpContinuity::Broken
         } else {
             GpuInterpContinuity::Continuous
@@ -3920,6 +4220,7 @@ impl HistFrame {
 /// 24p) — the user explicitly allows latency for interpolation filters.
 struct InterpWorker {
     job_tx: Option<Sender<InterpJob>>,
+    permit_tx: Option<Sender<InterpPermit>>,
     res_rx: Receiver<InterpResult>,
     /// identity of the OnnxStage this worker drives (rebuild on chain swap)
     stage_ptr: usize,
@@ -3935,12 +4236,23 @@ impl Drop for InterpWorkerDone {
 }
 
 struct InterpJob {
+    pair_id: u64,
     w: i32,
     h: i32,
     frames: Vec<Arc<Vec<u8>>>,
     ts: Vec<f32>,
     rgba: bool,
+    /// Force one ordinary ORT run per requested phase. v798 leaves this false
+    /// for DirectML DRBA so process_interp_many_rgba8() can restore the model's
+    /// native dynamic multi-phase batch while keeping CPU-visible owned outputs.
+    force_sequential: bool,
     prefer_dml_vulkan_shared: bool,
+    neoamd_stream_slots: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InterpPermit {
+    pair_id: u64,
 }
 
 struct DmlSharedFallback {
@@ -3952,6 +4264,7 @@ struct DmlSharedFallback {
 
 enum InterpPayload {
     Cpu(i32, i32, Vec<u8>),
+    NeoAmdShared(PreparedNeoAmdSharedOutput),
     DmlShared {
         shared: PreparedDmlSharedOutput,
         fallback: DmlSharedFallback,
@@ -3959,6 +4272,7 @@ enum InterpPayload {
 }
 
 struct InterpResult {
+    pair_id: u64,
     idx: usize,
     r: Result<InterpPayload>,
     /// (pack_ms, run_ms, out_ms)
@@ -3969,6 +4283,7 @@ impl InterpWorker {
     fn spawn(stage: Arc<Mutex<crate::render::onnx_stage::OnnxStage>>, stage_ptr: usize) -> Self {
         stage.lock().unwrap().reset_interp_pack_cache();
         let (job_tx, job_rx) = channel::<InterpJob>();
+        let (permit_tx, permit_rx) = channel::<InterpPermit>();
         let (res_tx, res_rx) = channel::<InterpResult>();
         let (done_tx, done_rx) = channel::<()>();
         let thread = std::thread::Builder::new()
@@ -3979,9 +4294,139 @@ impl InterpWorker {
                 while let Ok(job) = job_rx.recv() {
                     let frames: Vec<&[u8]> =
                         job.frames.iter().map(|frame| frame.as_slice()).collect();
+                    if job.rgba && job.neoamd_stream_slots {
+                        let shared_prepared = {
+                            let mut st = stage.lock().unwrap();
+                            st.prepare_neoamd_interp_stream_shared_rgba8(job.w, job.h, &frames)
+                        };
+                        match shared_prepared {
+                            Ok(Some(shared)) => {
+                                if job.pair_id < 3 {
+                                    log::info!(
+                                        "neoamd-interp-stream-job: pair={} outputs={} mode=shared-rgba8-cooperative-slots key={}",
+                                        job.pair_id,
+                                        job.ts.len(),
+                                        shared.resource_key
+                                    );
+                                }
+                                for (idx, t) in job.ts.iter().copied().enumerate() {
+                                    let mut st = stage.lock().unwrap();
+                                    let r = st
+                                        .run_neoamd_interp_stream_phase_shared_rgba8(
+                                            job.w,
+                                            job.h,
+                                            frames.len(),
+                                            t,
+                                            shared,
+                                        )
+                                        .map(InterpPayload::NeoAmdShared);
+                                    let profile = st
+                                        .last_interp_profile()
+                                        .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
+                                    drop(st);
+                                    let failed = r.is_err();
+                                    if res_tx
+                                        .send(InterpResult { pair_id: job.pair_id, idx, r, profile })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if failed {
+                                        break;
+                                    }
+                                    // v816 shared RGBA8 uses one reusable output buffer.
+                                    // Wait after *every* phase, including the final midpoint,
+                                    // so the next source pair cannot overwrite it before GL
+                                    // retires the conversion read fence.
+                                    loop {
+                                        match permit_rx.recv() {
+                                            Ok(permit) if permit.pair_id == job.pair_id => break,
+                                            Ok(_) => continue,
+                                            Err(_) => return,
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                log::warn!(
+                                    "neoamd-interp-shared-prepare-fallback: pair={} reason={error:#} route=cpu-visible-cooperative-stream",
+                                    job.pair_id
+                                );
+                            }
+                        }
+
+                        let prepared = {
+                            let mut st = stage.lock().unwrap();
+                            st.prepare_neoamd_interp_stream_rgba8(job.w, job.h, &frames)
+                        };
+                        match prepared {
+                            Ok(true) => {
+                                if job.pair_id < 3 {
+                                    log::info!(
+                                        "neoamd-interp-stream-job: pair={} outputs={} mode=cpu-visible-cooperative-slots",
+                                        job.pair_id,
+                                        job.ts.len()
+                                    );
+                                }
+                                for (idx, t) in job.ts.iter().copied().enumerate() {
+                                    let mut st = stage.lock().unwrap();
+                                    let r = st
+                                        .run_neoamd_interp_stream_phase_rgba8(
+                                            job.w,
+                                            job.h,
+                                            frames.len(),
+                                            t,
+                                        )
+                                        .map(|(w, h, data)| InterpPayload::Cpu(w, h, data));
+                                    let profile = st
+                                        .last_interp_profile()
+                                        .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
+                                    drop(st);
+                                    let failed = r.is_err();
+                                    if res_tx
+                                        .send(InterpResult { pair_id: job.pair_id, idx, r, profile })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if failed {
+                                        break;
+                                    }
+                                    if idx + 1 < job.ts.len() {
+                                        loop {
+                                            match permit_rx.recv() {
+                                                Ok(permit) if permit.pair_id == job.pair_id => break,
+                                                Ok(_) => continue,
+                                                Err(_) => return,
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                log::warn!(
+                                    "neoamd-interp-stream-prepare-fallback: pair={} reason={error:#} route=cpu-visible-batch",
+                                    job.pair_id
+                                );
+                            }
+                        }
+                    }
                     if job.rgba {
                         let mut st = stage.lock().unwrap();
-                        let results: Result<Vec<InterpPayload>> = if job.prefer_dml_vulkan_shared {
+                        let results: Result<Vec<InterpPayload>> = if job.force_sequential {
+                            job.ts
+                                .iter()
+                                .copied()
+                                .map(|t| {
+                                    st.process_interp_rgba8(job.w, job.h, &frames, t)
+                                        .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
+                                })
+                                .collect()
+                        } else if job.prefer_dml_vulkan_shared {
                             match st.process_interp_many_rgba8_dml_shared(
                                 job.w,
                                 job.h,
@@ -4072,7 +4517,7 @@ impl InterpWorker {
                         match results {
                             Ok(results) => {
                                 for (idx, r) in results.into_iter().map(Ok).enumerate() {
-                                    if res_tx.send(InterpResult { idx, r, profile }).is_err() {
+                                    if res_tx.send(InterpResult { pair_id: job.pair_id, idx, r, profile }).is_err() {
                                         return;
                                     }
                                 }
@@ -4081,7 +4526,7 @@ impl InterpWorker {
                                 let message = format!("{error:#}");
                                 for idx in 0..job.ts.len() {
                                     let r = Err(anyhow::anyhow!(message.clone()));
-                                    if res_tx.send(InterpResult { idx, r, profile }).is_err() {
+                                    if res_tx.send(InterpResult { pair_id: job.pair_id, idx, r, profile }).is_err() {
                                         return;
                                     }
                                 }
@@ -4097,7 +4542,7 @@ impl InterpWorker {
                                 .last_interp_profile()
                                 .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
                             drop(st);
-                            if res_tx.send(InterpResult { idx, r, profile }).is_err() {
+                            if res_tx.send(InterpResult { pair_id: job.pair_id, idx, r, profile }).is_err() {
                                 return;
                             }
                         }
@@ -4107,10 +4552,19 @@ impl InterpWorker {
             .expect("spawn interp worker");
         Self {
             job_tx: Some(job_tx),
+            permit_tx: Some(permit_tx),
             res_rx,
             stage_ptr,
             thread: Some(thread),
             done_rx,
+        }
+    }
+}
+
+impl InterpWorker {
+    fn permit_next_slot(&self, pair_id: u64) {
+        if let Some(tx) = self.permit_tx.as_ref() {
+            let _ = tx.send(InterpPermit { pair_id });
         }
     }
 }
@@ -4120,6 +4574,10 @@ impl Drop for InterpWorker {
         // Closing the channel and joining prevents an old interpolation model
         // from consuming GPU time after a RIFE -> DRBA or stop/start switch.
         self.job_tx.take();
+        // A v780 NeoAMD worker may be sleeping between generated phases until
+        // the render thread confirms that the previous midpoint was presented.
+        // Closing permits wakes it immediately on Stop/backend/geometry changes.
+        self.permit_tx.take();
         if let Some(thread) = self.thread.take() {
             let started = Instant::now();
             if self
@@ -4178,6 +4636,10 @@ struct GpuInterpResult {
 #[derive(Clone, Copy)]
 struct ReadyGpuInterpOutput {
     tex: GpuTex,
+    /// True when v807 copied a DirectML DRBA external NCHW slot into an
+    /// ordinary GL-owned SSBO before RGBA conversion. The resulting texture is
+    /// already detached from shared-resource visibility/lifetime concerns.
+    local_snapshot: bool,
     /// First chain stage that still needs to run when this texture is
     /// presented. v661 can execute the complete DirectML -> Vulkan post range
     /// before the texture reaches OpenGL, in which case this equals stage_count.
@@ -4186,6 +4648,31 @@ struct ReadyGpuInterpOutput {
     /// restored into path_ms(chain=...) after the no-op presentation chain so
     /// Vulkan statistics do not become artificially optimistic.
     preprocessed_chain_ms: f64,
+}
+
+/// v801: a completed DirectML DRBA output that is fully detached from the
+/// provider job and can therefore wait for presentation without keeping the
+/// provider pair in flight.  This is the key separation between inference and
+/// presentation: the render thread may admit/capture the next real source pair
+/// while these already-computed frames are paced to the display.
+struct DrbaQueuedPresent {
+    generation: u64,
+    pair_id: u64,
+    slot_index: usize,
+    slot_count: usize,
+    factor: u32,
+    tex: GpuTex,
+    out_size: (i32, i32),
+    chain_start: usize,
+    preprocessed_chain_ms: f64,
+    timing: FrameTiming,
+    frame_seq: u64,
+    is_real: bool,
+    /// Original pair output period.  Presentation can refine this from the
+    /// current source cadence, but this remains the fallback during startup.
+    output_period: f64,
+    /// Source/output ratio used when recomputing the period after cadence locks.
+    output_ratio: f64,
 }
 
 struct BeamOnnxJob {
@@ -4344,7 +4831,8 @@ fn beam_async_onnx_stage(
         crate::render::onnx_stage::OnnxProvider::DirectML => Some("DirectML"),
         crate::render::onnx_stage::OnnxProvider::TensorRT => Some("TensorRT"),
         crate::render::onnx_stage::OnnxProvider::MigraphX
-        | crate::render::onnx_stage::OnnxProvider::Cuda => None,
+        | crate::render::onnx_stage::OnnxProvider::Cuda
+        | crate::render::onnx_stage::OnnxProvider::NeoAMD => None,
     })?;
     Some((stage, metric_name, provider_name))
 }
@@ -4361,10 +4849,20 @@ struct PendingGpuInterp {
     /// User-selected interpolation factor.  Keep this explicit so narrow
     /// factor-specific safety workarounds never leak into x2/x4/x5.
     factor: u32,
+    /// True for DRBA regardless of provider. This preserves the v785
+    /// midpoint-cost EMA/admission state used by the proven NeoAMD path.
+    is_drba: bool,
+    /// Modern DirectML-DRBA special presentation path selector. v803 restores
+    /// DirectML DRBA to the v782 generic cooperative stream lane, so this is
+    /// intentionally false for the restored baseline.
+    directml_drba: bool,
+    /// True only for DirectML DRBA restored to the v782 cooperative stream lane.
+    /// Used for chronology diagnostics, never for provider scheduling.
+    directml_drba_v782: bool,
     cooperative_slots: bool,
-    /// x4/x5 release the next unique inference after the current output's
-    /// post-GLSL commands are submitted but before SwapBuffers. x3 leaves this
-    /// false and releases only after present to avoid DirectML/GL contention.
+    /// Multi-slot interpolation can release the next unique inference after
+    /// the current output's post-GLSL commands are submitted but before
+    /// SwapBuffers, using the same ownership rule for every eligible factor.
     permit_next_after_post_submit: bool,
     stage: Arc<Mutex<crate::render::onnx_stage::OnnxStage>>,
     /// Exact metric identity from the executable FilterChain, including the
@@ -4386,12 +4884,20 @@ struct PendingGpuInterp {
     post_chain_start: usize,
     frame: FrameBuf,
     start_source_time_100ns: Option<i64>,
+    /// Source-picture cadence for overload decisions. DRBA x4/x5 must never
+    /// create temporal history gaps merely to honor an impossible multiplier.
+    source_period: f64,
     output_period: f64,
     out_size: (i32, i32),
     /// Set when the provider job is actually submitted. Keep the current
     /// filtered frame on screen until this exact provider result is ready;
     /// never substitute an unfiltered/live frame while editing a preset.
     submitted_at: Instant,
+    /// DirectML DRBA presentation diagnostics. Provider work is never reduced;
+    /// a completed midpoint may be omitted only when its monotonic display slot
+    /// is already obsolete. This mirrors the v796 CPU-visible correctness path.
+    presented_mid_count: usize,
+    late_present_drops: usize,
     /// One-shot diagnostic proving whether the render thread is still cycling
     /// while a provider invocation is unusually slow.
     slow_wait_logged: bool,
@@ -4599,6 +5105,13 @@ impl Drop for GpuInterpWorker {
 struct PendingInterp {
     /// Exact ONNX model name plus the provider selected by the live stage.
     interp_name: String,
+    pair_id: u64,
+    /// Original user multiplier. Kept even when adaptive DRBA drops individual
+    /// midpoint phases so pacing can leave real holes on that exact phase grid.
+    factor: u32,
+    is_drba: bool,
+    directml_drba: bool,
+    requested_mid_count: usize,
     real: HistFrame,
     count: usize,
     rgba: bool,
@@ -4617,12 +5130,22 @@ struct PendingInterp {
     /// First GUI-chain stage after the interpolation model. Stages before the
     /// model were already executed once on each real endpoint.
     chain_start_index: usize,
+    /// NeoAMD currently returns CPU-visible midpoint payloads. For exact integer
+    /// x2/x3/x4/x5 cadence, anchor their presentation to the current source tick
+    /// instead of carrying a deadline from the previous pair. The carried clock
+    /// amplifies small batch-runtime variation into short/long present intervals.
+    neoamd_cpu_visible: bool,
+    /// v780: Backend Pack v041 can expose one phase at a time. The worker is
+    /// then permit-gated so every generated midpoint is presented exactly once
+    /// before the next phase is allowed to overwrite/reuse its work buffers.
+    neoamd_stream_slots: bool,
 }
 
 fn interp_pair_is_contiguous(
     pair_dt: Option<f64>,
     cadence_period: Option<f64>,
     arrival_interval: f64,
+    directml_drba_preserve_forward_gaps: bool,
 ) -> bool {
     let Some(pair_dt) = pair_dt.filter(|dt| dt.is_finite() && *dt >= 0.0) else {
         return true;
@@ -4633,6 +5156,14 @@ fn interp_pair_is_contiguous(
             (arrival_interval.is_finite() && arrival_interval > 0.0 && arrival_interval <= 0.2)
                 .then_some(arrival_interval)
         });
+    // v796: once DirectML DRBA has accepted two strictly increasing source
+    // pictures, every forward interval remains an interpolation interval.
+    // Provider/render overload may make that interval wide, but must never
+    // silently turn it into a real-only branch. Backward/duplicate timestamps
+    // are rejected before history insertion in the live DRBA path.
+    if directml_drba_preserve_forward_gaps {
+        return true;
+    }
     let limit = baseline
         .map(|period| (period * 4.0).clamp(0.1, 0.2))
         .unwrap_or(0.2);
@@ -4773,6 +5304,7 @@ fn apply_chain_update(
         if let Some(mut pending) = s.gpu_interp_pending.take() {
             recycle_pending_gpu_outputs(gc, &mut pending);
         }
+        recycle_drba_present_queue(gc, s);
         if let Some(mut worker) = s.gpu_interp_worker.take() {
             let clean = worker.shutdown();
             if !clean {
@@ -4857,6 +5389,18 @@ fn apply_chain_update(
         }
     }
 
+    // v815: an ordinary DirectML temporal stage that already existed in the
+    // running chain must get a fresh ORT/DML session if the live filter specs
+    // change.  The reproducible failure is: append TemporalFix after an
+    // upscaler (first execution at 1440x1080), then move it before the
+    // upscaler (640x480).  StageFactory otherwise cache-hits the same session
+    // and it remains ~2x slower until Stop/Start drops DirectML sessions.
+    // A newly-added TemporalFix does not need this rebuild because it has not
+    // yet executed in the old generation.
+    let rebuild_existing_directml_temporal = !explicit_interp_hard_handoff
+        && s.chain_specs != specs
+        && s.chain.has_directml_temporal_filter();
+
     let (mut chain, errs) = FilterChain::from_specs(factory, specs);
     // A warm TensorRT Session may be reused from StageFactory. Per-capture
     // temporal/packing state must never cross the session boundary even though
@@ -4911,6 +5455,7 @@ fn apply_chain_update(
         if let Some(mut pending) = s.gpu_interp_pending.take() {
             recycle_pending_gpu_outputs(gc, &mut pending);
         }
+        recycle_drba_present_queue(gc, s);
         if let Some(mut worker) = s.gpu_interp_worker.take() {
             let _ = worker.shutdown();
         }
@@ -4975,6 +5520,22 @@ fn apply_chain_update(
     };
     if !explicit_interp_hard_handoff {
         s.chain.prepare_gpu_transition(gc);
+    }
+    if rebuild_existing_directml_temporal && chain.has_directml_temporal_filter() {
+        // Candidate validation happens before the running bridge is touched.
+        // Now that the old temporal bridge is retired, evict/recreate only the
+        // shape-sensitive DirectML temporal session. This is the narrow
+        // Stop/Start-equivalent boundary required by TemporalFix.
+        match chain.rebuild_directml_temporal_filter_sessions(factory) {
+            Ok(rebuilt) if rebuilt > 0 => log::info!(
+                "directml-temporal-live-route-rebuild: stages={} policy=fresh-session-after-old-bridge-retire",
+                rebuilt
+            ),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "directml-temporal-live-route-rebuild-failed: {error:#}; action=continue-with-validated-session"
+            ),
+        }
     }
     if directml_interp_pre_route_changed && !explicit_interp_hard_handoff {
         // The candidate chain was intentionally validated before touching the
@@ -5130,12 +5691,24 @@ fn apply_chain_update(
     s.smooth_content_pattern_hits = 0;
     s.smooth_content_candidate_gaps.clear();
     s.smooth_content_24p_detected = false;
+
     s.source.set_queue_enabled(s.chain.has_interp());
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
+    // v815: reset already removes the previous generation's EWMA.  Do not
+    // hide several sparse (1/30-frame) probes after a live edit: that made the
+    // statistics rows stay blank for seconds.  Show the first normal probe and
+    // use only a short 50/50 settle window.
+    metrics.arm_stage_cold_skip(0);
+    metrics.arm_stage_fast_settle(6);
+    log::debug!(
+        "chain-stats-generation-reset: cold_skip=0 fast_settle=6 policy=first-sampled-frame-fast-ewma-50 stages={:?}",
+        s.chain.metric_stage_order()
+    );
     {
         let mut state = status.lock().unwrap();
         state.chain_errors = errs;
+        state.onnx_neoamd_stages = usage.neoamd;
         state.onnx_tensorrt_stages = usage.tensorrt;
         state.onnx_cuda_stages = usage.cuda;
         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -5181,11 +5754,20 @@ fn reset_gpu_interp_for_backend_switch(
     while let Some(frame) = s.gpu_interp_hist.pop_front() {
         gc.recycle(frame.tex);
     }
+    recycle_drba_present_queue(gc, s);
     s.gpu_interp_result_stash.clear();
     s.gpu_interp_permit_after_post_submit = None;
     s.interp_generation = s.interp_generation.saturating_add(1);
     s.gpu_interp_pair_id = 0;
     s.gpu_interp_active_logged = false;
+    s.drba_lookahead_needs_anchor = true;
+    s.drba_diag_present_seq = 0;
+    s.drba_diag_last_semantic_ts_100ns = None;
+    s.drba_midpoint_ema_ms = 0.0;
+    s.drba_perf_samples = 0;
+    s.drba_compute_credit_ms = 0.0;
+    s.drba_phase_rotation = 0;
+    s.drba_dropped_midpoints = 0;
     log::info!(
         "interp-gpu-backend-transition-reset: generation={} worker=stopped pending=0 history=0",
         s.interp_generation
@@ -5207,11 +5789,20 @@ fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext,
     while let Some(frame) = s.gpu_interp_hist.pop_front() {
         gc.recycle(frame.tex);
     }
+    recycle_drba_present_queue(gc, s);
     s.gpu_interp_result_stash.clear();
     s.gpu_interp_permit_after_post_submit = None;
     s.interp_generation = s.interp_generation.saturating_add(1);
     s.gpu_interp_pair_id = 0;
     s.gpu_interp_active_logged = false;
+    s.drba_lookahead_needs_anchor = true;
+    s.drba_diag_present_seq = 0;
+    s.drba_diag_last_semantic_ts_100ns = None;
+    s.drba_midpoint_ema_ms = 0.0;
+    s.drba_perf_samples = 0;
+    s.drba_compute_credit_ms = 0.0;
+    s.drba_phase_rotation = 0;
+    s.drba_dropped_midpoints = 0;
     s.flow_output_cadence.reset();
     s.interp_present_deadline = None;
     s.chain.prepare_gpu_transition(gc);
@@ -5222,6 +5813,113 @@ fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext,
     );
 }
 
+
+fn restart_wgc_epoch_for_backend_switch(s: &mut Session) -> bool {
+    let pixel_exact_raw_hint = if s.source_monitor_fullscreen && s.capture_canvas.is_none() {
+        s.source_restore_rect
+            .or_else(|| win32::window_rect(s.hwnd))
+            .and_then(|(_, _, w, h)| (w > 0 && h > 0).then_some((w as u32, h as u32)))
+    } else {
+        None
+    };
+
+    // v829: v827/v828 called this a Stop -> Start-equivalent WGC epoch, but
+    // the replacement source was actually started *before* the old source was
+    // stopped.  That leaves two WGC sessions for the same HWND alive for a
+    // short interval.  The v829 field log proves this boundary still differs
+    // materially from a user Stop -> Start: RTMoSR can remain at ~10-12 ms GPU
+    // time after a live DirectML -> NeoAMD switch, while a real Stop -> Start
+    // immediately returns the same cache-hit NeoAMD session to ~5-6 ms.
+    //
+    // CaptureControl::stop() is synchronous (it posts WM_QUIT and joins the
+    // capture thread), so stop the old WGC session first and only then create
+    // the new one.  This is the first backend-switch epoch that is truly
+    // non-overlapping.  Provider/model sessions, packed weights and the overlay
+    // still remain resident.
+    if !source_identity_matches(s) {
+        log::warn!(
+            "onnx-backend-wgc-epoch-restart: result=fallback reason=identity-changed-before-stop hwnd={:#x} expected_pid={} current_pid={}",
+            s.hwnd,
+            s.source_pid,
+            win32::window_pid(s.hwnd)
+        );
+        return false;
+    }
+    let stop_started = Instant::now();
+    s.source.stop();
+    let stop_ms = stop_started.elapsed().as_secs_f64() * 1000.0;
+
+    let new_source = match WgcSource::start_fmt_with_pixel_lock(
+        s.hwnd,
+        s.fps_cap,
+        s.capture_client_only,
+        false,
+        pixel_exact_raw_hint,
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            // The old source is already stopped.  Leave it in that explicit
+            // ended state so the existing main-loop in-place reconnect watchdog
+            // immediately owns recovery instead of pretending a stale WGC
+            // session is still valid.
+            s.source_restart_since = None;
+            s.source_restart_last = Instant::now() - Duration::from_millis(250);
+            log::warn!(
+                "onnx-backend-wgc-epoch-restart: result=fallback reason=start-failed-after-hard-stop hwnd={:#x} old_stop_ms={:.2} action=main-loop-in-place-reconnect error={error:#}",
+                s.hwnd,
+                stop_ms
+            );
+            return false;
+        }
+    };
+    new_source.set_user_crop(s.capture_crop);
+    if !source_identity_matches(s) {
+        drop(new_source);
+        s.source_restart_since = None;
+        s.source_restart_last = Instant::now() - Duration::from_millis(250);
+        log::warn!(
+            "onnx-backend-wgc-epoch-restart: result=fallback reason=identity-changed-after-hard-stop hwnd={:#x} expected_pid={} current_pid={} action=main-loop-in-place-reconnect",
+            s.hwnd,
+            s.source_pid,
+            win32::window_pid(s.hwnd)
+        );
+        return false;
+    }
+
+    s.source = new_source;
+    s.source.set_queue_enabled(s.chain.has_interp());
+    s.metric_seq = 0;
+    s.next_cap_deadline = None;
+    s.next_cap_deadline_src = None;
+    s.cap_rate_gate = CapRateGate::default();
+    s.cap_filter_seq = 0;
+    s.hdr_highlight_protected_seq = None;
+    s.arrival_interval = 0.0;
+    s.last_arrival = Instant::now();
+    s.starve_released = false;
+    s.source_restart_since = None;
+    s.source_restart_last = Instant::now();
+    s.last_present = Instant::now();
+    s.last_present_started = Instant::now();
+    s.frame = FrameBuf::default();
+    s.chain_reprocess_pending = false;
+    s.cadence.reset();
+    s.smooth_pacer.reset();
+    s.paced_present_deadline = None;
+    s.flow_output_cadence.reset();
+    s.interp_present_deadline = None;
+    s.present_cadence = PresentCadence::default();
+    s.cap_diag = CapDiag::new();
+    log::info!(
+        "onnx-backend-wgc-epoch-restart: result=ok hwnd={:#x} queue_enabled={} interp={} old_stop_ms={:.2} policy=hard-stop-then-start-no-overlap provider-session=preserved scope=all-directml-neoamd-onnx",
+        s.hwnd,
+        s.chain.has_interp(),
+        s.chain.has_interp(),
+        stop_ms
+    );
+    true
+}
+
 fn switch_onnx_backend(
     session: &mut Option<Session>,
     gc: &mut GlContext,
@@ -5230,6 +5928,7 @@ fn switch_onnx_backend(
     trt_device_id: Option<i32>,
     cache_root: std::path::PathBuf,
     specs: &[StageSpec],
+    interp_factor: u32,
     metrics: &Metrics,
     status: &Arc<Mutex<Status>>,
 ) -> bool {
@@ -5249,6 +5948,7 @@ fn switch_onnx_backend(
         state.onnx_backend = backend;
         state.onnx_backend_switching = false;
         state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
+        state.onnx_neoamd_stages = 0;
         state.onnx_tensorrt_stages = 0;
         state.onnx_cuda_stages = 0;
         state.onnx_directml_fallbacks = 0;
@@ -5307,14 +6007,105 @@ fn switch_onnx_backend(
             .filter(|(w, h)| *w > 0 && *h > 0)
             .unwrap_or((s.frame.w, s.frame.h));
         let started = Instant::now();
-        let result =
+        let mut result =
             candidate_chain.warmup_candidate(gc, s.frame.w, s.frame.h, &rgba, out_size, &preserve);
+
+        // v786: a live DirectML <-> NeoAMD transition must commit only after
+        // the *whole candidate chain* reaches its steady provider state. Earlier
+        // versions primed only the first NeoAMD image stage and reused old
+        // DirectML sessions, so TemporalFix/stacked chains could remain in a
+        // slow post-switch state until Stop/Start. Use two additional full-chain
+        // passes for DirectML and NeoAMD. Candidate sessions are generation-fresh
+        // (TensorRT keeps its explicit cache policy).
+        if result.is_ok()
+            && matches!(
+                backend,
+                OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML
+            )
+            && !candidate_chain.has_interp()
+        {
+            for prime in 2..=3 {
+                let prime_result = candidate_chain.warmup_candidate(
+                    gc,
+                    s.frame.w,
+                    s.frame.h,
+                    &rgba,
+                    out_size,
+                    &preserve,
+                );
+                match prime_result {
+                    Ok(_) => log::debug!(
+                        "onnx-backend-warmup-prime: backend={backend:?} pass={} size={}x{} scope=full-chain result=ok",
+                        prime,
+                        s.frame.w,
+                        s.frame.h
+                    ),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+        }
+        // v812: generic OpenGL-texture warmup can leave NeoAMD's full
+        // bidirectional shared-FP16 bridge attached to the fresh provider
+        // generation.  Stop/Start retires that per-capture bridge and then
+        // immediately runs the fused RGBA8 -> shared-output lane; field logs
+        // show Compact models at ~8-9 ms after live switch versus ~6.3 ms after
+        // Stop/Start.  Preserve the warmed session/packed weights/HIP Graph,
+        // retire only generic warmup bridge resources, then prime the exact
+        // live ingress.  This executes only at a provider switch.
+        if result.is_ok()
+            && backend == OnnxBackendPreference::NeoAMD
+            && !candidate_chain.has_interp()
+        {
+            let retired =
+                candidate_chain.rearm_neoamd_live_ingress_after_generic_warmup(gc);
+            log::debug!(
+                "onnx-backend-live-ingress-rearm: backend=NeoAMD stages={} action=retire-generic-shared-io preserve=session-packed-weights",
+                retired
+            );
+
+            // The live WGC fast path enters the first NeoAMD stage through
+            // process_first_onnx_rgba8(). Prime that exact path last so the
+            // committed provider owns only the resources it will use live.
+            for prime in 1..=3 {
+                match candidate_chain.warmup_neoamd_live_rgba8(
+                    gc,
+                    s.frame.w,
+                    s.frame.h,
+                    &rgba,
+                    out_size,
+                ) {
+                    Ok(true) => log::debug!(
+                        "onnx-backend-live-ingress-prime: backend=NeoAMD pass={} size={}x{} scope=exact-live-chain result=ok",
+                        prime,
+                        s.frame.w,
+                        s.frame.h
+                    ),
+                    Ok(false) => {
+                        log::debug!(
+                            "onnx-backend-live-ingress-prime: backend=NeoAMD pass={} size={}x{} scope=exact-live-chain result=skipped",
+                            prime,
+                            s.frame.w,
+                            s.frame.h
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+        }
         match &result {
             Ok(usage) => log::info!(
-                "onnx-backend-warmup: backend={backend:?} size={}x{} result=ok elapsed_ms={:.2} tensorrt={} cuda={} directml={} directml_fallback={}",
+                "onnx-backend-warmup: backend={backend:?} size={}x{} result=ok elapsed_ms={:.2} neoamd={} tensorrt={} cuda={} directml={} directml_fallback={}",
                 s.frame.w,
                 s.frame.h,
                 started.elapsed().as_secs_f64() * 1000.0,
+                usage.neoamd,
                 usage.tensorrt,
                 usage.cuda,
                 usage.directml,
@@ -5330,7 +6121,7 @@ fn switch_onnx_backend(
         result
     };
 
-    let usage = match warmup_result {
+    let mut usage = match warmup_result {
         Ok(usage) => usage,
         Err(error) => {
             candidate_chain.prepare_gpu_transition(gc);
@@ -5370,9 +6161,12 @@ fn switch_onnx_backend(
         return false;
     }
 
-    // Warmup must not become temporal history for the first live frame.
-    candidate_chain.prepare_gpu_transition(gc);
-    candidate_chain.reset_backend_runtime_state();
+    // v763: the candidate has just been constructed for this provider
+    // generation. Do NOT retire/reset it after warmup: v761 warmed NeoAMD down
+    // to ~5-6ms and then immediately destroyed the very shared IO/HIP Graph it
+    // had warmed, so the first live RGBA8 frame restarted cold at ~16-18ms.
+    // Temporal/presentation history belongs to Session and is cleared below;
+    // provider resources must remain exactly as warmed until commit.
 
     let transition_snapshot = s.last_tex.map(|texture| {
         (
@@ -5412,7 +6206,95 @@ fn switch_onnx_backend(
     s.chain = candidate_chain;
     s.chain_specs = specs.to_vec();
     *factory = candidate_factory;
-    s.chain_reprocess_pending = !s.frame.data.is_empty();
+
+    // v814: the candidate was validated while the previous provider generation
+    // still existed.  Field logs show that both directions can then retain a
+    // ~2 ms slower steady state until Stop -> Start.  Stop/Start differs in two
+    // important ways: all per-capture shared GPU bridges/GL pool resources are
+    // gone before live inference resumes, and DirectML gets a fresh ORT/DML
+    // session while NeoAMD intentionally keeps only its model/packed-weight
+    // session.  Reproduce that boundary here after the old provider has been
+    // fully dropped, without changing the steady-state kernels.
+    if matches!(backend, OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML)
+        && !s.chain.has_interp()
+    {
+        // Preserve the last visible image as ordinary CPU RGBA while the target
+        // provider's warmup-only bridge and transient GL pool are retired.
+        let clean_snapshot = s.last_tex.take().map(|texture| {
+            let width = texture.w();
+            let height = texture.h();
+            let rgba = gc.download_rgba8(texture);
+            gc.recycle(texture);
+            (width, height, rgba)
+        });
+
+        // The validated target generation must not carry its warmup resource
+        // fence/history into the real WGC cadence.  NeoAMD keeps the expensive
+        // model/packed-weight session; DirectML is rebuilt below because a real
+        // Stop drops DirectML sessions entirely.
+        s.chain.prepare_gpu_transition(gc);
+
+        let mut directml_rebuilt = false;
+        if backend == OnnxBackendPreference::DirectML {
+            // Evict the candidate's DirectML cache only after the previous
+            // NeoAMD generation is already gone.  Build a second/final chain in
+            // the clean provider environment.  The already validated candidate
+            // remains usable if this conservative rebuild unexpectedly fails.
+            let dropped = factory.drop_directml_sessions();
+            let (final_chain, final_errors) = FilterChain::from_specs(factory, specs);
+            let final_requested = specs.iter().filter(|spec| spec.enabled).count();
+            if (final_requested == 0 || !final_chain.stages.is_empty()) && final_errors.is_empty() {
+                usage = final_chain.onnx_backend_usage();
+                s.chain = final_chain;
+                directml_rebuilt = true;
+                log::info!(
+                    "onnx-backend-clean-generation-rebuild: backend=DirectML dropped_candidate_sessions={} result=ok enabled={} policy=post-old-provider-fresh-session",
+                    dropped,
+                    s.chain.stages.len()
+                );
+            } else {
+                log::warn!(
+                    "onnx-backend-clean-generation-rebuild: backend=DirectML dropped_candidate_sessions={} result=keep-validated-candidate errors={:?}",
+                    dropped,
+                    final_errors
+                );
+            }
+        }
+
+        // Stop_session() clears the transient GL pool after every provider
+        // bridge has detached.  Do the same here so neither DirectML nor NeoAMD
+        // inherits imported-buffer/fence/pool history from the warmup or the
+        // previous provider.  Re-upload only the preserved visible frame.
+        gc.clear_pool();
+        if let Some((width, height, rgba)) = clean_snapshot {
+            s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
+        }
+        gc.clear_gpu_timers();
+        gc.clear_temporal_shader_storage();
+        log::info!(
+            "onnx-backend-clean-generation-boundary: backend={backend:?} bridge=retired gl_pool=cleared directml_rebuilt={} last_frame_preserved={} policy=match-stop-start-gpu-boundary",
+            directml_rebuilt,
+            s.last_tex.is_some()
+        );
+    }
+
+    // v828: the v827 fresh-WGC boundary is provider-wide, not RTMoSR- or
+    // image-stage-specific. Field logs showed that the fix removes the
+    // persistent slow state for ordinary NeoAMD ONNX while keeping the same
+    // provider/model session resident. Interpolation chains already cross a
+    // hard temporal-ownership boundary above (worker stopped, pending/history
+    // cleared, generation advanced), and restart_wgc_epoch_for_backend_switch()
+    // restores queue mode from the committed chain. Apply the same real
+    // Stop->Start capture epoch to RIFE/DRBA/TemporalFix/mixed ONNX chains too,
+    // so no DirectML <-> NeoAMD ONNX switch can resume from a cached pre-switch
+    // frame or an inherited WGC cadence epoch. TensorRT/CUDA policy is unchanged.
+    let wgc_epoch_restarted = matches!(
+        (previous, backend),
+        (OnnxBackendPreference::DirectML, OnnxBackendPreference::NeoAMD)
+            | (OnnxBackendPreference::NeoAMD, OnnxBackendPreference::DirectML)
+    ) && restart_wgc_epoch_for_backend_switch(s);
+
+    s.chain_reprocess_pending = !wgc_epoch_restarted && !s.frame.data.is_empty();
     s.smooth_content_signature = None;
     s.smooth_content_duplicates = 0;
     s.smooth_content_seq = 0;
@@ -5422,9 +6304,49 @@ fn switch_onnx_backend(
     s.smooth_content_pattern_hits = 0;
     s.smooth_content_candidate_gaps.clear();
     s.smooth_content_24p_detected = false;
-    s.source.set_queue_enabled(s.chain.has_interp());
+
+    // v761/v813 fallback for providers/routes where v828 does not replace WGC.
+    // For every DirectML <-> NeoAMD ONNX route, the new WGC source already
+    // defines a clean sequence/timing epoch; do not discard its first fresh
+    // frame or re-enable an old queue on top of it.
+    if !wgc_epoch_restarted {
+        s.source.set_queue_enabled(false);
+        s.source.discard_pending_frames();
+        s.source.set_queue_enabled(s.chain.has_interp());
+        log::debug!("onnx-backend-capture-boundary: action=discard-pending-frames-to-current-seq");
+    } else {
+        log::debug!("onnx-backend-capture-boundary: action=new-wgc-epoch first-frame=fresh cached-reprocess=false");
+    }
+    s.cadence.reset();
+    s.smooth_pacer.reset();
+    s.paced_present_deadline = None;
+    s.flow_output_cadence.reset();
+    s.interp_present_deadline = None;
+    s.present_cadence = PresentCadence::default();
+    s.last_compute_ms = 0.0;
+    s.last_present_block_ms = 0.0;
+    s.last_present_call_ms = 0.0;
+    s.last_pacer_wait_ms = 0.0;
+    s.gpu_interp_pair_id = 0;
+    s.gpu_interp_active_logged = false;
+    s.drba_lookahead_needs_anchor = true;
+    s.drba_diag_present_seq = 0;
+    s.drba_diag_last_semantic_ts_100ns = None;
+    log::info!(
+        "backend-switch-runtime-rearm: backend={backend:?} factor=x{} phases={} queue=flushed cadence=reset timing=reset pair_id=0",
+        interp_factor.clamp(2, 5),
+        interp_factor.clamp(2, 5).saturating_sub(1)
+    );
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
+    // v815: provider statistics use sparse probes, so skipping six probes can
+    // hide the row for several seconds.  reset() already removes the old
+    // backend EWMA; expose the first normal sample and settle quickly.
+    metrics.arm_stage_cold_skip(0);
+    metrics.arm_stage_fast_settle(6);
+    log::debug!(
+        "onnx-backend-stats-settle: backend={backend:?} samples=6 cold_skip=0 policy=first-sampled-frame-fast-ewma-50"
+    );
 
     {
         let mut state = status.lock().unwrap();
@@ -5433,12 +6355,14 @@ fn switch_onnx_backend(
         state.onnx_backend_switching = false;
         state.onnx_backend_error = None;
         state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
+        state.onnx_neoamd_stages = usage.neoamd;
         state.onnx_tensorrt_stages = usage.tensorrt;
         state.onnx_cuda_stages = usage.cuda;
         state.onnx_directml_fallbacks = usage.directml_fallback;
     }
     log::info!(
-        "onnx-backend-switch-commit: active={backend:?} tensorrt={} cuda={} directml={} fallback_count={}",
+        "onnx-backend-switch-commit: active={backend:?} neoamd={} tensorrt={} cuda={} directml={} fallback_count={} phase=provider-ready-await-present",
+        usage.neoamd,
         usage.tensorrt,
         usage.cuda,
         usage.directml,
@@ -5558,6 +6482,338 @@ fn should_detach_gpu_x3_midpoint(
     mid.w() == dw && mid.h() == dh
 }
 
+
+fn should_detach_directml_drba_midpoint(
+    overlay: &OverlayWindow,
+    s: &Session,
+    pending: &PendingGpuInterp,
+    mid: GpuTex,
+) -> bool {
+    // v806 ownership fallback retained for drivers/resources that do not enter
+    // v807's bound-storage snapshot lane. v807 no longer assumes that a later
+    // resample makes the external NCHW read itself safe: the local snapshot is
+    // selected earlier, from the actual per-resource import state.
+    if !pending.directml_drba_v782
+        || s.chain.stage_count() != 1
+        || pending.post_chain_start != s.chain.stage_count()
+    {
+        return false;
+    }
+    let desired_overlay = overlay_geometry(s, overlay);
+    let (vw, vh) = (desired_overlay.2, desired_overlay.3);
+    let display_aspect = session_presentation_aspect(s, (mid.w(), mid.h()));
+    let (dw, dh) = fit_aspect_inside(display_aspect, (vw, vh));
+    mid.w() == dw && mid.h() == dh
+}
+
+/// Release every frame waiting in the v802 one-pair DirectML DRBA presentation FIFO.
+/// The FIFO owns detached GL textures; provider/history textures are never
+/// stored here, so recycling these handles cannot invalidate a live DRBA job.
+fn recycle_drba_present_queue(gc: &mut GlContext, s: &mut Session) {
+    while let Some(queued) = s.drba_present_queue.pop_front() {
+        gc.recycle(queued.tex);
+    }
+    s.drba_present_deadline = None;
+}
+
+/// Textures that must survive a `release_frame()` while a detached DRBA frame
+/// is being presented.  Presentation is intentionally decoupled from provider
+/// execution, so a render tick can coexist with both a queued prior pair and a
+/// new pair whose history/output imports are still alive.
+fn drba_present_keep_textures(s: &Session) -> Vec<GpuTex> {
+    let mut keep = Vec::new();
+    keep.extend(s.drba_present_queue.iter().map(|queued| queued.tex));
+    keep.extend(s.gpu_interp_hist.iter().map(|frame| frame.tex));
+    if let Some(pending) = s.gpu_interp_pending.as_ref() {
+        keep.push(pending.real_tex);
+        keep.extend(pending.history_keep.iter().copied());
+        keep.extend(
+            pending
+                .ready_outputs
+                .iter()
+                .flatten()
+                .map(|ready| ready.tex),
+        );
+    }
+    if let Some(pack) = s.gpu_interp_pack_pending.as_ref() {
+        keep.push(pack.pending.real_tex);
+        keep.extend(pack.pending.history_keep.iter().copied());
+        keep.extend(
+            pack.pending
+                .ready_outputs
+                .iter()
+                .flatten()
+                .map(|ready| ready.tex),
+        );
+    }
+    keep
+}
+
+/// Move one completed DirectML DRBA pair out of provider-owned output slots and
+/// into independent GL textures.  No midpoint is omitted.  One `glFinish`
+/// closes all identity copies before the provider is allowed to reuse its
+/// persistent output resources for the next source pair.
+fn queue_directml_drba_midpoint_for_present(
+    gc: &mut GlContext,
+    s: &mut Session,
+    pending: &PendingGpuInterp,
+    index: usize,
+) -> std::result::Result<(), String> {
+    let Some(ready) = pending.ready_outputs.get(index).and_then(|ready| *ready) else {
+        return Err(format!(
+            "DirectML DRBA output {} completed without an imported texture",
+            index
+        ));
+    };
+    let detached = crate::render::scaler::detach_identity(gc, ready.tex).map_err(|error| {
+        format!(
+            "DirectML DRBA presentation detach failed for midpoint {}: {error:#}",
+            index
+        )
+    })?;
+    let now = Instant::now();
+    s.drba_present_queue.push_back(DrbaQueuedPresent {
+        generation: pending.generation,
+        pair_id: pending.pair_id,
+        slot_index: index,
+        slot_count: pending.timesteps.len() + usize::from(pending.present_real),
+        factor: pending.factor,
+        tex: detached,
+        out_size: pending.out_size,
+        chain_start: ready.chain_start,
+        preprocessed_chain_ms: ready.preprocessed_chain_ms,
+        timing: FrameTiming::from_interpolated(
+            &pending.frame,
+            pending.start_source_time_100ns,
+            pending.timesteps[index],
+            now,
+        ),
+        frame_seq: pending.frame.seq,
+        is_real: false,
+        output_period: pending.output_period,
+        output_ratio: pending.factor.clamp(2, 5) as f64,
+    });
+    Ok(())
+}
+
+/// Close one DirectML DRBA provider pair after every midpoint has already been
+/// detached and enqueued.  The real endpoint is detached here as the final
+/// display-owned frame. One `glFinish` then closes all outstanding identity
+/// copies before persistent provider output slots can be reused by the next
+/// source pair.
+fn finalize_directml_drba_pair_for_present(
+    gc: &mut GlContext,
+    s: &mut Session,
+    pending: &mut PendingGpuInterp,
+) -> std::result::Result<usize, String> {
+    let mut added = 0usize;
+    if pending.present_real {
+        let detached_real = crate::render::scaler::detach_identity(gc, pending.real_tex)
+            .map_err(|error| {
+                format!(
+                    "DirectML DRBA presentation detach failed for real endpoint: {error:#}"
+                )
+            })?;
+        let now = Instant::now();
+        s.drba_present_queue.push_back(DrbaQueuedPresent {
+            generation: pending.generation,
+            pair_id: pending.pair_id,
+            slot_index: pending.timesteps.len(),
+            slot_count: pending.timesteps.len() + 1,
+            factor: pending.factor,
+            tex: detached_real,
+            out_size: pending.out_size,
+            chain_start: pending.post_chain_start,
+            preprocessed_chain_ms: 0.0,
+            timing: FrameTiming::from_frame(&pending.frame, now),
+            frame_seq: pending.frame.seq,
+            is_real: true,
+            output_period: pending.output_period,
+            output_ratio: pending.factor.clamp(2, 5) as f64,
+        });
+        added = 1;
+    }
+
+    // The detached presentation textures are GL-owned. Finish all copy draws
+    // before releasing imported provider views and allowing the next DML pair
+    // to reuse its persistent output resources.
+    gc.finish();
+    for ready in pending.ready_outputs.iter_mut().filter_map(Option::take) {
+        gc.recycle(ready.tex);
+    }
+    Ok(added)
+}
+
+fn directml_drba_pipeline_busy(s: &Session) -> bool {
+    !s.drba_present_queue.is_empty()
+        || s
+            .gpu_interp_pending
+            .as_ref()
+            .is_some_and(|pending| pending.directml_drba)
+        || s
+            .gpu_interp_pack_pending
+            .as_ref()
+            .is_some_and(|pack| pack.pending.directml_drba)
+}
+
+fn short_wait_for_directml_drba_slot(s: &Session) {
+    if let Some(deadline) = s.drba_present_deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining > Duration::from_micros(750) {
+            std::thread::sleep(remaining.min(Duration::from_millis(1)));
+        } else {
+            std::thread::yield_now();
+        }
+    } else {
+        std::thread::yield_now();
+    }
+}
+
+/// Present at most one queued DirectML DRBA output and never sleep for the full
+/// slot here.  v802 keeps only one B->C source interval in flight: later mids of
+/// that same pair may continue computing while the render loop presents earlier
+/// outputs, but the next source pair is backpressured until this pair's real
+/// endpoint has been shown.  If provider work is late, the next deadline is
+/// anchored to the actual present so processing shortfall becomes ordinary lower
+/// output fps rather than a burst/catch-up pattern.
+#[allow(clippy::too_many_arguments)]
+fn service_directml_drba_present_queue(
+    gc: &mut GlContext,
+    overlay: &mut OverlayWindow,
+    s: &mut Session,
+    metrics: &Metrics,
+    status: &Arc<Mutex<Status>>,
+    downscaler: crate::render::scaler::Kernel,
+) -> bool {
+    while s
+        .drba_present_queue
+        .front()
+        .is_some_and(|queued| queued.generation != s.interp_generation)
+    {
+        if let Some(stale) = s.drba_present_queue.pop_front() {
+            log::info!(
+                "dml-drba-present-stale: pair={} generation={} active_generation={} slot={}/{} action=recycle",
+                stale.pair_id,
+                stale.generation,
+                s.interp_generation,
+                stale.slot_index + 1,
+                stale.slot_count
+            );
+            gc.recycle(stale.tex);
+        }
+    }
+    let Some(front) = s.drba_present_queue.front() else {
+        s.drba_present_deadline = None;
+        return false;
+    };
+
+    // Each queued DRBA output belongs to one already-established B -> C
+    // source interval.  Keep that pair's clock immutable while it is waiting
+    // for display; a later global cadence update must not stretch/compress an
+    // older queued pair.
+    let output_period = front.output_period.clamp(1.0 / 240.0, 0.2);
+    let period = Duration::from_secs_f64(output_period);
+    let now = Instant::now();
+    if let Some(deadline) = s.drba_present_deadline {
+        if now < deadline {
+            return false;
+        }
+    }
+
+    let queued = s
+        .drba_present_queue
+        .pop_front()
+        .expect("DRBA presentation queue front");
+    let keep = drba_present_keep_textures(s);
+    let captures = if queued.is_real {
+        let delivered = s.source.delivered();
+        let captures = delivered.saturating_sub(s.metric_seq) as u32;
+        s.metric_seq = delivered;
+        captures
+    } else {
+        0
+    };
+    let t0 = Instant::now();
+    if queued.preprocessed_chain_ms > 0.0 {
+        process_and_present_from_impl(
+            gc,
+            overlay,
+            s,
+            metrics,
+            status,
+            queued.tex,
+            queued.out_size,
+            metrics.detailed_enabled() && queued.frame_seq % 30 == 0,
+            t0,
+            captures,
+            Some(queued.timing),
+            &keep,
+            downscaler,
+            queued.chain_start,
+            true,
+            queued.preprocessed_chain_ms,
+            false,
+        );
+    } else {
+        process_and_present_from(
+            gc,
+            overlay,
+            s,
+            metrics,
+            status,
+            queued.tex,
+            queued.out_size,
+            metrics.detailed_enabled() && queued.frame_seq % 30 == 0,
+            t0,
+            captures,
+            Some(queued.timing),
+            &keep,
+            downscaler,
+            queued.chain_start,
+        );
+    }
+
+    // Always schedule from the actual present. If this output was late, do not
+    // attempt to catch up by emitting several frames back-to-back.
+    s.drba_present_deadline = Some(s.last_present_started + period);
+    if !s.gpu_interp_active_logged {
+        log::info!(
+            "interp-gpu-path-active: backend=DirectML kind=Drba worker=onepair-present-fifo first_presented_pair={}",
+            queued.pair_id
+        );
+        s.gpu_interp_active_logged = true;
+    }
+    if queued.pair_id < 3 || queued.pair_id % 120 == 0 {
+        log::info!(
+            "dml-drba-present-fifo: pair={} generation={} slot={}/{} kind={} factor=x{} queue_remaining={} period_ms={:.2} policy=onepair-central-clock",
+            queued.pair_id,
+            queued.generation,
+            queued.slot_index + 1,
+            queued.slot_count,
+            if queued.is_real { "real" } else { "mid" },
+            queued.factor,
+            s.drba_present_queue.len(),
+            output_period * 1000.0
+        );
+    }
+    true
+}
+
+
+fn drba_v782_semantic_ts_100ns(
+    start: Option<i64>,
+    end: Option<i64>,
+    phase: f32,
+) -> Option<i64> {
+    match (start, end) {
+        (Some(a), Some(b)) if b > a => {
+            let t = phase.clamp(0.0, 1.0) as f64;
+            Some(a + (((b - a) as f64) * t).round() as i64)
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_gpu_interp_stream(
     gc: &mut GlContext,
@@ -5590,6 +6846,17 @@ fn drain_gpu_interp_stream(
         }
         return false;
     };
+    if pending.directml_drba {
+        // DirectML DRBA no longer presents provider outputs from this drain.
+        // Pull every result already available so a completed pair can be
+        // detached/enqueued in one render iteration, then release provider
+        // ownership immediately for the next source pair.
+        if let Some(worker) = s.gpu_interp_worker.as_ref() {
+            while let Ok(result) = worker.result_rx.try_recv() {
+                completed.push(result);
+            }
+        }
+    }
 
     let mut progressed = false;
     let mut failure: Option<String> = None;
@@ -5678,6 +6945,7 @@ fn drain_gpu_interp_stream(
                             }
                             ready = Some(ReadyGpuInterpOutput {
                                 tex: texture,
+                                local_snapshot: false,
                                 chain_start: stage_count,
                                 preprocessed_chain_ms: direct_ms,
                             });
@@ -5718,11 +6986,34 @@ fn drain_gpu_interp_stream(
         }
 
         if ready.is_none() {
+            let local_snapshot = slot.directml_drba_snapshot_candidate
+                && slot.fp16
+                && !slot.preserve_float
+                && gc.external_import_uses_bound_storage_fallback(slot.key);
             match crate::render::onnx_stage::OnnxStage::finish_prepared_interp_gpu_output(gc, slot)
             {
                 Ok(texture) => {
+                    if local_snapshot
+                        && (pending.pair_id < 3 || pending.pair_id % 120 == 0)
+                    {
+                        log::info!(
+                            "dml-drba-v807-local-snapshot: pair={} generation={} slot={}/{} factor=x{} key={} visible={}x{} padded={}x{} bound_storage_fallback=true post_stages={} path=external-nchw-f16->local-gl-ssbo->rgba8 sync=single-glFinish",
+                            pending.pair_id,
+                            pending.generation,
+                            done.index + 1,
+                            pending.timesteps.len(),
+                            pending.factor,
+                            slot.key,
+                            slot.size.0,
+                            slot.size.1,
+                            slot.padded.0,
+                            slot.padded.1,
+                            stage_count.saturating_sub(pending.post_chain_start),
+                        );
+                    }
                     ready = Some(ReadyGpuInterpOutput {
                         tex: texture,
+                        local_snapshot,
                         chain_start: pending.post_chain_start,
                         preprocessed_chain_ms: 0.0,
                     });
@@ -5734,6 +7025,26 @@ fn drain_gpu_interp_stream(
             }
         }
         if let Some(ready) = ready {
+            if pending.directml_drba_v782 {
+                let phase = pending.timesteps.get(done.index).copied().unwrap_or(0.0);
+                let semantic_ts = drba_v782_semantic_ts_100ns(
+                    pending.start_source_time_100ns,
+                    pending.frame.source_time_100ns,
+                    phase,
+                );
+                if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                    log::info!(
+                        "dml-drba-v782-output-ready: pair={} generation={} slot={}/{} phase={:.3} semantic_ts={:?} run_ms={:.2}",
+                        pending.pair_id,
+                        pending.generation,
+                        done.index + 1,
+                        pending.timesteps.len(),
+                        phase,
+                        semantic_ts,
+                        done.run_ms
+                    );
+                }
+            }
             if let Some(existing) = pending.ready_outputs[done.index].replace(ready) {
                 gc.recycle(existing.tex);
             }
@@ -5768,8 +7079,165 @@ fn drain_gpu_interp_stream(
                 .disable_interp_gpu_path(&reason);
         }
         recycle_pending_gpu_outputs(gc, &mut pending);
+        if pending.directml_drba {
+            recycle_drba_present_queue(gc, s);
+        }
         while let Some(old) = s.gpu_interp_hist.pop_front() {
             gc.recycle(old.tex);
+        }
+        return true;
+    }
+
+    if pending.directml_drba {
+        // Stage each completed midpoint immediately.  Provider slots are
+        // distinct for DirectML DRBA, so slot N can be copied into an owned GL
+        // texture while the worker computes slot N+1.  This keeps the old
+        // provider view alive until pair finalization but makes the display
+        // frame independently available to the nonblocking presentation FIFO.
+        while pending.next_output_index < pending.timesteps.len() {
+            let index = pending.next_output_index;
+            if pending.ready_outputs[index].is_none() {
+                break;
+            }
+            if let Err(reason) =
+                queue_directml_drba_midpoint_for_present(gc, s, &pending, index)
+            {
+                log::error!(
+                    "dml-drba-present-stage-error: pair={} generation={} slot={}/{} reason={} action=disable-gpu-path",
+                    pending.pair_id,
+                    pending.generation,
+                    index + 1,
+                    pending.timesteps.len(),
+                    reason
+                );
+                pending
+                    .stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .disable_interp_gpu_path(&reason);
+                recycle_drba_present_queue(gc, s);
+                recycle_pending_gpu_outputs(gc, &mut pending);
+                while let Some(old) = s.gpu_interp_hist.pop_front() {
+                    gc.recycle(old.tex);
+                }
+                return true;
+            }
+            pending.next_output_index += 1;
+            progressed = true;
+            if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                log::debug!(
+                    "dml-drba-mid-staged: pair={} generation={} slot={}/{} queue={} policy=detach-as-provider-completes",
+                    pending.pair_id,
+                    pending.generation,
+                    index + 1,
+                    pending.timesteps.len(),
+                    s.drba_present_queue.len()
+                );
+            }
+        }
+
+        let pair_complete = pending.completed_outputs >= pending.timesteps.len()
+            && pending.next_output_index >= pending.timesteps.len();
+        if !pair_complete {
+            let wait_budget = Duration::from_millis(2);
+            s.gpu_interp_pending = Some(pending);
+            if let Some(worker) = s.gpu_interp_worker.as_ref() {
+                if let Some(result) = wait_for_gpu_interp_result(overlay, worker, wait_budget) {
+                    s.gpu_interp_result_stash.push_back(result);
+                    return true;
+                }
+            }
+            return progressed;
+        }
+
+        // Every synthetic phase is already queued. Add the real endpoint and
+        // close the GL copy boundary before allowing the provider's persistent
+        // output resources to be reused for the next source pair.
+        let real_added = match finalize_directml_drba_pair_for_present(gc, s, &mut pending) {
+            Ok(count) => count,
+            Err(reason) => {
+                log::error!(
+                    "dml-drba-present-finalize-error: pair={} generation={} reason={} action=disable-gpu-path",
+                    pending.pair_id,
+                    pending.generation,
+                    reason
+                );
+                pending
+                    .stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .disable_interp_gpu_path(&reason);
+                recycle_drba_present_queue(gc, s);
+                recycle_pending_gpu_outputs(gc, &mut pending);
+                while let Some(old) = s.gpu_interp_hist.pop_front() {
+                    gc.recycle(old.tex);
+                }
+                return true;
+            }
+        };
+        let staged_count = pending.timesteps.len() + real_added;
+
+        if pending.is_drba {
+            observe_drba_midpoint_cost(
+                &mut s.drba_midpoint_ema_ms,
+                &mut s.drba_perf_samples,
+                pending.run_ms_total,
+                pending.timesteps.len(),
+            );
+            if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                log::info!(
+                    "drba-realtime-profile: pair={} requested=x{} generated_mids={} inference_ms={:.2} ema_mid_ms={:.2} source_period_ms={:.2} dropped_total={}",
+                    pending.pair_id,
+                    pending.factor,
+                    pending.timesteps.len(),
+                    pending.run_ms_total,
+                    s.drba_midpoint_ema_ms,
+                    pending.source_period * 1000.0,
+                    s.drba_dropped_midpoints
+                );
+            }
+        }
+        if metrics.detailed_enabled() {
+            metrics.probe(&pending.metric_name, "onnx", pending.run_ms_total);
+        }
+        if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+            log::info!(
+                "interp-gpu-pair-staged: pair={} generation={} mids={} staged_outputs={} inference_ms={:.2} provider_wall_ms={:.2} present_queue={} pacing=directml-drba-onepair-fifo",
+                pending.pair_id,
+                pending.generation,
+                pending.timesteps.len(),
+                staged_count,
+                pending.run_ms_total,
+                pending.submitted_at.elapsed().as_secs_f64() * 1000.0,
+                s.drba_present_queue.len()
+            );
+        }
+        if crate::logging::diagnostics_enabled() {
+            let residency = crate::render::onnx_stage::interp_residency_snapshot();
+            if residency.gpu_output_frames > 0
+                && residency.gpu_output_frames % 300 < pending.timesteps.len() as u64
+            {
+                log::debug!(
+                    "interp-gpu-residency: input_frames={} output_frames={} cpu_readbacks={} cpu_uploads={} cpu_pack_frames={} cpu_output_conversions={} cpu_fallback_frames={} violations={} result={}",
+                    residency.gpu_input_frames,
+                    residency.gpu_output_frames,
+                    residency.cpu_frame_readbacks,
+                    residency.cpu_frame_uploads,
+                    residency.cpu_pack_frames,
+                    residency.cpu_output_conversions,
+                    residency.cpu_fallback_frames,
+                    residency.violations,
+                    if residency.cpu_frame_readbacks == 0
+                        && residency.cpu_frame_uploads == 0
+                        && residency.cpu_pack_frames == 0
+                        && residency.cpu_output_conversions == 0
+                    {
+                        "full"
+                    } else {
+                        "violation"
+                    }
+                );
+            }
         }
         return true;
     }
@@ -5778,22 +7246,157 @@ fn drain_gpu_interp_stream(
         let index = pending.next_output_index;
         if let Some(ready) = pending.ready_outputs[index].take() {
             let mut mid = ready.tex;
+            let local_snapshot = ready.local_snapshot;
             let mid_chain_start = ready.chain_start;
             let preprocessed_chain_ms = ready.preprocessed_chain_ms;
+            // DirectML DRBA multi-slot scheduling uses one persistent output resource per
+            // timestep. When DRBA is the final chain stage, the completed slot
+            // is already detached from the provider's *next* output resource.
+            // Release the next provider invocation before waiting for this
+            // slot's display phase so inference overlaps presentation pacing.
+            // v788 released only after the GL post submit, but the pacing wait
+            // occurs before that submit; at 1080p this serialized ~32 ms of
+            // inference with ~42 ms of display pacing and starved the WGC queue.
+            let provider_released_before_pacing = pending.directml_drba
+                && pending.cooperative_slots
+                && pending.permit_next_after_post_submit
+                && index + 1 < pending.timesteps.len()
+                && pending.post_chain_start >= s.chain.stages.len();
+            if provider_released_before_pacing {
+                if let Some(worker) = s.gpu_interp_worker.as_ref() {
+                    worker.permit_next_slot(pending.generation, pending.pair_id);
+                    if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                        log::debug!(
+                            "dml-drba-provider-overlap: pair={} generation={} slot={}/{} point=output-ready-before-present-wait",
+                            pending.pair_id,
+                            pending.generation,
+                            index + 1,
+                            pending.timesteps.len()
+                        );
+                    }
+                }
+            }
             let lead_s = gpu_interp_present_lead_s(
                 s.last_compute_ms,
                 s.last_present_block_ms,
                 pending.output_period,
             );
-            s.flow_output_cadence.wait_for_present_with_lead(
-                overlay,
-                pending.output_period,
-                vsync_on,
-                s.smooth_pacing,
-                lead_s,
-            );
+            // Preserve the original multiplier phase grid when adaptive DRBA
+            // has omitted a synthetic slot. A missing x5 t=0.4 frame must
+            // produce one actual 16.67ms gap between t=0.2 and t=0.6 at 120fps
+            // timing, not squeeze the surviving phases into adjacent 8.33ms
+            // presents. Present FPS therefore reports what was truly shown.
+            let current_phase_slot = drba_phase_slot(pending.timesteps[index], pending.factor);
+            let previous_phase_slot = if index == 0 {
+                0
+            } else {
+                drba_phase_slot(pending.timesteps[index - 1], pending.factor)
+            };
+            let slot_delta = current_phase_slot.saturating_sub(previous_phase_slot).max(1);
+            if pending.directml_drba {
+                // v800: never discard a completed DRBA midpoint merely because
+                // the provider finished a few milliseconds after its ideal
+                // source-time slot. v799 proved that 1080p x4 can generate all
+                // three mids in ~32 ms, but the fixed source-time deadline then
+                // classified every one of those valid frames as late and showed
+                // only the real endpoints. That produced ~24-30 fps even though
+                // the GPU had already done the interpolation work.
+                //
+                // Pace from the ACTUAL previous present instead. A midpoint that
+                // is ready early waits for one output slot; a midpoint that is
+                // ready late is presented immediately, in order, without a
+                // catch-up burst and without any interpolation bypass. This is
+                // the normal overload behaviour used by media pipelines: output
+                // cadence stretches to the available provider throughput while
+                // chronology remains strictly forward-only.
+                let slot_period = Duration::from_secs_f64(
+                    pending.output_period.max(1.0 / 240.0),
+                );
+                let deadline = s.last_present_started + slot_period;
+                let now = Instant::now();
+                if !vsync_on && now < deadline {
+                    wait_until_with_pump(overlay, deadline);
+                } else if now > deadline && (pending.pair_id < 3 || pending.pair_id % 120 == 0) {
+                    log::debug!(
+                        "dml-drba-gpu-provider-late-present: pair={} generation={} slot={}/{} phase={:.3} late_ms={:.2} action=present-in-order interpolation_preserved=true",
+                        pending.pair_id,
+                        pending.generation,
+                        index + 1,
+                        pending.timesteps.len(),
+                        pending.timesteps[index],
+                        now.duration_since(deadline).as_secs_f64() * 1000.0
+                    );
+                }
+            } else {
+                let skipped_slots = slot_delta.saturating_sub(1);
+                if s.smooth_pacing && !vsync_on && skipped_slots > 0 {
+                    s.flow_output_cadence.skip_present_slots(
+                        Instant::now(),
+                        pending.output_period,
+                        skipped_slots,
+                    );
+                }
+                s.flow_output_cadence.wait_for_present_with_lead(
+                    overlay,
+                    pending.output_period,
+                    vsync_on,
+                    s.smooth_pacing,
+                    lead_s,
+                );
+            }
 
-            if should_detach_gpu_x3_midpoint(overlay, s, &pending, mid) {
+
+
+            if should_detach_directml_drba_midpoint(overlay, s, &pending, mid) {
+                match crate::render::scaler::detach_identity(gc, mid) {
+                    Ok(detached) => {
+                        if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+                            if local_snapshot {
+                                log::info!(
+                                    "dml-drba-v808-double-isolation: pair={} generation={} slot={}/{} factor=x{} size={}x{} path=external-nchw-local-snapshot->rgba8->identity-f16 reason=bound-storage-plus-final-texture-lifetime",
+                                    pending.pair_id,
+                                    pending.generation,
+                                    index + 1,
+                                    pending.timesteps.len(),
+                                    pending.factor,
+                                    mid.w(),
+                                    mid.h()
+                                );
+                            } else {
+                                log::info!(
+                                    "dml-drba-v806-mid-detach: pair={} generation={} slot={}/{} factor=x{} size={}x{} path=gpu-identity-f16 reason=provider-owned-final-size",
+                                    pending.pair_id,
+                                    pending.generation,
+                                    index + 1,
+                                    pending.timesteps.len(),
+                                    pending.factor,
+                                    mid.w(),
+                                    mid.h()
+                                );
+                            }
+                        }
+                        mid = detached;
+                        // Complete the final texture ownership transfer before
+                        // permitting a later DRBA phase to recycle conversion/output
+                        // resources. v808 deliberately keeps this boundary even when
+                        // v807 already snapped the external NCHW tensor: the 1080p
+                        // x3 path proved that both isolation boundaries are required.
+                        gc.finish();
+                    }
+                    Err(error) => {
+                        pending.permit_next_after_post_submit = false;
+                        log::warn!(
+                            "dml-drba-v808-mid-detach-fallback: pair={} generation={} slot={}/{} factor=x{} local_snapshot={} reason={error:#}",
+                            pending.pair_id,
+                            pending.generation,
+                            index + 1,
+                            pending.timesteps.len(),
+                            pending.factor,
+                            local_snapshot
+                        );
+                    }
+                }
+            } else if should_detach_gpu_x3_midpoint(overlay, s, &pending, mid) {
                 match crate::render::scaler::detach_identity(gc, mid) {
                     Ok(detached) => {
                         if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
@@ -5808,19 +7411,9 @@ fn drain_gpu_interp_stream(
                             );
                         }
                         mid = detached;
-                        // Keep the same completion boundary used by v522, but
-                        // the detach target is now F16 to mirror a real GLSL
-                        // render pass. Complete this tiny handoff before the next
-                        // provider invocation so DML/TensorRT cannot contend with
-                        // the copy. Final back-buffer draw/SwapBuffers remains
-                        // overlapped.
                         gc.finish();
                     }
                     Err(error) => {
-                        // Without a detached texture, keep this pair on the
-                        // conservative post-present permit path so a failed
-                        // safety copy can never reintroduce the old output
-                        // lifetime race.
                         pending.permit_next_after_post_submit = false;
                         if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
                             log::warn!(
@@ -5850,6 +7443,7 @@ fn drain_gpu_interp_stream(
                     .map(|ready| ready.tex),
             );
             if pending.permit_next_after_post_submit
+                && !provider_released_before_pacing
                 && pending.cooperative_slots
                 && index + 1 < pending.timesteps.len()
             {
@@ -5900,7 +7494,8 @@ fn drain_gpu_interp_stream(
             }
             let last_present = s.last_present;
             let last_present_block_s = s.last_present_block_ms / 1000.0;
-            let phase_corrected = s.smooth_pacing
+            let phase_corrected = !pending.directml_drba
+                && s.smooth_pacing
                 && !vsync_on
                 && s.flow_output_cadence.observe_blocking_present(
                     s.last_present_started,
@@ -5920,6 +7515,46 @@ fn drain_gpu_interp_stream(
                 );
             }
             let presented_after = status.lock().unwrap().presented;
+            if pending.directml_drba_v782 && presented_after > presented_before {
+                let phase = pending.timesteps[index];
+                let semantic_ts = drba_v782_semantic_ts_100ns(
+                    pending.start_source_time_100ns,
+                    pending.frame.source_time_100ns,
+                    phase,
+                );
+                let previous = s.drba_diag_last_semantic_ts_100ns;
+                let monotonic = match (previous, semantic_ts) {
+                    (Some(prev), Some(cur)) => cur > prev,
+                    _ => true,
+                };
+                s.drba_diag_present_seq = s.drba_diag_present_seq.saturating_add(1);
+                log::info!(
+                    "dml-drba-v782-present: present_seq={} pair={} generation={} kind=mid slot={}/{} phase={:.3} semantic_ts={:?} previous_semantic_ts={:?} monotonic={}",
+                    s.drba_diag_present_seq,
+                    pending.pair_id,
+                    pending.generation,
+                    index + 1,
+                    pending.timesteps.len(),
+                    phase,
+                    semantic_ts,
+                    previous,
+                    monotonic
+                );
+                if monotonic {
+                    if semantic_ts.is_some() {
+                        s.drba_diag_last_semantic_ts_100ns = semantic_ts;
+                    }
+                } else {
+                    log::error!(
+                        "dml-drba-v782-present-order-violation: pair={} generation={} kind=mid phase={:.3} semantic_ts={:?} previous_semantic_ts={:?}",
+                        pending.pair_id,
+                        pending.generation,
+                        phase,
+                        semantic_ts,
+                        previous
+                    );
+                }
+            }
             if !s.gpu_interp_active_logged && presented_after > presented_before {
                 let stage = pending.stage.lock().unwrap();
                 log::info!(
@@ -5931,6 +7566,9 @@ fn drain_gpu_interp_stream(
                 s.gpu_interp_active_logged = true;
             }
             pending.next_output_index += 1;
+            if pending.directml_drba || pending.directml_drba_v782 {
+                pending.presented_mid_count = pending.presented_mid_count.saturating_add(1);
+            }
             // Multi-slot jobs normally release from process_and_present_from
             // after post-chain submission, overlapping only compositor wait.
             if pending.cooperative_slots
@@ -5983,6 +7621,31 @@ fn drain_gpu_interp_stream(
         return false;
     }
 
+    // v785: learn actual provider cost per generated DRBA midpoint. The next
+    // source pair uses this measurement only to decide which original phase
+    // slots can really be computed; it never rewrites the selected x2..x5
+    // multiplier and never fabricates target FPS.
+    if pending.is_drba {
+        observe_drba_midpoint_cost(
+            &mut s.drba_midpoint_ema_ms,
+            &mut s.drba_perf_samples,
+            pending.run_ms_total,
+            pending.timesteps.len(),
+        );
+        if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
+            log::info!(
+                "drba-realtime-profile: pair={} requested=x{} generated_mids={} inference_ms={:.2} ema_mid_ms={:.2} source_period_ms={:.2} dropped_total={}",
+                pending.pair_id,
+                pending.factor,
+                pending.timesteps.len(),
+                pending.run_ms_total,
+                s.drba_midpoint_ema_ms,
+                pending.source_period * 1000.0,
+                s.drba_dropped_midpoints
+            );
+        }
+    }
+
     if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
         // Diagnostics only: keep the proven v349e timing path unchanged.
         // These values let us compare x4/x5 cadence without feeding any
@@ -5993,15 +7656,24 @@ fn drain_gpu_interp_stream(
             pending.output_period,
         ) * 1000.0;
         log::info!(
-            "interp-gpu-stream-pair: pair={} generation={} unique_mids={} phases={:?} inference_ms={:.2} wall_ms={:.2} real_endpoint={} target_fps={:.2} raw_present_block_ms={:.2} raw_lead_ms={:.2}",
+            "interp-gpu-stream-pair: pair={} generation={} unique_mids={} presented_mids={} late_present_drops={} phases={:?} inference_ms={:.2} wall_ms={:.2} real_endpoint={} target_fps={:.2} pacing={} raw_present_block_ms={:.2} raw_lead_ms={:.2}",
             pending.pair_id,
             pending.generation,
             pending.timesteps.len(),
+            pending.presented_mid_count,
+            pending.late_present_drops,
             pending.timesteps,
             pending.run_ms_total,
             pending.submitted_at.elapsed().as_secs_f64() * 1000.0,
             pending.present_real,
             1.0 / pending.output_period.max(1e-6),
+            if pending.directml_drba {
+                "directml-drba-gpu-provider-paced"
+            } else if pending.directml_drba_v782 {
+                "directml-drba-v782-cooperative"
+            } else {
+                "provider-default"
+            },
             s.last_present_block_ms,
             raw_lead_ms
         );
@@ -6017,17 +7689,54 @@ fn drain_gpu_interp_stream(
             s.last_present_block_ms,
             pending.output_period,
         );
-        s.flow_output_cadence.wait_for_present_with_lead(
-            overlay,
-            pending.output_period,
-            vsync_on,
-            s.smooth_pacing,
-            lead_s,
-        );
+        let last_phase_slot = pending
+            .timesteps
+            .last()
+            .copied()
+            .map(|t| drba_phase_slot(t, pending.factor))
+            .unwrap_or(0);
+        let real_slot_delta = (pending.factor as usize)
+            .saturating_sub(last_phase_slot)
+            .max(1);
+        if pending.directml_drba {
+            // Keep the REAL endpoint one output slot after the last generated
+            // midpoint. v799 anchored the endpoint to the original source tick;
+            // when provider startup/interop added a few milliseconds this could
+            // squeeze the final gap to almost zero. Chaining from the actual
+            // previous present makes overload look like ordinary lower-fps video
+            // rather than a short/long burst pattern.
+            let slot_period = Duration::from_secs_f64(
+                pending.output_period.max(1.0 / 240.0),
+            );
+            let deadline = s.last_present_started + slot_period;
+            let now = Instant::now();
+            if !vsync_on && now < deadline {
+                wait_until_with_pump(overlay, deadline);
+            }
+        } else {
+            if s.smooth_pacing && !vsync_on {
+                let skipped_before_real = real_slot_delta.saturating_sub(1);
+                if skipped_before_real > 0 {
+                    s.flow_output_cadence.skip_present_slots(
+                        Instant::now(),
+                        pending.output_period,
+                        skipped_before_real,
+                    );
+                }
+            }
+            s.flow_output_cadence.wait_for_present_with_lead(
+                overlay,
+                pending.output_period,
+                vsync_on,
+                s.smooth_pacing,
+                lead_s,
+            );
+        }
         let now = Instant::now();
         let delivered = s.source.delivered();
         let captures = delivered.saturating_sub(s.metric_seq) as u32;
         s.metric_seq = delivered;
+        let drba_real_presented_before = status.lock().unwrap().presented;
         process_and_present_from(
             gc,
             overlay,
@@ -6044,9 +7753,44 @@ fn drain_gpu_interp_stream(
             downscaler,
             pending.post_chain_start,
         );
+        let drba_real_presented_after = status.lock().unwrap().presented;
+        if pending.directml_drba_v782 && drba_real_presented_after > drba_real_presented_before {
+            let semantic_ts = pending.frame.source_time_100ns;
+            let previous = s.drba_diag_last_semantic_ts_100ns;
+            let monotonic = match (previous, semantic_ts) {
+                (Some(prev), Some(cur)) => cur > prev,
+                _ => true,
+            };
+            s.drba_diag_present_seq = s.drba_diag_present_seq.saturating_add(1);
+            log::info!(
+                "dml-drba-v782-present: present_seq={} pair={} generation={} kind=real slot={}/{} phase=1.000 semantic_ts={:?} previous_semantic_ts={:?} monotonic={}",
+                s.drba_diag_present_seq,
+                pending.pair_id,
+                pending.generation,
+                pending.timesteps.len() + 1,
+                pending.timesteps.len() + 1,
+                semantic_ts,
+                previous,
+                monotonic
+            );
+            if monotonic {
+                if semantic_ts.is_some() {
+                    s.drba_diag_last_semantic_ts_100ns = semantic_ts;
+                }
+            } else {
+                log::error!(
+                    "dml-drba-v782-present-order-violation: pair={} generation={} kind=real semantic_ts={:?} previous_semantic_ts={:?}",
+                    pending.pair_id,
+                    pending.generation,
+                    semantic_ts,
+                    previous
+                );
+            }
+        }
         let last_present = s.last_present;
         let last_present_block_s = s.last_present_block_ms / 1000.0;
-        let _ = s.smooth_pacing
+        let _ = !pending.directml_drba
+            && s.smooth_pacing
             && !vsync_on
             && s.flow_output_cadence.observe_blocking_present(
                 s.last_present_started,
@@ -6110,6 +7854,26 @@ fn apply_interp_factor_now(
         // alive.  This mirrors the clean part of Stop/Start without flashing
         // or dropping GPU residency for the rest of the application.
         if factor_changed {
+            // Cancel every old-factor ownership object before retiring bridges.
+            // v761 deferred the command while any pair was in flight; NeoAMD's
+            // continuous pipeline could therefore defer forever. v763 makes the
+            // transition deterministic by discarding that one stale pair.
+            if let Some(pack) = s.gpu_interp_pack_pending.take() {
+                gc.cancel_commands_fence(pack.fence);
+            }
+            if let Some(mut pending) = s.gpu_interp_pending.take() {
+                recycle_pending_gpu_outputs(gc, &mut pending);
+            }
+            recycle_drba_present_queue(gc, s);
+            // Drop both interpolation workers. The CPU-visible worker may still
+            // have jobs queued with the old phase vector even when the GPU
+            // cooperative worker is already idle. Stop/Start naturally drops
+            // both, so a live multiplier change must do the same.
+            s.interp_worker = None;
+            s.interp_pending = None;
+            s.interp_post_warm = false;
+            s.interp_last_tick = None;
+            s.interp_tail = None;
             if let Some(mut worker) = s.gpu_interp_worker.take() {
                 let _ = worker.shutdown();
             }
@@ -6125,6 +7889,14 @@ fn apply_interp_factor_now(
                 stage.reset_interp_pack_cache();
             }
             s.gpu_interp_pair_id = 0;
+            s.drba_lookahead_needs_anchor = true;
+            s.drba_diag_present_seq = 0;
+            s.drba_diag_last_semantic_ts_100ns = None;
+            s.drba_midpoint_ema_ms = 0.0;
+            s.drba_perf_samples = 0;
+            s.drba_compute_credit_ms = 0.0;
+            s.drba_phase_rotation = 0;
+            s.drba_dropped_midpoints = 0;
             // Old x4 present/GL-tail timings are not valid preparation hints
             // for the shorter x5 slot (and vice versa).  Starting those hints
             // clean is what Stop/Start already does.
@@ -6139,6 +7911,18 @@ fn apply_interp_factor_now(
                 previous,
                 next
             );
+            // Drop any source frames already queued under the old output
+            // period. This keeps x2/x3/x4/x5 changes from spending several
+            // pairs draining stale cadence before the requested multiplier is
+            // visibly active. WGC itself remains alive.
+            s.source.set_queue_enabled(false);
+            s.source.set_queue_enabled(s.chain.has_interp());
+            s.cadence.reset();
+            log::info!(
+                "interp-factor-source-rearm: factor=x{} phases={} queue=flushed cadence=reset",
+                next,
+                next.saturating_sub(1)
+            );
         }
 
         s.hist.clear();
@@ -6148,6 +7932,9 @@ fn apply_interp_factor_now(
         s.gpu_interp_result_stash.clear();
         s.gpu_interp_permit_after_post_submit = None;
         s.interp_generation = s.interp_generation.saturating_add(1);
+        s.drba_lookahead_needs_anchor = true;
+        s.drba_diag_present_seq = 0;
+        s.drba_diag_last_semantic_ts_100ns = None;
         s.flow_output_cadence.reset();
         s.interp_present_deadline = None;
         s.present_cadence = PresentCadence::default();
@@ -6373,6 +8160,7 @@ fn resume_provider_transition_after_interpolated_present(
     input.set_transition_suspended(false);
     s.provider_transition_input_suspended = false;
     s.provider_transition_input_suspended_since = None;
+    s.provider_transition_recovery_attempts = 0;
     s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
     log::info!(
         "provider-transition-ready: first-interpolated-frame-presented route={} input=resume-after-120ms",
@@ -6687,7 +8475,7 @@ fn engine_main(
             stop_drag_follower(&mut drag_follower);
             drag_session_epoch = None;
             stop_session(&mut session, &mut overlay, &mut gc, &status);
-            factory.retain_tensorrt_sessions_for_capture_restart();
+            factory.retain_optional_backend_sessions_for_capture_restart();
             // Keep Start locked until the WakeForStop token reaches the head
             // of the queue. Every command before that token predates Stop and
             // must not become live again if the user clicks Start quickly.
@@ -6821,7 +8609,7 @@ fn engine_main(
                     input.set_transition_suspended(false);
                     input.release();
                     stop_session(&mut session, &mut overlay, &mut gc, &status);
-                    factory.retain_tensorrt_sessions_for_capture_restart();
+                    factory.retain_optional_backend_sessions_for_capture_restart();
                 }
                 Cmd::WakeForStop => {
                     // Idle engines wake inside recv_timeout before the loop's
@@ -6834,7 +8622,7 @@ fn engine_main(
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
-                        factory.retain_tensorrt_sessions_for_capture_restart();
+                        factory.retain_optional_backend_sessions_for_capture_restart();
                     }
                     status
                         .lock()
@@ -6943,7 +8731,7 @@ fn engine_main(
                     // Keep a previously warmed TensorRT ORT session across a normal
                     // Stop -> Start. DirectML remains recreate-on-start, matching
                     // its existing shape-specialization safety behavior.
-                    factory.retain_tensorrt_sessions_for_capture_restart();
+                    factory.retain_optional_backend_sessions_for_capture_restart();
                     match start_session(
                         hwnd,
                         source_pid,
@@ -7127,11 +8915,22 @@ fn engine_main(
                                 // was not TOPMOST.
                                 s.src_was_topmost || s.source_monitor_fullscreen,
                             ));
+                            g.onnx_neoamd_stages = usage.neoamd;
                             g.onnx_tensorrt_stages = usage.tensorrt;
                             g.onnx_cuda_stages = usage.cuda;
                             g.onnx_directml_fallbacks = usage.directml_fallback;
                             metrics.reset();
                             metrics.set_stage_order(s.chain.metric_stage_order());
+                            // v815: show stage numbers from the first normal
+                            // sparse timing probe. reset() already clears stale
+                            // values, while the short fast-EWMA absorbs ordinary
+                            // launch/scheduling variance without a multi-second
+                            // blank period.
+                            metrics.arm_stage_cold_skip(0);
+                            metrics.arm_stage_fast_settle(6);
+                            log::debug!(
+                                "capture-start-stats-settle: cold_skip=0 samples=6 policy=first-sampled-frame-fast-ewma-50"
+                            );
                             metrics.set_monitor(
                                 (s.monitor_rect.2, s.monitor_rect.3),
                                 s.monitor_refresh_hz,
@@ -7327,24 +9126,35 @@ fn engine_main(
                         state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
                         continue;
                     }
-                    input.set_transition_suspended(true);
-                    if let Some(s) = session.as_mut() {
-                        s.provider_transition_input_suspended = true;
-                        s.provider_transition_input_suspended_since = Some(Instant::now());
-                    }
+                    let provider_transition_in_flight = session
+                        .as_ref()
+                        .is_some_and(|s| s.provider_transition_input_suspended);
                     let gpu_pair_in_flight = session.as_ref().is_some_and(|s| {
                         s.gpu_interp_pack_pending.is_some() || s.gpu_interp_pending.is_some()
                     });
-                    if gpu_pair_in_flight {
+                    if provider_transition_in_flight || gpu_pair_in_flight {
                         let previous = factory.onnx_preference();
+                        let reason = if provider_transition_in_flight {
+                            "provider-first-present-pending"
+                        } else {
+                            "gpu-pair-in-flight"
+                        };
+                        // Keep only the newest request. This lets rapid GUI toggles
+                        // remain responsive without allowing two provider generations
+                        // to own/import shared resources at the same time.
                         deferred_backend_switch = Some((backend, trt_device_id, cache_root, specs));
                         let mut state = status.lock().unwrap();
                         state.onnx_backend_switching = true;
                         state.onnx_backend_error = None;
                         log::info!(
-                            "onnx-backend-switch-deferred: {previous:?} -> {backend:?} reason=gpu-pair-in-flight"
+                            "onnx-backend-switch-deferred: {previous:?} -> {backend:?} reason={reason} policy=coalesce-latest"
                         );
                     } else {
+                        input.set_transition_suspended(true);
+                        if let Some(s) = session.as_mut() {
+                            s.provider_transition_input_suspended = true;
+                            s.provider_transition_input_suspended_since = Some(Instant::now());
+                        }
                         let committed = switch_onnx_backend(
                             &mut session,
                             &mut gc,
@@ -7353,21 +9163,25 @@ fn engine_main(
                             trt_device_id,
                             cache_root,
                             &specs,
+                            interp_factor,
                             &metrics,
                             &status,
                         );
-                        let wait_for_first_interp = committed
-                            && session.as_ref().is_some_and(|s| {
-                                matches!(
-                                    s.chain.interp_stage(),
-                                    Some(crate::render::chain::InterpHandle::Onnx { .. })
-                                )
-                            });
-                        if !wait_for_first_interp {
+                        let wait_for_first_present = committed && session.is_some();
+                        if wait_for_first_present {
+                            if let Some(s) = session.as_mut() {
+                                s.provider_transition_recovery_attempts = 0;
+                                s.provider_transition_input_suspended_since = Some(Instant::now());
+                                log::info!(
+                                    "provider-transition-await-present: backend={backend:?} guard=first-filtered-present"
+                                );
+                            }
+                        } else {
                             input.set_transition_suspended(false);
                             if let Some(s) = session.as_mut() {
                                 s.provider_transition_input_suspended = false;
                                 s.provider_transition_input_suspended_since = None;
+                                s.provider_transition_recovery_attempts = 0;
                             }
                         }
                     }
@@ -7686,20 +9500,27 @@ fn engine_main(
                     input_speed_fix = speed_fix;
                 }
                 Cmd::SetInterpFactor(f) => {
+                    let next = f.clamp(2, 5);
                     let in_flight = session.as_ref().is_some_and(|s| {
                         s.gpu_interp_pack_pending.is_some()
                             || s.gpu_interp_pending.is_some()
                             || s.interp_pending.is_some()
                     });
+                    // v763: never wait for a continuously pipelined interpolation
+                    // route to become "idle". NeoAMD normally has the next CPU-visible
+                    // pair queued before the previous pair is fully drained, so v761's
+                    // deferred factor could stay pending forever and only become visible
+                    // after Stop/Start. A factor change is an explicit ownership boundary:
+                    // discard the old pair/worker and re-arm x2..x5 immediately while WGC
+                    // and the overlay remain alive.
                     if in_flight {
-                        deferred_interp_factor = Some(f.clamp(2, 5));
                         log::info!(
-                            "frame-interpolation factor deferred: requested=x{} reason=pair-in-flight",
-                            f.clamp(2, 5)
+                            "frame-interpolation factor force-transition: requested=x{} reason=pair-in-flight action=discard-old-pair",
+                            next
                         );
-                    } else {
-                        apply_interp_factor_now(session.as_mut(), &mut gc, &mut interp_factor, f);
                     }
+                    deferred_interp_factor = None;
+                    apply_interp_factor_now(session.as_mut(), &mut gc, &mut interp_factor, next);
                 }
                 Cmd::SetDownscaler(name) => {
                     downscaler = crate::render::scaler::Kernel::from_name(&name)
@@ -7811,13 +9632,20 @@ fn engine_main(
 
         let deferred_switch_ready = deferred_backend_switch.is_some()
             && session.as_ref().is_none_or(|s| {
-                s.gpu_interp_pack_pending.is_none() && s.gpu_interp_pending.is_none()
+                !s.provider_transition_input_suspended
+                    && s.gpu_interp_pack_pending.is_none()
+                    && s.gpu_interp_pending.is_none()
             });
         if deferred_switch_ready {
             let (backend, trt_device_id, cache_root, specs) = deferred_backend_switch
                 .take()
                 .expect("deferred backend switch");
-            log::info!("onnx-backend-switch-resume: requested={backend:?} state=gpu-idle");
+            log::info!("onnx-backend-switch-resume: requested={backend:?} state=gpu-idle-and-visual-transition-complete");
+            input.set_transition_suspended(true);
+            if let Some(s) = session.as_mut() {
+                s.provider_transition_input_suspended = true;
+                s.provider_transition_input_suspended_since = Some(Instant::now());
+            }
             let committed = switch_onnx_backend(
                 &mut session,
                 &mut gc,
@@ -7826,21 +9654,25 @@ fn engine_main(
                 trt_device_id,
                 cache_root,
                 &specs,
+                interp_factor,
                 &metrics,
                 &status,
             );
-            let wait_for_first_interp = committed
-                && session.as_ref().is_some_and(|s| {
-                    matches!(
-                        s.chain.interp_stage(),
-                        Some(crate::render::chain::InterpHandle::Onnx { .. })
-                    )
-                });
-            if !wait_for_first_interp {
+            let wait_for_first_present = committed && session.is_some();
+            if wait_for_first_present {
+                if let Some(s) = session.as_mut() {
+                    s.provider_transition_recovery_attempts = 0;
+                    s.provider_transition_input_suspended_since = Some(Instant::now());
+                    log::info!(
+                        "provider-transition-await-present: backend={backend:?} guard=first-filtered-present"
+                    );
+                }
+            } else {
                 input.set_transition_suspended(false);
                 if let Some(s) = session.as_mut() {
                     s.provider_transition_input_suspended = false;
                     s.provider_transition_input_suspended_since = None;
+                    s.provider_transition_recovery_attempts = 0;
                 }
             }
         }
@@ -8616,6 +10448,10 @@ fn engine_main(
             overlay.prepare_hidden_for_reveal();
         }
         if overlay_was_native_hidden {
+            // Stop physically removed this persistent WGL window.  Blank both
+            // newly-restaged buffers while alpha is still zero so DWM can never
+            // reuse the previous session's last capture frame during reveal.
+            overlay.blank_hidden_buffers(&gc, "start-after-hard-stop");
             // A hard Stop removed this HWND from USER32's visible z-list. Force
             // the boundary check to run on the same tick that it is reinserted,
             // even when Stop -> Start happens faster than the steady 200ms poll.
@@ -9017,6 +10853,27 @@ fn engine_main(
         // GUI responsiveness must never split, flush, finish or sleep
         // the normal GPU filter path. Low-spec relief is GUI-thread-only.
 
+        // v802 DirectML DRBA presentation is nonblocking *within one source pair*.
+        // Service at most one due output before provider work and never sleep for
+        // a full frame here.  Midpoints from the current B->C interval may overlap
+        // provider execution, while admission of the next source pair is held by
+        // the one-pair backpressure gate below until the real endpoint is shown.
+        let drba_presented = service_directml_drba_present_queue(
+            &mut gc,
+            &mut overlay,
+            s,
+            &metrics,
+            &status,
+            downscaler,
+        );
+        if drba_presented && s.provider_transition_input_suspended && s.gpu_interp_active_logged {
+            resume_provider_transition_after_interpolated_present(
+                &input,
+                s,
+                "gpu-resident-drba-fifo",
+            );
+        }
+
         // Advance the GL -> external-compute ownership handoff without ever
         // waiting on the render thread. Blocking here before the first job
         // reached the worker, which froze video, input and Stop/Shutdown.
@@ -9083,6 +10940,7 @@ fn engine_main(
                             while let Some(old) = s.gpu_interp_hist.pop_front() {
                                 gc.recycle(old.tex);
                             }
+                            recycle_drba_present_queue(&mut gc, s);
                         }
                     }
                 }
@@ -9104,6 +10962,7 @@ fn engine_main(
                     while let Some(old) = s.gpu_interp_hist.pop_front() {
                         gc.recycle(old.tex);
                     }
+                    recycle_drba_present_queue(&mut gc, s);
                 }
                 Ok(false) => {}
                 Err(error) => {
@@ -9122,6 +10981,7 @@ fn engine_main(
                     while let Some(old) = s.gpu_interp_hist.pop_front() {
                         gc.recycle(old.tex);
                     }
+                    recycle_drba_present_queue(&mut gc, s);
                 }
             }
         }
@@ -9146,20 +11006,73 @@ fn engine_main(
         {
             resume_provider_transition_after_interpolated_present(&input, s, "gpu-resident");
         }
-        // Absolute safety cap: never leave input intentionally suspended if a
-        // provider fails to produce a frame. The mapping remains released, so
-        // resuming only permits a later healthy configure tick to re-engage.
-        if s.provider_transition_input_suspended
-            && s.provider_transition_input_suspended_since
-                .is_some_and(|since| since.elapsed() > Duration::from_secs(60))
-        {
-            log::warn!(
-                "provider-transition-timeout: no presented frame within 60s; input suspension released"
-            );
-            input.set_transition_suspended(false);
-            s.provider_transition_input_suspended = false;
-            s.provider_transition_input_suspended_since = None;
-            s.input_reenable_after = Some(Instant::now() + Duration::from_millis(250));
+        // v751 provider-switch transaction watchdog. A healthy image-filter
+        // switch presents within a few source frames. If that does not happen,
+        // first retire/reimport all shared GPU bridges and retry the cached
+        // source. If the retry still does not present, keep NeoAMD inference
+        // but fall back to its CPU-visible output lane rather than leaving a
+        // frozen overlay.
+        if s.provider_transition_input_suspended {
+            if let Some(since) = s.provider_transition_input_suspended_since {
+                let elapsed = since.elapsed();
+                if elapsed > Duration::from_millis(750)
+                    && s.provider_transition_recovery_attempts == 0
+                {
+                    log::warn!(
+                        "provider-transition-recovery: phase=reimport elapsed_ms={} action=retire-shared-and-reprocess",
+                        elapsed.as_millis()
+                    );
+                    s.chain.prepare_gpu_transition(&mut gc);
+                    s.chain.reset_backend_runtime_state();
+                    gc.clear_external_buffer();
+                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.smooth_pacer.reset();
+                    s.paced_present_deadline = None;
+                    s.provider_transition_recovery_attempts = 1;
+                    s.provider_transition_input_suspended_since = Some(Instant::now());
+                } else if elapsed > Duration::from_millis(750)
+                    && s.provider_transition_recovery_attempts == 1
+                {
+                    log::warn!(
+                        "provider-transition-recovery: phase=safe-fallback elapsed_ms={} action=disable-neoamd-shared-output-and-reprocess",
+                        elapsed.as_millis()
+                    );
+                    s.chain.disable_neoamd_shared_output_for_recovery(
+                        &mut gc,
+                        "first-present watchdog",
+                    );
+                    gc.clear_external_buffer();
+                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.smooth_pacer.reset();
+                    s.paced_present_deadline = None;
+                    s.provider_transition_recovery_attempts = 2;
+                    s.provider_transition_input_suspended_since = Some(Instant::now());
+                } else if elapsed > Duration::from_secs(2)
+                    && s.provider_transition_recovery_attempts >= 2
+                {
+                    log::warn!(
+                        "provider-transition-timeout: recovery exhausted; input suspension released while keeping last complete frame"
+                    );
+                    input.set_transition_suspended(false);
+                    s.provider_transition_input_suspended = false;
+                    s.provider_transition_input_suspended_since = None;
+                    s.provider_transition_recovery_attempts = 0;
+                    s.input_reenable_after =
+                        Some(Instant::now() + Duration::from_millis(250));
+                }
+            }
+        }
+        // v802: keep exactly one DirectML DRBA source pair in flight.
+        // The worker may compute its midpoints while the render thread presents
+        // earlier slots from the *same* pair, but a second source pair is not
+        // admitted until the current pair's real endpoint has left the FIFO.
+        // This is backpressure, not interpolation shedding: every requested
+        // x2..x5 midpoint is still computed/presented, while WGC retains its
+        // newest source pictures if the machine genuinely cannot keep up.
+        if directml_drba_pipeline_busy(s) {
+            overlay.win.pump_messages();
+            short_wait_for_directml_drba_slot(s);
+            continue;
         }
         if gpu_stream_progressed {
             overlay.win.pump_messages();
@@ -9358,7 +11271,11 @@ fn engine_main(
             let max_queue = if flow_active {
                 NEOFLOW_QUEUE_MAX
             } else if interp_active {
-                ONNX_INTERP_QUEUE_MAX
+                if s.directml_drba_capture_queue {
+                    DIRECTML_DRBA_QUEUE_MAX
+                } else {
+                    ONNX_INTERP_QUEUE_MAX
+                }
             } else if load_reduction_lookahead {
                 LOAD_REDUCTION_QUEUE_MAX
             } else if neodeint_active {
@@ -10308,6 +12225,7 @@ fn engine_main(
                     let usage = s.chain.onnx_backend_usage();
                     {
                         let mut state = status.lock().unwrap();
+                        state.onnx_neoamd_stages = usage.neoamd;
                         state.onnx_tensorrt_stages = usage.tensorrt;
                         state.onnx_cuda_stages = usage.cuda;
                         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -10668,7 +12586,17 @@ fn engine_main(
             // serializing the GPU pipeline on every video frame.
             // A stopped source may never reach the next sampled sequence.
             // Publish completion/options-refresh timing once, not every idle tick.
-            let stats = metrics.detailed_enabled() && (dlssnr_refresh || s.frame.seq % 30 == 0);
+            // v829: backend/start/filter transitions arm six fast-settle stage
+            // samples.  Sampling only every 30 source frames made those six
+            // samples span ~7.5s at 24p, which is exactly the user-visible
+            // "7ms slowly drifting back to 5-6ms" behaviour even when raw
+            // provider timing had already recovered.  During this bounded
+            // settle window only, take the existing stage timings every frame;
+            // ordinary 1/30 sampling resumes automatically after six probes.
+            let stats = metrics.detailed_enabled()
+                && (dlssnr_refresh
+                    || s.frame.seq % 30 == 0
+                    || metrics.stage_fast_settle_active());
 
             // v682 Beam-specialized route. This branch exists only when the
             // exact ordinary DirectML/TensorRT ONNX -> CRT Beam chain was
@@ -11025,7 +12953,15 @@ fn engine_main(
                     s.interp_worker = None;
                     s.interp_pending = None;
                 }
-                let (need, delayed, rgba_direct, dml_rife) = {
+                let (
+                    need,
+                    delayed,
+                    rgba_direct,
+                    dml_rife,
+                    directml_drba,
+                    neoamd_cpu_visible,
+                    neoamd_stream_supported,
+                ) = {
                     let ist = ist.lock().unwrap();
                     (
                         ist.interp_frames(),
@@ -11040,11 +12976,27 @@ fn engine_main(
                                 &ist.interp,
                                 crate::render::onnx_stage::InterpKind::RifeV1 { .. }
                             ),
+                        ist.provider == crate::render::onnx_stage::OnnxProvider::DirectML
+                            && matches!(
+                                &ist.interp,
+                                crate::render::onnx_stage::InterpKind::Drba
+                            ),
+                        ist.provider == crate::render::onnx_stage::OnnxProvider::NeoAMD,
+                        ist.supports_neoamd_interp_stream(),
                     )
                 };
+                s.directml_drba_capture_queue = directml_drba;
                 let interp_index = s.chain.interp_index().unwrap_or(0);
                 let post_chain_start = (interp_index + 1).min(s.chain.stage_count());
-                let gpu_capable = !s.frame.hdr && ist.lock().unwrap().supports_interp_gpu();
+                // v799: re-enable the existing DirectML GPU-resident interpolation
+                // bridge for DRBA only after the v796-v798 chronological contract
+                // proved stable on the CPU-visible path. The resident route below now
+                // uses the same delayed startup anchor and monotonic ordered-grid
+                // presentation; provider outputs are not allowed to overtake/reuse a
+                // visible pair. The bridge itself remains the established conservative
+                // DirectML interop implementation (no new fast/direct mode here).
+                let gpu_capable = !s.frame.hdr
+                    && ist.lock().unwrap().supports_interp_gpu();
                 if gpu_capable {
                     let input = upload_session_frame_timed(&mut gc, s);
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
@@ -11156,6 +13108,7 @@ fn engine_main(
                                 &s.frame,
                                 s.cadence.period_s(),
                                 s.arrival_interval,
+                                false, // v803 DirectML DRBA: exact v782 continuity contract
                             )
                         })
                         .unwrap_or(GpuInterpContinuity::Continuous);
@@ -11177,10 +13130,37 @@ fn engine_main(
                     }
                     let continuity_broken = continuity == GpuInterpContinuity::Broken;
                     if dimensions_changed || continuity_broken {
+                        let previous_for_diag = s.gpu_interp_hist.back().cloned();
                         while let Some(old) = s.gpu_interp_hist.pop_front() {
                             gc.recycle(old.tex);
                         }
+                        recycle_drba_present_queue(&mut gc, s);
                         s.interp_generation = s.interp_generation.saturating_add(1);
+                        if directml_drba {
+                            let previous_seq = previous_for_diag.as_ref().map(|frame| frame.seq);
+                            let previous_ts = previous_for_diag.as_ref().and_then(|frame| frame.source_time_100ns);
+                            let seq_gap = previous_seq.map(|seq| s.frame.seq.saturating_sub(seq));
+                            let source_gap_ms = previous_ts.zip(s.frame.source_time_100ns)
+                                .map(|(a, b)| (b - a) as f64 / 10_000.0);
+                            let arrival_gap_ms = previous_for_diag.as_ref()
+                                .and_then(|frame| s.frame.received_at.zip(frame.received_at))
+                                .map(|(current, previous)| current.saturating_duration_since(previous).as_secs_f64() * 1000.0);
+                            s.drba_lookahead_needs_anchor = true;
+                            log::info!(
+                                "dml-drba-v782-history-reset: generation={} dimensions_changed={} continuity_broken={} prev_seq={:?} cur_seq={} seq_gap={:?} prev_ts={:?} cur_ts={:?} source_gap_ms={:?} arrival_gap_ms={:?} cadence_ms={:?} action=hold-first-anchor-until-full-window",
+                                s.interp_generation,
+                                dimensions_changed,
+                                continuity_broken,
+                                previous_seq,
+                                s.frame.seq,
+                                seq_gap,
+                                previous_ts,
+                                s.frame.source_time_100ns,
+                                source_gap_ms,
+                                arrival_gap_ms,
+                                s.cadence.period_s().map(|v| v * 1000.0)
+                            );
+                        }
                         log::info!(
                             "interp-gpu-history-reset: generation={} dimensions_changed={} continuity_broken={}",
                             s.interp_generation,
@@ -11188,6 +13168,14 @@ fn engine_main(
                             continuity_broken
                         );
                     }
+                    // v795: DirectML DRBA follows the same fundamental contract as
+                    // the other interpolation paths: once a real source frame is
+                    // accepted into interpolation history, timing/load heuristics
+                    // must not turn that interval into a real-only bypass. If WGC
+                    // delivery skipped a picture because the machine was busy, the
+                    // surviving adjacent history frames are still interpolated.
+                    // Genuine seek/resize/provider discontinuities continue to use
+                    // the common continuity reset above.
                     s.gpu_interp_hist.push_back(GpuInterpFrame {
                         tex: cur_tex,
                         seq: s.frame.seq,
@@ -11199,21 +13187,26 @@ fn engine_main(
                             gc.recycle(old.tex);
                         }
                     }
+                    // v785: keep the user-selected multiplier exact. DRBA load
+                    // shedding happens by dropping individual synthetic phases
+                    // from that multiplier's original phase grid, never by
+                    // rewriting x5 into x4/x3. Actual Present FPS therefore
+                    // reflects real throughput.
                     let factor = interp_factor.clamp(2, 5);
                     let mut history = Vec::with_capacity(need);
                     history.extend(s.gpu_interp_hist.iter().map(|frame| frame.tex));
-                    // DRBA is a delayed four-frame model.  Its interpolation
-                    // interval is the middle pair [N-2, N-1], so duplicating
-                    // startup frames or presenting N as its endpoint breaks
-                    // temporal order and looks like severe judder.  RIFE is
-                    // the ordinary two-frame [N-1, N] case.
+                    // DRBA is a delayed four-frame model. Its interpolation
+                    // interval is the middle pair [N-2, N-1].
                     let history_ready = if delayed {
                         s.gpu_interp_hist.len() >= need
                     } else {
                         s.gpu_interp_hist.len() >= 2
                     };
-                    let source_period = s
-                        .cadence
+                    // v803 DirectML DRBA: restore v782 cadence/arrival timing.
+                    // Do not derive the provider/display clock from one delayed B->C
+                    // history interval; that later experiment magnified missing WGC
+                    // callbacks into 100-300ms output slots.
+                    let source_period = s.cadence
                         .period_s()
                         .or_else(|| (s.arrival_interval > 0.0).then_some(s.arrival_interval))
                         .unwrap_or(1.0 / 30.0);
@@ -11222,38 +13215,168 @@ fn engine_main(
                     let phases = onnx_interpolation_phases(
                         factor,
                         output_ratio,
-                        onnx_x3_60hz_mode(s.monitor_refresh_hz),
+                        false,
                         &mut s.flow_output_cadence,
                     );
                     let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
-                    let timesteps = phases
+                    let requested_timesteps = phases
                         .into_iter()
                         .filter(|phase| *phase < 1.0 - 1e-5)
                         .collect::<Vec<_>>();
+                    // v795: DirectML DRBA must submit every phase requested by
+                    // the selected x2..x5 multiplier. Do not reinterpret slow
+                    // rendering, a WGC timestamp gap, or a scene-change heuristic
+                    // as permission to turn interpolation off for that interval.
+                    // If the machine cannot present every completed output in time,
+                    // normal presentation-frame loss is allowed downstream; the
+                    // interpolation contract itself remains intact. NeoAMD keeps
+                    // its already-proven adaptive admission path unchanged.
+                    let timesteps = if directml_drba {
+                        requested_timesteps.clone()
+                    } else if delayed && history_ready {
+                        let ema = s.drba_midpoint_ema_ms;
+                        let samples = s.drba_perf_samples;
+                        drba_admit_timesteps(
+                            &requested_timesteps,
+                            source_period,
+                            ema,
+                            samples,
+                            &mut s.drba_compute_credit_ms,
+                            &mut s.drba_phase_rotation,
+                        )
+                    } else {
+                        requested_timesteps.clone()
+                    };
+                    if directml_drba
+                        && history_ready
+                        && (s.gpu_interp_pair_id < 3 || s.gpu_interp_pair_id % 120 == 0)
+                    {
+                        log::info!(
+                            "dml-drba-v782-contract: factor=x{} requested_mids={} submitted_mids={} phases={:?} source_period_ms={:.2} clock=v782-cadence",
+                            factor,
+                            requested_timesteps.len(),
+                            timesteps.len(),
+                            timesteps,
+                            source_period * 1000.0
+                        );
+                    } else if delayed && timesteps.len() < requested_timesteps.len() {
+                        let dropped = requested_timesteps.len() - timesteps.len();
+                        s.drba_dropped_midpoints =
+                            s.drba_dropped_midpoints.saturating_add(dropped as u64);
+                        if s.drba_dropped_midpoints <= 8
+                            || s.drba_dropped_midpoints % 120 < dropped as u64
+                        {
+                            log::warn!(
+                                "drba-realtime-drop: requested=x{} requested_mids={} admitted_mids={} phases={:?} ema_mid_ms={:.2} source_budget_ms={:.2} route=non-directml actual_fps_policy=present-count-only",
+                                factor,
+                                requested_timesteps.len(),
+                                timesteps.len(),
+                                timesteps,
+                                s.drba_midpoint_ema_ms,
+                                source_period * 1000.0
+                            );
+                        }
+                    }
                     let output_period = source_period / output_ratio.max(1.0);
                     let history_keep = s.gpu_interp_hist.iter().map(|f| f.tex).collect::<Vec<_>>();
                     if !history_ready {
-                        let now = Instant::now();
-                        process_and_present_from(
-                            &mut gc,
-                            &mut overlay,
-                            s,
-                            &metrics,
-                            &status,
-                            cur_tex,
-                            out_size,
-                            stats,
-                            now,
-                            0,
-                            Some(FrameTiming::from_frame(&s.frame, now)),
-                            &history_keep,
-                            downscaler,
-                            post_chain_start,
-                        );
+                        if directml_drba {
+                            // v799 ports the v796 delayed-start correctness rule to
+                            // the GPU-resident path. DRBA needs [A,B,C,D] to generate
+                            // the B->C interval. Showing B/C while that lookahead is
+                            // still being collected would force the first synthetic
+                            // output to move the picture backwards in time. Present A
+                            // once, then hold it until the first complete window exists.
+                            if s.gpu_interp_hist.len() == 1 {
+                                // Never let last_tex alias a DRBA history texture.
+                                // process_and_present_from() recycles the previous
+                                // display texture on the next present; aliasing it with
+                                // history would let the GL pool reuse A while DirectML
+                                // still needs [A,B,C,D], which is exactly the class of
+                                // lifetime bug that can appear as tiled/mosaic output.
+                                match crate::render::scaler::detach_identity(&mut gc, cur_tex) {
+                                    Ok(display_tex) => {
+                                        let now = Instant::now();
+                                        process_and_present_from(
+                                            &mut gc,
+                                            &mut overlay,
+                                            s,
+                                            &metrics,
+                                            &status,
+                                            display_tex,
+                                            out_size,
+                                            stats,
+                                            now,
+                                            0,
+                                            Some(FrameTiming::from_frame(&s.frame, now)),
+                                            &history_keep,
+                                            downscaler,
+                                            post_chain_start,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "dml-drba-v782-startup-hold: result=hold reason={error:#}"
+                                        );
+                                        let mut keep = history_keep.clone();
+                                        if let Some(last_good) = s.last_tex {
+                                            keep.push(last_good);
+                                        }
+                                        keep_display_hz_base(s, &mut keep);
+                                        gc.release_frame(&keep);
+                                    }
+                                }
+                            } else {
+                                let mut keep = history_keep.clone();
+                                if let Some(last_good) = s.last_tex {
+                                    keep.push(last_good);
+                                }
+                                keep_display_hz_base(s, &mut keep);
+                                gc.release_frame(&keep);
+                            }
+                        } else {
+                            let now = Instant::now();
+                            process_and_present_from(
+                                &mut gc,
+                                &mut overlay,
+                                s,
+                                &metrics,
+                                &status,
+                                cur_tex,
+                                out_size,
+                                stats,
+                                now,
+                                0,
+                                Some(FrameTiming::from_frame(&s.frame, now)),
+                                &history_keep,
+                                downscaler,
+                                post_chain_start,
+                            );
+                        }
                         overlay.win.pump_messages();
                         continue;
                     }
                     if timesteps.is_empty() {
+                        // A fully dropped synthetic batch still presents the
+                        // correct REAL endpoint. Do not substitute the newest
+                        // DRBA look-ahead frame N for delayed endpoint N-1.
+                        let endpoint = if delayed {
+                            s.gpu_interp_hist
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .cloned()
+                                .expect("complete DRBA history")
+                        } else {
+                            s.gpu_interp_hist
+                                .back()
+                                .cloned()
+                                .expect("complete RIFE history")
+                        };
+                        let mut endpoint_frame = s.frame.clone();
+                        endpoint_frame.seq = endpoint.seq;
+                        endpoint_frame.received_at = endpoint.received_at;
+                        endpoint_frame.source_time_100ns = endpoint.source_time_100ns;
                         let now = Instant::now();
                         process_and_present_from(
                             &mut gc,
@@ -11261,12 +13384,12 @@ fn engine_main(
                             s,
                             &metrics,
                             &status,
-                            cur_tex,
+                            endpoint.tex,
                             out_size,
                             stats,
                             now,
                             0,
-                            Some(FrameTiming::from_frame(&s.frame, now)),
+                            Some(FrameTiming::from_frame(&endpoint_frame, now)),
                             &history_keep,
                             downscaler,
                             post_chain_start,
@@ -11274,6 +13397,112 @@ fn engine_main(
                         overlay.win.pump_messages();
                         continue;
                     }
+                    let gpu_pair_display_anchor = Instant::now();
+                    if directml_drba {
+                        let seqs = s
+                            .gpu_interp_hist
+                            .iter()
+                            .map(|frame| frame.seq)
+                            .collect::<Vec<_>>();
+                        let source_ts = s
+                            .gpu_interp_hist
+                            .iter()
+                            .map(|frame| frame.source_time_100ns)
+                            .collect::<Vec<_>>();
+                        let seq_order_ok = seqs.windows(2).all(|w| w[0] < w[1]);
+                        let ts_order_ok = source_ts.windows(2).all(|w| match (w[0], w[1]) {
+                            (Some(a), Some(b)) => a < b,
+                            _ => true,
+                        });
+                        if s.gpu_interp_pair_id < 3 || s.gpu_interp_pair_id % 120 == 0 {
+                            let bc_ms = source_ts.get(1).copied().flatten().zip(source_ts.get(2).copied().flatten())
+                                .map(|(b, c)| (c - b) as f64 / 10_000.0);
+                            let seq_deltas = seqs.windows(2).map(|w| w[1].saturating_sub(w[0])).collect::<Vec<_>>();
+                            let source_delta_ms = source_ts.windows(2).map(|w| match (w[0], w[1]) {
+                                (Some(a), Some(b)) => Some((b - a) as f64 / 10_000.0),
+                                _ => None,
+                            }).collect::<Vec<_>>();
+                            log::info!(
+                                "dml-drba-v782-input: pair={} generation={} factor=x{} seqs={:?} seq_deltas={:?} source_ts={:?} source_delta_ms={:?} seq_order_ok={} ts_order_ok={} bc_ms={:?}",
+                                s.gpu_interp_pair_id,
+                                s.interp_generation,
+                                factor,
+                                seqs,
+                                seq_deltas,
+                                source_ts,
+                                source_delta_ms,
+                                seq_order_ok,
+                                ts_order_ok,
+                                bc_ms
+                            );
+                        }
+                        if !seq_order_ok || !ts_order_ok {
+                            log::error!(
+                                "dml-drba-v782-source-order-reject: route=gpu-resident seqs={:?} source_ts={:?} action=reset-history-before-provider",
+                                seqs,
+                                source_ts
+                            );
+                            while let Some(old) = s.gpu_interp_hist.pop_front() {
+                                gc.recycle(old.tex);
+                            }
+                            recycle_drba_present_queue(&mut gc, s);
+                            s.interp_generation = s.interp_generation.saturating_add(1);
+                            s.drba_lookahead_needs_anchor = true;
+                            s.drba_diag_last_semantic_ts_100ns = None;
+                            overlay.win.pump_messages();
+                            continue;
+                        }
+
+                        // First complete [A,B,C,D] window: A is still visible. Move
+                        // forward to B exactly once before any B->C midpoint can be
+                        // shown. This is the GPU-resident equivalent of v796's
+                        // dml-drba-timeline-anchor and prevents startup/rebuild
+                        // A->B->C->(B..C) temporal reversal.
+                        if s.drba_lookahead_needs_anchor {
+                            if let Some(anchor) = s.gpu_interp_hist.iter().rev().nth(2).cloned() {
+                                let mut anchor_frame = s.frame.clone();
+                                anchor_frame.seq = anchor.seq;
+                                anchor_frame.received_at = anchor.received_at;
+                                anchor_frame.source_time_100ns = anchor.source_time_100ns;
+                                match crate::render::scaler::detach_identity(&mut gc, anchor.tex) {
+                                    Ok(display_tex) => {
+                                        let now = gpu_pair_display_anchor;
+                                        process_and_present_from(
+                                            &mut gc,
+                                            &mut overlay,
+                                            s,
+                                            &metrics,
+                                            &status,
+                                            display_tex,
+                                            out_size,
+                                            stats,
+                                            now,
+                                            0,
+                                            Some(FrameTiming::from_frame(&anchor_frame, now)),
+                                            &history_keep,
+                                            downscaler,
+                                            post_chain_start,
+                                        );
+                                        log::info!(
+                                            "dml-drba-v782-timeline-anchor: route=gpu-resident seq={} source_ts={:?} policy=hold-a-then-b-mid-c display_copy=detached",
+                                            anchor.seq,
+                                            anchor.source_time_100ns
+                                        );
+                                        s.drba_lookahead_needs_anchor = false;
+                                        s.drba_diag_last_semantic_ts_100ns = anchor.source_time_100ns;
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "dml-drba-v782-timeline-anchor: route=gpu-resident seq={} source_ts={:?} policy=hold-start-endpoint reason={error:#}",
+                                            anchor.seq,
+                                            anchor.source_time_100ns
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let worker_matches_stage = s
                         .gpu_interp_worker
                         .as_ref()
@@ -11300,12 +13529,12 @@ fn engine_main(
                             .iter()
                             .rev()
                             .nth(1)
-                            .copied()
+                            .cloned()
                             .expect("complete DRBA history")
                     } else {
                         s.gpu_interp_hist
                             .back()
-                            .copied()
+                            .cloned()
                             .expect("complete RIFE history")
                     };
                     let mut endpoint_frame = s.frame.clone();
@@ -11366,12 +13595,28 @@ fn engine_main(
                         (prepared, slots)
                     };
                     let ready_outputs = vec![None; timesteps.len()];
+                    // v803 DirectML DRBA: exact v782 cooperative provider-slot
+                    // ownership. Each next phase is permitted only after the prior
+                    // phase's GL post work has been submitted.
                     let (cooperative_slots, permit_next_after_post_submit) =
-                        gpu_interp_slot_policy(factor, timesteps.len());
+                        gpu_interp_slot_policy_for_path(false, factor, timesteps.len());
+                    if directml_drba && (pair_id < 3 || pair_id % 120 == 0) {
+                        log::info!(
+                            "dml-drba-v782-provider: pair={} factor=x{} mids={} cooperative_slots={} permit_after_post_submit={}",
+                            pair_id,
+                            factor,
+                            timesteps.len(),
+                            cooperative_slots,
+                            permit_next_after_post_submit
+                        );
+                    }
                     let pending = PendingGpuInterp {
                         generation: s.interp_generation,
                         pair_id,
                         factor,
+                        is_drba: delayed,
+                        directml_drba: false, // v803: bypass v783-v802 DirectML-DRBA special presentation lanes
+                        directml_drba_v782: directml_drba,
                         cooperative_slots,
                         permit_next_after_post_submit,
                         stage: ist.clone(),
@@ -11388,9 +13633,12 @@ fn engine_main(
                         post_chain_start,
                         frame: endpoint_frame,
                         start_source_time_100ns,
+                        source_period,
                         output_period,
                         out_size,
                         submitted_at: Instant::now(),
+                        presented_mid_count: 0,
+                        late_present_drops: 0,
                         slow_wait_logged: false,
                     };
                     match prepared {
@@ -11425,6 +13673,7 @@ fn engine_main(
                     while let Some(old) = s.gpu_interp_hist.pop_front() {
                         gc.recycle(old.tex);
                     }
+                    recycle_drba_present_queue(&mut gc, s);
                 } else if matches!(
                     std::env::var("CHIDESCALER_INTERP_GPU").ok().as_deref(),
                     Some("require")
@@ -11564,6 +13813,35 @@ fn engine_main(
                 // tick presents the previous pair's mids + real frame, hiding
                 // the ~30-40ms DML run inside the source period (48fps pin).
                 if ((!delayed && need == 2) || (delayed && need == 4)) && !s.frame.hdr {
+                    // v796: DRBA is a delayed four-frame model, so feeding even one
+                    // duplicate/backward WGC picture corrupts the temporal window.
+                    // WGC callback sequence numbers are only delivery IDs; source
+                    // timestamps are the authoritative ordering signal when present.
+                    // Reject only duplicate/backward deliveries here. Forward gaps are
+                    // still accepted and interpolated; this is not a load-shedding or
+                    // interpolation-disable branch.
+                    if directml_drba {
+                        if let Some(prev) = s.hist.back() {
+                            let stale_or_duplicate = match (
+                                prev.source_time_100ns,
+                                s.frame.source_time_100ns,
+                            ) {
+                                (Some(a), Some(b)) => b <= a,
+                                _ => s.frame.seq <= prev.seq,
+                            };
+                            if stale_or_duplicate {
+                                log::warn!(
+                                    "dml-drba-source-order-reject: prev_seq={} cur_seq={} prev_ts={:?} cur_ts={:?} action=hold-last-correct-frame",
+                                    prev.seq,
+                                    s.frame.seq,
+                                    prev.source_time_100ns,
+                                    s.frame.source_time_100ns
+                                );
+                                overlay.win.pump_messages();
+                                continue;
+                            }
+                        }
+                    }
                     let pair_dt = s.hist.back().and_then(|prev| {
                         normalized_frame_span_s(
                             prev.source_time_100ns,
@@ -11585,6 +13863,7 @@ fn engine_main(
                             pair_dt,
                             s.cadence.period_s(),
                             s.arrival_interval,
+                            directml_drba,
                         )
                     {
                         log::info!(
@@ -11673,16 +13952,45 @@ fn engine_main(
                     }
                     if s.interp_worker.as_ref().map(|w| w.stage_ptr) != Some(stage_ptr) {
                         s.interp_worker = Some(InterpWorker::spawn(ist.clone(), stage_ptr));
+                        if directml_drba {
+                            log::info!(
+                                "interp-execution-path: mode=directml-drba-safe-batch provider_compute=DirectML output=cpu-visible-rgb8 phase_mode=dynamic-batch-when-multi pair_pipeline=one-ahead-fifo"
+                            );
+                        }
                     }
-                    // 2) submit the new pair FIRST, so the ~27ms DML run
-                    //    starts NOW and finishes well before the source's
-                    //    next DWM composition. Submitting after the paced
-                    //    presentation made the inference overlap that
-                    //    composition on the shared GPU — WGC delivery slipped
-                    //    by the inference time every frame and the take rate
-                    //    fell to ~15/s (measured wait_take_ms≈38).
+                    // 2) Build the next interpolation job. Non-DRBA providers retain the
+                    //    established overlapped submission. v796 DirectML DRBA deliberately
+                    //    defers submission until the previous pair has been fully consumed,
+                    //    so pair ownership and display order can never overlap while the
+                    //    correctness baseline is being validated.
                     let job_inputs = if delayed {
                         (s.hist.len() + 1 >= need).then(|| {
+                            if directml_drba {
+                                let mut seqs = s.hist.iter().map(|frame| frame.seq).collect::<Vec<_>>();
+                                seqs.push(s.frame.seq);
+                                let mut times = s
+                                    .hist
+                                    .iter()
+                                    .map(|frame| frame.source_time_100ns)
+                                    .collect::<Vec<_>>();
+                                times.push(s.frame.source_time_100ns);
+                                let seq_order_ok = seqs.windows(2).all(|w| w[0] < w[1]);
+                                let ts_order_ok = times.windows(2).all(|w| match (w[0], w[1]) {
+                                    (Some(a), Some(b)) => a < b,
+                                    _ => true,
+                                });
+                                if s.drba_perf_samples < 3 || s.frame.seq % 120 == 0 {
+                                    log::info!(
+                                        "dml-drba-input-window: seqs={:?} source_ts={:?} seq_order_ok={} ts_order_ok={}",
+                                        seqs,
+                                        times,
+                                        seq_order_ok,
+                                        ts_order_ok
+                                    );
+                                }
+                                debug_assert!(seq_order_ok, "DRBA input sequence must be strictly increasing");
+                                debug_assert!(ts_order_ok, "DRBA source timestamps must be strictly increasing when present");
+                            }
                             let mut frames: Vec<Arc<Vec<u8>>> =
                                 s.hist.iter().map(|frame| frame.data.clone()).collect();
                             frames.push(cur_frame.clone());
@@ -11712,14 +14020,50 @@ fn engine_main(
                         let phases = onnx_interpolation_phases(
                             factor,
                             output_ratio,
-                            onnx_x3_60hz_mode(s.monitor_refresh_hz),
+                            false,
                             &mut s.flow_output_cadence,
                         );
                         let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
-                        let ts: Vec<f32> = phases
+                        let requested_ts: Vec<f32> = phases
                             .into_iter()
                             .filter(|phase| *phase < 1.0 - 1e-5)
                             .collect();
+                        // Keep the proven NeoAMD DRBA admission/pacing path
+                        // byte-for-behaviour equivalent to v785. Only DirectML
+                        // moves to deadline-miss dropping in v786.
+                        let ts = if delayed && neoamd_cpu_visible {
+                            let period = source_period_s.unwrap_or(1.0 / 30.0);
+                            let ema = s.drba_midpoint_ema_ms;
+                            let samples = s.drba_perf_samples;
+                            drba_admit_timesteps(
+                                &requested_ts,
+                                period,
+                                ema,
+                                samples,
+                                &mut s.drba_compute_credit_ms,
+                                &mut s.drba_phase_rotation,
+                            )
+                        } else {
+                            requested_ts.clone()
+                        };
+                        if delayed && neoamd_cpu_visible && ts.len() < requested_ts.len() {
+                            let dropped = requested_ts.len() - ts.len();
+                            s.drba_dropped_midpoints =
+                                s.drba_dropped_midpoints.saturating_add(dropped as u64);
+                            if s.drba_dropped_midpoints <= 8
+                                || s.drba_dropped_midpoints % 120 < dropped as u64
+                            {
+                                log::warn!(
+                                    "drba-realtime-drop: requested=x{} requested_mids={} admitted_mids={} phases={:?} ema_mid_ms={:.2} source_budget_ms={:.2} route=cpu-visible actual_fps_policy=present-count-only",
+                                    factor,
+                                    requested_ts.len(),
+                                    ts.len(),
+                                    ts,
+                                    s.drba_midpoint_ema_ms,
+                                    source_period_s.unwrap_or(1.0 / 30.0) * 1000.0
+                                );
+                            }
+                        }
                         let start_source_time_100ns = if delayed {
                             s.hist
                                 .iter()
@@ -11731,27 +14075,55 @@ fn engine_main(
                         };
                         let output_period_s =
                             source_period_s.map(|period| period / output_ratio.max(1.0));
+                        let pair_id = s.frame.seq;
                         let job = InterpJob {
+                            pair_id,
                             w: interp_w,
                             h: interp_h,
                             frames,
                             ts: ts.clone(),
                             rgba: rgba_direct,
-                            prefer_dml_vulkan_shared: rgba_direct
+                            // v798 isolated speed restore: dynamic multi-phase batch is
+                            // allowed again for DirectML DRBA, but the suspicious shared
+                            // D3D12/OpenGL output bridge remains disabled. process_interp_many_rgba8()
+                            // therefore returns owned CPU-visible RGB8 frames in phase order.
+                            force_sequential: false,
+                            prefer_dml_vulkan_shared: !directml_drba
+                                && !neoamd_stream_supported
+                                && rgba_direct
                                 && s.chain.can_process_range_from_dml_shared(
                                     post_chain_start,
                                     s.chain.stage_count(),
                                 ),
+                            neoamd_stream_slots: neoamd_stream_supported,
                         };
-                        let submitted = s
-                            .interp_worker
-                            .as_ref()
-                            .and_then(|worker| worker.job_tx.as_ref())
-                            .is_some_and(|tx| tx.send(job).is_ok());
+                        // v797: restore exactly one performance feature on top of the
+                        // v796 correctness baseline: queue the next DirectML DRBA pair before
+                        // presenting the previous pair. The worker is single-threaded/FIFO,
+                        // DirectML DRBA still returns owned CPU-visible RGB8 payloads, and
+                        // drain_pending_interp() validates pair_id/slot before presentation.
+                        // Therefore provider work can overlap presentation without allowing
+                        // a later pair to overtake or overwrite an older pair's visible data.
+                        // v798 restores only the native DRBA dynamic multi-phase batch.
+                        // The D3D12/OpenGL shared-output bridge remains disabled, so each
+                        // completed phase is still an owned CPU-visible payload before display.
+                        let submitted = if ts.is_empty() {
+                            true
+                        } else {
+                            s.interp_worker
+                                .as_ref()
+                                .and_then(|worker| worker.job_tx.as_ref())
+                                .is_some_and(|tx| tx.send(job).is_ok())
+                        };
                         (
                             submitted,
                             Some(PendingInterp {
                                 interp_name: interp_name.clone(),
+                                pair_id,
+                                factor,
+                                is_drba: delayed,
+                                directml_drba,
+                                requested_mid_count: requested_ts.len(),
                                 real,
                                 count: ts.len(),
                                 rgba: rgba_direct,
@@ -11761,6 +14133,8 @@ fn engine_main(
                                 start_source_time_100ns,
                                 pair_dt,
                                 chain_start_index: post_chain_start,
+                                neoamd_cpu_visible,
+                                neoamd_stream_slots: neoamd_stream_supported,
                             }),
                         )
                     } else {
@@ -11771,11 +14145,12 @@ fn engine_main(
                     // pull x2 below its target. Pace only the mids inside the
                     // interval in drain_pending_interp().
                     let paced_tick_t0 = Instant::now();
+                    let had_previous_pending = s.interp_pending.is_some();
                     // 3) present the PREVIOUS pair (its inference finished
                     //    during the last period; the worker is FIFO so the
                     //    results read here belong to that pair, not the job
                     //    just submitted)
-                    drain_pending_interp(
+                    let previous_pair_ok = drain_pending_interp(
                         &mut gc,
                         &mut overlay,
                         &input,
@@ -11788,35 +14163,115 @@ fn engine_main(
                         paced_tick_t0,
                         downscaler,
                     );
-                    s.interp_pending = submitted.then_some(next_pending).flatten();
-                    if s.interp_pending.is_none() {
-                        // very first frame: nothing to interpolate against —
-                        // present it directly so the view appears instantly
-                        let delivered = s.source.delivered();
-                        let captures = delivered.saturating_sub(s.metric_seq) as u32;
-                        s.metric_seq = delivered;
-                        let rt = Instant::now();
-                        let tex = if rgba_direct {
-                            gc.upload_rgba8(interp_w, interp_h, &cur_frame)
-                        } else {
-                            gc.upload_rgb8(interp_w, interp_h, &cur_frame)
-                        };
-                        process_and_present_from(
-                            &mut gc,
-                            &mut overlay,
-                            s,
-                            &metrics,
-                            &status,
-                            tex,
-                            out_size,
-                            stats,
-                            rt,
-                            captures,
-                            Some(FrameTiming::from_frame(&s.frame, rt)),
-                            &[],
-                            downscaler,
-                            post_chain_start,
+                    if previous_pair_ok {
+                        if directml_drba {
+                            // First complete DRBA window: the screen has been
+                            // holding frame A. Anchor the new delayed timeline at
+                            // frame B before B->C mids become visible on the next
+                            // source tick. Never show C first and then go backwards.
+                            if submitted && !had_previous_pending {
+                                if let Some(anchor) = s.hist.iter().rev().nth(1).cloned() {
+                                    let rt = Instant::now();
+                                    let tex = if rgba_direct {
+                                        gc.upload_rgba8(anchor.w, anchor.h, &anchor.data)
+                                    } else {
+                                        gc.upload_rgb8(anchor.w, anchor.h, &anchor.data)
+                                    };
+                                    process_and_present_from(
+                                        &mut gc,
+                                        &mut overlay,
+                                        s,
+                                        &metrics,
+                                        &status,
+                                        tex,
+                                        out_size,
+                                        stats,
+                                        rt,
+                                        0,
+                                        Some(anchor.timing(rt)),
+                                        &[],
+                                        downscaler,
+                                        post_chain_start,
+                                    );
+                                    log::info!(
+                                        "dml-drba-timeline-anchor: seq={} source_ts={:?} policy=first-window-start-endpoint",
+                                        anchor.seq,
+                                        anchor.source_time_100ns
+                                    );
+                                }
+                            }
+                        }
+                        s.interp_pending = submitted.then_some(next_pending).flatten();
+                    } else {
+                        // v780 fail-safe: if a generated slot failed to arrive,
+                        // arrived out of order, or did not commit to an actual
+                        // present, tear down the permit-gated worker. This also
+                        // closes the permit channel so a worker blocked between
+                        // phases cannot survive Stop/provider/geometry recovery.
+                        // The already-submitted next pair is intentionally
+                        // discarded; the current REAL frame is shown below and
+                        // interpolation restarts cleanly on the next source tick.
+                        s.interp_worker = None;
+                        s.interp_pending = None;
+                        s.interp_present_deadline = None;
+                        s.flow_output_cadence.reset();
+                        log::warn!(
+                            "neoamd-cooperative-stream-reset: reason=slot-contract-failure action=worker-rebuild-next-tick"
                         );
+                    }
+                    if s.interp_pending.is_none() {
+                        // v796 delayed-DRBA warm-up must never show B/C and later
+                        // go backwards to the B->C interpolation interval. Show the
+                        // first real frame immediately, then hold it until a complete
+                        // four-frame window exists. When the first job is submitted,
+                        // present the start endpoint (history N-2) once, so the first
+                        // generated midpoint can only move forward in time.
+                        let startup_frame = if directml_drba && delayed {
+                            if s.hist.is_empty() {
+                                Some(HistFrame::from_processed(
+                                    &s.frame,
+                                    interp_w,
+                                    interp_h,
+                                    cur_frame.clone(),
+                                ))
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(HistFrame::from_processed(
+                                &s.frame,
+                                interp_w,
+                                interp_h,
+                                cur_frame.clone(),
+                            ))
+                        };
+                        if let Some(startup_frame) = startup_frame {
+                            let delivered = s.source.delivered();
+                            let captures = delivered.saturating_sub(s.metric_seq) as u32;
+                            s.metric_seq = delivered;
+                            let rt = Instant::now();
+                            let tex = if rgba_direct {
+                                gc.upload_rgba8(startup_frame.w, startup_frame.h, &startup_frame.data)
+                            } else {
+                                gc.upload_rgb8(startup_frame.w, startup_frame.h, &startup_frame.data)
+                            };
+                            process_and_present_from(
+                                &mut gc,
+                                &mut overlay,
+                                s,
+                                &metrics,
+                                &status,
+                                tex,
+                                out_size,
+                                stats,
+                                rt,
+                                captures,
+                                Some(startup_frame.timing(rt)),
+                                &[],
+                                downscaler,
+                                post_chain_start,
+                            );
+                        }
                     }
                     s.hist.push_back(HistFrame::from_processed(
                         &s.frame, interp_w, interp_h, cur_frame,
@@ -12159,34 +14614,48 @@ fn engine_main(
             let direct_onnx = if s.frame.hdr {
                 Ok(None)
             } else {
-                let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
-                    metrics.probe(name, metrics_kind_label(kind), ms);
-                };
-                match s.chain.process_first_onnx_vulkan_resident_rgba8(
+                match s.chain.process_first_neoamd_peer_chain_rgba8(
                     &mut gc,
                     s.frame.w,
                     s.frame.h,
                     &s.frame.data,
-                    out_size,
-                    if stats {
-                        Some(&mut resident_probe as &mut dyn FnMut(&str, StageKind, f64))
-                    } else {
-                        None
-                    },
                 ) {
-                    Ok(Some((input, name, ms))) => {
-                        Ok(Some((input, name, ms, s.chain.stage_count())))
+                    Ok(Some((input, timings, chain_start_index))) => {
+                        Ok(Some((input, timings, chain_start_index)))
                     }
-                    Ok(None) | Err(_) => s
-                        .chain
-                        .process_first_onnx_rgba8(&mut gc, s.frame.w, s.frame.h, &s.frame.data)
-                        .map(|output| output.map(|(input, name, ms)| (input, name, ms, 1usize))),
+                    Ok(None) | Err(_) => {
+                        let mut resident_probe = |name: &str, kind: StageKind, ms: f64| {
+                            metrics.probe(name, metrics_kind_label(kind), ms);
+                        };
+                        match s.chain.process_first_onnx_vulkan_resident_rgba8(
+                            &mut gc,
+                            s.frame.w,
+                            s.frame.h,
+                            &s.frame.data,
+                            out_size,
+                            if stats {
+                                Some(&mut resident_probe as &mut dyn FnMut(&str, StageKind, f64))
+                            } else {
+                                None
+                            },
+                        ) {
+                            Ok(Some((input, name, ms))) => {
+                                Ok(Some((input, vec![(name, ms)], s.chain.stage_count())))
+                            }
+                            Ok(None) | Err(_) => s
+                                .chain
+                                .process_first_onnx_rgba8(&mut gc, s.frame.w, s.frame.h, &s.frame.data)
+                                .map(|output| output.map(|(input, name, ms)| (input, vec![(name, ms)], 1usize))),
+                        }
+                    }
                 }
             };
             match direct_onnx {
-                Ok(Some((input, name, ms, chain_start_index))) => {
+                Ok(Some((input, timings, chain_start_index))) => {
                     if stats {
-                        metrics.probe(&name, "onnx", ms);
+                        for (name, ms) in &timings {
+                            metrics.probe(name, "onnx", *ms);
+                        }
                     }
                     process_and_present_from(
                         &mut gc,
@@ -12456,8 +14925,9 @@ fn engine_main(
             // 24p), and draining here each gap serialized the pipeline down
             // well below the delivered rate when pacing is constrained.
             let out_size = virtual_shader_output_size((s.frame.w, s.frame.h));
-            let stats = metrics.detailed_enabled() && s.frame.seq % 30 == 0;
-            drain_pending_interp(
+            let stats = metrics.detailed_enabled()
+                && (s.frame.seq % 30 == 0 || metrics.stage_fast_settle_active());
+            let pending_ok = drain_pending_interp(
                 &mut gc,
                 &mut overlay,
                 &input,
@@ -12470,6 +14940,14 @@ fn engine_main(
                 Instant::now(),
                 downscaler,
             );
+            if !pending_ok {
+                s.interp_worker = None;
+                s.interp_present_deadline = None;
+                s.flow_output_cadence.reset();
+                log::warn!(
+                    "neoamd-cooperative-stream-reset: reason=quiet-drain-slot-contract-failure action=worker-rebuild-next-tick"
+                );
+            }
         } else if s.display_hz_base_tex.is_some()
             && !s.chain_reprocess_pending
             && !s.capture_resolution_applied
@@ -12962,6 +15440,20 @@ fn start_session(
             "Interpolation chain plan: pre={pre:?} interp={interp:?} post={post:?} effective_order=pre->interp->post verified=true"
         );
     }
+    let directml_drba_capture_queue = match chain.interp_stage() {
+        Some(crate::render::chain::InterpHandle::Onnx { stage, .. }) => {
+            let stage = stage.lock().unwrap();
+            stage.provider == crate::render::onnx_stage::OnnxProvider::DirectML
+                && stage.interp_delayed()
+        }
+        _ => false,
+    };
+    if directml_drba_capture_queue {
+        log::info!(
+            "dml-drba-v806-capture-queue: max={} policy=preserve-unique-source-frames bounded=true",
+            DIRECTML_DRBA_QUEUE_MAX
+        );
+    }
     source.set_queue_enabled(chain.has_interp());
     let warning = display_hz_chain_warning(&chain);
     if let Some(message) = warning.as_deref() {
@@ -13158,12 +15650,24 @@ fn start_session(
             gpu_interp_worker: None,
             gpu_interp_pack_pending: None,
             gpu_interp_pending: None,
+            drba_present_queue: std::collections::VecDeque::new(),
+            drba_present_deadline: None,
+            drba_lookahead_needs_anchor: true,
+            drba_diag_present_seq: 0,
+            drba_diag_last_semantic_ts_100ns: None,
+            directml_drba_capture_queue,
             gpu_interp_result_stash: std::collections::VecDeque::new(),
             gpu_interp_permit_after_post_submit: None,
             gpu_interp_pair_id: 0,
             gpu_interp_active_logged: false,
+            drba_midpoint_ema_ms: 0.0,
+            drba_perf_samples: 0,
+            drba_compute_credit_ms: 0.0,
+            drba_phase_rotation: 0,
+            drba_dropped_midpoints: 0,
             provider_transition_input_suspended: false,
             provider_transition_input_suspended_since: None,
+            provider_transition_recovery_attempts: 0,
             interp_last_tick: None,
             interp_tail: None,
             interp_present_deadline: None,
@@ -13679,6 +16183,12 @@ fn stop_session(
             .take()
             .map(|mut worker| worker.shutdown())
             .unwrap_or(true);
+        // Detached v801/v802 presentation frames are owned by the Session, not
+        // by the provider bridge. Retire them explicitly at the Stop boundary
+        // so a safety-stop can never carry an old frame into the next session.
+        recycle_drba_present_queue(gc, &mut s);
+        s.gpu_interp_result_stash.clear();
+        s.drba_present_deadline = None;
         if worker_clean {
             s.chain.prepare_gpu_transition(gc)
         } else {
@@ -13748,6 +16258,10 @@ fn stop_session(
         }
     }
     detach_overlay_owned_helpers(overlay.hwnd().0 as isize);
+    // Clear both persistent WGL buffers before removing the HWND from DWM.
+    // This complements resource retirement: the compositor cannot resurrect
+    // the final scanout image from the just-ended session on a later Start.
+    overlay.blank_hidden_buffers(gc, "capture-stop");
     overlay.hide_for_stop();
     if let Some((hwnd, pid, rect, placement, was_maximized)) = final_source_geometry {
         let _ = finalize_source_geometry_restore(hwnd, pid, rect, placement, was_maximized);
@@ -13821,6 +16335,7 @@ fn stop_session(
     g.warning = None;
     g.source_live_fullscreen = false;
     g.capture_resolution_resize_intent = None;
+    g.onnx_neoamd_stages = 0;
     g.onnx_tensorrt_stages = 0;
     g.onnx_cuda_stages = 0;
     g.onnx_directml_fallbacks = 0;
@@ -14422,6 +16937,416 @@ fn frame_present_latency_ms(timing: FrameTiming, present_time: PresentTime) -> f
 /// interval, in t order) then the delayed REAL end frame. Worker errors and
 /// timeouts skip the affected mids but the real frame is always presented.
 #[allow(clippy::too_many_arguments)]
+fn drain_pending_interp_neoamd_stream(
+    gc: &mut GlContext,
+    overlay: &mut OverlayWindow,
+    input: &crate::input::InputSystem,
+    s: &mut Session,
+    metrics: &Metrics,
+    status: &Arc<Mutex<Status>>,
+    out_size: (i32, i32),
+    stats: bool,
+    vsync_on: bool,
+    tick_t0: Instant,
+    downscaler: crate::render::scaler::Kernel,
+    pending: PendingInterp,
+) -> bool {
+    let drain_t0 = Instant::now();
+    let gap_ms = s
+        .interp_last_tick
+        .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    s.interp_last_tick = Some(tick_t0);
+    let pre_ms = drain_t0.duration_since(tick_t0).as_secs_f64() * 1000.0;
+    let wait_take_ms = s
+        .interp_tail
+        .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    let n = pending.count + usize::from(pending.present_real);
+    let content_dt = if s.smooth_pacing {
+        s.cadence
+            .period_s()
+            .or(pending.pair_dt)
+            .unwrap_or(s.arrival_interval)
+    } else {
+        pending.pair_dt.unwrap_or(s.arrival_interval)
+    }
+    .clamp(1.0 / 240.0, 0.1);
+    let output_step = Duration::from_secs_f64(
+        pending
+            .output_period_s
+            .unwrap_or_else(|| content_dt / n.max(1) as f64)
+            .clamp(1.0 / 1000.0, 0.1),
+    );
+    let output_period_s = output_step.as_secs_f64();
+
+    // v780: NeoAMD Backend Pack v041 mirrors DirectML's cooperative-slot
+    // contract. Only one generated midpoint is allowed to become ready at a
+    // time; after it is actually presented, the render thread authorizes the
+    // worker to execute the next phase. Deadlines are chained from the ACTUAL
+    // previous present, never from an already-missed theoretical clock. This
+    // forbids the 0.3-0.5 ms catch-up bursts seen in v778/v779 and guarantees
+    // that every generated x2/x3/x4/x5 midpoint owns one visible output slot.
+    let mut next_deadline = s
+        .interp_present_deadline
+        .unwrap_or_else(Instant::now);
+    let mut fail: Option<String> = None;
+    let mut interp_run_ms = 0.0f64;
+    let mut mids_ok = 0usize;
+    let mut presented_mid_count = 0usize;
+    let mut slot_wait_overshoot_max_ms = 0.0f64;
+    let mut slot_present_work_ms = 0.0f64;
+    let mut slot_present_count = 0usize;
+    let recv_started = Instant::now();
+    let mids_started = Instant::now();
+
+    for expected_idx in 0..pending.count {
+        let result = match s.interp_worker.as_ref() {
+            Some(worker) => match worker.res_rx.recv_timeout(Duration::from_millis(400)) {
+                Ok(result) => result,
+                Err(_) => {
+                    fail = Some(format!(
+                        "NeoAMD cooperative slot timeout: pair={} slot={}/{}",
+                        pending.pair_id,
+                        expected_idx + 1,
+                        pending.count
+                    ));
+                    break;
+                }
+            },
+            None => {
+                fail = Some("NeoAMD cooperative interpolation worker disappeared".into());
+                break;
+            }
+        };
+        if result.pair_id != pending.pair_id || result.idx != expected_idx {
+            fail = Some(format!(
+                "NeoAMD cooperative slot order mismatch: expected pair={} slot={} got pair={} slot={}",
+                pending.pair_id, expected_idx, result.pair_id, result.idx
+            ));
+            break;
+        }
+        if let Some((p, r, o)) = result.profile {
+            interp_run_ms += r;
+            if stats {
+                metrics.probe("Frame interpolation pack", "cpu", p);
+                metrics.probe("Frame interpolation run", "onnx", r);
+                metrics.probe("Frame interpolation output", "cpu", o);
+            }
+        }
+        let payload = match result.r {
+            Ok(payload) => {
+                mids_ok += 1;
+                payload
+            }
+            Err(error) => {
+                fail = Some(format!("{error:#}"));
+                break;
+            }
+        };
+        if s.smooth_pacing {
+            let current_phase_slot = pending
+                .mid_ts
+                .get(expected_idx)
+                .copied()
+                .map(|t| drba_phase_slot(t, pending.factor))
+                .unwrap_or(expected_idx + 1);
+            let previous_phase_slot = if expected_idx == 0 {
+                0
+            } else {
+                pending
+                    .mid_ts
+                    .get(expected_idx - 1)
+                    .copied()
+                    .map(|t| drba_phase_slot(t, pending.factor))
+                    .unwrap_or(expected_idx)
+            };
+            let skipped_slots = current_phase_slot
+                .saturating_sub(previous_phase_slot)
+                .saturating_sub(1);
+            if skipped_slots > 0 {
+                next_deadline += output_step.mul_f64(skipped_slots as f64);
+            }
+            let now = Instant::now();
+            let overshoot_ms = if now < next_deadline {
+                wait_until_interp_slot_precise(overlay, next_deadline)
+            } else {
+                now.duration_since(next_deadline).as_secs_f64() * 1000.0
+            };
+            slot_wait_overshoot_max_ms = slot_wait_overshoot_max_ms.max(overshoot_ms);
+        }
+        // Anchor the next slot at the start of this present, not after the
+        // upload/post/present work returns.  v780 added that work to every
+        // interval, so the error accumulated with x3/x4/x5.
+        let slot_anchor = Instant::now();
+        let t0 = slot_anchor;
+        let mut neoamd_shared_read_key = None;
+        let tex = match payload {
+            InterpPayload::Cpu(mw, mh, mid) => gc.upload_rgb8(mw, mh, &mid),
+            InterpPayload::NeoAmdShared(mut shared) => {
+                if !gc.has_external_import(shared.key) {
+                    let handle = shared.take_handle();
+                    if let Err(error) = gc.import_external_d3d12_buffer(
+                        shared.key,
+                        handle,
+                        shared.byte_len,
+                        shared.heap_byte_len,
+                        shared.luid,
+                    ) {
+                        fail = Some(format!(
+                            "NeoAMD shared interpolation output import failed: {error}"
+                        ));
+                        break;
+                    }
+                }
+                match gc.external_rgba8_buffer_to_texture(
+                    shared.key,
+                    shared.size.0,
+                    shared.size.1,
+                ) {
+                    Ok(texture) => {
+                        neoamd_shared_read_key = Some(shared.key);
+                        texture
+                    }
+                    Err(error) => {
+                        fail = Some(format!(
+                            "NeoAMD shared interpolation output conversion failed: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            InterpPayload::DmlShared { .. } => {
+                fail = Some("NeoAMD cooperative stream returned an unexpected DirectML shared payload".into());
+                break;
+            }
+        };
+        let presented_before = status.lock().unwrap().presented;
+        let transition_was_suspended = s.provider_transition_input_suspended;
+        process_and_present_from(
+            gc,
+            overlay,
+            s,
+            metrics,
+            status,
+            tex,
+            out_size,
+            stats,
+            t0,
+            0,
+            Some(FrameTiming {
+                received_at: pending.real.received_at,
+                source_time_100ns: match (
+                    pending.start_source_time_100ns,
+                    pending.real.source_time_100ns,
+                    pending.mid_ts.get(expected_idx),
+                ) {
+                    (Some(a), Some(b), Some(t)) if b >= a => {
+                        Some(a + ((b - a) as f64 * *t as f64).round() as i64)
+                    }
+                    _ => pending.real.source_time_100ns,
+                },
+                fallback_start: t0,
+            }),
+            &[],
+            downscaler,
+            pending.chain_start_index,
+        );
+        let presented_after = status.lock().unwrap().presented;
+        if presented_after > presented_before {
+            presented_mid_count += 1;
+            if transition_was_suspended {
+                resume_provider_transition_after_interpolated_present(
+                    input,
+                    s,
+                    "neoamd-cooperative-slot",
+                );
+            }
+        } else {
+            fail = Some(format!(
+                "NeoAMD generated midpoint was not committed to present: pair={} slot={}/{}",
+                pending.pair_id,
+                expected_idx + 1,
+                pending.count
+            ));
+            break;
+        }
+        slot_present_work_ms += slot_anchor.elapsed().as_secs_f64() * 1000.0;
+        slot_present_count += 1;
+        if s.smooth_pacing {
+            next_deadline = slot_anchor + output_step;
+        } else if !vsync_on {
+            let phase = pending
+                .mid_ts
+                .get(expected_idx)
+                .copied()
+                .map(|t| t as f64)
+                .unwrap_or((expected_idx + 1) as f64 / pending.factor.max(2) as f64);
+            let target = (content_dt * phase).min(0.08);
+            wait_until_with_pump(overlay, tick_t0 + Duration::from_secs_f64(target));
+        }
+        if let Some(key) = neoamd_shared_read_key {
+            if let Err(error) = gc.wait_external_buffer_idle(key) {
+                fail = Some(format!(
+                    "NeoAMD shared interpolation output GL fence failed: {error}"
+                ));
+                break;
+            }
+        }
+        if neoamd_shared_read_key.is_some() || expected_idx + 1 < pending.count {
+            if let Some(worker) = s.interp_worker.as_ref() {
+                worker.permit_next_slot(pending.pair_id);
+            }
+        }
+    }
+
+    let recv_ms = recv_started.elapsed().as_secs_f64() * 1000.0;
+    let mids_ms = mids_started.elapsed().as_secs_f64() * 1000.0;
+    let real_started = Instant::now();
+    let mut presented_real_count = 0usize;
+    if pending.present_real {
+        if s.smooth_pacing {
+            if pending.count > 0 {
+                let last_phase_slot = pending
+                    .mid_ts
+                    .last()
+                    .copied()
+                    .map(|t| drba_phase_slot(t, pending.factor))
+                    .unwrap_or(pending.count);
+                let skipped_before_real = pending
+                    .factor
+                    .saturating_sub(last_phase_slot as u32)
+                    .saturating_sub(1) as usize;
+                if skipped_before_real > 0 {
+                    next_deadline += output_step.mul_f64(skipped_before_real as f64);
+                }
+            }
+            let now = Instant::now();
+            let overshoot_ms = if now < next_deadline {
+                wait_until_interp_slot_precise(overlay, next_deadline)
+            } else {
+                now.duration_since(next_deadline).as_secs_f64() * 1000.0
+            };
+            slot_wait_overshoot_max_ms = slot_wait_overshoot_max_ms.max(overshoot_ms);
+        }
+        let slot_anchor = Instant::now();
+        let t0 = slot_anchor;
+        let tex = if pending.rgba {
+            gc.upload_rgba8(pending.real.w, pending.real.h, &pending.real.data)
+        } else {
+            gc.upload_rgb8(pending.real.w, pending.real.h, &pending.real.data)
+        };
+        let delivered = s.source.delivered();
+        let captures = delivered.saturating_sub(s.metric_seq) as u32;
+        s.metric_seq = delivered;
+        let presented_before = status.lock().unwrap().presented;
+        process_and_present_from(
+            gc,
+            overlay,
+            s,
+            metrics,
+            status,
+            tex,
+            out_size,
+            stats,
+            t0,
+            captures,
+            Some(pending.real.timing(t0)),
+            &[],
+            downscaler,
+            pending.chain_start_index,
+        );
+        if status.lock().unwrap().presented > presented_before {
+            presented_real_count = 1;
+        } else if fail.is_none() {
+            fail = Some(format!(
+                "NeoAMD REAL endpoint was not committed to present: pair={}",
+                pending.pair_id
+            ));
+        }
+        slot_present_work_ms += slot_anchor.elapsed().as_secs_f64() * 1000.0;
+        slot_present_count += 1;
+        if s.smooth_pacing {
+            next_deadline = slot_anchor + output_step;
+        }
+    }
+    s.interp_present_deadline = s.smooth_pacing.then_some(next_deadline);
+
+    if pending.is_drba && fail.is_none() && interp_run_ms > 0.0 {
+        observe_drba_midpoint_cost(
+            &mut s.drba_midpoint_ema_ms,
+            &mut s.drba_perf_samples,
+            interp_run_ms,
+            pending.count,
+        );
+    }
+    if stats && interp_run_ms > 0.0 {
+        metrics.probe(&pending.interp_name, "onnx", interp_run_ms);
+    }
+    if let Some(msg) = &fail {
+        let message = format!("補間: {msg}");
+        let mut state = status.lock().unwrap();
+        if !state.chain_errors.contains(&message) {
+            state.chain_errors.push(message);
+        }
+    }
+    let expected_total = pending.count + usize::from(pending.present_real);
+    let presented_total = presented_mid_count + presented_real_count;
+    let present_order_ok = fail.is_none()
+        && mids_ok == pending.count
+        && presented_mid_count == pending.count
+        && presented_total == expected_total;
+    if s.last_neoflow_log.elapsed() >= Duration::from_secs(1) {
+        let source_fps = 1.0 / content_dt.max(1.0 / 240.0);
+        let requested_output_fps = 1.0 / output_period_s.max(1.0 / 1000.0);
+        let actual_pair_output_fps = source_fps * presented_total as f64;
+        let pre_stage_count = pending.chain_start_index.saturating_sub(1);
+        let post_stage_count = s
+            .chain
+            .stage_count()
+            .saturating_sub(pending.chain_start_index);
+        log::info!(
+            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} pacing=neoamd-cooperative-slots cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} mids_ms={:.1} real_ms={:.1} slot_present_ms_avg={:.3} slot_wait_overshoot_ms_max={:.3} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} generated_mid_count={} presented_mid_count={} presented_total_count={} expected_total_count={} present_order_ok={} dropped_mid_count={} repeated_present_count=0",
+            pending.real.w,
+            pending.real.h,
+            mids_ok,
+            pending.count,
+            fail.as_deref(),
+            s.smooth_pacing,
+            s.cadence.period_s().unwrap_or(0.0) * 1000.0,
+            s.arrival_interval * 1000.0,
+            pending.pair_dt.unwrap_or(0.0) * 1000.0,
+            output_step.as_secs_f64() * 1000.0,
+            gap_ms,
+            wait_take_ms,
+            pre_ms,
+            recv_ms,
+            mids_ms,
+            real_started.elapsed().as_secs_f64() * 1000.0,
+            if slot_present_count > 0 {
+                slot_present_work_ms / slot_present_count as f64
+            } else {
+                0.0
+            },
+            slot_wait_overshoot_max_ms,
+            pre_stage_count,
+            post_stage_count,
+            if pre_stage_count > 0 { source_fps } else { 0.0 },
+            source_fps,
+            requested_output_fps,
+            actual_pair_output_fps,
+            mids_ok,
+            presented_mid_count,
+            presented_total,
+            expected_total,
+            present_order_ok,
+            pending.requested_mid_count.saturating_sub(presented_mid_count),
+        );
+        s.last_neoflow_log = Instant::now();
+    }
+    present_order_ok
+}
+
 fn drain_pending_interp(
     gc: &mut GlContext,
     overlay: &mut OverlayWindow,
@@ -14434,10 +17359,26 @@ fn drain_pending_interp(
     vsync_on: bool,
     tick_t0: Instant,
     downscaler: crate::render::scaler::Kernel,
-) {
+) -> bool {
     let Some(pending) = s.interp_pending.take() else {
-        return;
+        return true;
     };
+    if pending.neoamd_stream_slots {
+        return drain_pending_interp_neoamd_stream(
+            gc,
+            overlay,
+            input,
+            s,
+            metrics,
+            status,
+            out_size,
+            stats,
+            vsync_on,
+            tick_t0,
+            downscaler,
+            pending,
+        );
+    }
     let drain_t0 = Instant::now();
     let gap_ms = s
         .interp_last_tick
@@ -14456,12 +17397,25 @@ fn drain_pending_interp(
         for _ in 0..pending.count {
             match worker.res_rx.recv_timeout(Duration::from_millis(400)) {
                 Ok(res) => {
-                    if stats {
-                        if let Some((p, r, o)) = res.profile {
+                    if res.pair_id != pending.pair_id
+                        || res.idx >= pending.count
+                        || got[res.idx].is_some()
+                    {
+                        fail = Some(format!(
+                            "interpolation result order mismatch: expected pair={} slots=0..{} got pair={} slot={}",
+                            pending.pair_id,
+                            pending.count.saturating_sub(1),
+                            res.pair_id,
+                            res.idx
+                        ));
+                        break;
+                    }
+                    if let Some((p, r, o)) = res.profile {
+                        interp_run_ms = interp_run_ms.max(r);
+                        if stats {
                             metrics.probe("Frame interpolation pack", "cpu", p);
                             metrics.probe("Frame interpolation run", "onnx", r);
                             metrics.probe("Frame interpolation output", "cpu", o);
-                            interp_run_ms = interp_run_ms.max(r);
                         }
                     }
                     match res.r {
@@ -14475,6 +17429,14 @@ fn drain_pending_interp(
                 }
             }
         }
+    }
+    if pending.is_drba && fail.is_none() && interp_run_ms > 0.0 {
+        observe_drba_midpoint_cost(
+            &mut s.drba_midpoint_ema_ms,
+            &mut s.drba_perf_samples,
+            interp_run_ms,
+            pending.count,
+        );
     }
     if stats && interp_run_ms > 0.0 {
         metrics.probe(&pending.interp_name, "onnx", interp_run_ms);
@@ -14504,36 +17466,90 @@ fn drain_pending_interp(
             .unwrap_or_else(|| content_dt / n.max(1) as f64)
             .clamp(1.0 / 1000.0, 0.1),
     );
-    let mut output_deadline = if s.smooth_pacing {
-        let now = Instant::now();
-        match s.interp_present_deadline {
-            Some(deadline)
-                if now.saturating_duration_since(deadline) <= output_step.mul_f64(1.5) =>
-            {
-                deadline
-            }
-            _ => now,
-        }
-    } else {
-        tick_t0
-    };
-    let mids_t0 = Instant::now();
+    let output_period_s = output_step.as_secs_f64();
+    // v779: preserve the output-slot clock across the NeoAMD pair boundary.
+    // v778 spaced x4's three mids and REAL endpoint inside each pair, but then
+    // discarded the next deadline. If WGC already had the next source tick
+    // queued, the next pair could start ~0.4ms after the previous REAL frame.
+    //
+    // Keep one continuous slot clock for exact x2/x3/x4/x5. Before every
+    // present, if work is genuinely late by more than half a slot, re-anchor
+    // once to `now` instead of trying to catch up with back-to-back presents.
+    // When work is on time, planned slots remain exact (20.83/13.89/10.42/8.33
+    // ms) without adding rendering time to every interval.
+    let pair_clock_now = Instant::now();
+    let exact_multiplier_period = output_period_s * n.max(1) as f64;
+    let neoamd_continuous_slot_pacing = s.smooth_pacing
+        && pending.neoamd_cpu_visible
+        && pending.present_real
+        && (exact_multiplier_period - content_dt).abs()
+            <= (output_period_s * 0.15).max(0.000_25);
     let mut deadline_miss_count = 0u32;
+    let mut pair_next_deadline = if s.smooth_pacing {
+        s.interp_present_deadline.unwrap_or(pair_clock_now)
+    } else {
+        pair_clock_now
+    };
+    let late_reanchor = Duration::from_secs_f64((output_period_s * 0.50).max(0.0005));
+    // v800: DirectML DRBA keeps every completed midpoint and paces from the
+    // previous ACTUAL present. The v796-v799 source-time deadline was useful
+    // for proving chronology, but at 1080p it discarded valid x4 frames that
+    // arrived only ~5-6 ms after their ideal slot. Provider-late output now
+    // stretches cadence naturally instead of collapsing to real-only video.
+    let dml_native_cadence = false;
+    let dml_drba_ordered_grid = pending.directml_drba;
+    let dml_late_present_drops = 0usize;
+    let mut presented_mid_count = 0usize;
+    let mids_t0 = Instant::now();
     for (index, value) in got.into_iter().enumerate() {
+        if dml_drba_ordered_grid {
+            let deadline = s.last_present_started + output_step;
+            let now = Instant::now();
+            if !vsync_on && now < deadline {
+                wait_until_with_pump(overlay, deadline);
+            }
+        } else if s.smooth_pacing && !dml_native_cadence {
+            let current_phase_slot = pending
+                .mid_ts
+                .get(index)
+                .copied()
+                .map(|t| drba_phase_slot(t, pending.factor))
+                .unwrap_or(index + 1);
+            let previous_phase_slot = if index == 0 {
+                0
+            } else {
+                pending
+                    .mid_ts
+                    .get(index - 1)
+                    .copied()
+                    .map(|t| drba_phase_slot(t, pending.factor))
+                    .unwrap_or(index)
+            };
+            let skipped_slots = current_phase_slot
+                .saturating_sub(previous_phase_slot)
+                .saturating_sub(1);
+            if skipped_slots > 0 {
+                pair_next_deadline += output_step.mul_f64(skipped_slots as f64);
+            }
+            let now = Instant::now();
+            if neoamd_continuous_slot_pacing
+                && now > pair_next_deadline
+                && now.duration_since(pair_next_deadline) > late_reanchor
+            {
+                pair_next_deadline = now;
+                deadline_miss_count = deadline_miss_count.saturating_add(1);
+            }
+            if Instant::now() < pair_next_deadline {
+                wait_until_with_pump(overlay, pair_next_deadline);
+            }
+            pair_next_deadline += output_step;
+        }
         let Some(payload) = value else {
             continue;
         };
-        if s.smooth_pacing {
-            // Begin the expensive post-chain before its absolute presentation
-            // slot. Waiting until the slot and only then running a 20 ms ONNX
-            // stage produced alternating late/bunched presents on 60 Hz.
-            let predicted = Duration::from_secs_f64(
-                (s.last_process_ms / 1000.0).clamp(0.0, output_step.as_secs_f64()),
-            );
-            let prepare_at = output_deadline
-                .checked_sub(predicted)
-                .unwrap_or(output_deadline);
-            wait_until_with_pump(overlay, prepare_at);
+        if dml_native_cadence {
+            // No additional presentation wait: preserve the same DirectML DRBA
+            // frame handoff used when Smooth Pacing is disabled.
         }
         let t0 = Instant::now();
         let (tex, chain_start, transition_route) = match payload {
@@ -14542,6 +17558,12 @@ fn drain_pending_interp(
                 pending.chain_start_index,
                 "cpu-worker",
             ),
+            InterpPayload::NeoAmdShared(_) => {
+                fail = Some(
+                    "NeoAMD shared cooperative payload escaped the dedicated slot renderer".into(),
+                );
+                continue;
+            }
             InterpPayload::DmlShared { shared, fallback } => {
                 let stage_count = s.chain.stage_count();
                 let interp_stage = match s.chain.interp_stage() {
@@ -14822,25 +17844,14 @@ fn drain_pending_interp(
             downscaler,
             chain_start,
         );
+        presented_mid_count = presented_mid_count.saturating_add(1);
         if let Some(presented_before) = transition_presented_before {
             let presented_after = status.lock().unwrap().presented;
             if presented_after > presented_before {
                 resume_provider_transition_after_interpolated_present(input, s, transition_route);
             }
         }
-        if s.smooth_pacing {
-            let scheduled_next = output_deadline + output_step;
-            let now = Instant::now();
-            // Never catch up by presenting the next output immediately after
-            // a missed slot. Resynchronise one full slot ahead instead.
-            output_deadline = if now >= scheduled_next {
-                deadline_miss_count += 1;
-                now + output_step
-            } else {
-                scheduled_next
-            };
-        }
-        if !s.smooth_pacing && !vsync_on {
+        if !dml_drba_ordered_grid && !s.smooth_pacing && !vsync_on {
             // Low-latency mode retains arrival-relative pacing.
             let target = (content_dt * (index + 1) as f64 / n as f64).min(0.025);
             let deadline = tick_t0 + Duration::from_secs_f64(target);
@@ -14850,14 +17861,40 @@ fn drain_pending_interp(
     let mids_ms = mids_t0.elapsed().as_secs_f64() * 1000.0;
     let real_t0 = Instant::now();
     if pending.present_real {
-        if s.smooth_pacing {
-            let predicted = Duration::from_secs_f64(
-                (s.last_process_ms / 1000.0).clamp(0.0, output_step.as_secs_f64()),
-            );
-            let prepare_at = output_deadline
-                .checked_sub(predicted)
-                .unwrap_or(output_deadline);
-            wait_until_with_pump(overlay, prepare_at);
+        let last_phase_slot = pending
+            .mid_ts
+            .last()
+            .copied()
+            .map(|t| drba_phase_slot(t, pending.factor))
+            .unwrap_or(0);
+        let real_slot_delta = (pending.factor as usize)
+            .saturating_sub(last_phase_slot)
+            .max(1);
+        if dml_drba_ordered_grid {
+            let deadline = s.last_present_started + output_step;
+            let now = Instant::now();
+            if !vsync_on && now < deadline {
+                wait_until_with_pump(overlay, deadline);
+            }
+        } else if dml_native_cadence {
+            // retained for non-DRBA compatibility; currently false
+        } else if s.smooth_pacing {
+            let skipped_before_real = real_slot_delta.saturating_sub(1);
+            if skipped_before_real > 0 {
+                pair_next_deadline += output_step.mul_f64(skipped_before_real as f64);
+            }
+            let now = Instant::now();
+            if neoamd_continuous_slot_pacing
+                && now > pair_next_deadline
+                && now.duration_since(pair_next_deadline) > late_reanchor
+            {
+                pair_next_deadline = now;
+                deadline_miss_count = deadline_miss_count.saturating_add(1);
+            }
+            if Instant::now() < pair_next_deadline {
+                wait_until_with_pump(overlay, pair_next_deadline);
+            }
+            pair_next_deadline += output_step;
         }
         let t0 = Instant::now();
         let tex = if pending.rgba {
@@ -14884,38 +17921,41 @@ fn drain_pending_interp(
             downscaler,
             pending.chain_start_index,
         );
-        if s.smooth_pacing {
-            let scheduled_next = output_deadline + output_step;
-            let now = Instant::now();
-            output_deadline = if now >= scheduled_next {
-                deadline_miss_count += 1;
-                now + output_step
-            } else {
-                scheduled_next
-            };
-        }
     }
-    if s.smooth_pacing {
-        s.interp_present_deadline = Some(output_deadline);
-    } else {
-        s.interp_present_deadline = None;
-    }
+    s.interp_present_deadline = (s.smooth_pacing
+        && !dml_native_cadence
+        && !dml_drba_ordered_grid)
+        .then_some(pair_next_deadline);
     if s.last_neoflow_log.elapsed() >= Duration::from_secs(1) {
         let source_fps = 1.0 / content_dt.max(1.0 / 240.0);
-        let output_fps = 1.0 / output_step.as_secs_f64().max(1.0 / 1000.0);
+        let requested_output_fps = 1.0 / output_step.as_secs_f64().max(1.0 / 1000.0);
+        let actual_presented_mids = if dml_drba_ordered_grid {
+            presented_mid_count
+        } else {
+            mids_ok
+        };
+        let actual_pair_output_fps =
+            source_fps * (actual_presented_mids + usize::from(pending.present_real)) as f64;
         let pre_stage_count = pending.chain_start_index.saturating_sub(1);
         let post_stage_count = s
             .chain
             .stage_count()
             .saturating_sub(pending.chain_start_index);
         log::info!(
-            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} mids_ms={:.1} real_ms={:.1} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} post_outputs_per_s={:.2} deadline_miss_count={} dropped_mid_count={} repeated_present_count=0",
+            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} pacing={} cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} mids_ms={:.1} real_ms={:.1} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} deadline_miss_count={} dropped_mid_count={} late_present_drop_count={} repeated_present_count=0",
             pending.real.w,
             pending.real.h,
             mids_ok,
             pending.count,
             fail.as_deref(),
             s.smooth_pacing,
+            if dml_drba_ordered_grid {
+                "directml-drba-provider-paced"
+            } else if neoamd_continuous_slot_pacing {
+                "neoamd-continuous-slot-chain"
+            } else {
+                "pair-local-nonskip"
+            },
             s.cadence.period_s().unwrap_or(0.0) * 1000.0,
             s.arrival_interval * 1000.0,
             pending.pair_dt.unwrap_or(0.0) * 1000.0,
@@ -14930,16 +17970,15 @@ fn drain_pending_interp(
             post_stage_count,
             if pre_stage_count > 0 { source_fps } else { 0.0 },
             source_fps,
-            if post_stage_count > 0 {
-                output_fps
-            } else {
-                0.0
-            },
+            requested_output_fps,
+            actual_pair_output_fps,
             deadline_miss_count,
-            pending.count.saturating_sub(mids_ok),
+            pending.requested_mid_count.saturating_sub(mids_ok),
+            dml_late_present_drops,
         );
         s.last_neoflow_log = Instant::now();
     }
+    true
 }
 
 fn reset_display_hz_cache(s: &mut Session, gc: &mut GlContext, reason: &str) {
@@ -15509,7 +18548,7 @@ fn process_and_present_from_impl(
                 }
             }
             s.last_post_submit_ms = post_started.elapsed().as_secs_f64() * 1000.0;
-            // x4/x5: the current output's conversion + GLSL post-chain is now
+            // Multi-slot interpolation: the current output's conversion + GLSL post-chain is now
             // ordered on the GL queue. Release the next unique provider slot
             // here, not after import (which lets RIFE preempt the GLSL chain)
             // and not after SwapBuffers (which needlessly serializes DML with
@@ -15659,6 +18698,14 @@ fn process_and_present_from_impl(
                 s.paced_present_deadline = None;
             }
             if let Err(e) = present_result {
+                if s.provider_transition_input_suspended {
+                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    log::warn!(
+                        "provider-transition-present-failed: error={:#} retry_cached={}",
+                        e,
+                        s.chain_reprocess_pending
+                    );
+                }
                 if transition_overlay_repositioned {
                     let gui_hwnd = win32::main_gui_hwnd();
                     let gui_topmost = gui_hwnd != 0
@@ -15738,6 +18785,16 @@ fn process_and_present_from_impl(
                         s.capture_crop.bottom,
                         s.in_size.0,
                         s.in_size.1
+                    );
+                }
+                if s.provider_transition_input_suspended {
+                    crate::input::InputSystem::resume_transition_suspended();
+                    s.provider_transition_input_suspended = false;
+                    s.provider_transition_input_suspended_since = None;
+                    s.provider_transition_recovery_attempts = 0;
+                    s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+                    log::info!(
+                        "provider-transition-ready: first-filtered-frame-presented route=ordinary input=resume-after-120ms"
                     );
                 }
                 if (chain_reprocess_commit || dlssnr_refresh_commit) && overlay.is_visible() {
@@ -15924,6 +18981,7 @@ fn process_and_present_from_impl(
                         crate::input::InputSystem::resume_transition_suspended();
                         s.provider_transition_input_suspended = false;
                         s.provider_transition_input_suspended_since = None;
+                        s.provider_transition_recovery_attempts = 0;
                         s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
                         log::info!(
                             "provider-transition-ready: first-filtered-frame-ready-before-overlay-reveal input=resume-after-120ms"
@@ -16554,19 +19612,15 @@ mod tests {
     }
 
     #[test]
-    fn x5_startup_fractional_cadence_never_runs_a_fifth_synthetic_inference() {
+    fn x5_startup_cadence_cannot_reduce_requested_multiplier() {
         let mut cadence = FlowOutputCadence::default();
-        // Covers a transient cadence overshoot during interpolation startup.
-        // The old accumulator emitted five synthetic timesteps and no endpoint.
+        // Even if source-period estimation initially reports a ratio below 5,
+        // requested x5 is a processing contract: four unique mids plus the
+        // real endpoint. This is what Stop -> Start already produced reliably.
         let phases = onnx_interpolation_phases(5, 4.14, false, &mut cadence);
-        assert!(
-            phases.len() <= 4,
-            "x5 may generate at most four synthetic mids"
-        );
-        assert!(phases.iter().all(|phase| *phase < 1.0 - 1e-5));
-        for pair in phases.windows(2) {
-            assert!(pair[0] < pair[1], "every generated midpoint must be unique");
-        }
+        assert_eq!(phases, vec![0.2, 0.4, 0.6, 0.8, 1.0]);
+        assert!(cadence.next_phase.is_none());
+        assert_eq!(cadence.phase_step, 0.0);
     }
 
     #[test]
@@ -16718,12 +19772,23 @@ mod tests {
     }
 
     #[test]
-    fn pacing_guard_integer_multi_output_slot_policy_is_uniform() {
+    fn pacing_guard_integer_multi_output_slot_policy_matches_v782() {
         assert_eq!(gpu_interp_slot_policy(2, 1), (false, false));
         assert_eq!(gpu_interp_slot_policy(3, 1), (false, false));
         assert_eq!(gpu_interp_slot_policy(3, 2), (true, true));
+        assert_eq!(gpu_interp_slot_policy(4, 2), (false, false));
         assert_eq!(gpu_interp_slot_policy(4, 3), (true, true));
+        assert_eq!(gpu_interp_slot_policy(5, 2), (false, false));
         assert_eq!(gpu_interp_slot_policy(5, 4), (true, true));
+    }
+
+    #[test]
+    fn directml_drba_v803_restores_v782_cooperative_provider_permits() {
+        assert_eq!(gpu_interp_slot_policy_for_path(true, 2, 1), (false, false));
+        assert_eq!(gpu_interp_slot_policy_for_path(true, 3, 2), (true, true));
+        assert_eq!(gpu_interp_slot_policy_for_path(true, 4, 3), (true, true));
+        assert_eq!(gpu_interp_slot_policy_for_path(true, 5, 4), (true, true));
+        assert_eq!(gpu_interp_slot_policy_for_path(false, 4, 3), (true, true));
     }
 
     #[test]
@@ -16731,6 +19796,7 @@ mod tests {
         use crate::render::onnx_stage::OnnxProvider;
         assert!(provider_uses_gpu_x3_mid_detach(OnnxProvider::DirectML));
         assert!(provider_uses_gpu_x3_mid_detach(OnnxProvider::TensorRT));
+        assert!(!provider_uses_gpu_x3_mid_detach(OnnxProvider::NeoAMD));
         assert!(!provider_uses_gpu_x3_mid_detach(OnnxProvider::Cuda));
     }
 
@@ -16771,9 +19837,34 @@ mod tests {
                 &current,
                 Some(1.0 / 24.0),
                 1.0 / 24.0,
+                false,
             ),
             GpuInterpContinuity::Continuous
         );
+    }
+
+    #[test]
+    fn drba_two_period_delivery_does_not_recreate_v783_reset_loop() {
+        let now = Instant::now();
+        let current = FrameBuf {
+            seq: 104,
+            received_at: Some(now + Duration::from_micros(83_334)),
+            source_time_100ns: Some(10_833_334),
+            ..FrameBuf::default()
+        };
+        // Both generic interpolation and DirectML DRBA keep an ordinary
+        // two-period delivery. DirectML DRBA additionally preserves larger
+        // forward stalls below the seek-class threshold so a temporary driver
+        // delay cannot empty its four-frame history.
+        for preserve_forward_gap in [false, true] {
+            assert_eq!(
+                classify_gpu_interp_continuity(
+                    100, Some(now), Some(10_000_000), &current,
+                    Some(1.0 / 24.0), 1.0 / 24.0, preserve_forward_gap,
+                ),
+                GpuInterpContinuity::Continuous
+            );
+        }
     }
 
     #[test]
@@ -16793,6 +19884,7 @@ mod tests {
                 &current,
                 Some(1.0 / 24.0),
                 1.0 / 24.0,
+                false,
             ),
             GpuInterpContinuity::Duplicate
         );
@@ -16815,9 +19907,94 @@ mod tests {
                 &current,
                 Some(1.0 / 24.0),
                 1.0 / 24.0,
+                false,
             ),
             GpuInterpContinuity::Broken
         );
+    }
+
+    #[test]
+    fn directml_drba_preserves_forward_stall_but_not_large_seek() {
+        let now = Instant::now();
+        let stalled = FrameBuf {
+            seq: 101,
+            received_at: Some(now + Duration::from_millis(300)),
+            source_time_100ns: Some(13_000_000),
+            ..FrameBuf::default()
+        };
+        assert_eq!(
+            classify_gpu_interp_continuity(
+                100,
+                Some(now),
+                Some(10_000_000),
+                &stalled,
+                Some(1.0 / 24.0),
+                1.0 / 24.0,
+                true,
+            ),
+            GpuInterpContinuity::Continuous
+        );
+        let seek = FrameBuf {
+            seq: 102,
+            received_at: Some(now + Duration::from_millis(800)),
+            source_time_100ns: Some(18_000_000),
+            ..FrameBuf::default()
+        };
+        assert_eq!(
+            classify_gpu_interp_continuity(
+                101,
+                stalled.received_at,
+                stalled.source_time_100ns,
+                &seek,
+                Some(1.0 / 24.0),
+                1.0 / 24.0,
+                true,
+            ),
+            GpuInterpContinuity::Broken
+        );
+    }
+
+    #[test]
+    fn drba_realtime_admission_keeps_full_x5_when_provider_is_fast() {
+        let requested = vec![0.2, 0.4, 0.6, 0.8];
+        let mut credit = 0.0;
+        let mut rotation = 0usize;
+        let admitted = drba_admit_timesteps(
+            &requested, 1.0 / 24.0, 8.0, 8, &mut credit, &mut rotation,
+        );
+        assert_eq!(admitted, requested);
+    }
+
+    #[test]
+    fn drba_realtime_admission_reports_real_sub120_throughput_instead_of_fake_x5() {
+        let requested = vec![0.2, 0.4, 0.6, 0.8];
+        let mut credit = 0.0;
+        let mut rotation = 0usize;
+        let pairs = 240usize;
+        let mut presents = 0usize;
+        for _ in 0..pairs {
+            let admitted = drba_admit_timesteps(
+                &requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation,
+            );
+            presents += admitted.len() + 1; // + REAL endpoint
+        }
+        let seconds = pairs as f64 / 24.0;
+        let actual_fps = presents as f64 / seconds;
+        assert!(actual_fps > 90.0 && actual_fps < 100.0, "fps={actual_fps}");
+        assert!(actual_fps < 120.0);
+    }
+
+    #[test]
+    fn drba_realtime_admission_preserves_original_x5_phase_grid_when_dropping() {
+        let requested = vec![0.2, 0.4, 0.6, 0.8];
+        let mut credit = 0.0;
+        let mut rotation = 0usize;
+        let admitted = drba_admit_timesteps(
+            &requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation,
+        );
+        assert!(admitted.len() < requested.len());
+        assert!(admitted.iter().all(|phase| requested.contains(phase)));
+        assert!(admitted.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
@@ -16900,12 +20077,32 @@ mod tests {
         assert!(interp_pair_is_contiguous(
             Some(1.0 / 24.0),
             Some(1.0 / 24.0),
-            1.0 / 24.0
+            1.0 / 24.0,
+            false,
         ));
         assert!(interp_pair_is_contiguous(
             Some(2.0 / 24.0),
             Some(1.0 / 24.0),
-            1.0 / 24.0
+            1.0 / 24.0,
+            false,
+        ));
+        assert!(interp_pair_is_contiguous(
+            Some(2.0 / 24.0),
+            Some(1.0 / 24.0),
+            1.0 / 24.0,
+            true,
+        ));
+        assert!(interp_pair_is_contiguous(
+            Some(0.300),
+            Some(1.0 / 24.0),
+            1.0 / 24.0,
+            true,
+        ));
+        assert!(!interp_pair_is_contiguous(
+            Some(0.800),
+            Some(1.0 / 24.0),
+            1.0 / 24.0,
+            true,
         ));
     }
 
@@ -16914,9 +20111,10 @@ mod tests {
         assert!(!interp_pair_is_contiguous(
             Some(0.783),
             Some(1.0 / 24.0),
-            0.113
+            0.113,
+            false,
         ));
-        assert!(!interp_pair_is_contiguous(Some(4.7), None, 4.7));
+        assert!(!interp_pair_is_contiguous(Some(4.7), None, 4.7, false));
     }
 
     #[test]
@@ -16961,6 +20159,59 @@ mod tests {
         let exact = snap_video_period_with_history(1.0 / 24.0, 120);
         assert!((1.0 / film - 24.0).abs() < 1e-9);
         assert!((1.0 / exact - 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cadence_startup_recovers_24p_when_onnx_init_misses_pictures() {
+        let mut cadence = CadenceEstimator::default();
+        let mut t = 0i64;
+        cadence.observe(Some(t));
+        // A real 24p source with three missed-picture gaps during cold ONNX /
+        // shared-IO initialization.  The old arithmetic mean temporarily
+        // classified this near 17fps and the pacer then displayed that lower
+        // rate even after inference had become fast.
+        for dt in [416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667, 833_334] {
+            t += dt;
+            cadence.observe(Some(t));
+        }
+        let fps = 1.0 / cadence.period_s().unwrap();
+        assert!((fps - 24.0).abs() < 0.001, "startup cadence was {fps:.3}fps");
+    }
+
+    #[test]
+    fn cadence_standard_period_tiebreak_prefers_nearest_clock() {
+        let exact24 = [416_667i64, 416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667];
+        let film = [417_084i64, 417_084, 834_168, 417_084, 417_084, 834_168, 417_084, 417_084];
+        let exact_period = dominant_video_period_with_missed_pictures(&exact24).unwrap();
+        let film_period = dominant_video_period_with_missed_pictures(&film).unwrap();
+        assert!((1.0 / exact_period - 24.0).abs() < 0.001);
+        assert!((1.0 / film_period - 23.976).abs() < 0.001);
+    }
+
+    #[test]
+    fn cadence_rolling_window_keeps_24p_with_periodic_missed_pictures() {
+        let mut cadence = CadenceEstimator::default();
+        let mut t = 0i64;
+        cadence.observe(Some(t));
+        for i in 0..120 {
+            t += if i % 7 == 0 { 833_334 } else { 416_667 };
+            cadence.observe(Some(t));
+        }
+        let fps = 1.0 / cadence.period_s().unwrap();
+        assert!((fps - 24.0).abs() < 0.001, "rolling cadence was {fps:.3}fps");
+    }
+
+    #[test]
+    fn cadence_startup_does_not_promote_true_12p_to_24p() {
+        let mut cadence = CadenceEstimator::default();
+        let mut t = 0i64;
+        cadence.observe(Some(t));
+        for _ in 0..12 {
+            t += 833_334;
+            cadence.observe(Some(t));
+        }
+        let fps = 1.0 / cadence.period_s().unwrap();
+        assert!(fps < 13.0, "true low-rate source was promoted to {fps:.3}fps");
     }
 
     #[test]
@@ -17025,50 +20276,28 @@ mod tests {
     }
 
     #[test]
-    fn onnx_x3_60hz_mode_is_narrow_and_does_not_match_other_refresh_rates() {
-        assert!(onnx_x3_60hz_mode(Some(59.94)));
-        assert!(onnx_x3_60hz_mode(Some(60.0)));
-        assert!(!onnx_x3_60hz_mode(Some(59.0)));
-        assert!(!onnx_x3_60hz_mode(Some(61.0)));
-        assert!(!onnx_x3_60hz_mode(Some(75.0)));
-        assert!(!onnx_x3_60hz_mode(Some(120.0)));
-        assert!(!onnx_x3_60hz_mode(Some(144.0)));
-        assert!(!onnx_x3_60hz_mode(Some(165.0)));
-        assert!(!onnx_x3_60hz_mode(None));
-    }
-
-    #[test]
-    fn onnx_x3_60hz_keeps_refresh_limited_60fps_cadence() {
-        let period_24p = Some(1.0 / 24.0);
-        let ratio = onnx_output_ratio(3, period_24p, Some(60.0));
-        assert!((ratio - 2.5).abs() < 1e-9);
-        assert!((onnx_output_ratio(3, Some(1.0 / 25.0), Some(60.0)) - 2.4).abs() < 1e-9);
-        assert!((onnx_output_ratio(3, Some(1.0 / 30.0), Some(60.0)) - 2.0).abs() < 1e-9);
-        let mut cadence = FlowOutputCadence::default();
-        assert_eq!(
-            onnx_interpolation_phases(3, ratio, true, &mut cadence),
-            vec![0.2, 0.6, 1.0]
-        );
-        assert_eq!(
-            onnx_interpolation_phases(3, ratio, true, &mut cadence),
-            vec![0.4, 0.8]
-        );
-    }
-
-    #[test]
-    fn onnx_x3_non_60hz_is_strict_integer_and_clears_60hz_fractional_state() {
+    fn onnx_x2_x5_multiplier_is_strict_on_60hz_and_120hz() {
         let period = Some(1.0 / 24.0);
-        assert_eq!(onnx_output_ratio(3, period, Some(120.0)), 3.0);
-        assert_eq!(onnx_output_ratio(3, period, Some(75.0)), 3.0);
-        let mut cadence = FlowOutputCadence::default();
-        cadence.next_phase = Some(0.4);
-        cadence.phase_step = 0.4;
-        assert_eq!(
-            onnx_interpolation_phases(3, 3.0, false, &mut cadence),
-            vec![1.0 / 3.0, 2.0 / 3.0, 1.0]
-        );
-        assert!(cadence.next_phase.is_none());
-        assert_eq!(cadence.phase_step, 0.0);
+        for refresh in [Some(59.94), Some(60.0), Some(75.0), Some(120.0), None] {
+            for factor in 2..=5 {
+                assert_eq!(onnx_output_ratio(factor, period, refresh), factor as f64);
+                let mut cadence = FlowOutputCadence::default();
+                cadence.next_phase = Some(0.37);
+                cadence.phase_step = 0.41;
+                let phases = onnx_interpolation_phases(
+                    factor,
+                    factor as f64,
+                    false,
+                    &mut cadence,
+                );
+                let expected: Vec<f32> = (1..=factor)
+                    .map(|index| index as f32 / factor as f32)
+                    .collect();
+                assert_eq!(phases, expected);
+                assert!(cadence.next_phase.is_none());
+                assert_eq!(cadence.phase_step, 0.0);
+            }
+        }
     }
 
     #[test]

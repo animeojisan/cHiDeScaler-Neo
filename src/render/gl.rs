@@ -193,6 +193,14 @@ struct ExternalBufferImport {
     handle: HANDLE,
     read_fence: Option<glow::Fence>,
     byte_len: usize,
+    // True only when glNamedBufferStorageMemEXT was rejected and the driver
+    // accepted the equivalent bound glBufferStorageMemEXT route.  Keep this
+    // per import: v807 uses the actual problematic resource state rather than
+    // GPU vendor or frame resolution to select the DRBA snapshot path.
+    bound_storage_fallback: bool,
+    // Lazily allocated ordinary GL buffer used only by v807's DRBA safe lane.
+    // It is kept with the import to avoid per-frame buffer allocation churn.
+    local_snapshot: Option<glow::Buffer>,
 }
 
 const GL_HANDLE_TYPE_D3D12_RESOURCE_EXT: u32 = 0x958A;
@@ -329,6 +337,15 @@ impl GlContext {
         self.external_storage_fallbacks
     }
 
+    /// Whether this exact imported D3D12 buffer had to use the bound-storage
+    /// fallback.  Unlike the process-wide conservative recommendation this is
+    /// resource-specific, so unrelated NVIDIA/AMD paths are not changed.
+    pub fn external_import_uses_bound_storage_fallback(&self, key: u64) -> bool {
+        self.external_imports
+            .get(&key)
+            .is_some_and(|item| item.bound_storage_fallback)
+    }
+
     pub fn gl_vendor(&self) -> &str {
         &self.gl_vendor
     }
@@ -431,6 +448,7 @@ impl GlContext {
                         continue;
                     }
                 };
+                let mut used_bound_storage_fallback = false;
                 (api.named_buffer_storage_mem)(buffer.0.get(), byte_len as isize, memory, 0);
                 let named_error = self.gl.get_error();
                 if named_error != glow::NO_ERROR {
@@ -456,6 +474,7 @@ impl GlContext {
                         ));
                         continue;
                     }
+                    used_bound_storage_fallback = true;
                     self.external_conservative_sync = true;
                     self.external_storage_fallbacks =
                         self.external_storage_fallbacks.saturating_add(1);
@@ -471,6 +490,8 @@ impl GlContext {
                         handle,
                         read_fence: None,
                         byte_len,
+                        bound_storage_fallback: used_bound_storage_fallback,
+                        local_snapshot: None,
                     },
                 );
                 self.external_import_count = self.external_import_count.saturating_add(1);
@@ -542,16 +563,146 @@ impl GlContext {
             .get(&key)
             .map(|item| item.buffer)
             .ok_or_else(|| "shared D3D12 buffer is not imported".to_string())?;
-        let dest = self.make_tex(width, height, 4, Dtype::U8);
-        let program = self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA8)?;
+        self.nchw_f16_buffer_to_rgba8_crop(
+            buffer,
+            Some(key),
+            width,
+            height,
+            plane_width,
+            plane_height,
+        )
+    }
+
+    /// v807 DirectML-DRBA safety lane.  Copy the imported external NCHW tensor
+    /// into an ordinary OpenGL-owned buffer before the conversion shader reads
+    /// it. This deliberately avoids CPU readback/upload and is selected only
+    /// for DRBA output resources whose import actually used the AMD-style
+    /// bound-storage fallback. A single glFinish at the end completes both the
+    /// snapshot read and RGBA imageStore before the provider may recycle the
+    /// shared allocation.
+    pub fn external_nchw_f16_to_rgba8_crop_local_snapshot(
+        &mut self,
+        key: u64,
+        width: i32,
+        height: i32,
+        plane_width: i32,
+        plane_height: i32,
+    ) -> Result<GpuTex, String> {
+        let (source, imported_bytes, existing_snapshot) = self
+            .external_imports
+            .get(&key)
+            .map(|item| (item.buffer, item.byte_len, item.local_snapshot))
+            .ok_or_else(|| "shared D3D12 buffer is not imported".to_string())?;
+        let plane = usize::try_from(plane_width)
+            .ok()
+            .and_then(|w| usize::try_from(plane_height).ok().and_then(|h| w.checked_mul(h)))
+            .ok_or_else(|| "invalid shared output plane dimensions".to_string())?;
+        let snapshot_bytes = plane
+            .checked_mul(3)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<half::f16>()))
+            .ok_or_else(|| "shared output snapshot size overflow".to_string())?;
+        if snapshot_bytes > imported_bytes {
+            return Err(format!(
+                "shared output snapshot exceeds imported buffer: required={} imported={}",
+                snapshot_bytes, imported_bytes
+            ));
+        }
+        let snapshot_size = i32::try_from(snapshot_bytes)
+            .map_err(|_| "shared output snapshot exceeds OpenGL buffer size range".to_string())?;
+
+        let snapshot = if let Some(snapshot) = existing_snapshot {
+            snapshot
+        } else {
+            let snapshot = unsafe { self.gl.create_buffer().map_err(|error| error.to_string())? };
+            unsafe {
+                self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(snapshot));
+                self.gl.buffer_data_size(
+                    glow::COPY_WRITE_BUFFER,
+                    snapshot_size,
+                    glow::STREAM_COPY,
+                );
+                self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
+            }
+            if let Some(import) = self.external_imports.get_mut(&key) {
+                import.local_snapshot = Some(snapshot);
+            } else {
+                unsafe {
+                    self.gl.delete_buffer(snapshot);
+                }
+                return Err("shared D3D12 buffer disappeared during snapshot allocation".into());
+            }
+            snapshot
+        };
+
         unsafe {
-            // The producer may be DirectML/D3D12 rather than an earlier GL
-            // command. Its D3D12 fence proves completion, but that alone does
-            // not invalidate OpenGL's cached view of the imported buffer on
-            // every driver. Establish the consumer-side visibility boundary
-            // before the SSBO read. Without it, low-resolution RIFE output can
-            // retain isolated stale cache lines which a following Anime4K CNN
-            // amplifies into alternating dots/cells. This remains GPU-only.
+            // D3D12 completion is already established by the provider-copy
+            // fence. Publish the external consumer boundary, then force an
+            // actual GL buffer-copy read into driver-local storage before any
+            // shader samples the tensor.
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            self.gl.bind_buffer(glow::COPY_READ_BUFFER, Some(source));
+            self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(snapshot));
+            self.gl.copy_buffer_sub_data(
+                glow::COPY_READ_BUFFER,
+                glow::COPY_WRITE_BUFFER,
+                0,
+                0,
+                snapshot_size,
+            );
+            self.gl.memory_barrier(
+                glow::BUFFER_UPDATE_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT,
+            );
+            self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+            self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
+        }
+
+        let conversion = self.nchw_f16_buffer_to_rgba8_crop(
+            snapshot,
+            None,
+            width,
+            height,
+            plane_width,
+            plane_height,
+        );
+        unsafe {
+            // One completion point for this narrow safe lane. This makes the
+            // local snapshot self-contained; no external read fence is needed
+            // and the provider may reuse its shared output after return.
+            self.gl.finish();
+            self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
+            self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, None);
+        }
+        conversion
+    }
+
+    fn nchw_f16_buffer_to_rgba8_crop(
+        &mut self,
+        buffer: glow::Buffer,
+        external_read_key: Option<u64>,
+        width: i32,
+        height: i32,
+        plane_width: i32,
+        plane_height: i32,
+    ) -> Result<GpuTex, String> {
+        let dest = self.make_tex(width, height, 4, Dtype::U8);
+        let visible_pixels = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+            .ok_or_else(|| "invalid shared output dimensions".to_string())?;
+        let fast_pair_unpack = width == plane_width
+            && height == plane_height
+            && visible_pixels % 2 == 0;
+        let program = if fast_pair_unpack {
+            self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA8_PAIR_PIXELS)?
+        } else {
+            self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA8_LEGACY)?
+        };
+        unsafe {
+            // For imported buffers this is the D3D12 -> GL consumer boundary;
+            // for v807 local snapshots it publishes glCopyBufferSubData before
+            // the SSBO shader read. Both remain GPU-only.
             self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
@@ -577,17 +728,149 @@ impl GlContext {
             if let Some(loc) = self.gl.get_uniform_location(program, "plane_height") {
                 self.gl.uniform_1_i32(Some(&loc), plane_height);
             }
-            self.gl
-                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(16), 1);
-            // The conversion compute shader writes `dest` with imageStore,
-            // while the very next operation is commonly an mpv/Anime4K GLSL
-            // pass that reads `dest` through a sampler. IMAGE_ACCESS alone does
-            // not guarantee visibility to texture fetches; include the texture
-            // fetch barrier so interpolation -> GLSL never samples a stale
-            // pre-conversion image on aggressive/asynchronous drivers.
+            if fast_pair_unpack {
+                if let Some(loc) = self.gl.get_uniform_location(program, "pixel_count") {
+                    self.gl.uniform_1_u32(Some(&loc), visible_pixels as u32);
+                }
+                self.gl
+                    .dispatch_compute(((visible_pixels / 2) as u32).div_ceil(256), 1, 1);
+            } else {
+                self.gl.dispatch_compute(
+                    (width as u32).div_ceil(16),
+                    (height as u32).div_ceil(16),
+                    1,
+                );
+            }
             self.gl.memory_barrier(
                 glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
             );
+            if let Some(key) = external_read_key {
+                let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
+                if let Some(import) = self.external_imports.get_mut(&key) {
+                    if let Some(old) = import.read_fence.replace(fence) {
+                        self.gl.delete_sync(old);
+                    }
+                }
+            }
+        }
+        Ok(dest)
+    }
+
+    /// Pack a regular RGBA texture into an imported shared D3D12 RGBA8 buffer.
+    /// v743 uses this before the isolated DLSSNR worker consumes the same buffer.
+    /// `glFinish` is intentionally retained as the conservative cross-API ownership
+    /// boundary; the full-frame CPU readback is still eliminated.
+    pub fn rgba_texture_to_external_rgba8(
+        &mut self,
+        key: u64,
+        source: GpuTex,
+        width: i32,
+        height: i32,
+    ) -> Result<(), String> {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "external RGBA8 size overflow".to_string())?;
+        let (buffer, byte_len) = self
+            .external_imports
+            .get(&key)
+            .map(|item| (item.buffer, item.byte_len))
+            .ok_or_else(|| "shared D3D12 RGBA8 buffer is not imported".to_string())?;
+        if byte_len < expected {
+            return Err(format!("shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"));
+        }
+        let program = self.compute_program(RGBA_TEXTURE_TO_EXTERNAL_RGBA8)?;
+        unsafe {
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
+            self.gl.use_program(Some(program));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.bind_texture(source.target(), Some(source.tex));
+            if let Some(loc) = self.gl.get_uniform_location(program, "source_tex") {
+                self.gl.uniform_1_i32(Some(&loc), 0);
+            }
+            if let Some(loc) = self.gl.get_uniform_location(program, "width") {
+                self.gl.uniform_1_i32(Some(&loc), width);
+            }
+            if let Some(loc) = self.gl.get_uniform_location(program, "height") {
+                self.gl.uniform_1_i32(Some(&loc), height);
+            }
+            self.gl.dispatch_compute(
+                (width as u32).div_ceil(16),
+                (height as u32).div_ceil(8),
+                1,
+            );
+            self.gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
+            self.gl.finish();
+            self.gl.bind_texture(source.target(), None);
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, None);
+        }
+        Ok(())
+    }
+
+    /// Convert shared RGBA8 output back to a pooled texture while preserving the
+    /// source alpha on GPU. Feature 18 is an RGB enhancement and the legacy CPU
+    /// path restored alpha after readback; this shader keeps the same contract.
+    pub fn external_rgba8_buffer_to_texture_with_source_alpha(
+        &mut self,
+        key: u64,
+        source_alpha: GpuTex,
+        width: i32,
+        height: i32,
+    ) -> Result<GpuTex, String> {
+        let expected = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "external RGBA8 size overflow".to_string())?;
+        let (buffer, byte_len) = self
+            .external_imports
+            .get(&key)
+            .map(|item| (item.buffer, item.byte_len))
+            .ok_or_else(|| "shared D3D12 RGBA8 buffer is not imported".to_string())?;
+        if byte_len < expected {
+            return Err(format!("shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"));
+        }
+        let dest = self.make_tex(width, height, 4, Dtype::U8);
+        let program = self.compute_program(EXTERNAL_RGBA8_BUFFER_TO_TEXTURE_ALPHA)?;
+        unsafe {
+            self.gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
+            self.gl.use_program(Some(program));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.bind_texture(source_alpha.target(), Some(source_alpha.tex));
+            if let Some(loc) = self.gl.get_uniform_location(program, "alpha_tex") {
+                self.gl.uniform_1_i32(Some(&loc), 0);
+            }
+            self.gl.bind_image_texture(
+                0,
+                Some(dest.tex),
+                0,
+                false,
+                0,
+                glow::WRITE_ONLY,
+                glow::RGBA8,
+            );
+            if let Some(loc) = self.gl.get_uniform_location(program, "width") {
+                self.gl.uniform_1_i32(Some(&loc), width);
+            }
+            if let Some(loc) = self.gl.get_uniform_location(program, "height") {
+                self.gl.uniform_1_i32(Some(&loc), height);
+            }
+            self.gl.dispatch_compute(
+                (width as u32).div_ceil(16),
+                (height as u32).div_ceil(8),
+                1,
+            );
+            self.gl.memory_barrier(
+                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
+            );
+            self.gl.bind_texture(source_alpha.target(), None);
+            self.gl
+                .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, None);
             let fence = self.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?;
             if let Some(import) = self.external_imports.get_mut(&key) {
                 if let Some(old) = import.read_fence.replace(fence) {
@@ -847,12 +1130,20 @@ impl GlContext {
             .get(&key)
             .map(|item| item.buffer)
             .ok_or_else(|| "shared D3D12 input buffer is not imported".to_string())?;
-        let program = self.compute_program(RGBA_TEXTURE_TO_EXTERNAL_NCHW_F16)?;
-        let elements = usize::try_from(width)
+        let pixels = usize::try_from(width)
             .ok()
-            .and_then(|w| usize::try_from(height).ok().map(|h| w * h * 3))
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
             .ok_or_else(|| "invalid shared input dimensions".to_string())?;
-        let words = elements.div_ceil(2);
+        let fast_pair_pack = pixels % 2 == 0;
+        let program = if fast_pair_pack {
+            self.compute_program(RGBA_TEXTURE_TO_EXTERNAL_NCHW_FP16_PAIR_PIXELS)?
+        } else {
+            self.compute_program(RGBA_TEXTURE_TO_EXTERNAL_NCHW_FP16_LEGACY)?
+        };
+        let elements = pixels
+            .checked_mul(3)
+            .ok_or_else(|| "shared input element count overflow".to_string())?;
+        let work_items = if fast_pair_pack { pixels / 2 } else { elements.div_ceil(2) };
         unsafe {
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
@@ -868,10 +1159,15 @@ impl GlContext {
             if let Some(loc) = self.gl.get_uniform_location(program, "height") {
                 self.gl.uniform_1_i32(Some(&loc), height);
             }
-            if let Some(loc) = self.gl.get_uniform_location(program, "element_count") {
+            if fast_pair_pack {
+                if let Some(loc) = self.gl.get_uniform_location(program, "pixel_count") {
+                    self.gl.uniform_1_u32(Some(&loc), pixels as u32);
+                }
+            } else if let Some(loc) = self.gl.get_uniform_location(program, "element_count") {
                 self.gl.uniform_1_u32(Some(&loc), elements as u32);
             }
-            self.gl.dispatch_compute((words as u32).div_ceil(256), 1, 1);
+            self.gl
+                .dispatch_compute((work_items as u32).div_ceil(256), 1, 1);
             self.gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
             self.gl.finish();
             self.gl.bind_texture(source.target(), None);
@@ -882,7 +1178,11 @@ impl GlContext {
     }
 
     /// Pack one RGB texture into three channels of a padded FP16 NCHW shared
-    /// buffer. Pixels outside the source rectangle are zero-filled on GPU.
+    /// buffer. Padding must exactly match the long-standing CPU-visible
+    /// interpolation path: replicate the last source row/column. Zero padding
+    /// leaks artificial black borders into RIFE/DRBA internal Conv/GridSample
+    /// stages whenever the logical size is not already tile-aligned (notably
+    /// 1920x1080 -> 1920x1152 for RIFE and -> 1920x1088 for DRBA).
     pub fn pack_interp_rgb_f16(
         &mut self,
         key: u64,
@@ -1199,6 +1499,9 @@ impl GlContext {
                 if let Some(fence) = import.read_fence.take() {
                     self.gl.delete_sync(fence);
                 }
+                if let Some(snapshot) = import.local_snapshot.take() {
+                    self.gl.delete_buffer(snapshot);
+                }
                 self.gl.delete_buffer(import.buffer);
                 let _ = CloseHandle(import.handle);
             }
@@ -1207,6 +1510,9 @@ impl GlContext {
         unsafe {
             if let Some(fence) = import.read_fence.take() {
                 self.gl.delete_sync(fence);
+            }
+            if let Some(snapshot) = import.local_snapshot.take() {
+                self.gl.delete_buffer(snapshot);
             }
             self.gl.delete_buffer(import.buffer);
             (api.delete_memory_objects)(1, &import.memory);
@@ -2016,11 +2322,13 @@ void main(){
         }
     }
 
-    /// Read the final filtered texture as tightly packed RGBA8. Used only for
-    /// an explicit screenshot request; PNG encoding is performed off-thread.
-    pub fn download_rgba8(&mut self, t: GpuTex) -> Vec<u8> {
+    /// Read a filtered texture as tightly packed RGBA8 into caller-owned
+    /// storage. DLSSNR uses this to retain the same large allocation across
+    /// frames; screenshots can keep using the allocating convenience wrapper.
+    pub fn download_rgba8_into(&mut self, t: GpuTex, rgba: &mut Vec<u8>) {
         let gl = self.gl.clone();
         let (w, h) = (t.w() as usize, t.h() as usize);
+        rgba.resize(w * h * 4, 0);
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             gl.framebuffer_texture_2d(
@@ -2030,7 +2338,6 @@ void main(){
                 Some(t.tex),
                 0,
             );
-            let mut rgba = vec![0u8; w * h * 4];
             gl.read_pixels(
                 0,
                 0,
@@ -2038,11 +2345,18 @@ void main(){
                 t.h(),
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut rgba)),
+                glow::PixelPackData::Slice(Some(rgba.as_mut_slice())),
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            rgba
         }
+    }
+
+    /// Read the final filtered texture as tightly packed RGBA8. Used only for
+    /// an explicit screenshot request; PNG encoding is performed off-thread.
+    pub fn download_rgba8(&mut self, t: GpuTex) -> Vec<u8> {
+        let mut rgba = Vec::new();
+        self.download_rgba8_into(t, &mut rgba);
+        rgba
     }
 
     /// Read raw f32 RGBA (diagnostics).
@@ -2668,7 +2982,30 @@ void main() {
 }
 "#;
 
-const EXTERNAL_NCHW_F16_TO_RGBA8: &str = r#"#version 430
+const EXTERNAL_NCHW_F16_TO_RGBA8_PAIR_PIXELS: &str = r#"#version 430
+layout(local_size_x=256) in;
+layout(std430, binding=0) readonly buffer Source { uint words[]; };
+layout(rgba8, binding=0) uniform writeonly image2D dst;
+uniform int width;
+uniform int height;
+uniform uint pixel_count;
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint first = pair * 2u;
+    if (first >= pixel_count) return;
+    uint second = first + 1u;
+    uint plane_words = pixel_count >> 1u;
+    vec2 r = unpackHalf2x16(words[pair]);
+    vec2 g = unpackHalf2x16(words[plane_words + pair]);
+    vec2 b = unpackHalf2x16(words[2u * plane_words + pair]);
+    ivec2 p0 = ivec2(int(first % uint(width)), int(first / uint(width)));
+    ivec2 p1 = ivec2(int(second % uint(width)), int(second / uint(width)));
+    imageStore(dst, p0, vec4(r.x, g.x, b.x, 1.0));
+    imageStore(dst, p1, vec4(r.y, g.y, b.y, 1.0));
+}
+"#;
+
+const EXTERNAL_NCHW_F16_TO_RGBA8_LEGACY: &str = r#"#version 430
 layout(local_size_x=16, local_size_y=16) in;
 layout(std430, binding=0) readonly buffer Source { uint words[]; };
 layout(rgba8, binding=0) uniform writeonly image2D dst;
@@ -2726,7 +3063,53 @@ uniform int width; uniform int height; uniform int plane_width; uniform int plan
 void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=width||p.y>=height)return;uint i=uint(p.y*plane_width+p.x);uint plane=uint(plane_width*plane_height);imageStore(dst,p,vec4(values[i],values[plane+i],values[2u*plane+i],1.0));}
 "#;
 
-const RGBA_TEXTURE_TO_EXTERNAL_NCHW_F16: &str = r#"#version 430
+const RGBA_TEXTURE_TO_EXTERNAL_RGBA8: &str = r#"#version 430
+layout(local_size_x=16,local_size_y=8) in;
+layout(std430,binding=0) writeonly buffer Destination{uint words[];};
+uniform sampler2D source_tex; uniform int width; uniform int height;
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=width||p.y>=height)return;uint i=uint(p.y*width+p.x);vec4 v=clamp(texelFetch(source_tex,p,0),0.0,1.0);words[i]=packUnorm4x8(v);}
+"#;
+
+const EXTERNAL_RGBA8_BUFFER_TO_TEXTURE_ALPHA: &str = r#"#version 430
+layout(local_size_x=16,local_size_y=8) in;
+layout(std430,binding=0) readonly buffer Source{uint words[];};
+layout(rgba8,binding=0) uniform writeonly image2D dst;
+uniform sampler2D alpha_tex; uniform int width; uniform int height;
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=width||p.y>=height)return;uint i=uint(p.y*width+p.x);vec4 v=unpackUnorm4x8(words[i]);v.a=texelFetch(alpha_tex,p,0).a;imageStore(dst,p,v);}
+"#;
+
+// Fast path for the overwhelmingly common even-pixel image geometry. Each
+// invocation fetches two RGBA pixels once and emits one packed FP16 word per
+// R/G/B plane. The previous element-major shader fetched the same source pixel
+// separately for each channel (up to 3 texelFetch operations per pixel) and
+// launched three times as many invocations. NeoAMD's Backend Pack already
+// outruns DirectML enough that this host-side pack became measurable.
+const RGBA_TEXTURE_TO_EXTERNAL_NCHW_FP16_PAIR_PIXELS: &str = r#"#version 430
+layout(local_size_x=256) in;
+layout(std430, binding=0) writeonly buffer Destination { uint words[]; };
+uniform sampler2D source_tex;
+uniform int width;
+uniform int height;
+uniform uint pixel_count;
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    uint first = pair * 2u;
+    if (first >= pixel_count) return;
+    uint second = first + 1u;
+    ivec2 p0 = ivec2(int(first % uint(width)), int(first / uint(width)));
+    ivec2 p1 = ivec2(int(second % uint(width)), int(second / uint(width)));
+    vec3 a = texelFetch(source_tex, p0, 0).rgb;
+    vec3 b = texelFetch(source_tex, p1, 0).rgb;
+    uint plane_words = pixel_count >> 1u;
+    words[pair] = packHalf2x16(vec2(a.r, b.r));
+    words[plane_words + pair] = packHalf2x16(vec2(a.g, b.g));
+    words[2u * plane_words + pair] = packHalf2x16(vec2(a.b, b.b));
+}
+"#;
+
+// Exact fallback for odd pixel counts where an FP16 word can straddle two NCHW
+// planes. Keep the long-standing element-major mapping for those rare shapes.
+const RGBA_TEXTURE_TO_EXTERNAL_NCHW_FP16_LEGACY: &str = r#"#version 430
 layout(local_size_x=256) in;
 layout(std430, binding=0) writeonly buffer Destination { uint words[]; };
 uniform sampler2D source_tex;
@@ -2767,7 +3150,10 @@ float value_at(uint element) {
     uint pixel = element - channel * plane;
     int x = int(pixel % uint(padded_width));
     int y = int(pixel / uint(padded_width));
-    if (x >= source_width || y >= source_height) return 0.0;
+    // Match fill_padded_rgb_frame_* exactly: edge replication, never black
+    // padding. source_width/source_height are validated positive by caller.
+    x = min(x, source_width - 1);
+    y = min(y, source_height - 1);
     vec4 value = texelFetch(source_tex, ivec2(x, y), 0);
     return channel == 0u ? value.r : (channel == 1u ? value.g : value.b);
 }
@@ -2782,7 +3168,7 @@ void main() {
 const PACK_INTERP_RGB_F32: &str = r#"#version 430
 layout(local_size_x=256) in; layout(std430,binding=0) buffer Destination{float values[];};
 uniform sampler2D source_tex; uniform int source_width; uniform int source_height; uniform int padded_width; uniform int padded_height; uniform uint destination_element;
-void main(){uint e=gl_GlobalInvocationID.x;uint plane=uint(padded_width*padded_height);if(e>=3u*plane)return;uint c=e/plane;uint pixel=e-c*plane;int x=int(pixel%uint(padded_width));int y=int(pixel/uint(padded_width));float v=0.0;if(x<source_width&&y<source_height){vec4 p=texelFetch(source_tex,ivec2(x,y),0);v=c==0u?p.r:(c==1u?p.g:p.b);}values[destination_element+e]=v;}
+void main(){uint e=gl_GlobalInvocationID.x;uint plane=uint(padded_width*padded_height);if(e>=3u*plane)return;uint c=e/plane;uint pixel=e-c*plane;int x=min(int(pixel%uint(padded_width)),source_width-1);int y=min(int(pixel/uint(padded_width)),source_height-1);vec4 p=texelFetch(source_tex,ivec2(x,y),0);float v=c==0u?p.r:(c==1u?p.g:p.b);values[destination_element+e]=v;}
 "#;
 
 const FILL_INTERP_AUX_F16: &str = r#"#version 430

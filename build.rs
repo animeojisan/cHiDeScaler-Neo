@@ -22,13 +22,13 @@ fn main() {
         res.set("LegalCopyright", "(c) 2026 cHiDeScaler-Neo project");
         res.set("OriginalFilename", "cHiDeScaler-Neo.exe");
         res.set("InternalName", "chidescaler-neo");
-        res.set("ProductVersion", "0.99.2.0");
-        res.set("FileVersion", "0.99.2.0");
+        res.set("ProductVersion", "0.99.3.0");
+        res.set("FileVersion", "0.99.3.0");
         res.set_version_info(
             winresource::VersionInfo::PRODUCTVERSION,
-            0x0000_0063_0002_0000,
+            0x0000_0063_0003_0000,
         );
-        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0063_0002_0000);
+        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0063_0003_0000);
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon resource compile failed: {e}");
         }
@@ -40,13 +40,14 @@ fn guard_text_encoding() {
         std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()),
     );
     let mut files = Vec::new();
+    // Build-time encoding validation is intentionally limited to code that
+    // participates in the Neo host build. Optional backend-pack sources and
+    // documentation must not be able to break a host-only Cargo build.
     collect_text_files(&root.join("src"), &mut files);
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && is_checked_text_file(&p) {
-                files.push(p);
-            }
+    for name in ["build.rs", "Cargo.toml"] {
+        let p = root.join(name);
+        if p.is_file() {
+            files.push(p);
         }
     }
     for file in files {

@@ -760,7 +760,45 @@ impl GraphicsCaptureApiHandler for Handler {
             };
             queued.data = frame_data;
             let mut q = self.shared.queue.lock().unwrap();
-            q.push_back(queued);
+            // v795: WGC may notify the same decoded video picture more than once
+            // (for example a 24p source presented by a 120 Hz compositor).  A
+            // queued interpolation path must preserve *unique source pictures*,
+            // not let repeated notifications consume the bounded queue and evict
+            // the next real picture while a heavy DRBA batch is running.
+            //
+            // Coalesce only when the authoritative source timestamp and geometry
+            // are identical.  Missing timestamps, resize/crop transitions and HDR
+            // changes are never guessed/deduplicated here.
+            let duplicate_of_back = queued.source_time_100ns.is_some()
+                && q.back().is_some_and(|back| {
+                    back.source_time_100ns == queued.source_time_100ns
+                        && back.w == queued.w
+                        && back.h == queued.h
+                        && back.crop_base_w == queued.crop_base_w
+                        && back.crop_base_h == queued.crop_base_h
+                        && back.hdr == queued.hdr
+                });
+            if duplicate_of_back {
+                let queue_len = q.len();
+                if let Some(back) = q.back_mut() {
+                    let mut recycled = std::mem::replace(&mut back.data, queued.data);
+                    recycled.clear();
+                    self.shared.recycled_data.lock().unwrap().push(recycled);
+                    back.seq = queued.seq;
+                    back.received_at = queued.received_at;
+                    back.source_time_100ns = queued.source_time_100ns;
+                    if seq < 10 || seq % 300 == 0 {
+                        log::debug!(
+                            "wgc-queue-duplicate-coalesced: seq={} source_time_100ns={:?} queue_len={} policy=preserve-unique-source-pictures",
+                            seq,
+                            back.source_time_100ns,
+                            queue_len
+                        );
+                    }
+                }
+            } else {
+                q.push_back(queued);
+            }
             while q.len() > CAPTURE_QUEUE_HARD_MAX {
                 if let Some(mut dropped) = q.pop_front() {
                     dropped.data.clear();

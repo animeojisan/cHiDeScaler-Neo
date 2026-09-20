@@ -148,7 +148,9 @@ unsafe extern "system" fn wnd_proc(
                 // its normal eframe on_exit path still owns every cleanup step.
                 let root = super::win32::main_gui_hwnd();
                 let posted = super::win32::request_main_gui_close(root);
-                log::info!("task-tray-native-exit-dispatch: gui={root:#x} posted={posted}");
+                log::info!(
+                    "task-tray-native-exit-dispatch: gui={root:#x} posted={posted}"
+                );
                 notify(TrayEvent::Exit);
             }
             _ => {}

@@ -31,6 +31,7 @@ use chidescaler_neo::platform::tray::{TrayEvent, TrayLabels, TrayThread};
 use chidescaler_neo::platform::win32;
 use chidescaler_neo::render::dlssnr_backend::detect_dlssnr_backend_pack;
 use chidescaler_neo::render::mpv::{Param, ParamTy, UserShader};
+use chidescaler_neo::render::neoamd_backend::{NeoAmdAvailability, detect_neoamd_backend};
 use chidescaler_neo::render::onnx_backend::{
     TensorRtAvailability, detect_tensorrt_backend, tensorrt_cache_root,
 };
@@ -77,6 +78,45 @@ fn tensorrt_option_visible(availability: &TensorRtAvailability) -> bool {
     availability.available
 }
 
+fn neoamd_option_visible(availability: &NeoAmdAvailability) -> bool {
+    availability.available
+}
+
+/// Resolve NeoAMD against the same physical adapter that Neo will use for
+/// ONNX. With Auto selected, the render GPU becomes the compute GPU once it
+/// is known. A secondary AMD adapter must not make NeoAMD appear usable while
+/// Auto is actually rendering/processing on Intel or NVIDIA; users can still
+/// explicitly select that AMD adapter from the GPU selector.
+fn detect_neoamd_for_selection(
+    app_dir: &std::path::Path,
+    adapters: &[GpuAdapter],
+    requested_luid: Option<u64>,
+    render_luid: Option<u64>,
+) -> NeoAmdAvailability {
+    if let Some(requested) = requested_luid {
+        return detect_neoamd_backend(app_dir, Some(requested));
+    }
+    if let Some(render) = render_luid {
+        if gpu::adapter_for_luid(adapters, Some(render))
+            .is_some_and(|adapter| adapter.vendor_id == 0x1002)
+        {
+            return detect_neoamd_backend(app_dir, Some(render));
+        }
+        let mut availability = detect_neoamd_backend(app_dir, None);
+        if availability.installed {
+            availability.available = false;
+            availability.gpu_luid = None;
+            availability.gpu_architecture = None;
+            availability.reason = Some(
+                "Auto GPU is not using an AMD presentation adapter; explicitly select an RDNA4 AMD GPU to use NeoAMD"
+                    .to_string(),
+            );
+        }
+        return availability;
+    }
+    detect_neoamd_backend(app_dir, None)
+}
+
 /// TensorRT Crop execution is allowed only for a geometry that belongs to the
 /// selected/saved preset. The enabled flag is intentionally ignored here so a
 /// saved Crop can still be toggled OFF/ON while TensorRT is active without
@@ -89,7 +129,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20260906-v0.99.2-public";
+const BUILD_ID: &str = "v0.99.3";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -902,9 +942,8 @@ fn main() -> eframe::Result {
     // WGPU/WGL as presentation devices and switches compute backends directly,
     // so a manual GPU change while capture is stopped requires no Neo restart.
     log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
-    // Show the build tag in the title so a still-running older instance is
-    // immediately distinguishable from the executable currently on disk.
-    let build_tag = BUILD_ID.split('-').nth(1).unwrap_or("dev");
+    // Public releases keep the native title stable and versionless.
+    // BUILD_ID remains available only for diagnostics and Windows file metadata.
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -919,7 +958,7 @@ fn main() -> eframe::Result {
         .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title(format!("cHiDeScaler-Neo [{build_tag}]"))
+        .with_title("cHiDeScaler-Neo")
         .with_visible(!saved.3);
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
@@ -2705,6 +2744,7 @@ struct App {
     locale_test_override: Option<UiLanguage>,
     custom_locales: Vec<i18n::CustomLocale>,
     tensorrt_availability: TensorRtAvailability,
+    neoamd_availability: NeoAmdAvailability,
     onnx_backend_selected: OnnxBackendPreference,
     onnx_backend_pending: Option<OnnxBackendPreference>,
     onnx_backend_revision_seen: u64,
@@ -2938,7 +2978,9 @@ impl App {
             .unwrap_or_default();
         let (chain, legacy_dlssnr) = chidescaler_neo::core::dlssnr::split(chain);
         if legacy_dlssnr.is_some() {
-            log::info!("dlssnr-preset-state-ignored: source=startup action=manual-enable-required");
+            log::info!(
+                "dlssnr-preset-state-ignored: source=startup action=manual-enable-required"
+            );
         }
         // DLSSNR remains experimental: ordinary Neo presets never restore its
         // ON/OFF state. Every app session starts with DLSSNR disabled and the
@@ -2973,33 +3015,85 @@ impl App {
                 );
             }
         }
+        let neoamd_availability = detect_neoamd_for_selection(
+            &dir,
+            &gpu_adapters,
+            settings.gpu_adapter_luid,
+            None,
+        );
+        if neoamd_availability.installed {
+            if neoamd_availability.available {
+                log::info!(
+                    "neoamd-backend-discovery: available=true luid={} arch={} path={}",
+                    neoamd_availability
+                        .gpu_luid
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    neoamd_availability
+                        .gpu_architecture
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    neoamd_availability
+                        .backend_dir
+                        .as_deref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                );
+            } else {
+                log::warn!(
+                    "neoamd-backend-discovery: available=false reason='{}' action=DirectML-unchanged",
+                    neoamd_availability.reason.as_deref().unwrap_or("invalid NeoAMD Backend Pack")
+                );
+            }
+        }
         let tensorrt_availability = detect_tensorrt_backend(&dir, settings.gpu_adapter_luid);
         let tensorrt_crop_start_allowed =
             tensorrt_crop_switch_allowed(settings.capture_crop, active_crop);
-        let onnx_backend_selected = if settings.onnx_backend == OnnxBackendPreference::TensorRT
-            && tensorrt_availability.available
-            && tensorrt_crop_start_allowed
-        {
-            OnnxBackendPreference::TensorRT
-        } else {
-            if settings.onnx_backend == OnnxBackendPreference::TensorRT
-                && tensorrt_availability.available
-                && !tensorrt_crop_start_allowed
-            {
-                log::warn!(
-                    "onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason=unsaved-crop-geometry current=({}, {}, {}, {}) saved=({}, {}, {}, {})",
-                    settings.capture_crop.left,
-                    settings.capture_crop.top,
-                    settings.capture_crop.right,
-                    settings.capture_crop.bottom,
-                    active_crop.left,
-                    active_crop.top,
-                    active_crop.right,
-                    active_crop.bottom
-                );
-                settings.onnx_backend = OnnxBackendPreference::DirectML;
+        let onnx_backend_selected = match settings.onnx_backend {
+            OnnxBackendPreference::NeoAMD if neoamd_availability.available => {
+                OnnxBackendPreference::NeoAMD
             }
-            OnnxBackendPreference::DirectML
+            OnnxBackendPreference::TensorRT
+                if tensorrt_availability.available && tensorrt_crop_start_allowed =>
+            {
+                OnnxBackendPreference::TensorRT
+            }
+            requested => {
+                if requested == OnnxBackendPreference::TensorRT
+                    && tensorrt_availability.available
+                    && !tensorrt_crop_start_allowed
+                {
+                    log::warn!(
+                        "onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason=unsaved-crop-geometry current=({}, {}, {}, {}) saved=({}, {}, {}, {})",
+                        settings.capture_crop.left,
+                        settings.capture_crop.top,
+                        settings.capture_crop.right,
+                        settings.capture_crop.bottom,
+                        active_crop.left,
+                        active_crop.top,
+                        active_crop.right,
+                        active_crop.bottom
+                    );
+                } else if requested == OnnxBackendPreference::NeoAMD {
+                    log::warn!(
+                        "onnx-backend-startup-fallback: requested=NeoAMD active=DirectML reason='{}'",
+                        neoamd_availability
+                            .reason
+                            .as_deref()
+                            .unwrap_or("NeoAMD Backend Pack unavailable")
+                    );
+                } else if requested == OnnxBackendPreference::TensorRT {
+                    log::warn!(
+                        "onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason='{}'",
+                        tensorrt_availability
+                            .reason
+                            .as_deref()
+                            .unwrap_or("TensorRT Backend Pack unavailable")
+                    );
+                }
+                settings.onnx_backend = OnnxBackendPreference::DirectML;
+                OnnxBackendPreference::DirectML
+            }
         };
         let trt_cache_root =
             tensorrt_cache_root(&dir, &tensorrt_availability, settings.gpu_adapter_luid);
@@ -3075,11 +3169,14 @@ impl App {
             dlssnr_installed: dlssnr_availability.installed,
             dlssnr_editor: None,
             dlssnr_saved_presets,
-            dlssnr_options_supported: dlssnr_availability.manifest.as_ref().is_some_and(|m| {
-                m.compatibility_tags
-                    .iter()
-                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-            }),
+            dlssnr_options_supported: dlssnr_availability
+                .manifest
+                .as_ref()
+                .is_some_and(|m| {
+                    m.compatibility_tags
+                        .iter()
+                        .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+                }),
             dlssnr_advanced_options_supported: dlssnr_availability
                 .manifest
                 .as_ref()
@@ -3176,6 +3273,7 @@ impl App {
             locale_test_override,
             custom_locales,
             tensorrt_availability,
+            neoamd_availability,
             onnx_backend_selected,
             onnx_backend_pending: None,
             onnx_backend_revision_seen: 0,
@@ -3257,6 +3355,72 @@ impl App {
                             .unwrap_or("TensorRT exact-LUID reprobe failed"),
                         self.tensorrt_availability.available
                     );
+                }
+            }
+
+            // Once WGL identifies Auto's real presentation/compute GPU,
+            // re-evaluate NeoAMD against that exact LUID. This also hides the
+            // option on Auto+Intel/NVIDIA systems even when a secondary AMD GPU
+            // happens to be installed, avoiding a GUI/backend identity split.
+            if requested.is_none()
+                && self.neoamd_availability.manifest.is_some()
+                && let Some(actual) = status.render_gpu_luid
+            {
+                let reprobe = detect_neoamd_for_selection(
+                    &self.app_dir,
+                    &self.gpu_adapters,
+                    None,
+                    Some(actual),
+                );
+                let mapping_changed = reprobe.available != self.neoamd_availability.available
+                    || reprobe.gpu_luid != self.neoamd_availability.gpu_luid
+                    || reprobe.gpu_architecture != self.neoamd_availability.gpu_architecture;
+                if mapping_changed {
+                    log::info!(
+                        "neoamd-auto-reprobe: phase=post-render-gpu requested=Auto actual_gl_luid={actual:016x} available={} arch={} reason='{}'",
+                        reprobe.available,
+                        reprobe.gpu_architecture.as_deref().unwrap_or("unavailable"),
+                        reprobe.reason.as_deref().unwrap_or("none")
+                    );
+                }
+                self.neoamd_availability = reprobe;
+                if self.onnx_backend_selected == OnnxBackendPreference::NeoAMD
+                    && !self.neoamd_availability.available
+                {
+                    log::warn!(
+                        "neoamd-auto-reprobe: active=NeoAMD result=unavailable action=DirectML reason='{}'",
+                        self.neoamd_availability
+                            .reason
+                            .as_deref()
+                            .unwrap_or("Auto render GPU is not NeoAMD compatible")
+                    );
+                    self.settings.onnx_backend = OnnxBackendPreference::DirectML;
+                    self.onnx_backend_selected = OnnxBackendPreference::DirectML;
+                    self.onnx_backend_pending = None;
+                    save_settings(&self.app_dir, &self.settings);
+                    let cache_root =
+                        tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, None);
+                    self.engine.send(Cmd::SetGpuSelection {
+                        gpu_adapter: gpu::device_id_for_luid(&self.gpu_adapters, Some(actual)),
+                        explicit_gpu_luid: None,
+                        force_vulkan_glsl: false,
+                        backend: OnnxBackendPreference::DirectML,
+                        trt_device_id: self.tensorrt_availability.device_id,
+                        cache_root,
+                    });
+                } else if self.onnx_backend_selected == OnnxBackendPreference::NeoAMD
+                    && mapping_changed
+                {
+                    let cache_root =
+                        tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, None);
+                    self.engine.send(Cmd::SetGpuSelection {
+                        gpu_adapter: gpu::device_id_for_luid(&self.gpu_adapters, Some(actual)),
+                        explicit_gpu_luid: None,
+                        force_vulkan_glsl: false,
+                        backend: self.onnx_backend_selected,
+                        trt_device_id: self.tensorrt_availability.device_id,
+                        cache_root,
+                    });
                 }
             }
 
@@ -3578,6 +3742,18 @@ impl App {
                 );
                 detect_tensorrt_backend(&self.app_dir, tensorrt_probe_luid)
             };
+
+            // NeoAMD follows the selected AMD DXGI adapter exactly. Under Auto,
+            // prefer the actual OpenGL AMD adapter once it is known. The bridge
+            // performs the final RDNA4 architecture/capability check, so this is
+            // not tied to any one RX 90xx device id.
+            let new_neoamd = detect_neoamd_for_selection(
+                &self.app_dir,
+                &self.gpu_adapters,
+                requested,
+                render_gpu_luid,
+            );
+
             let mut backend = self.onnx_backend_selected;
             if backend == OnnxBackendPreference::TensorRT && !new_tensorrt.available {
                 log::warn!(
@@ -3596,7 +3772,25 @@ impl App {
                 self.onnx_backend_selected = OnnxBackendPreference::DirectML;
                 self.onnx_backend_pending = None;
             }
+            if backend == OnnxBackendPreference::NeoAMD && !new_neoamd.available {
+                log::warn!(
+                    "gpu-selection-neoamd-fallback: requested_luid={} name='{}' reason='{}' active=DirectML",
+                    requested
+                        .map(|luid| format!("{luid:016x}"))
+                        .unwrap_or_else(|| "Auto".to_string()),
+                    requested_name,
+                    new_neoamd
+                        .reason
+                        .as_deref()
+                        .unwrap_or("selected GPU is not available to NeoAMD"),
+                );
+                backend = OnnxBackendPreference::DirectML;
+                self.settings.onnx_backend = OnnxBackendPreference::DirectML;
+                self.onnx_backend_selected = OnnxBackendPreference::DirectML;
+                self.onnx_backend_pending = None;
+            }
             self.tensorrt_availability = new_tensorrt;
+            self.neoamd_availability = new_neoamd;
             self.settings.gpu_adapter_luid = requested;
             self.settings.gpu_force_vulkan = force_vulkan_glsl;
             save_settings(&self.app_dir, &self.settings);
@@ -3631,6 +3825,9 @@ impl App {
         if backend == OnnxBackendPreference::TensorRT && !self.tensorrt_availability.available {
             return;
         }
+        if backend == OnnxBackendPreference::NeoAMD && !self.neoamd_availability.available {
+            return;
+        }
         if backend == OnnxBackendPreference::TensorRT
             && !tensorrt_crop_switch_allowed(self.settings.capture_crop, self.saved_crop)
         {
@@ -3650,7 +3847,7 @@ impl App {
         // Reflect the user's requested state immediately. The render engine
         // remains authoritative and the revision handler rolls this back on a
         // failed switch, but the checkbox must not appear to reject an idle
-        // DirectML <-> TensorRT click while the command crosses threads.
+        // DirectML <-> optional-backend click while the command crosses threads.
         self.onnx_backend_selected = backend;
         self.onnx_backend_pending = Some(backend);
         log::info!("onnx-backend-switch-requested: requested={backend:?}");
@@ -4119,13 +4316,16 @@ impl App {
 
         // Requested order:
         // FPS cap -> duplicate reduction -> rendering stabilization
-        // -> VSync -> TensorRT.
+        // -> VSync -> NeoAMD -> TensorRT.
         let mut cadence_labels = vec![
             tr(lang, "", "FPS cap"),
             tr(lang, "", "Duplicate reduction"),
             tr(lang, "", "Smooth pacing"),
             tr(lang, "", "VSync"),
         ];
+        if neoamd_option_visible(&self.neoamd_availability) {
+            cadence_labels.push("NeoAMD");
+        }
         if tensorrt_option_visible(&self.tensorrt_availability) {
             cadence_labels.push(tr(lang, "TensorRT（準備中）", "TensorRT (preparing)"));
         }
@@ -5503,7 +5703,9 @@ impl App {
                 self.tray_hidden = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 let restored = win32::restore_own_window(self.gui_hwnd);
-                log::info!("task-tray-action: toggle-gui result=shown restored={restored}");
+                log::info!(
+                    "task-tray-action: toggle-gui result=shown restored={restored}"
+                );
             }
         }
         if exit {
@@ -5610,7 +5812,9 @@ impl App {
         }
         ctx.request_repaint();
         ctx.request_repaint_after(Duration::from_millis(16));
-        log::debug!("background-hotkey-wake: armed restore_to={background_gui:?} goal={goal:?}");
+        log::debug!(
+            "background-hotkey-wake: armed restore_to={background_gui:?} goal={goal:?}"
+        );
     }
 
     fn settle_background_hotkey_wake(&mut self, ctx: &egui::Context) {
@@ -5631,9 +5835,7 @@ impl App {
                 && win32::is_own_window(self.panel_hwnd)
                 && self.panel_placed_for_run
                 && win32::is_window_visible(self.panel_hwnd));
-        let capture_busy = status.starting
-            || status.running
-            || status.stopping
+        let capture_busy = status.starting || status.running || status.stopping
             || chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
         let mut wake = wake;
         wake.saw_capture_busy |= capture_busy;
@@ -5655,11 +5857,13 @@ impl App {
                 start_ready || stopped_ready || rejected_ready
             }
             BackgroundWakeGoal::StopCleanup => !capture_busy && panel_quiescent,
-            BackgroundWakeGoal::Generic => generic_background_wake_ready(
-                now.duration_since(wake.armed_at),
-                self.gui_topmost_off_pending,
-                self.panel_screenshot_feedback_until,
-            ),
+            BackgroundWakeGoal::Generic => {
+                generic_background_wake_ready(
+                    now.duration_since(wake.armed_at),
+                    self.gui_topmost_off_pending,
+                    self.panel_screenshot_feedback_until,
+                )
+            }
         };
         let timed_out = now >= wake.deadline;
         if !ready && !timed_out {
@@ -5823,11 +6027,14 @@ impl App {
         self.glsl_param_paths = discover_glsl_param_paths(&self.app_dir, &discovered);
         let nr = detect_dlssnr_backend_pack(&self.app_dir);
         self.dlssnr_installed = nr.installed;
-        self.dlssnr_options_supported = nr.manifest.as_ref().is_some_and(|m| {
-            m.compatibility_tags
-                .iter()
-                .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-        });
+        self.dlssnr_options_supported = nr
+            .manifest
+            .as_ref()
+            .is_some_and(|m| {
+                m.compatibility_tags
+                    .iter()
+                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+            });
         self.dlssnr_advanced_options_supported = nr
             .manifest
             .as_ref()
@@ -6313,7 +6520,8 @@ impl App {
         if still_cloaked {
             // Once a delayed cloak is observed, require another short stable
             // interval after this frame before declaring the restore complete.
-            self.gui_restore_reveal_confirm_after = Some(now + Duration::from_millis(160));
+            self.gui_restore_reveal_confirm_after =
+                Some(now + Duration::from_millis(160));
         }
         let confirm_after = self
             .gui_restore_reveal_confirm_after
@@ -6414,8 +6622,10 @@ impl App {
             // Keep a short fail-visible guard alive even when this immediate
             // sample is already clear.
             let reveal_now = Instant::now();
-            self.gui_restore_reveal_retry_until = Some(reveal_now + Duration::from_secs(2));
-            self.gui_restore_reveal_confirm_after = Some(reveal_now + Duration::from_millis(240));
+            self.gui_restore_reveal_retry_until =
+                Some(reveal_now + Duration::from_secs(2));
+            self.gui_restore_reveal_confirm_after =
+                Some(reveal_now + Duration::from_millis(240));
             ctx.request_repaint_after(Duration::from_millis(16));
             if !still_cloaked {
                 win32::activate_window(self.gui_hwnd);
@@ -8583,7 +8793,9 @@ impl eframe::App for App {
                 .tray_hidden_stop_close_guard_until
                 .is_some_and(|deadline| now <= deadline)
         {
-            log::warn!("task-tray-resident-guard: root-close-cancelled source=hidden-capture-stop");
+            log::warn!(
+                "task-tray-resident-guard: root-close-cancelled source=hidden-capture-stop"
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
@@ -10119,7 +10331,7 @@ impl eframe::App for App {
             // Row 2 starts after capture resolution at every window width.
             // The important timing controls keep the requested fixed order in
             // every language: FPS cap -> duplicate reduction -> rendering
-            // stabilization -> VSync -> TensorRT (only when the backend pack is detected).
+            // stabilization -> VSync -> NeoAMD / TensorRT (only when each backend pack is detected).
             ui.horizontal_wrapped(|ui| {
                 if ink_centered_checkbox(
                     ui,
@@ -10176,6 +10388,53 @@ impl eframe::App for App {
                 {
                     settings_changed = true;
                     self.engine.send(Cmd::SetVsync(self.settings.vsync));
+                }
+
+                if neoamd_option_visible(&self.neoamd_availability) {
+                    let backend_switching =
+                        self.onnx_backend_pending.is_some() || status.onnx_backend_switching;
+                    let mut neoamd_on =
+                        self.onnx_backend_selected == OnnxBackendPreference::NeoAMD;
+                    let response = ink_centered_checkbox_enabled(
+                        ui,
+                        !backend_switching,
+                        &mut neoamd_on,
+                        "NeoAMD",
+                    )
+                    .on_hover_text({
+                        let mut help = i18n::text(lang, "neoamd.help").to_owned();
+                        if let Some(arch) = self.neoamd_availability.gpu_architecture.as_deref() {
+                            help.push('\n');
+                            help.push_str(&i18n::format_text(
+                                lang,
+                                "neoamd.architecture",
+                                &[("arch", arch.to_string())],
+                            ));
+                        }
+                        if status.onnx_directml_fallbacks > 0 {
+                            help.push('\n');
+                            help.push_str(&i18n::format_text(
+                                lang,
+                                "neoamd.directml_fallback_count",
+                                &[("count", status.onnx_directml_fallbacks.to_string())],
+                            ));
+                        }
+                        help
+                    });
+                    let requested_neoamd = if response.changed() {
+                        Some(neoamd_on)
+                    } else if response.clicked() {
+                        Some(self.onnx_backend_selected != OnnxBackendPreference::NeoAMD)
+                    } else {
+                        None
+                    };
+                    if let Some(neoamd_on) = requested_neoamd {
+                        self.request_onnx_backend_switch(if neoamd_on {
+                            OnnxBackendPreference::NeoAMD
+                        } else {
+                            OnnxBackendPreference::DirectML
+                        });
+                    }
                 }
 
                 if tensorrt_option_visible(&self.tensorrt_availability) {
@@ -11279,26 +11538,10 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.preset_3"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut values.preset,
-                                                    0,
-                                                    i18n::text(lang, "dlssnr.preset_default"),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut values.preset,
-                                                    1,
-                                                    i18n::text(lang, "dlssnr.preset_1"),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut values.preset,
-                                                    2,
-                                                    i18n::text(lang, "dlssnr.preset_2"),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut values.preset,
-                                                    3,
-                                                    i18n::text(lang, "dlssnr.preset_3"),
-                                                );
+                                                ui.selectable_value(&mut values.preset, 0, i18n::text(lang, "dlssnr.preset_default"));
+                                                ui.selectable_value(&mut values.preset, 1, i18n::text(lang, "dlssnr.preset_1"));
+                                                ui.selectable_value(&mut values.preset, 2, i18n::text(lang, "dlssnr.preset_2"));
+                                                ui.selectable_value(&mut values.preset, 3, i18n::text(lang, "dlssnr.preset_3"));
                                             });
                                     });
                                     if values.preset != old_preset {
@@ -11317,59 +11560,34 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.style_default"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    &mut values.style,
-                                                    0,
-                                                    i18n::text(lang, "dlssnr.style_default"),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut values.style,
-                                                    1,
-                                                    i18n::text(lang, "dlssnr.style_natural"),
-                                                );
-                                                ui.selectable_value(
-                                                    &mut values.style,
-                                                    2,
-                                                    i18n::text(lang, "dlssnr.style_cinematic"),
-                                                );
+                                                ui.selectable_value(&mut values.style, 0, i18n::text(lang, "dlssnr.style_default"));
+                                                ui.selectable_value(&mut values.style, 1, i18n::text(lang, "dlssnr.style_natural"));
+                                                ui.selectable_value(&mut values.style, 2, i18n::text(lang, "dlssnr.style_cinematic"));
                                             });
                                         values_changed |= values.style != before;
                                     });
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                                .fixed_decimals(2)
-                                                .text(i18n::text(lang, "dlssnr.intensity")),
-                                        )
-                                        .changed();
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                                .fixed_decimals(2)
-                                                .text(i18n::text(lang, "dlssnr.local_tone")),
-                                        )
-                                        .changed();
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut values.local_structure,
-                                                0.0..=1.0,
-                                            )
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.intensity")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_tone")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                        )
-                                        .changed();
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut values.skin_structure,
-                                                -1.0..=1.0,
-                                            )
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.skin_structure, -1.0..=1.0)
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.skin_structure")),
-                                        )
-                                        .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
-                                        .changed();
+                                    )
+                                    .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
+                                    .changed();
                                     ui.horizontal(|ui| {
                                         values_changed |= ink_centered_checkbox(
                                             ui,
@@ -11383,10 +11601,7 @@ impl eframe::App for App {
                                             &mut values.ui_correction,
                                             i18n::text(lang, "dlssnr.ui_correction"),
                                         )
-                                        .on_hover_text(i18n::text(
-                                            lang,
-                                            "dlssnr.ui_correction_help",
-                                        ))
+                                        .on_hover_text(i18n::text(lang, "dlssnr.ui_correction_help"))
                                         .changed();
                                     });
                                     ui.label(
@@ -11395,37 +11610,25 @@ impl eframe::App for App {
                                             .weak(),
                                     );
                                 } else {
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                                .fixed_decimals(2)
-                                                .text(i18n::text(lang, "dlssnr.intensity")),
-                                        )
-                                        .changed();
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                                .fixed_decimals(2)
-                                                .text(i18n::text(lang, "dlssnr.local_tone")),
-                                        )
-                                        .changed();
-                                    values_changed |= ui
-                                        .add(
-                                            egui::Slider::new(
-                                                &mut values.local_structure,
-                                                0.0..=1.0,
-                                            )
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.intensity")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                            .fixed_decimals(2)
+                                            .text(i18n::text(lang, "dlssnr.local_tone")),
+                                    ).changed();
+                                    values_changed |= ui.add(
+                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                        )
-                                        .changed();
+                                    ).changed();
                                     ui.label(
-                                        egui::RichText::new(i18n::text(
-                                            lang,
-                                            "dlssnr.update_pack_advanced",
-                                        ))
-                                        .size(10.5)
-                                        .weak(),
+                                        egui::RichText::new(i18n::text(lang, "dlssnr.update_pack_advanced"))
+                                            .size(10.5)
+                                            .weak(),
                                     );
                                 }
                             });
@@ -11433,12 +11636,9 @@ impl eframe::App for App {
                         ui.separator();
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset"))
-                                .clicked()
-                            {
+                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
                                 let preset = values.preset.min(3);
-                                values = chidescaler_neo::core::dlssnr::factory_presets()
-                                    [preset as usize];
+                                values = chidescaler_neo::core::dlssnr::factory_presets()[preset as usize];
                                 values_changed = true;
                             }
                             if self.dlssnr_advanced_options_supported
@@ -11462,7 +11662,9 @@ impl eframe::App for App {
                     .get_or_insert_with(chidescaler_neo::core::dlssnr::new_spec);
                 chidescaler_neo::core::dlssnr::set_options(spec, values);
                 self.apply_live();
-                log::info!("dlssnr-gui-options-live: values={values:?} action=immediate-update");
+                log::info!(
+                    "dlssnr-gui-options-live: values={values:?} action=immediate-update"
+                );
             }
             if save_requested {
                 let index = values.preset.min(3) as usize;
@@ -12230,7 +12432,7 @@ mod app_tests {
     }
 
     #[test]
-    fn full_cadence_row_uses_requested_order_and_contains_tensorrt_only_once() {
+    fn full_cadence_row_uses_requested_order_and_optional_backends_once() {
         let source = include_str!("main.rs");
         let row = source
             .split("// Row 2 starts after capture resolution")
@@ -12252,12 +12454,18 @@ mod app_tests {
             .find("&mut self.settings.smooth_pacing")
             .expect("rendering stabilization");
         let vsync_pos = row.find("&mut self.settings.vsync").expect("VSync");
-        let tensorrt_pos = row.find("let backend_switching").expect("TensorRT control");
+        let neoamd_pos = row
+            .find("if neoamd_option_visible(&self.neoamd_availability)")
+            .expect("NeoAMD control");
+        let tensorrt_pos = row
+            .find("if tensorrt_option_visible(&self.tensorrt_availability)")
+            .expect("TensorRT control");
         assert!(fps_pos < drag_pos);
         assert!(drag_pos < duplicate_pos);
         assert!(duplicate_pos < smooth_pos);
         assert!(smooth_pos < vsync_pos);
-        assert!(vsync_pos < tensorrt_pos);
+        assert!(vsync_pos < neoamd_pos);
+        assert!(neoamd_pos < tensorrt_pos);
 
         let options = source
             .split("// row 2: options")
@@ -12287,6 +12495,26 @@ mod app_tests {
             .next()
             .expect("cadence row end");
         assert!(row.contains("if tensorrt_option_visible(&self.tensorrt_availability)"));
+    }
+
+    #[test]
+    fn neoamd_option_is_hidden_until_backend_is_detected() {
+        let unavailable = NeoAmdAvailability::default();
+        assert!(!neoamd_option_visible(&unavailable));
+
+        let mut available = NeoAmdAvailability::default();
+        available.available = true;
+        assert!(neoamd_option_visible(&available));
+
+        let source = include_str!("main.rs");
+        let row = source
+            .split("// Row 2 starts after capture resolution")
+            .nth(1)
+            .expect("cadence row")
+            .split("// row 2: options")
+            .next()
+            .expect("cadence row end");
+        assert!(row.contains("if neoamd_option_visible(&self.neoamd_availability)"));
     }
 
     #[test]
@@ -12538,7 +12766,9 @@ mod app_tests {
     fn tray_hidden_hotkey_stop_keeps_the_root_application_resident() {
         let main = include_str!("main.rs");
         let hotkeys = include_str!("platform/hotkeys.rs");
-        assert!(hotkeys.contains("capture_active && background_gui != BackgroundGui::Foreground"));
+        assert!(hotkeys.contains(
+            "capture_active && background_gui != BackgroundGui::Foreground"
+        ));
         assert!(hotkeys.contains("request_stop(\"background-global-hotkey\")"));
         assert!(hotkeys.contains("quiesce_panel_for_capture_stop"));
         assert!(hotkeys.contains("wake_background_gui(gui_hwnd)"));
@@ -12663,6 +12893,7 @@ mod app_tests {
         assert!(main.contains("!self.background_hotkey_wake_active()"));
     }
 
+
     #[test]
     fn background_stop_pumps_gui_until_panel_cleanup_is_committed() {
         let main = include_str!("main.rs");
@@ -12779,9 +13010,7 @@ mod app_tests {
         let main = include_str!("main.rs");
         assert!(main.contains("gui_restore_reveal_retry_until"));
         assert!(main.contains("gui_restore_reveal_confirm_after"));
-        assert!(main.contains(
-            "gui_control_should_restore(background_intent, minimized, visible, cloaked)"
-        ));
+        assert!(main.contains("gui_control_should_restore(background_intent, minimized, visible, cloaked)"));
         assert!(main.contains("win32::sync_gui_transition_with_dwm();"));
         assert!(main.contains("self.drive_gui_restore_reveal(ctx);"));
         assert!(main.contains("GUI control: reveal-stable-complete"));
@@ -13269,6 +13498,7 @@ mod app_tests {
         for key in [
             "smooth.help",
             "interpolation.factor_help",
+            "neoamd.help",
             "tensorrt.help",
             "tensorrt.pack_required",
             "tensorrt.unavailable_help",

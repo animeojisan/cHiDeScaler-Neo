@@ -101,6 +101,7 @@ pub enum OnnxBackendPreference {
     #[default]
     DirectML,
     TensorRT,
+    NeoAMD,
 }
 
 /// Legacy HDR-to-SDR profile values retained only for settings-file compatibility.
@@ -341,7 +342,7 @@ pub struct Settings {
     #[serde(default)]
     pub gpu_force_vulkan: bool,
     /// Global ONNX backend preference. Presets intentionally remain backend
-    /// agnostic; unavailable TensorRT installations resolve to DirectML.
+    /// agnostic; unavailable optional backends resolve to DirectML.
     #[serde(default)]
     pub onnx_backend: OnnxBackendPreference,
     /// Source-window client resize before/while capturing. None = auto/no resize.
@@ -584,6 +585,11 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.onnx_backend, OnnxBackendPreference::TensorRT);
+
+        settings.onnx_backend = OnnxBackendPreference::NeoAMD;
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.onnx_backend, OnnxBackendPreference::NeoAMD);
     }
 
     #[test]

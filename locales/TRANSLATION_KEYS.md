@@ -127,6 +127,9 @@ Every locale JSON must start with `_language_name`, `_language_code`, and `_lang
 | `stats.help` | Total is the measured time from capture arrival to presentation.<br>Delay frames are total ms divided by the source frame interval. |
 | `stats.main` | Input: {in_w}x{in_h} → Internal: {internal_w}x{internal_h} → Output: {out_w}x{out_h}   Total: {total_ms}ms / Delay: {lag_frames} frames   Present: {present_fps}fps / Capture: {capture_fps}fps |
 | `stats.monitor` | Monitor: {width}x{height} @ {refresh}Hz |
+| `neoamd.architecture` | GPU architecture: {arch} |
+| `neoamd.directml_fallback_count` | DirectML fallback: {count} filter(s) |
+| `neoamd.help` | Run compatible ONNX filters with the separately distributed NeoAMD Backend Pack on an RDNA4 AMD GPU. Models are identified by graph structure, unsupported filters fall back to DirectML, and no per-resolution engine is built. |
 | `tensorrt.cuda_fallback_count` | CUDA fallback: {count} filter(s) |
 | `tensorrt.directml_fallback_count` | DirectML fallback: {count} filter(s) |
 | `tensorrt.help` | Run ONNX filters with TensorRT priority on an NVIDIA GPU. Unsupported filters automatically fall back to DirectML. |

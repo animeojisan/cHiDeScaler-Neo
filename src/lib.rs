@@ -35,6 +35,7 @@ pub mod render {
     pub mod mpv;
     pub mod onnx_accel;
     pub mod onnx_backend;
+    pub mod neoamd_backend;
     pub mod onnx_stage;
     pub mod scaler;
     pub mod slangp;
