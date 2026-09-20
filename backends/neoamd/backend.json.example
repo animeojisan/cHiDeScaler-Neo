@@ -1,0 +1,20 @@
+{
+  "backend_api": 1,
+  "name": "NeoAMD Backend Pack",
+  "architecture": "x86_64",
+  "bridge_abi": 1,
+  "bridge": "neo_amd_backend.dll",
+  "provider": "NeoAMD-HIP-RDNA4",
+  "supported_gpu_architectures": ["gfx1200", "gfx1201"],
+  "required_files": ["neo_amd_backend.dll"],
+  "file_sha256": {
+    "neo_amd_backend.dll": "REPLACE_WITH_SHA256"
+  },
+  "compatibility_tags": [
+    "dynamic-resolution",
+    "fp16-native",
+    "gfx12-wmma",
+    "structural-routing",
+    "directml-fallback-safe"
+  ]
+}
