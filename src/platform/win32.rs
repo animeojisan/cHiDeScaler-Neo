@@ -2,7 +2,7 @@
 
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU32, Ordering},
 };
 use windows::Win32::Foundation::{
     COLORREF, CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -120,7 +120,70 @@ static CAPTURE_EXCLUDED_WINDOWS: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
 // SC_MINIMIZE) is forwarded unchanged so Windows owns minimize/restore.
 static MAIN_GUI_SUBCLASS_HWND: AtomicIsize = AtomicIsize::new(0);
 static MAIN_GUI_OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+// The AMD compositor keepalive is an eframe top-level window. When the visible
+// operation panel is disabled we still keep this surface alive, but it must be
+// completely input-transparent without changing its extended window styles.
+// Subclass WM_NCHITTEST instead of adding WS_EX_TRANSPARENT so the DWM/window
+// classification used by the known-good compositor path remains unchanged.
+static COMPOSITOR_KEEPALIVE_SUBCLASS_HWND: AtomicIsize = AtomicIsize::new(0);
+static COMPOSITOR_KEEPALIVE_OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static SINGLE_INSTANCE_HANDLE: AtomicIsize = AtomicIsize::new(0);
+
+unsafe extern "system" fn compositor_keepalive_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCHITTEST {
+        return LRESULT(HTTRANSPARENT as isize);
+    }
+    if msg == WM_MOUSEACTIVATE {
+        return LRESULT(MA_NOACTIVATE as isize);
+    }
+    let old = COMPOSITOR_KEEPALIVE_OLD_WNDPROC.load(Ordering::Acquire);
+    let result = if old != 0 {
+        let old_proc: WNDPROC = unsafe { std::mem::transmute(old) };
+        unsafe { CallWindowProcW(old_proc, hwnd, msg, wparam, lparam) }
+    } else {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    };
+    if msg == WM_NCDESTROY
+        && COMPOSITOR_KEEPALIVE_SUBCLASS_HWND.load(Ordering::Acquire) == hwnd.0 as isize
+    {
+        COMPOSITOR_KEEPALIVE_SUBCLASS_HWND.store(0, Ordering::Release);
+        COMPOSITOR_KEEPALIVE_OLD_WNDPROC.store(0, Ordering::Release);
+    }
+    result
+}
+
+pub fn install_compositor_keepalive_input_passthrough(hwnd: isize) {
+    if hwnd == 0
+        || !is_window_valid(hwnd)
+        || !is_own_window(hwnd)
+        || COMPOSITOR_KEEPALIVE_SUBCLASS_HWND.load(Ordering::Acquire) == hwnd
+    {
+        return;
+    }
+    unsafe {
+        let old = SetWindowLongPtrW(
+            HWND(hwnd as *mut _),
+            GWL_WNDPROC,
+            compositor_keepalive_wndproc as *const () as usize as isize,
+        );
+        if old != 0 {
+            COMPOSITOR_KEEPALIVE_OLD_WNDPROC.store(old, Ordering::Release);
+            COMPOSITOR_KEEPALIVE_SUBCLASS_HWND.store(hwnd, Ordering::Release);
+            log::info!(
+                "compositor-keepalive-input-route: hwnd={hwnd:#x} mode=wndproc-hit-transparent styles=unchanged"
+            );
+        } else {
+            log::warn!(
+                "compositor-keepalive-input-route: hwnd={hwnd:#x} install=failed"
+            );
+        }
+    }
+}
 
 unsafe extern "system" fn main_gui_caption_wndproc(
     hwnd: HWND,
@@ -2706,9 +2769,9 @@ pub fn activate_other_instance(title: &str) {
             if pid != ctx.pid {
                 let mut buf = [0u16; 64];
                 let n = GetWindowTextW(hwnd, &mut buf);
-                // PREFIX match keeps compatibility with development builds that
-                // may append an internal build tag while public releases use the
-                // stable title "cHiDeScaler-Neo".
+                // PREFIX match: titles carry a build tag ("cHiDeScaler-Neo
+                // build tag so which build is running is visible at a glance;
+                // an old instance with a different tag must still be found
                 let got = &buf[..n.max(0) as usize];
                 if got.len() >= ctx.title.len() && got[..ctx.title.len()] == ctx.title[..] {
                     ctx.found = hwnd.0 as isize;
@@ -3748,15 +3811,7 @@ pub fn request_main_gui_close(hwnd: isize) -> bool {
     if hwnd == 0 || !is_window_valid(hwnd) || !is_own_window(hwnd) {
         return false;
     }
-    unsafe {
-        PostMessageW(
-            Some(HWND(hwnd as *mut _)),
-            WM_CLOSE,
-            WPARAM(0),
-            LPARAM(0),
-        )
-        .is_ok()
-    }
+    unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 pub fn main_gui_explicit_exiting() -> bool {

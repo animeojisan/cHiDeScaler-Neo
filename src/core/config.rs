@@ -11,8 +11,114 @@ pub struct StageSpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Per-instance values for mpv-style `//!PARAM` declarations.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "stage_param_map"
+    )]
     pub params: BTreeMap<String, f32>,
+}
+
+/// JSON cannot round-trip non-finite IEEE-754 values as numbers. MVUtensils
+/// legitimately uses +Infinity for limits such as `limit_y` / `limit_c`, so
+/// persist only infinities as stable strings while keeping every finite value
+/// in the existing numeric JSON representation. This is backwards-compatible
+/// with presets written by earlier releases.
+mod stage_param_map {
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredParam {
+        Number(f32),
+        Text(String),
+        Null(()),
+    }
+
+    pub fn serialize<S>(
+        params: &BTreeMap<String, f32>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(params.len()))?;
+        for (key, value) in params {
+            if value.is_nan() {
+                return Err(<S::Error as serde::ser::Error>::custom(format!(
+                    "stage parameter '{key}' is NaN and cannot be persisted"
+                )));
+            }
+            if value.is_infinite() {
+                let token = if value.is_sign_positive() {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                };
+                map.serialize_entry(key, token)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, f32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ParamMapVisitor;
+
+        impl<'de> Visitor<'de> for ParamMapVisitor {
+            type Value = BTreeMap<String, f32>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map of numeric stage parameters")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = BTreeMap::new();
+                while let Some((key, stored)) = access.next_entry::<String, StoredParam>()? {
+                    let value = match stored {
+                        StoredParam::Number(value) => value,
+                        StoredParam::Text(token) => match token.as_str() {
+                            "Infinity" | "+Infinity" | "inf" | "+inf" => f32::INFINITY,
+                            "-Infinity" | "-inf" => f32::NEG_INFINITY,
+                            _ => {
+                                return Err(de::Error::custom(format!(
+                                    "invalid non-finite stage parameter '{key}': {token}"
+                                )))
+                            }
+                        },
+                        // serde_json <= v851 serialized non-finite f32 values
+                        // as null. Only the two MVUtensils unlimited-limit
+                        // parameters legitimately use that representation, so
+                        // recover those old files without weakening validation
+                        // for unrelated parameters.
+                        StoredParam::Null(()) if key == "limit_y" || key == "limit_c" => {
+                            f32::INFINITY
+                        }
+                        StoredParam::Null(()) => {
+                            return Err(de::Error::custom(format!(
+                                "null stage parameter '{key}' is not supported"
+                            )))
+                        }
+                    };
+                    out.insert(key, value);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_map(ParamMapVisitor)
+    }
 }
 
 fn default_true() -> bool {
@@ -30,6 +136,8 @@ pub enum StageKind {
     Slangp,
     /// built-in GPU filter (e.g. NeoFlow frame interpolation)
     Flow,
+    /// Native bidirectional Super -> AnalyseMany -> Degrain temporal filter.
+    Mvutensils,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +375,11 @@ pub struct Settings {
     /// perceptual duplicate. Presentation cadence is preserved.
     #[serde(default)]
     pub duplicate_frame_reduction: bool,
+    /// Detect severe sustained GLSL overload and allow Neo to stop capture
+    /// after the existing warning grace. The responsiveness guard itself stays
+    /// active even when this is OFF; only forced automatic Stop is disabled.
+    #[serde(default = "default_true_s")]
+    pub load_detection: bool,
     /// Dormant compatibility field for the frozen NeoAccel experiments. v692
     /// forces this false at startup and does not expose it in the GUI. Retained
     /// only so older settings.json files continue to deserialize cleanly.
@@ -423,6 +536,7 @@ impl Default for Settings {
             vsync: false,
             smooth_pacing: true,
             duplicate_frame_reduction: false,
+            load_detection: true,
             neo_accel: false,
             gui_topmost: false,
             start_in_tray: false,
@@ -533,6 +647,19 @@ mod tests {
     fn explicitly_disabled_smooth_pacing_is_preserved() {
         let parsed: Settings = serde_json::from_str(r#"{"smooth_pacing":false}"#).unwrap();
         assert!(!parsed.smooth_pacing);
+    }
+
+    #[test]
+    fn load_detection_defaults_on_and_explicit_off_round_trips() {
+        assert!(Settings::default().load_detection);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.load_detection);
+
+        let mut settings = Settings::default();
+        settings.load_detection = false;
+        let parsed: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!parsed.load_detection);
     }
 
     #[test]

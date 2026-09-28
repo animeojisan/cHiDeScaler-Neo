@@ -145,6 +145,10 @@ struct Inner {
     /// resources are already warm by the time the first displayed statistic is
     /// sampled.
     cold_skip_remaining: HashMap<String, u8>,
+    /// While an ONNX provider is being rebuilt/switched, setup/Graph/autotune
+    /// frames are real wall-clock work but are not representative per-frame
+    /// inference timings. Do not let them enter the user-facing ONNX row.
+    suppress_onnx_stage_probes: bool,
 }
 
 impl Metrics {
@@ -259,9 +263,55 @@ impl Metrics {
             .any(|remaining| *remaining > 0)
     }
 
+    /// Provider/session transitions can finish one very expensive setup frame
+    /// before the first representative live frame is available.  Clear only
+    /// the per-stage display state at that exact presentation boundary, then
+    /// sample the next few live frames at full cadence.  This keeps FPS/monitor
+    /// history intact while preventing a 100+ ms setup frame from taking tens
+    /// of seconds to decay out of an ONNX row.
+    pub fn reseed_stage_display_after_transition(&self, samples: u8) {
+        let mut g = self.inner.lock().unwrap();
+        g.snap.stages.clear();
+        g.snap.stage_order = g.configured_stage_order.clone();
+        g.frame_stage_max_ms = 0.0;
+        g.cold_skip_remaining.clear();
+        g.fast_settle_remaining.clear();
+        if samples > 0 {
+            for name in g.configured_stage_order.clone() {
+                g.fast_settle_remaining.insert(name, samples);
+            }
+        }
+    }
+
+    /// Begin a provider transition. ONNX probes continue to exist for backend
+    /// diagnostics, but the GUI row is held empty until the new provider has
+    /// presented its first valid frame.
+    pub fn begin_onnx_transition_display(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.suppress_onnx_stage_probes = true;
+        g.snap.stages.retain(|_, stat| stat.kind != "onnx");
+        g.frame_stage_max_ms = 0.0;
+        g.cold_skip_remaining.clear();
+        g.fast_settle_remaining.clear();
+    }
+
+    /// End a provider transition at the first valid Present boundary. The next
+    /// completed ONNX frame becomes the displayed value directly.
+    pub fn end_onnx_transition_display(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.snap.stages.retain(|_, stat| stat.kind != "onnx");
+        g.frame_stage_max_ms = 0.0;
+        g.cold_skip_remaining.clear();
+        g.fast_settle_remaining.clear();
+        g.suppress_onnx_stage_probes = false;
+    }
+
     pub fn probe(&self, name: &str, kind: &str, ms: f64) {
         let mut g = self.inner.lock().unwrap();
         if !g.gui_enabled {
+            return;
+        }
+        if kind == "onnx" && g.suppress_onnx_stage_probes {
             return;
         }
         // Asynchronous GL timer results may arrive after a preset switch.
@@ -321,6 +371,11 @@ impl Metrics {
                 // ordinary steadier 0.9/0.1 EWMA resumes after this bounded
                 // settle window.
                 e.ms * 0.5 + ms * 0.5
+            } else if kind == "onnx" {
+                // v835: this is already a completed provider-frame timing.
+                // Report the current frame directly; backend-switch setup
+                // frames are suppressed by begin/end_onnx_transition_display.
+                ms
             } else {
                 e.ms * 0.9 + ms * 0.1
             };
@@ -739,6 +794,33 @@ mod tests {
         // resumes instead of permanently making the statistics noisy.
         metrics.probe(&name, "onnx", 6.0);
         assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 7.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn provider_transition_reseed_discards_setup_frame_and_seeds_from_next_live_sample() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        let name = "esrgan.onnx [NeoAMD]".to_string();
+        metrics.set_stage_order(vec![name.clone()]);
+        metrics.probe(&name, "onnx", 138.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 138.0).abs() < 0.001);
+
+        metrics.reseed_stage_display_after_transition(4);
+        assert!(metrics.snapshot().stages.get(&name).is_none());
+        assert!(metrics.stage_fast_settle_active());
+        metrics.probe(&name, "onnx", 14.5);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 14.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn steady_onnx_display_tracks_live_timing_at_half_weight() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        let name = "esrgan.onnx [NeoAMD]".to_string();
+        metrics.set_stage_order(vec![name.clone()]);
+        metrics.probe(&name, "onnx", 14.0);
+        metrics.probe(&name, "onnx", 16.0);
+        assert!((metrics.snapshot().stages.get(&name).unwrap().ms - 15.0).abs() < 0.001);
     }
 
     #[test]

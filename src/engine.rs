@@ -45,6 +45,7 @@ fn metrics_kind_label(kind: StageKind) -> &'static str {
         StageKind::Dlssnr => "dlssnr",
         StageKind::Onnx => "onnx",
         StageKind::Flow => "gpu",
+        StageKind::Mvutensils => "mvutensils",
     }
 }
 
@@ -131,9 +132,20 @@ const DISPLAY_REGION_CAPTURE_RESOLUTION_SETTLE: Duration = Duration::from_millis
 // workload is beyond the machine, give the user a readable warning interval
 // and then use the ordinary Stop route. While that grace period is active,
 // non-interpolation GLSL chains hold the last complete filtered frame instead
-// of continuing to saturate the GPU. This does not alter the overload
-// thresholds or healthy-frame scheduling.
+// of continuing to saturate the GPU.
+//
+// v836: the Soft/Hard admission guard itself remains unchanged, but warning +
+// automatic Stop now require a second, deliberately stricter "critical stall"
+// threshold. A fast GPU is allowed to run a deliberately heavy chain at 100%
+// utilization and a lower steady FPS as long as frame/present latency remains
+// bounded. This avoids treating useful saturation (for example ~44 ms/frame on
+// gfx1201) as a system-responsiveness failure, while preserving the old frame-
+// hold protection and still stopping truly pathological stalls.
 const GLSL_OVERLOAD_AUTO_STOP_GRACE: Duration = Duration::from_secs(6);
+const GLSL_AUTO_STOP_FRAME_MIN_MS: f64 = 55.0;
+const GLSL_AUTO_STOP_FRAME_BUDGET_MULTIPLIER: f64 = 3.0;
+const GLSL_AUTO_STOP_PRESENT_MIN_MS: f64 = 40.0;
+const GLSL_AUTO_STOP_PRESENT_BUDGET_MULTIPLIER: f64 = 2.0;
 // GUI GPU usage is still sampled for the ordinary non-interpolation GLSL
 // admission guard. Interpolation chains never omit selected post filters.
 static GUI_GPU_PERCENT_X10: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -274,6 +286,8 @@ pub enum Cmd {
         aspect_height_scale: f32,
         capture_crop: CaptureCrop,
         fps_cap: Option<u32>,
+        /// User option: allow the severe-overload detector to arm automatic Stop.
+        load_detection: bool,
         hide_source: bool,
         client_only: bool,
         hdr: bool,
@@ -399,6 +413,9 @@ pub enum Cmd {
     SetSmoothPacing(bool),
     /// Skip expensive upscaling for perceptually identical source frames.
     SetDuplicateFrameReduction(bool),
+    /// Enable/disable only overload-triggered automatic Stop. The existing
+    /// responsiveness guard may still hold already-filtered frames.
+    SetLoadDetection(bool),
     Shutdown,
 }
 
@@ -1994,6 +2011,12 @@ struct Session {
     browser_fullscreen_cadence: bool,
     source: WgcSource,
     chain: FilterChain,
+    mvutensils_runtime: Option<(
+        usize,
+        crate::render::mvutensils_neo::Options,
+        crate::render::mvutensils_neo::PortableBackendSession,
+    )>,
+    mvutensils_output_rgba: Vec<u8>,
     mode: ScaleMode,
     ratio: f32,
     aspect_correction: bool,
@@ -2012,6 +2035,7 @@ struct Session {
     /// being stretched through an intermediate aspect while live-editing.
     aspect_transition_pending: bool,
     fps_cap: Option<u32>,
+    load_detection: bool,
     capture_client_only: bool,
     capture_hdr: bool,
     hdr_sdr_mode: HdrSdrMode,
@@ -2628,6 +2652,97 @@ fn glsl_guard_budget_ms(s: &Session) -> f64 {
         .unwrap_or(1000.0 / 60.0)
 }
 
+fn glsl_auto_stop_is_critical(
+    mode: GlslGuardMode,
+    frame_ms: f64,
+    present_ms: f64,
+    budget_ms: f64,
+) -> bool {
+    let budget = budget_ms.clamp(4.0, 1000.0);
+    let hard_critical = (frame_ms >= GLSL_AUTO_STOP_FRAME_MIN_MS
+        && frame_ms >= budget * GLSL_AUTO_STOP_FRAME_BUDGET_MULTIPLIER)
+        || (present_ms >= GLSL_AUTO_STOP_PRESENT_MIN_MS
+            && present_ms >= budget * GLSL_AUTO_STOP_PRESENT_BUDGET_MULTIPLIER);
+    match mode {
+        GlslGuardMode::Hard => hard_critical,
+        // Preserve an emergency escape even when PDH reports only 86-94% GPU.
+        // Soft is never stopped for an ordinary deadline miss; it must be far
+        // beyond the already-relaxed Hard auto-stop threshold.
+        GlslGuardMode::Soft => {
+            (frame_ms >= 120.0 && frame_ms >= budget * 4.0)
+                || (present_ms >= 80.0 && present_ms >= budget * 3.0)
+        }
+        GlslGuardMode::Off => false,
+    }
+}
+
+fn arm_glsl_overload_auto_stop_if_critical(
+    s: &Session,
+    status: &Arc<Mutex<Status>>,
+    frame_ms: f64,
+    present_ms: f64,
+    budget_ms: f64,
+    reason: &str,
+    log_suppressed: bool,
+) -> bool {
+    if !s.load_detection {
+        if log_suppressed {
+            log::info!(
+                "glsl-overload-auto-stop: suppressed reason=load-detection-disabled mode={:?} frame_ms={:.2} present_ms={:.2} budget_ms={:.2} action=guard-only",
+                s.glsl_guard.mode,
+                frame_ms,
+                present_ms,
+                budget_ms
+            );
+        }
+        return false;
+    }
+    if !glsl_auto_stop_is_critical(s.glsl_guard.mode, frame_ms, present_ms, budget_ms) {
+        if log_suppressed {
+            log::info!(
+                "glsl-overload-auto-stop: suppressed mode={:?} reason={} frame_ms={:.2} present_ms={:.2} budget_ms={:.2} thresholds=frame>={:.0}ms/{:.2}x,present>={:.0}ms/{:.2}x action=guard-only",
+                s.glsl_guard.mode,
+                reason,
+                frame_ms,
+                present_ms,
+                budget_ms,
+                GLSL_AUTO_STOP_FRAME_MIN_MS,
+                GLSL_AUTO_STOP_FRAME_BUDGET_MULTIPLIER,
+                GLSL_AUTO_STOP_PRESENT_MIN_MS,
+                GLSL_AUTO_STOP_PRESENT_BUDGET_MULTIPLIER,
+            );
+        }
+        return false;
+    }
+
+    let mut state = status.lock().unwrap();
+    if !state.glsl_overload_notice_latched {
+        state.glsl_overload_notice_latched = true;
+        log::info!(
+            "glsl-overload-notice: latched=true mode={:?} reason={} frame_ms={:.2} present_ms={:.2} budget_ms={:.2}",
+            s.glsl_guard.mode,
+            reason,
+            frame_ms,
+            present_ms,
+            budget_ms,
+        );
+    }
+    if state.glsl_overload_auto_stop_deadline.is_none() {
+        state.glsl_overload_auto_stop_deadline =
+            Some(Instant::now() + GLSL_OVERLOAD_AUTO_STOP_GRACE);
+        log::info!(
+            "glsl-overload-auto-stop: armed grace_ms={} mode={:?} reason={} frame_ms={:.2} present_ms={:.2} budget_ms={:.2} action=warn-then-normal-stop",
+            GLSL_OVERLOAD_AUTO_STOP_GRACE.as_millis(),
+            s.glsl_guard.mode,
+            reason,
+            frame_ms,
+            present_ms,
+            budget_ms,
+        );
+    }
+    true
+}
+
 fn update_glsl_guard_after_processed(s: &mut Session, status: &Arc<Mutex<Status>>) {
     let eligible = glsl_guard_eligible(s);
     let gpu = latest_gui_gpu_percent();
@@ -2704,21 +2819,15 @@ fn update_glsl_guard_after_processed(s: &mut Session, status: &Arc<Mutex<Status>
             s.glsl_guard.set_mode(next, gpu_value, frame_ms, budget);
             s.glsl_overload_hint = false;
             remember_glsl_overload(s);
-            {
-                let mut state = status.lock().unwrap();
-                if !state.glsl_overload_notice_latched {
-                    state.glsl_overload_notice_latched = true;
-                    log::info!("glsl-overload-notice: latched=true reason=fast-reconfirm");
-                }
-                if state.glsl_overload_auto_stop_deadline.is_none() {
-                    state.glsl_overload_auto_stop_deadline =
-                        Some(Instant::now() + GLSL_OVERLOAD_AUTO_STOP_GRACE);
-                    log::info!(
-                        "glsl-overload-auto-stop: armed grace_ms={} reason=fast-reconfirm action=warn-then-normal-stop",
-                        GLSL_OVERLOAD_AUTO_STOP_GRACE.as_millis()
-                    );
-                }
-            }
+            arm_glsl_overload_auto_stop_if_critical(
+                s,
+                status,
+                frame_ms,
+                present_ms,
+                budget,
+                "fast-reconfirm",
+                true,
+            );
             log::info!(
                 "glsl-responsiveness-history: action=fast-reconfirm mode={next:?} gpu={gpu_value:.1}% frame_ms={frame_ms:.2} budget_ms={budget:.2}"
             );
@@ -2741,23 +2850,15 @@ fn update_glsl_guard_after_processed(s: &mut Session, status: &Arc<Mutex<Status>
         allow_immediate,
     );
     if s.glsl_guard.mode != GlslGuardMode::Off {
-        let mut state = status.lock().unwrap();
-        if !state.glsl_overload_notice_latched {
-            state.glsl_overload_notice_latched = true;
-            log::info!(
-                "glsl-overload-notice: latched=true mode={:?} reason=overload-proven",
-                s.glsl_guard.mode
-            );
-        }
-        if state.glsl_overload_auto_stop_deadline.is_none() {
-            state.glsl_overload_auto_stop_deadline =
-                Some(Instant::now() + GLSL_OVERLOAD_AUTO_STOP_GRACE);
-            log::info!(
-                "glsl-overload-auto-stop: armed grace_ms={} mode={:?} reason=overload-proven action=warn-then-normal-stop",
-                GLSL_OVERLOAD_AUTO_STOP_GRACE.as_millis(),
-                s.glsl_guard.mode
-            );
-        }
+        arm_glsl_overload_auto_stop_if_critical(
+            s,
+            status,
+            frame_ms,
+            present_ms,
+            budget_ms,
+            "overload-proven",
+            s.glsl_guard.mode != before,
+        );
     }
     if s.glsl_guard.mode != GlslGuardMode::Off && s.glsl_guard.mode != before {
         remember_glsl_overload(s);
@@ -3212,8 +3313,7 @@ fn dominant_video_period_with_missed_pictures(samples: &[i64]) -> Option<f64> {
             let mean_error = error_sum / matched.max(1) as f64;
             let candidate = (matched, direct, mean_error, 1.0 / fps);
             let better = best.as_ref().is_none_or(|&(bm, bd, be, _)| {
-                (matched, direct) > (bm, bd)
-                    || ((matched, direct) == (bm, bd) && mean_error < be)
+                (matched, direct) > (bm, bd) || ((matched, direct) == (bm, bd) && mean_error < be)
             });
             if better {
                 best = Some(candidate);
@@ -3316,7 +3416,11 @@ fn refresh_limited_output_ratio(
 /// of monitor refresh or a transient source-period estimate.  Presentation may
 /// naturally drop/hold frames when the selected multiplier exceeds the display
 /// refresh, but inference cadence must not silently change the user's setting.
-fn onnx_output_ratio(requested: u32, _source_period_s: Option<f64>, _refresh_hz: Option<f64>) -> f64 {
+fn onnx_output_ratio(
+    requested: u32,
+    _source_period_s: Option<f64>,
+    _refresh_hz: Option<f64>,
+) -> f64 {
     requested.clamp(2, 5) as f64
 }
 
@@ -3719,7 +3823,11 @@ fn observe_drba_midpoint_cost(
         // React quickly when the provider gets slower so synthetic frames are
         // shed before the capture queue is starved. Recover more gradually when
         // cost falls; this prevents an oscillation between full x5 and overload.
-        let alpha = if sample > *midpoint_ema_ms { 0.55 } else { 0.15 };
+        let alpha = if sample > *midpoint_ema_ms {
+            0.55
+        } else {
+            0.15
+        };
         *midpoint_ema_ms = *midpoint_ema_ms * (1.0 - alpha) + sample * alpha;
     }
     *perf_samples = perf_samples.saturating_add(1);
@@ -4098,9 +4206,7 @@ enum GpuInterpContinuity {
 /// interval.  Its output clock must therefore be derived from B/C themselves,
 /// not from a transient WGC/cadence estimator that also sees startup repeats,
 /// queue gaps or compositor notifications.
-fn drba_central_source_period(
-    history: &std::collections::VecDeque<GpuInterpFrame>,
-) -> Option<f64> {
+fn drba_central_source_period(history: &std::collections::VecDeque<GpuInterpFrame>) -> Option<f64> {
     if history.len() < 4 {
         return None;
     }
@@ -5660,7 +5766,7 @@ fn apply_chain_update(
     // Keep the same bounded warm cache used by geometry transitions instead of
     // waiting for a later source resize to reclaim gigabytes of stale textures.
     // This touches only recycled/free textures and never runs on the frame path.
-    gc.trim_transient_pool(2);
+    gc.trim_transient_pool(0);
     if glsl_guard_eligible(s) {
         let guard_arm = Instant::now();
         s.glsl_chain_settle_until = Some(guard_arm + GLSL_GUARD_CHAIN_SETTLE);
@@ -5695,14 +5801,15 @@ fn apply_chain_update(
     s.source.set_queue_enabled(s.chain.has_interp());
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
-    // v815: reset already removes the previous generation's EWMA.  Do not
-    // hide several sparse (1/30-frame) probes after a live edit: that made the
-    // statistics rows stay blank for seconds.  Show the first normal probe and
-    // use only a short 50/50 settle window.
-    metrics.arm_stage_cold_skip(0);
-    metrics.arm_stage_fast_settle(6);
+    // v833: v829 already samples stage timing every processed frame while the
+    // bounded settle window is active.  We can therefore discard exactly one
+    // transition frame (provider/Graph/bridge re-arm work) without leaving the
+    // row blank for seconds.  The next frame seeds the statistic directly, then
+    // four fast 50/50 samples absorb normal clock/scheduling jitter.
+    metrics.arm_stage_cold_skip(1);
+    metrics.arm_stage_fast_settle(4);
     log::debug!(
-        "chain-stats-generation-reset: cold_skip=0 fast_settle=6 policy=first-sampled-frame-fast-ewma-50 stages={:?}",
+        "chain-stats-generation-reset: cold_skip=1 fast_settle=4 policy=drop-one-transition-frame-then-fast-ewma-50 stages={:?}",
         s.chain.metric_stage_order()
     );
     {
@@ -5812,7 +5919,6 @@ fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext,
         s.interp_generation
     );
 }
-
 
 fn restart_wgc_epoch_for_backend_switch(s: &mut Session) -> bool {
     let pixel_exact_raw_hint = if s.source_monitor_fullscreen && s.capture_canvas.is_none() {
@@ -6025,14 +6131,8 @@ fn switch_onnx_backend(
             && !candidate_chain.has_interp()
         {
             for prime in 2..=3 {
-                let prime_result = candidate_chain.warmup_candidate(
-                    gc,
-                    s.frame.w,
-                    s.frame.h,
-                    &rgba,
-                    out_size,
-                    &preserve,
-                );
+                let prime_result = candidate_chain
+                    .warmup_candidate(gc, s.frame.w, s.frame.h, &rgba, out_size, &preserve);
                 match prime_result {
                     Ok(_) => log::debug!(
                         "onnx-backend-warmup-prime: backend={backend:?} pass={} size={}x{} scope=full-chain result=ok",
@@ -6059,8 +6159,7 @@ fn switch_onnx_backend(
             && backend == OnnxBackendPreference::NeoAMD
             && !candidate_chain.has_interp()
         {
-            let retired =
-                candidate_chain.rearm_neoamd_live_ingress_after_generic_warmup(gc);
+            let retired = candidate_chain.rearm_neoamd_live_ingress_after_generic_warmup(gc);
             log::debug!(
                 "onnx-backend-live-ingress-rearm: backend=NeoAMD stages={} action=retire-generic-shared-io preserve=session-packed-weights",
                 retired
@@ -6070,13 +6169,9 @@ fn switch_onnx_backend(
             // process_first_onnx_rgba8(). Prime that exact path last so the
             // committed provider owns only the resources it will use live.
             for prime in 1..=3 {
-                match candidate_chain.warmup_neoamd_live_rgba8(
-                    gc,
-                    s.frame.w,
-                    s.frame.h,
-                    &rgba,
-                    out_size,
-                ) {
+                match candidate_chain
+                    .warmup_neoamd_live_rgba8(gc, s.frame.w, s.frame.h, &rgba, out_size)
+                {
                     Ok(true) => log::debug!(
                         "onnx-backend-live-ingress-prime: backend=NeoAMD pass={} size={}x{} scope=exact-live-chain result=ok",
                         prime,
@@ -6215,8 +6310,10 @@ fn switch_onnx_backend(
     // session while NeoAMD intentionally keeps only its model/packed-weight
     // session.  Reproduce that boundary here after the old provider has been
     // fully dropped, without changing the steady-state kernels.
-    if matches!(backend, OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML)
-        && !s.chain.has_interp()
+    if matches!(
+        backend,
+        OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML
+    ) && !s.chain.has_interp()
     {
         // Preserve the last visible image as ordinary CPU RGBA while the target
         // provider's warmup-only bridge and transient GL pool are retired.
@@ -6290,8 +6387,13 @@ fn switch_onnx_backend(
     // frame or an inherited WGC cadence epoch. TensorRT/CUDA policy is unchanged.
     let wgc_epoch_restarted = matches!(
         (previous, backend),
-        (OnnxBackendPreference::DirectML, OnnxBackendPreference::NeoAMD)
-            | (OnnxBackendPreference::NeoAMD, OnnxBackendPreference::DirectML)
+        (
+            OnnxBackendPreference::DirectML,
+            OnnxBackendPreference::NeoAMD
+        ) | (
+            OnnxBackendPreference::NeoAMD,
+            OnnxBackendPreference::DirectML
+        )
     ) && restart_wgc_epoch_for_backend_switch(s);
 
     s.chain_reprocess_pending = !wgc_epoch_restarted && !s.frame.data.is_empty();
@@ -6315,7 +6417,9 @@ fn switch_onnx_backend(
         s.source.set_queue_enabled(s.chain.has_interp());
         log::debug!("onnx-backend-capture-boundary: action=discard-pending-frames-to-current-seq");
     } else {
-        log::debug!("onnx-backend-capture-boundary: action=new-wgc-epoch first-frame=fresh cached-reprocess=false");
+        log::debug!(
+            "onnx-backend-capture-boundary: action=new-wgc-epoch first-frame=fresh cached-reprocess=false"
+        );
     }
     s.cadence.reset();
     s.smooth_pacer.reset();
@@ -6339,13 +6443,12 @@ fn switch_onnx_backend(
     );
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
-    // v815: provider statistics use sparse probes, so skipping six probes can
-    // hide the row for several seconds.  reset() already removes the old
-    // backend EWMA; expose the first normal sample and settle quickly.
-    metrics.arm_stage_cold_skip(0);
-    metrics.arm_stage_fast_settle(6);
+    // v835: do not average provider/session/Graph/autotune setup into the
+    // user-facing ONNX row. Hold the row empty during the transition; the
+    // first completed frame after Present becomes the live value directly.
+    metrics.begin_onnx_transition_display();
     log::debug!(
-        "onnx-backend-stats-settle: backend={backend:?} samples=6 cold_skip=0 policy=first-sampled-frame-fast-ewma-50"
+        "onnx-backend-stats-live: backend={backend:?} policy=suppress-transition-then-current-frame"
     );
 
     {
@@ -6482,7 +6585,6 @@ fn should_detach_gpu_x3_midpoint(
     mid.w() == dw && mid.h() == dh
 }
 
-
 fn should_detach_directml_drba_midpoint(
     overlay: &OverlayWindow,
     s: &Session,
@@ -6608,11 +6710,9 @@ fn finalize_directml_drba_pair_for_present(
 ) -> std::result::Result<usize, String> {
     let mut added = 0usize;
     if pending.present_real {
-        let detached_real = crate::render::scaler::detach_identity(gc, pending.real_tex)
-            .map_err(|error| {
-                format!(
-                    "DirectML DRBA presentation detach failed for real endpoint: {error:#}"
-                )
+        let detached_real =
+            crate::render::scaler::detach_identity(gc, pending.real_tex).map_err(|error| {
+                format!("DirectML DRBA presentation detach failed for real endpoint: {error:#}")
             })?;
         let now = Instant::now();
         s.drba_present_queue.push_back(DrbaQueuedPresent {
@@ -6646,12 +6746,10 @@ fn finalize_directml_drba_pair_for_present(
 
 fn directml_drba_pipeline_busy(s: &Session) -> bool {
     !s.drba_present_queue.is_empty()
-        || s
-            .gpu_interp_pending
+        || s.gpu_interp_pending
             .as_ref()
             .is_some_and(|pending| pending.directml_drba)
-        || s
-            .gpu_interp_pack_pending
+        || s.gpu_interp_pack_pending
             .as_ref()
             .is_some_and(|pack| pack.pending.directml_drba)
 }
@@ -6799,12 +6897,7 @@ fn service_directml_drba_present_queue(
     true
 }
 
-
-fn drba_v782_semantic_ts_100ns(
-    start: Option<i64>,
-    end: Option<i64>,
-    phase: f32,
-) -> Option<i64> {
+fn drba_v782_semantic_ts_100ns(start: Option<i64>, end: Option<i64>, phase: f32) -> Option<i64> {
     match (start, end) {
         (Some(a), Some(b)) if b > a => {
             let t = phase.clamp(0.0, 1.0) as f64;
@@ -6993,9 +7086,7 @@ fn drain_gpu_interp_stream(
             match crate::render::onnx_stage::OnnxStage::finish_prepared_interp_gpu_output(gc, slot)
             {
                 Ok(texture) => {
-                    if local_snapshot
-                        && (pending.pair_id < 3 || pending.pair_id % 120 == 0)
-                    {
+                    if local_snapshot && (pending.pair_id < 3 || pending.pair_id % 120 == 0) {
                         log::info!(
                             "dml-drba-v807-local-snapshot: pair={} generation={} slot={}/{} factor=x{} key={} visible={}x{} padded={}x{} bound_storage_fallback=true post_stages={} path=external-nchw-f16->local-gl-ssbo->rgba8 sync=single-glFinish",
                             pending.pair_id,
@@ -7099,9 +7190,7 @@ fn drain_gpu_interp_stream(
             if pending.ready_outputs[index].is_none() {
                 break;
             }
-            if let Err(reason) =
-                queue_directml_drba_midpoint_for_present(gc, s, &pending, index)
-            {
+            if let Err(reason) = queue_directml_drba_midpoint_for_present(gc, s, &pending, index) {
                 log::error!(
                     "dml-drba-present-stage-error: pair={} generation={} slot={}/{} reason={} action=disable-gpu-path",
                     pending.pair_id,
@@ -7292,7 +7381,9 @@ fn drain_gpu_interp_stream(
             } else {
                 drba_phase_slot(pending.timesteps[index - 1], pending.factor)
             };
-            let slot_delta = current_phase_slot.saturating_sub(previous_phase_slot).max(1);
+            let slot_delta = current_phase_slot
+                .saturating_sub(previous_phase_slot)
+                .max(1);
             if pending.directml_drba {
                 // v800: never discard a completed DRBA midpoint merely because
                 // the provider finished a few milliseconds after its ideal
@@ -7309,9 +7400,7 @@ fn drain_gpu_interp_stream(
                 // the normal overload behaviour used by media pipelines: output
                 // cadence stretches to the available provider throughput while
                 // chronology remains strictly forward-only.
-                let slot_period = Duration::from_secs_f64(
-                    pending.output_period.max(1.0 / 240.0),
-                );
+                let slot_period = Duration::from_secs_f64(pending.output_period.max(1.0 / 240.0));
                 let deadline = s.last_present_started + slot_period;
                 let now = Instant::now();
                 if !vsync_on && now < deadline {
@@ -7344,8 +7433,6 @@ fn drain_gpu_interp_stream(
                     lead_s,
                 );
             }
-
-
 
             if should_detach_directml_drba_midpoint(overlay, s, &pending, mid) {
                 match crate::render::scaler::detach_identity(gc, mid) {
@@ -7705,9 +7792,7 @@ fn drain_gpu_interp_stream(
             // squeeze the final gap to almost zero. Chaining from the actual
             // previous present makes overload look like ordinary lower-fps video
             // rather than a short/long burst pattern.
-            let slot_period = Duration::from_secs_f64(
-                pending.output_period.max(1.0 / 240.0),
-            );
+            let slot_period = Duration::from_secs_f64(pending.output_period.max(1.0 / 240.0));
             let deadline = s.last_present_started + slot_period;
             let now = Instant::now();
             if !vsync_on && now < deadline {
@@ -8152,6 +8237,7 @@ fn stop_drag_follower(slot: &mut Option<DragFollower>) {
 fn resume_provider_transition_after_interpolated_present(
     input: &crate::input::InputSystem,
     s: &mut Session,
+    metrics: &Metrics,
     route: &'static str,
 ) {
     if !s.provider_transition_input_suspended {
@@ -8162,8 +8248,9 @@ fn resume_provider_transition_after_interpolated_present(
     s.provider_transition_input_suspended_since = None;
     s.provider_transition_recovery_attempts = 0;
     s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+    metrics.end_onnx_transition_display();
     log::info!(
-        "provider-transition-ready: first-interpolated-frame-presented route={} input=resume-after-120ms",
+        "provider-transition-ready: first-interpolated-frame-presented route={} input=resume-after-120ms stats=live-onnx-next-frame",
         route
     );
 }
@@ -8475,7 +8562,18 @@ fn engine_main(
             stop_drag_follower(&mut drag_follower);
             drag_session_epoch = None;
             stop_session(&mut session, &mut overlay, &mut gc, &status);
-            factory.retain_optional_backend_sessions_for_capture_restart();
+            // v851: Stop is a GPU *bridge/texture* teardown boundary. Preserve
+            // the just-finished optional-backend chain first, then fill the
+            // bounded cache with older MRU sessions. s.chain.prepare_gpu_transition()
+            // in stop_session() already retired all per-capture shared I/O
+            // before gc.clear_pool(), so the retained entries are model/provider
+            // sessions only, not old-resolution frame buffers.
+            let kept = factory.retain_optional_backend_sessions_for_capture_restart();
+            log::info!(
+                "onnx-session-stop-cache: action=retain-last-chain-then-lru kept={} limit={} bridge_resources=retired",
+                kept,
+                crate::render::chain::OPTIONAL_BACKEND_SESSION_CACHE_LIMIT
+            );
             // Keep Start locked until the WakeForStop token reaches the head
             // of the queue. Every command before that token predates Stop and
             // must not become live again if the user clicks Start quickly.
@@ -8609,7 +8707,12 @@ fn engine_main(
                     input.set_transition_suspended(false);
                     input.release();
                     stop_session(&mut session, &mut overlay, &mut gc, &status);
-                    factory.retain_optional_backend_sessions_for_capture_restart();
+                    let kept = factory.retain_optional_backend_sessions_for_capture_restart();
+                    log::info!(
+                        "onnx-session-stop-cache: action=retain-last-chain-then-lru kept={} limit={} bridge_resources=retired source=cmd-stop",
+                        kept,
+                        crate::render::chain::OPTIONAL_BACKEND_SESSION_CACHE_LIMIT
+                    );
                 }
                 Cmd::WakeForStop => {
                     // Idle engines wake inside recv_timeout before the loop's
@@ -8622,7 +8725,13 @@ fn engine_main(
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
-                        factory.retain_optional_backend_sessions_for_capture_restart();
+                        let kept =
+                            factory.retain_optional_backend_sessions_for_capture_restart();
+                        log::info!(
+                            "onnx-session-stop-cache: action=retain-last-chain-then-lru kept={} limit={} bridge_resources=retired source=wake-for-stop",
+                            kept,
+                            crate::render::chain::OPTIONAL_BACKEND_SESSION_CACHE_LIMIT
+                        );
                     }
                     status
                         .lock()
@@ -8681,6 +8790,7 @@ fn engine_main(
                     aspect_height_scale,
                     capture_crop,
                     fps_cap,
+                    load_detection,
                     hide_source,
                     client_only,
                     hdr,
@@ -8745,6 +8855,7 @@ fn engine_main(
                         aspect_height_scale,
                         capture_crop,
                         fps_cap,
+                        load_detection,
                         hide_source,
                         client_only,
                         hdr,
@@ -8921,15 +9032,14 @@ fn engine_main(
                             g.onnx_directml_fallbacks = usage.directml_fallback;
                             metrics.reset();
                             metrics.set_stage_order(s.chain.metric_stage_order());
-                            // v815: show stage numbers from the first normal
-                            // sparse timing probe. reset() already clears stale
-                            // values, while the short fast-EWMA absorbs ordinary
-                            // launch/scheduling variance without a multi-second
-                            // blank period.
-                            metrics.arm_stage_cold_skip(0);
-                            metrics.arm_stage_fast_settle(6);
+                            // v833: discard the single capture-start transition
+                            // frame, then seed from the next frame.  Because v829
+                            // takes per-frame timing while settle is active this is
+                            // only a one-frame blank, not the old multi-second skip.
+                            metrics.arm_stage_cold_skip(1);
+                            metrics.arm_stage_fast_settle(4);
                             log::debug!(
-                                "capture-start-stats-settle: cold_skip=0 samples=6 policy=first-sampled-frame-fast-ewma-50"
+                                "capture-start-stats-settle: cold_skip=1 samples=4 policy=drop-one-transition-frame-then-fast-ewma-50"
                             );
                             metrics.set_monitor(
                                 (s.monitor_rect.2, s.monitor_rect.3),
@@ -9627,6 +9737,30 @@ fn engine_main(
                     }
                     log::info!("duplicate-frame reduction: enabled={on}");
                 }
+                Cmd::SetLoadDetection(on) => {
+                    if let Some(s) = session.as_mut() {
+                        s.load_detection = on;
+                    }
+                    if !on {
+                        let mut state = status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let deadline_cancelled = state.glsl_overload_auto_stop_deadline.take().is_some();
+                        let notice_cleared = state.glsl_overload_notice_latched;
+                        state.glsl_overload_notice_latched = false;
+                        if deadline_cancelled || notice_cleared {
+                            log::info!(
+                                "glsl-overload-auto-stop: cancelled reason=load-detection-disabled deadline_cancelled={} notice_cleared={}",
+                                deadline_cancelled,
+                                notice_cleared
+                            );
+                        }
+                    }
+                    log::info!(
+                        "load-detection: enabled={} policy=automatic-stop-only responsiveness-guard=unchanged",
+                        on
+                    );
+                }
             }
         }
 
@@ -9640,7 +9774,9 @@ fn engine_main(
             let (backend, trt_device_id, cache_root, specs) = deferred_backend_switch
                 .take()
                 .expect("deferred backend switch");
-            log::info!("onnx-backend-switch-resume: requested={backend:?} state=gpu-idle-and-visual-transition-complete");
+            log::info!(
+                "onnx-backend-switch-resume: requested={backend:?} state=gpu-idle-and-visual-transition-complete"
+            );
             input.set_transition_suspended(true);
             if let Some(s) = session.as_mut() {
                 s.provider_transition_input_suspended = true;
@@ -10536,7 +10672,12 @@ fn engine_main(
             } else {
                 current_panel_rect.unwrap_or(target_panel_rect)
             };
-            if panel_moved || last_panel_raise_check.elapsed() >= Duration::from_millis(200) {
+            // Moving the panel repairs z-order immediately. In steady state,
+            // sample the sibling order only once per second; repeatedly walking
+            // the TOPMOST list every 200 ms is unnecessary compositor-adjacent
+            // work on the Radeon path reported to lose fps when the panel is not
+            // at the monitor edge.
+            if panel_moved || last_panel_raise_check.elapsed() >= Duration::from_millis(1000) {
                 let overlay_hwnd = overlay.hwnd().0 as isize;
                 if gui_priority_topmost {
                     // Modern GUI-topmost path: maintain one deterministic stack
@@ -10870,6 +11011,7 @@ fn engine_main(
             resume_provider_transition_after_interpolated_present(
                 &input,
                 s,
+                &metrics,
                 "gpu-resident-drba-fifo",
             );
         }
@@ -11004,7 +11146,12 @@ fn engine_main(
             && !gpu_path_was_active
             && s.gpu_interp_active_logged
         {
-            resume_provider_transition_after_interpolated_present(&input, s, "gpu-resident");
+            resume_provider_transition_after_interpolated_present(
+                &input,
+                s,
+                &metrics,
+                "gpu-resident",
+            );
         }
         // v751 provider-switch transaction watchdog. A healthy image-filter
         // switch presents within a few source frames. If that does not happen,
@@ -11057,8 +11204,7 @@ fn engine_main(
                     s.provider_transition_input_suspended = false;
                     s.provider_transition_input_suspended_since = None;
                     s.provider_transition_recovery_attempts = 0;
-                    s.input_reenable_after =
-                        Some(Instant::now() + Duration::from_millis(250));
+                    s.input_reenable_after = Some(Instant::now() + Duration::from_millis(250));
                 }
             }
         }
@@ -12219,6 +12365,16 @@ fn engine_main(
             }
         }
         if resize_committed && s.onnx_geometry_rebuild_pending {
+            // v849: the first exact frame at the new geometry is now available,
+            // so the old transition shield no longer needs the previous ONNX
+            // shared bridge. Retire it before allocating the new-size bridge.
+            // This prevents old/new NeoAMD D3D12 shared surfaces from stacking
+            // across repeated rescale cycles.
+            s.chain.prepare_gpu_transition(&mut gc);
+            if let Some(texture) = s.last_tex.take() {
+                gc.recycle(texture);
+            }
+            gc.trim_transient_pool(0);
             match s.chain.rebuild_onnx_sessions_for_geometry(&mut factory) {
                 Ok(count) => {
                     s.onnx_geometry_rebuild_pending = false;
@@ -12594,9 +12750,7 @@ fn engine_main(
             // settle window only, take the existing stage timings every frame;
             // ordinary 1/30 sampling resumes automatically after six probes.
             let stats = metrics.detailed_enabled()
-                && (dlssnr_refresh
-                    || s.frame.seq % 30 == 0
-                    || metrics.stage_fast_settle_active());
+                && (dlssnr_refresh || s.frame.seq % 30 == 0 || metrics.stage_fast_settle_active());
 
             // v682 Beam-specialized route. This branch exists only when the
             // exact ordinary DirectML/TensorRT ONNX -> CRT Beam chain was
@@ -12977,10 +13131,7 @@ fn engine_main(
                                 crate::render::onnx_stage::InterpKind::RifeV1 { .. }
                             ),
                         ist.provider == crate::render::onnx_stage::OnnxProvider::DirectML
-                            && matches!(
-                                &ist.interp,
-                                crate::render::onnx_stage::InterpKind::Drba
-                            ),
+                            && matches!(&ist.interp, crate::render::onnx_stage::InterpKind::Drba),
                         ist.provider == crate::render::onnx_stage::OnnxProvider::NeoAMD,
                         ist.supports_neoamd_interp_stream(),
                     )
@@ -12995,8 +13146,7 @@ fn engine_main(
                 // presentation; provider outputs are not allowed to overtake/reuse a
                 // visible pair. The bridge itself remains the established conservative
                 // DirectML interop implementation (no new fast/direct mode here).
-                let gpu_capable = !s.frame.hdr
-                    && ist.lock().unwrap().supports_interp_gpu();
+                let gpu_capable = !s.frame.hdr && ist.lock().unwrap().supports_interp_gpu();
                 if gpu_capable {
                     let input = upload_session_frame_timed(&mut gc, s);
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
@@ -13138,13 +13288,20 @@ fn engine_main(
                         s.interp_generation = s.interp_generation.saturating_add(1);
                         if directml_drba {
                             let previous_seq = previous_for_diag.as_ref().map(|frame| frame.seq);
-                            let previous_ts = previous_for_diag.as_ref().and_then(|frame| frame.source_time_100ns);
+                            let previous_ts = previous_for_diag
+                                .as_ref()
+                                .and_then(|frame| frame.source_time_100ns);
                             let seq_gap = previous_seq.map(|seq| s.frame.seq.saturating_sub(seq));
-                            let source_gap_ms = previous_ts.zip(s.frame.source_time_100ns)
+                            let source_gap_ms = previous_ts
+                                .zip(s.frame.source_time_100ns)
                                 .map(|(a, b)| (b - a) as f64 / 10_000.0);
-                            let arrival_gap_ms = previous_for_diag.as_ref()
+                            let arrival_gap_ms = previous_for_diag
+                                .as_ref()
                                 .and_then(|frame| s.frame.received_at.zip(frame.received_at))
-                                .map(|(current, previous)| current.saturating_duration_since(previous).as_secs_f64() * 1000.0);
+                                .map(|(current, previous)| {
+                                    current.saturating_duration_since(previous).as_secs_f64()
+                                        * 1000.0
+                                });
                             s.drba_lookahead_needs_anchor = true;
                             log::info!(
                                 "dml-drba-v782-history-reset: generation={} dimensions_changed={} continuity_broken={} prev_seq={:?} cur_seq={} seq_gap={:?} prev_ts={:?} cur_ts={:?} source_gap_ms={:?} arrival_gap_ms={:?} cadence_ms={:?} action=hold-first-anchor-until-full-window",
@@ -13206,7 +13363,8 @@ fn engine_main(
                     // Do not derive the provider/display clock from one delayed B->C
                     // history interval; that later experiment magnified missing WGC
                     // callbacks into 100-300ms output slots.
-                    let source_period = s.cadence
+                    let source_period = s
+                        .cadence
                         .period_s()
                         .or_else(|| (s.arrival_interval > 0.0).then_some(s.arrival_interval))
                         .unwrap_or(1.0 / 30.0);
@@ -13415,13 +13573,23 @@ fn engine_main(
                             _ => true,
                         });
                         if s.gpu_interp_pair_id < 3 || s.gpu_interp_pair_id % 120 == 0 {
-                            let bc_ms = source_ts.get(1).copied().flatten().zip(source_ts.get(2).copied().flatten())
+                            let bc_ms = source_ts
+                                .get(1)
+                                .copied()
+                                .flatten()
+                                .zip(source_ts.get(2).copied().flatten())
                                 .map(|(b, c)| (c - b) as f64 / 10_000.0);
-                            let seq_deltas = seqs.windows(2).map(|w| w[1].saturating_sub(w[0])).collect::<Vec<_>>();
-                            let source_delta_ms = source_ts.windows(2).map(|w| match (w[0], w[1]) {
-                                (Some(a), Some(b)) => Some((b - a) as f64 / 10_000.0),
-                                _ => None,
-                            }).collect::<Vec<_>>();
+                            let seq_deltas = seqs
+                                .windows(2)
+                                .map(|w| w[1].saturating_sub(w[0]))
+                                .collect::<Vec<_>>();
+                            let source_delta_ms = source_ts
+                                .windows(2)
+                                .map(|w| match (w[0], w[1]) {
+                                    (Some(a), Some(b)) => Some((b - a) as f64 / 10_000.0),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
                             log::info!(
                                 "dml-drba-v782-input: pair={} generation={} factor=x{} seqs={:?} seq_deltas={:?} source_ts={:?} source_delta_ms={:?} seq_order_ok={} ts_order_ok={} bc_ms={:?}",
                                 s.gpu_interp_pair_id,
@@ -13489,7 +13657,8 @@ fn engine_main(
                                             anchor.source_time_100ns
                                         );
                                         s.drba_lookahead_needs_anchor = false;
-                                        s.drba_diag_last_semantic_ts_100ns = anchor.source_time_100ns;
+                                        s.drba_diag_last_semantic_ts_100ns =
+                                            anchor.source_time_100ns;
                                     }
                                     Err(error) => {
                                         log::warn!(
@@ -13822,13 +13991,11 @@ fn engine_main(
                     // interpolation-disable branch.
                     if directml_drba {
                         if let Some(prev) = s.hist.back() {
-                            let stale_or_duplicate = match (
-                                prev.source_time_100ns,
-                                s.frame.source_time_100ns,
-                            ) {
-                                (Some(a), Some(b)) => b <= a,
-                                _ => s.frame.seq <= prev.seq,
-                            };
+                            let stale_or_duplicate =
+                                match (prev.source_time_100ns, s.frame.source_time_100ns) {
+                                    (Some(a), Some(b)) => b <= a,
+                                    _ => s.frame.seq <= prev.seq,
+                                };
                             if stale_or_duplicate {
                                 log::warn!(
                                     "dml-drba-source-order-reject: prev_seq={} cur_seq={} prev_ts={:?} cur_ts={:?} action=hold-last-correct-frame",
@@ -14251,9 +14418,17 @@ fn engine_main(
                             s.metric_seq = delivered;
                             let rt = Instant::now();
                             let tex = if rgba_direct {
-                                gc.upload_rgba8(startup_frame.w, startup_frame.h, &startup_frame.data)
+                                gc.upload_rgba8(
+                                    startup_frame.w,
+                                    startup_frame.h,
+                                    &startup_frame.data,
+                                )
                             } else {
-                                gc.upload_rgb8(startup_frame.w, startup_frame.h, &startup_frame.data)
+                                gc.upload_rgb8(
+                                    startup_frame.w,
+                                    startup_frame.h,
+                                    &startup_frame.data,
+                                )
                             };
                             process_and_present_from(
                                 &mut gc,
@@ -14644,15 +14819,27 @@ fn engine_main(
                             }
                             Ok(None) | Err(_) => s
                                 .chain
-                                .process_first_onnx_rgba8(&mut gc, s.frame.w, s.frame.h, &s.frame.data)
-                                .map(|output| output.map(|(input, name, ms)| (input, vec![(name, ms)], 1usize))),
+                                .process_first_onnx_rgba8(
+                                    &mut gc,
+                                    s.frame.w,
+                                    s.frame.h,
+                                    &s.frame.data,
+                                )
+                                .map(|output| {
+                                    output
+                                        .map(|(input, name, ms)| (input, vec![(name, ms)], 1usize))
+                                }),
                         }
                     }
                 }
             };
             match direct_onnx {
                 Ok(Some((input, timings, chain_start_index))) => {
-                    if stats {
+                    // Leading ONNX already returns a completed wall-clock timing
+                    // every frame.  Publishing it does not force a GLSL glFinish,
+                    // so keep the ONNX row near-live even when expensive generic
+                    // stage sampling remains on its normal sparse cadence.
+                    if metrics.detailed_enabled() {
                         for (name, ms) in &timings {
                             metrics.probe(name, "onnx", *ms);
                         }
@@ -14896,6 +15083,15 @@ fn engine_main(
                             chain_start_index,
                         );
                     } else {
+                        if !s.frame.hdr
+                            && s.chain.mvutensils_stage().is_some_and(|(index, _)| index == 0)
+                        {
+                            s.chain.store_mvutensils_cpu_boundary_copy(
+                                s.frame.w,
+                                s.frame.h,
+                                &s.frame.data,
+                            );
+                        }
                         let input = upload_session_frame_timed(&mut gc, s);
                         process_and_present(
                             &mut gc,
@@ -15057,6 +15253,7 @@ fn start_session(
     aspect_height_scale: f32,
     capture_crop: CaptureCrop,
     fps_cap: Option<u32>,
+    load_detection: bool,
     hide_source: bool,
     client_only: bool,
     hdr: bool,
@@ -15534,6 +15731,8 @@ fn start_session(
                 && win32::is_monitor_fullscreen(hwnd),
             source,
             chain,
+            mvutensils_runtime: None,
+            mvutensils_output_rgba: Vec::new(),
             mode,
             ratio,
             aspect_correction,
@@ -15545,6 +15744,7 @@ fn start_session(
             crop_transition_pending: false,
             aspect_transition_pending: false,
             fps_cap,
+            load_detection,
             capture_client_only: effective_client_only,
             capture_hdr: hdr,
             hdr_sdr_mode,
@@ -16896,10 +17096,10 @@ fn reset_for_source_resize(
     s.pending_resize_size = pending_capture_size;
     s.onnx_geometry_rebuild_pending = s.chain.has_onnx();
     metrics.reset();
-    // Preserve reusable shader textures and a bounded set of old/new frame
-    // sizes. This makes repeated capture-resolution tests recover in-session
-    // instead of requiring Stop/Start to rebuild the entire GL working set.
-    gc.trim_transient_pool(2);
+    // Persistent shader/LUT resources remain cached separately, but every
+    // free transient frame texture from the previous geometry is retired here.
+    // This prevents repeated rescale cycles from accumulating old-size VRAM.
+    gc.trim_transient_pool(0);
 }
 
 fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
@@ -16987,9 +17187,7 @@ fn drain_pending_interp_neoamd_stream(
     // previous present, never from an already-missed theoretical clock. This
     // forbids the 0.3-0.5 ms catch-up bursts seen in v778/v779 and guarantees
     // that every generated x2/x3/x4/x5 midpoint owns one visible output slot.
-    let mut next_deadline = s
-        .interp_present_deadline
-        .unwrap_or_else(Instant::now);
+    let mut next_deadline = s.interp_present_deadline.unwrap_or_else(Instant::now);
     let mut fail: Option<String> = None;
     let mut interp_run_ms = 0.0f64;
     let mut mids_ok = 0usize;
@@ -17099,11 +17297,8 @@ fn drain_pending_interp_neoamd_stream(
                         break;
                     }
                 }
-                match gc.external_rgba8_buffer_to_texture(
-                    shared.key,
-                    shared.size.0,
-                    shared.size.1,
-                ) {
+                match gc.external_rgba8_buffer_to_texture(shared.key, shared.size.0, shared.size.1)
+                {
                     Ok(texture) => {
                         neoamd_shared_read_key = Some(shared.key);
                         texture
@@ -17117,7 +17312,10 @@ fn drain_pending_interp_neoamd_stream(
                 }
             }
             InterpPayload::DmlShared { .. } => {
-                fail = Some("NeoAMD cooperative stream returned an unexpected DirectML shared payload".into());
+                fail = Some(
+                    "NeoAMD cooperative stream returned an unexpected DirectML shared payload"
+                        .into(),
+                );
                 break;
             }
         };
@@ -17159,6 +17357,7 @@ fn drain_pending_interp_neoamd_stream(
                 resume_provider_transition_after_interpolated_present(
                     input,
                     s,
+                    metrics,
                     "neoamd-cooperative-slot",
                 );
             }
@@ -17340,7 +17539,9 @@ fn drain_pending_interp_neoamd_stream(
             presented_total,
             expected_total,
             present_order_ok,
-            pending.requested_mid_count.saturating_sub(presented_mid_count),
+            pending
+                .requested_mid_count
+                .saturating_sub(presented_mid_count),
         );
         s.last_neoflow_log = Instant::now();
     }
@@ -17365,17 +17566,7 @@ fn drain_pending_interp(
     };
     if pending.neoamd_stream_slots {
         return drain_pending_interp_neoamd_stream(
-            gc,
-            overlay,
-            input,
-            s,
-            metrics,
-            status,
-            out_size,
-            stats,
-            vsync_on,
-            tick_t0,
-            downscaler,
+            gc, overlay, input, s, metrics, status, out_size, stats, vsync_on, tick_t0, downscaler,
             pending,
         );
     }
@@ -17482,8 +17673,7 @@ fn drain_pending_interp(
     let neoamd_continuous_slot_pacing = s.smooth_pacing
         && pending.neoamd_cpu_visible
         && pending.present_real
-        && (exact_multiplier_period - content_dt).abs()
-            <= (output_period_s * 0.15).max(0.000_25);
+        && (exact_multiplier_period - content_dt).abs() <= (output_period_s * 0.15).max(0.000_25);
     let mut deadline_miss_count = 0u32;
     let mut pair_next_deadline = if s.smooth_pacing {
         s.interp_present_deadline.unwrap_or(pair_clock_now)
@@ -17848,7 +18038,12 @@ fn drain_pending_interp(
         if let Some(presented_before) = transition_presented_before {
             let presented_after = status.lock().unwrap().presented;
             if presented_after > presented_before {
-                resume_provider_transition_after_interpolated_present(input, s, transition_route);
+                resume_provider_transition_after_interpolated_present(
+                    input,
+                    s,
+                    metrics,
+                    transition_route,
+                );
             }
         }
         if !dml_drba_ordered_grid && !s.smooth_pacing && !vsync_on {
@@ -17922,9 +18117,7 @@ fn drain_pending_interp(
             pending.chain_start_index,
         );
     }
-    s.interp_present_deadline = (s.smooth_pacing
-        && !dml_native_cadence
-        && !dml_drba_ordered_grid)
+    s.interp_present_deadline = (s.smooth_pacing && !dml_native_cadence && !dml_drba_ordered_grid)
         .then_some(pair_next_deadline);
     if s.last_neoflow_log.elapsed() >= Duration::from_secs(1) {
         let source_fps = 1.0 / content_dt.max(1.0 / 240.0);
@@ -18256,7 +18449,8 @@ fn process_and_present_from_impl(
         && s.glsl_guard.mode != GlslGuardMode::Off
         && !s.glsl_resolution_recheck_active
         && crate::input::main_gui_has_native_cursor_ownership();
-    let auto_stop_hold = guard_can_hold
+    let auto_stop_hold = s.load_detection
+        && guard_can_hold
         && !s.glsl_resolution_recheck_active
         && status
             .lock()
@@ -18336,9 +18530,191 @@ fn process_and_present_from_impl(
     let display_replay_index = if chain_already_processed {
         None
     } else {
-        display_hz_replay_index(s).filter(|index| *index >= chain_start_index)
+        display_hz_replay_index(s)
+            .filter(|index| *index >= chain_start_index)
+            // A real image must enter the temporal scheduler before a
+            // refresh-only replay boundary can cache it.
+            .filter(|_| !chain_frame_tick || s.chain.mvutensils_stage().is_none())
     };
-    let result = if chain_already_processed {
+    let mvutensils_stage = s
+        .chain
+        .mvutensils_stage()
+        .filter(|(index, _)| *index >= chain_start_index)
+        .map(|(index, options)| (index, options.clone()));
+    let mut mvutensils_result = None;
+    if !chain_already_processed && display_replay_index.is_none() && chain_frame_tick {
+        if let Some((stage_index, options)) = mvutensils_stage {
+            let mut runtime_options = options.clone();
+            runtime_options.degrain.async_pipeline = options.degrain.async_pipeline
+                && s.chain.mvutensils_cpu_pipeline_beneficial(stage_index);
+            let prefix = s.chain.process_range_with_frame_tick(
+                gc,
+                input,
+                out_size,
+                chain_start_index,
+                stage_index,
+                if stats { Some(&mut probe_fn) } else { None },
+                true,
+            );
+            match prefix {
+                Ok(prefix_tex) => {
+                    let recreate =
+                        s.mvutensils_runtime
+                            .as_ref()
+                            .is_none_or(|(index, active, _)| {
+                                *index != stage_index || active != &runtime_options
+                            });
+                    if recreate {
+                        let app_dir = crate::core::config::app_dir();
+                        let created =
+                            crate::render::mvutensils_neo::PortableBackendLayout::discover(
+                                &app_dir,
+                            )
+                            .and_then(|found| {
+                                found.ok_or_else(|| {
+                                    "MVUtensils-Neo backend pack is not installed".to_string()
+                                })
+                            })
+                            .and_then(|(layout, _)| {
+                                crate::render::mvutensils_neo::PortableBackendLibrary::load(&layout)
+                                    .and_then(|library| library.create_session(&layout, &runtime_options))
+                            });
+                        match created {
+                            Ok(runtime) => {
+                                let variant = runtime.variant().unwrap_or_else(|| "unknown".to_string());
+                                log::info!(
+                                    "MVUtensils-Neo runtime active: stage={} radius={} internal_precision={}bit analysis_precision={}bit cpu_pipeline={} highres_fast={} variant={}",
+                                    stage_index,
+                                    runtime_options.degrain.radius,
+                                    runtime_options.degrain.precision_bits,
+                                    runtime_options.degrain.analysis_precision_bits,
+                                    runtime_options.degrain.async_pipeline,
+                                    runtime_options.degrain.highres_fast,
+                                    variant
+                                );
+                                s.mvutensils_runtime =
+                                    Some((stage_index, runtime_options.clone(), runtime));
+                            }
+                            Err(error) => {
+                                mvutensils_result = Some(Err(anyhow::anyhow!(error)));
+                            }
+                        }
+                    }
+                    if mvutensils_result.is_none() {
+                        let width = prefix_tex.w() as u32;
+                        let height = prefix_tex.h() as u32;
+                        // MVUtensils is a CPU temporal boundary, so its visible
+                        // stage cost includes the required GL readback and the
+                        // upload of the completed filtered frame. This both
+                        // reports the true cost and makes cross-API stalls
+                        // obvious instead of hiding them outside stage stats.
+                        let stage_started = Instant::now();
+                        let cached_cpu = s.chain.mvutensils_cpu_boundary(width as i32, height as i32);
+                        let downloaded;
+                        let rgba: &[u8] = if let Some(bytes) = cached_cpu {
+                            bytes
+                        } else {
+                            downloaded = gc.download_rgba8(prefix_tex);
+                            &downloaded
+                        };
+                        let filtered = {
+                            let runtime = &mut s
+                                .mvutensils_runtime
+                                .as_mut()
+                                .expect("MVUtensils runtime was created")
+                                .2;
+                            runtime.push_rgba8_into(
+                                width,
+                                height,
+                                width * 4,
+                                rgba,
+                                &mut s.mvutensils_output_rgba,
+                            )
+                        };
+                        let used_cached_cpu = cached_cpu.is_some();
+                        if used_cached_cpu {
+                            s.chain.clear_mvutensils_cpu_boundary();
+                        }
+                        let backend_profile = s
+                            .mvutensils_runtime
+                            .as_ref()
+                            .and_then(|(_, _, runtime)| runtime.profile());
+                        if stats {
+                            if let Some(profile) = backend_profile {
+                                log::debug!(
+                                    "mvutensils-profile: threads={} in_ms={:.3} mvtools_ms={:.3} out_ms={:.3} backend_total_ms={:.3} boundary={} cpu_pipeline={}",
+                                    profile.threads,
+                                    profile.convert_in_ms,
+                                    profile.mvtools_ms,
+                                    profile.convert_out_ms,
+                                    profile.total_ms,
+                                    if used_cached_cpu { "cpu-direct" } else { "gl-readback" },
+                                    runtime_options.degrain.async_pipeline
+                                );
+                            }
+                        }
+                        match filtered {
+                            Ok(true) => {
+                                let upload_started = Instant::now();
+                                let temporal_tex = gc.upload_rgba8(
+                                    width as i32,
+                                    height as i32,
+                                    &s.mvutensils_output_rgba,
+                                );
+                                let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                                if stats {
+                                    // In CPU-pipeline mode the FFI call intentionally returns a
+                                    // previously completed frame, so wall time here is only the
+                                    // queue hand-off. Keep stage statistics meaningful by reporting
+                                    // the worker's actual CPU cost plus the visible GL upload.
+                                    let stage_ms = if runtime_options.degrain.async_pipeline {
+                                        backend_profile
+                                            .map(|profile| profile.total_ms + upload_ms)
+                                            .unwrap_or_else(|| stage_started.elapsed().as_secs_f64() * 1000.0)
+                                    } else {
+                                        stage_started.elapsed().as_secs_f64() * 1000.0
+                                    };
+                                    metrics.probe(
+                                        crate::render::mvutensils_neo::FILTER_NAME,
+                                        metrics_kind_label(StageKind::Mvutensils),
+                                        stage_ms,
+                                    );
+                                }
+                                mvutensils_result = Some(s.chain.process_range_with_frame_tick(
+                                    gc,
+                                    temporal_tex,
+                                    out_size,
+                                    stage_index + 1,
+                                    s.chain.stage_count(),
+                                    if stats { Some(&mut probe_fn) } else { None },
+                                    true,
+                                ));
+                            }
+                            Ok(false) => {
+                                // Exact bidirectional processing: never expose an
+                                // unfiltered frame while future references fill.
+                                release_gpu_interp_permit_after_post_submit(s);
+                                let mut keep = Vec::with_capacity(1 + keep_extra.len());
+                                if let Some(last_good) = s.last_tex {
+                                    keep.push(last_good);
+                                }
+                                keep.extend_from_slice(keep_extra);
+                                keep_display_hz_base(s, &mut keep);
+                                gc.release_frame(&keep);
+                                schedule_next_display_hz_present(s, Instant::now());
+                                return;
+                            }
+                            Err(error) => mvutensils_result = Some(Err(anyhow::anyhow!(error))),
+                        }
+                    }
+                }
+                Err(error) => mvutensils_result = Some(Err(error)),
+            }
+        }
+    }
+    let result = if let Some(result) = mvutensils_result {
+        result
+    } else if chain_already_processed {
         // v661 direct DML -> Vulkan post handoff has already executed the
         // requested regular chain range and advanced mpv's frame builtin.
         // Display-Hz shaders are excluded from that shared-post route, so a
@@ -18793,8 +19169,13 @@ fn process_and_present_from_impl(
                     s.provider_transition_input_suspended_since = None;
                     s.provider_transition_recovery_attempts = 0;
                     s.input_reenable_after = Some(Instant::now() + Duration::from_millis(120));
+                    // The frame just presented may include backend/session/Graph
+                    // setup and may already have reached Metrics.  Remove that
+                    // setup-only stage value now; the next live ONNX frame is
+                    // sampled every frame and seeds the row immediately.
+                    metrics.end_onnx_transition_display();
                     log::info!(
-                        "provider-transition-ready: first-filtered-frame-presented route=ordinary input=resume-after-120ms"
+                        "provider-transition-ready: first-filtered-frame-presented route=ordinary input=resume-after-120ms stats=live-onnx-next-frame"
                     );
                 }
                 if (chain_reprocess_commit || dlssnr_refresh_commit) && overlay.is_visible() {
@@ -18807,7 +19188,11 @@ fn process_and_present_from_impl(
                     overlay.flush_compositor();
                     log::info!(
                         "chain-reprocess-present-commit: reason={} action=dwm-flush filtered_frame_visible=true",
-                        if dlssnr_refresh_commit { "dlssnr-refresh" } else { "chain-change" }
+                        if dlssnr_refresh_commit {
+                            "dlssnr-refresh"
+                        } else {
+                            "chain-change"
+                        }
                     );
                 }
                 s.present_cadence.record(present_time.instant);
@@ -19859,8 +20244,13 @@ mod tests {
         for preserve_forward_gap in [false, true] {
             assert_eq!(
                 classify_gpu_interp_continuity(
-                    100, Some(now), Some(10_000_000), &current,
-                    Some(1.0 / 24.0), 1.0 / 24.0, preserve_forward_gap,
+                    100,
+                    Some(now),
+                    Some(10_000_000),
+                    &current,
+                    Some(1.0 / 24.0),
+                    1.0 / 24.0,
+                    preserve_forward_gap,
                 ),
                 GpuInterpContinuity::Continuous
             );
@@ -19959,9 +20349,8 @@ mod tests {
         let requested = vec![0.2, 0.4, 0.6, 0.8];
         let mut credit = 0.0;
         let mut rotation = 0usize;
-        let admitted = drba_admit_timesteps(
-            &requested, 1.0 / 24.0, 8.0, 8, &mut credit, &mut rotation,
-        );
+        let admitted =
+            drba_admit_timesteps(&requested, 1.0 / 24.0, 8.0, 8, &mut credit, &mut rotation);
         assert_eq!(admitted, requested);
     }
 
@@ -19973,9 +20362,8 @@ mod tests {
         let pairs = 240usize;
         let mut presents = 0usize;
         for _ in 0..pairs {
-            let admitted = drba_admit_timesteps(
-                &requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation,
-            );
+            let admitted =
+                drba_admit_timesteps(&requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation);
             presents += admitted.len() + 1; // + REAL endpoint
         }
         let seconds = pairs as f64 / 24.0;
@@ -19989,9 +20377,8 @@ mod tests {
         let requested = vec![0.2, 0.4, 0.6, 0.8];
         let mut credit = 0.0;
         let mut rotation = 0usize;
-        let admitted = drba_admit_timesteps(
-            &requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation,
-        );
+        let admitted =
+            drba_admit_timesteps(&requested, 1.0 / 24.0, 14.0, 8, &mut credit, &mut rotation);
         assert!(admitted.len() < requested.len());
         assert!(admitted.iter().all(|phase| requested.contains(phase)));
         assert!(admitted.windows(2).all(|pair| pair[0] < pair[1]));
@@ -20170,18 +20557,27 @@ mod tests {
         // shared-IO initialization.  The old arithmetic mean temporarily
         // classified this near 17fps and the pacer then displayed that lower
         // rate even after inference had become fast.
-        for dt in [416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667, 833_334] {
+        for dt in [
+            416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667, 833_334,
+        ] {
             t += dt;
             cadence.observe(Some(t));
         }
         let fps = 1.0 / cadence.period_s().unwrap();
-        assert!((fps - 24.0).abs() < 0.001, "startup cadence was {fps:.3}fps");
+        assert!(
+            (fps - 24.0).abs() < 0.001,
+            "startup cadence was {fps:.3}fps"
+        );
     }
 
     #[test]
     fn cadence_standard_period_tiebreak_prefers_nearest_clock() {
-        let exact24 = [416_667i64, 416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667];
-        let film = [417_084i64, 417_084, 834_168, 417_084, 417_084, 834_168, 417_084, 417_084];
+        let exact24 = [
+            416_667i64, 416_667, 833_334, 416_667, 416_667, 833_334, 416_667, 416_667,
+        ];
+        let film = [
+            417_084i64, 417_084, 834_168, 417_084, 417_084, 834_168, 417_084, 417_084,
+        ];
         let exact_period = dominant_video_period_with_missed_pictures(&exact24).unwrap();
         let film_period = dominant_video_period_with_missed_pictures(&film).unwrap();
         assert!((1.0 / exact_period - 24.0).abs() < 0.001);
@@ -20198,7 +20594,10 @@ mod tests {
             cadence.observe(Some(t));
         }
         let fps = 1.0 / cadence.period_s().unwrap();
-        assert!((fps - 24.0).abs() < 0.001, "rolling cadence was {fps:.3}fps");
+        assert!(
+            (fps - 24.0).abs() < 0.001,
+            "rolling cadence was {fps:.3}fps"
+        );
     }
 
     #[test]
@@ -20211,7 +20610,10 @@ mod tests {
             cadence.observe(Some(t));
         }
         let fps = 1.0 / cadence.period_s().unwrap();
-        assert!(fps < 13.0, "true low-rate source was promoted to {fps:.3}fps");
+        assert!(
+            fps < 13.0,
+            "true low-rate source was promoted to {fps:.3}fps"
+        );
     }
 
     #[test]
@@ -20284,12 +20686,7 @@ mod tests {
                 let mut cadence = FlowOutputCadence::default();
                 cadence.next_phase = Some(0.37);
                 cadence.phase_step = 0.41;
-                let phases = onnx_interpolation_phases(
-                    factor,
-                    factor as f64,
-                    false,
-                    &mut cadence,
-                );
+                let phases = onnx_interpolation_phases(factor, factor as f64, false, &mut cadence);
                 let expected: Vec<f32> = (1..=factor)
                     .map(|index| index as f32 / factor as f32)
                     .collect();
@@ -21421,7 +21818,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_panel_starts_top_center_of_visible_content() {
+    fn fullscreen_panel_follows_visible_content_top() {
         assert_eq!(
             panel_target_position(
                 ScaleMode::Auto,
@@ -21430,6 +21827,15 @@ mod tests {
                 (236, 30),
             ),
             (842, 4)
+        );
+        assert_eq!(
+            panel_target_position(
+                ScaleMode::Auto,
+                (1920, 100, 2560, 1440),
+                (2240, 280, 1920, 1080),
+                (236, 30),
+            ),
+            (3082, 284)
         );
     }
 

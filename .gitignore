@@ -1,10 +1,40 @@
+# Build output
 /target/
 /dist/
 /BUILD_RELEASE.log
-/settings.json
-/*.log
 *.pdb
 *.ilk
 *.exp
 *.lib
+
+# Local application state
+/settings.json
+/dlssnr_presets.json
+/*.log
+/logs/
+cache/
+caches/
+_diagnostics/
+
+# Generated/local binaries
+/cHiDeScaler-Neo.exe
+/cHiDeScaler-Neo_previous.exe
+
+# TensorRT local backend pack and generated engines
+/backends/tensorrt/*.dll
+/backends/tensorrt/*.lib
+/backends/tensorrt/*.engine
 /backends/tensorrt/cache/
+/backends/tensorrt/_diagnostics/
+
+# DLSS Neural Rendering local runtime/build artifacts
+/backends/dlssnr/*.lib
+/backends/dlssnr/runtime/*.dll
+/backends/dlssnr/_diagnostics/
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

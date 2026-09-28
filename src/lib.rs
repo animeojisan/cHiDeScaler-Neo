@@ -33,9 +33,10 @@ pub mod render {
     pub mod gl;
     pub mod glsl_engine;
     pub mod mpv;
+    pub mod mvutensils_neo;
+    pub mod neoamd_backend;
     pub mod onnx_accel;
     pub mod onnx_backend;
-    pub mod neoamd_backend;
     pub mod onnx_stage;
     pub mod scaler;
     pub mod slangp;

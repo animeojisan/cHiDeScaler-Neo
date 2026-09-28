@@ -129,7 +129,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "v0.99.3";
+const BUILD_ID: &str = "v0.99.4";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -313,6 +313,14 @@ fn stage_file_name(path: &str) -> String {
         .to_string()
 }
 
+fn stage_stats_identity(stage: &StageSpec) -> String {
+    if stage.kind == StageKind::Mvutensils {
+        chidescaler_neo::render::mvutensils_neo::FILTER_NAME.to_string()
+    } else {
+        stage_file_name(&stage.path)
+    }
+}
+
 fn metric_row_occurrence(label: &str) -> Option<usize> {
     label.rsplit_once(" #").and_then(|(_, suffix)| {
         (!suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
@@ -360,13 +368,13 @@ fn stats_rows_in_filter_chain_order(
     let mut totals = std::collections::HashMap::<String, usize>::new();
     for stage in chain.iter().filter(|stage| stage.enabled) {
         *totals
-            .entry(stage_file_name(&stage.path).to_ascii_lowercase())
+            .entry(stage_stats_identity(stage).to_ascii_lowercase())
             .or_default() += 1;
     }
     let mut seen = std::collections::HashMap::<String, usize>::new();
 
     for stage in chain.iter().filter(|stage| stage.enabled) {
-        let expected = stage_file_name(&stage.path);
+        let expected = stage_stats_identity(stage);
         let key = expected.to_ascii_lowercase();
         let occurrence = seen.entry(key.clone()).or_default();
         *occurrence += 1;
@@ -399,6 +407,7 @@ fn stats_rows_in_filter_chain_order(
                 StageKind::Slangp => "slangp",
                 StageKind::Dlssnr => "dlssnr",
                 StageKind::Flow => "gpu",
+                StageKind::Mvutensils => "mvutensils",
             };
             ordered.push((
                 expected,
@@ -748,6 +757,7 @@ fn chain_stage_name_job(
         StageKind::Slangp => ("SLANGP", egui::Color32::from_rgb(232, 142, 152)),
         StageKind::Dlssnr => ("DLSSNR", egui::Color32::from_rgb(140, 220, 120)),
         StageKind::Flow => ("FG", flow_accent_color()),
+        StageKind::Mvutensils => ("MV", egui::Color32::from_rgb(90, 210, 170)),
     };
     let normal = egui::TextFormat {
         font_id: egui::FontId::proportional(14.0),
@@ -942,8 +952,9 @@ fn main() -> eframe::Result {
     // WGPU/WGL as presentation devices and switches compute backends directly,
     // so a manual GPU change while capture is stopped requires no Neo restart.
     log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
-    // Public releases keep the native title stable and versionless.
-    // BUILD_ID remains available only for diagnostics and Windows file metadata.
+    // Show the build tag in the title so a still-running older instance is
+    // immediately distinguishable from the executable currently on disk.
+    let build_tag = BUILD_ID.split('-').nth(1).unwrap_or("dev");
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -958,7 +969,7 @@ fn main() -> eframe::Result {
         .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title("cHiDeScaler-Neo")
+        .with_title(format!("cHiDeScaler-Neo [{build_tag}]"))
         .with_visible(!saved.3);
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
@@ -2377,6 +2388,7 @@ fn render_filter_tree_picker(
             StageKind::Slangp => "SLANGP",
             StageKind::Dlssnr => "DLSSNR",
             StageKind::Flow => tr(lang, "内蔵", "Built-in"),
+            StageKind::Mvutensils => "MVUtensils-Neo",
         };
         let response = ui.selectable_label(false, format!("[{badge}] {display}"));
         log_ui_test_rect(&format!("filter-item:{path}"), &response);
@@ -2434,6 +2446,286 @@ struct GlslParamEditor {
     index: usize,
     title: String,
     params: Vec<Param>,
+}
+
+fn mvutensils_editor_params(spec: &StageSpec) -> Vec<Param> {
+    let mut out = Vec::new();
+    let mut add = |name: &str, desc: &str, min: f32, max: f32, default: f32, ty: ParamTy| {
+        out.push(Param {
+            name: name.into(),
+            desc: desc.into(),
+            min,
+            max,
+            default,
+            value: spec.params.get(name).copied().unwrap_or(default),
+            ty,
+        });
+    };
+    let int = ParamTy::Int;
+    add("radius", "Temporal radius", 1.0, 25.0, 4.0, int);
+    let precision_default = spec.params.get("precision").copied().unwrap_or(8.0);
+    let analysis_precision_default = spec
+        .params
+        .get("analysis_precision")
+        .copied()
+        .unwrap_or(precision_default);
+    add(
+        "precision",
+        "Internal Precision (8 or 16)",
+        8.0,
+        16.0,
+        8.0,
+        int,
+    );
+    add(
+        "analysis_precision",
+        "Motion-analysis precision (8 = faster, 16 = legacy exact path)",
+        8.0,
+        16.0,
+        analysis_precision_default,
+        int,
+    );
+    add(
+        "cpu_pipeline",
+        "CPU Pipeline (1 = overlap MVTools CPU work with adjacent GPU stages, 0 = synchronous)",
+        0.0,
+        1.0,
+        1.0,
+        int,
+    );
+    add(
+        "highres_fast",
+        "High-res Fast (1 = lighter motion analysis at 1280x720+, 0 = exact legacy analysis)",
+        0.0,
+        1.0,
+        1.0,
+        int,
+    );
+    // Keep the Degrain thresholds near the top of the editor. These are the
+    // MVTools controls users most often tune, and previously they were buried
+    // below the long Analyse option list (and could be clipped in Basic mode).
+    add("thsad_y", "Luma SAD threshold", 0.0, 10000000.0, 400.0, int);
+    add(
+        "thsad_c",
+        "Chroma SAD threshold",
+        0.0,
+        10000000.0,
+        400.0,
+        int,
+    );
+    add(
+        "thsad2_y",
+        "Luma SAD2 threshold",
+        0.0,
+        10000000.0,
+        400.0,
+        int,
+    );
+    add(
+        "thsad2_c",
+        "Chroma SAD2 threshold",
+        0.0,
+        10000000.0,
+        400.0,
+        int,
+    );
+    add(
+        "thscd1",
+        "Scene-change block SAD",
+        0.0,
+        10000000.0,
+        400.0,
+        int,
+    );
+    add(
+        "thscd2",
+        "Scene-change changed blocks (%)",
+        0.0,
+        100.0,
+        51.0,
+        ParamTy::Float,
+    );
+    add("blksize_x", "Block width", 4.0, 64.0, 16.0, int);
+    add("blksize_y", "Block height", 4.0, 64.0, 16.0, int);
+    add("overlap_x", "Horizontal overlap", 0.0, 32.0, 8.0, int);
+    add("overlap_y", "Vertical overlap", 0.0, 32.0, 8.0, int);
+    add("pad_x", "Super horizontal padding", 0.0, 256.0, 16.0, int);
+    add("pad_y", "Super vertical padding", 0.0, 256.0, 16.0, int);
+    add(
+        "pel",
+        "Sub-pixel precision (1, 2, or 4)",
+        1.0,
+        4.0,
+        2.0,
+        int,
+    );
+    add("sharp", "Super interpolation sharpness", 0.0, 2.0, 2.0, int);
+    add("rfilter", "Super reduce filter", 0.0, 4.0, 1.0, int);
+    add("onelevel", "Use one pyramid level", 0.0, 1.0, 0.0, int);
+    add(
+        "levels",
+        "Analysis pyramid levels (0 = auto)",
+        0.0,
+        32.0,
+        0.0,
+        int,
+    );
+    add("search_mode", "Motion search mode", 0.0, 5.0, 2.0, int);
+    add("search", "Motion search distance", 0.0, 256.0, 2.0, int);
+    add(
+        "pelsearch",
+        "Sub-pixel search distance",
+        0.0,
+        256.0,
+        2.0,
+        int,
+    );
+    add("lambda", "Motion-vector lambda", 0.0, 100000.0, 1000.0, int);
+    add("chroma", "Use chroma in motion search", 0.0, 1.0, 1.0, int);
+    add("delta", "Reference-frame delta", 1.0, 25.0, 1.0, int);
+    add("lsad", "Large-SAD threshold", 0.0, 1000000.0, 400.0, int);
+    add("plevel", "Pyramid penalty level", 0.0, 2.0, 1.0, int);
+    add("global", "Estimate global motion", 0.0, 1.0, 1.0, int);
+    add("pnew", "New-vector penalty", 0.0, 100000.0, 25.0, int);
+    add("pzero", "Zero-vector penalty", 0.0, 100000.0, 25.0, int);
+    add("pglobal", "Global-vector penalty", 0.0, 100000.0, 0.0, int);
+    add("badsad", "Bad-vector SAD", 0.0, 10000000.0, 10000.0, int);
+    add(
+        "badrange",
+        "Bad-vector search range",
+        0.0,
+        1024.0,
+        24.0,
+        int,
+    );
+    add("meander", "Meander search", 0.0, 1.0, 1.0, int);
+    add("trymany", "Try many predictors", 0.0, 1.0, 0.0, int);
+    add("fields", "Field-based analysis", 0.0, 1.0, 0.0, int);
+    add("tff", "Top field first", 0.0, 1.0, 0.0, int);
+    add("satd", "Use SATD", 0.0, 1.0, 0.0, int);
+    add("plane_y", "Process luma", 0.0, 1.0, 1.0, int);
+    add("plane_u", "Process chroma U", 0.0, 1.0, 1.0, int);
+    add("plane_v", "Process chroma V", 0.0, 1.0, 1.0, int);
+    add(
+        "limit_y",
+        "Luma change limit",
+        0.0,
+        f32::INFINITY,
+        f32::INFINITY,
+        ParamTy::Float,
+    );
+    add(
+        "limit_c",
+        "Chroma change limit",
+        0.0,
+        f32::INFINITY,
+        f32::INFINITY,
+        ParamTy::Float,
+    );
+    let radius = spec
+        .params
+        .get("radius")
+        .copied()
+        .unwrap_or(4.0)
+        .round()
+        .clamp(1.0, 25.0) as usize;
+    for index in 0..radius * 2 + 1 {
+        add(
+            &format!("weight_{index}"),
+            "Temporal frame weight",
+            0.0,
+            2_800_000.0,
+            1.0,
+            int,
+        );
+    }
+    out
+}
+
+fn render_filter_param_row(ui: &mut egui::Ui, param: &mut Param, mvutensils: bool) -> bool {
+    let label = if param.desc.trim().is_empty() {
+        param.name.as_str()
+    } else {
+        param.desc.as_str()
+    };
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = match param.ty {
+            ParamTy::Int
+            | ParamTy::Uint
+            | ParamTy::Define
+            | ParamTy::ConstInt
+            | ParamTy::ConstUint => {
+                let min = if param.min.is_finite() {
+                    param.min
+                } else {
+                    -1_000_000.0
+                };
+                let max = if param.max.is_finite() {
+                    param.max
+                } else {
+                    1_000_000.0
+                };
+                ui.add(
+                    egui::DragValue::new(&mut param.value)
+                        .range(min..=max)
+                        .speed(1.0)
+                        .fixed_decimals(0),
+                )
+            }
+            ParamTy::Float | ParamTy::ConstFloat => {
+                if param.min.is_finite() && param.max.is_finite() {
+                    ui.add(
+                        egui::Slider::new(&mut param.value, param.min..=param.max)
+                            .show_value(true),
+                    )
+                } else {
+                    ui.add(
+                        egui::DragValue::new(&mut param.value)
+                            .speed(0.01)
+                            .fixed_decimals(3),
+                    )
+                }
+            }
+        };
+        if response.changed() {
+            match param.ty {
+                ParamTy::Int
+                | ParamTy::Uint
+                | ParamTy::Define
+                | ParamTy::ConstInt
+                | ParamTy::ConstUint => param.value = param.value.round(),
+                ParamTy::Float | ParamTy::ConstFloat => {}
+            }
+            param.value = param.value.clamp(param.min, param.max);
+            if mvutensils {
+                match param.name.as_str() {
+                    "precision" | "analysis_precision" => {
+                        param.value = if param.value < 12.0 { 8.0 } else { 16.0 };
+                    }
+                    "pel" => {
+                        param.value = if param.value < 1.5 {
+                            1.0
+                        } else if param.value < 3.0 {
+                            2.0
+                        } else {
+                            4.0
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            changed = true;
+        }
+        ui.label(
+            egui::RichText::new(&param.name)
+                .monospace()
+                .size(9.5)
+                .weak(),
+        );
+    });
+    changed
 }
 
 fn discover_glsl_param_paths(
@@ -2978,9 +3270,7 @@ impl App {
             .unwrap_or_default();
         let (chain, legacy_dlssnr) = chidescaler_neo::core::dlssnr::split(chain);
         if legacy_dlssnr.is_some() {
-            log::info!(
-                "dlssnr-preset-state-ignored: source=startup action=manual-enable-required"
-            );
+            log::info!("dlssnr-preset-state-ignored: source=startup action=manual-enable-required");
         }
         // DLSSNR remains experimental: ordinary Neo presets never restore its
         // ON/OFF state. Every app session starts with DLSSNR disabled and the
@@ -3015,12 +3305,8 @@ impl App {
                 );
             }
         }
-        let neoamd_availability = detect_neoamd_for_selection(
-            &dir,
-            &gpu_adapters,
-            settings.gpu_adapter_luid,
-            None,
-        );
+        let neoamd_availability =
+            detect_neoamd_for_selection(&dir, &gpu_adapters, settings.gpu_adapter_luid, None);
         if neoamd_availability.installed {
             if neoamd_availability.available {
                 log::info!(
@@ -3042,7 +3328,10 @@ impl App {
             } else {
                 log::warn!(
                     "neoamd-backend-discovery: available=false reason='{}' action=DirectML-unchanged",
-                    neoamd_availability.reason.as_deref().unwrap_or("invalid NeoAMD Backend Pack")
+                    neoamd_availability
+                        .reason
+                        .as_deref()
+                        .unwrap_or("invalid NeoAMD Backend Pack")
                 );
             }
         }
@@ -3169,14 +3458,11 @@ impl App {
             dlssnr_installed: dlssnr_availability.installed,
             dlssnr_editor: None,
             dlssnr_saved_presets,
-            dlssnr_options_supported: dlssnr_availability
-                .manifest
-                .as_ref()
-                .is_some_and(|m| {
-                    m.compatibility_tags
-                        .iter()
-                        .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-                }),
+            dlssnr_options_supported: dlssnr_availability.manifest.as_ref().is_some_and(|m| {
+                m.compatibility_tags
+                    .iter()
+                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+            }),
             dlssnr_advanced_options_supported: dlssnr_availability
                 .manifest
                 .as_ref()
@@ -4345,6 +4631,7 @@ impl App {
             tr(lang, "", "Stats"),
             tr(lang, "", "Keep GUI on top"),
             tr(lang, "", "Show control panel"),
+            tr(lang, "負荷検知", "Load Detection"),
             tr(lang, "", "Client area only"),
             tr(lang, "", "Save log"),
         ];
@@ -5524,6 +5811,7 @@ impl App {
                 .settings
                 .fps_cap_enabled
                 .then_some(self.settings.fps_cap),
+            load_detection: self.settings.load_detection,
             hide_source: self.settings.hide_source,
             client_only: effective_client_only,
             hdr: hdr_capture_requested(&self.settings),
@@ -5703,9 +5991,7 @@ impl App {
                 self.tray_hidden = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 let restored = win32::restore_own_window(self.gui_hwnd);
-                log::info!(
-                    "task-tray-action: toggle-gui result=shown restored={restored}"
-                );
+                log::info!("task-tray-action: toggle-gui result=shown restored={restored}");
             }
         }
         if exit {
@@ -5812,9 +6098,7 @@ impl App {
         }
         ctx.request_repaint();
         ctx.request_repaint_after(Duration::from_millis(16));
-        log::debug!(
-            "background-hotkey-wake: armed restore_to={background_gui:?} goal={goal:?}"
-        );
+        log::debug!("background-hotkey-wake: armed restore_to={background_gui:?} goal={goal:?}");
     }
 
     fn settle_background_hotkey_wake(&mut self, ctx: &egui::Context) {
@@ -5835,7 +6119,9 @@ impl App {
                 && win32::is_own_window(self.panel_hwnd)
                 && self.panel_placed_for_run
                 && win32::is_window_visible(self.panel_hwnd));
-        let capture_busy = status.starting || status.running || status.stopping
+        let capture_busy = status.starting
+            || status.running
+            || status.stopping
             || chidescaler_neo::render::onnx_stage::tensorrt_is_preparing();
         let mut wake = wake;
         wake.saw_capture_busy |= capture_busy;
@@ -5857,13 +6143,11 @@ impl App {
                 start_ready || stopped_ready || rejected_ready
             }
             BackgroundWakeGoal::StopCleanup => !capture_busy && panel_quiescent,
-            BackgroundWakeGoal::Generic => {
-                generic_background_wake_ready(
-                    now.duration_since(wake.armed_at),
-                    self.gui_topmost_off_pending,
-                    self.panel_screenshot_feedback_until,
-                )
-            }
+            BackgroundWakeGoal::Generic => generic_background_wake_ready(
+                now.duration_since(wake.armed_at),
+                self.gui_topmost_off_pending,
+                self.panel_screenshot_feedback_until,
+            ),
         };
         let timed_out = now >= wake.deadline;
         if !ready && !timed_out {
@@ -6027,14 +6311,11 @@ impl App {
         self.glsl_param_paths = discover_glsl_param_paths(&self.app_dir, &discovered);
         let nr = detect_dlssnr_backend_pack(&self.app_dir);
         self.dlssnr_installed = nr.installed;
-        self.dlssnr_options_supported = nr
-            .manifest
-            .as_ref()
-            .is_some_and(|m| {
-                m.compatibility_tags
-                    .iter()
-                    .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
-            });
+        self.dlssnr_options_supported = nr.manifest.as_ref().is_some_and(|m| {
+            m.compatibility_tags
+                .iter()
+                .any(|t| t == "eval-options-v1" || t == "eval-options-v2")
+        });
         self.dlssnr_advanced_options_supported = nr
             .manifest
             .as_ref()
@@ -6520,8 +6801,7 @@ impl App {
         if still_cloaked {
             // Once a delayed cloak is observed, require another short stable
             // interval after this frame before declaring the restore complete.
-            self.gui_restore_reveal_confirm_after =
-                Some(now + Duration::from_millis(160));
+            self.gui_restore_reveal_confirm_after = Some(now + Duration::from_millis(160));
         }
         let confirm_after = self
             .gui_restore_reveal_confirm_after
@@ -6622,10 +6902,8 @@ impl App {
             // Keep a short fail-visible guard alive even when this immediate
             // sample is already clear.
             let reveal_now = Instant::now();
-            self.gui_restore_reveal_retry_until =
-                Some(reveal_now + Duration::from_secs(2));
-            self.gui_restore_reveal_confirm_after =
-                Some(reveal_now + Duration::from_millis(240));
+            self.gui_restore_reveal_retry_until = Some(reveal_now + Duration::from_secs(2));
+            self.gui_restore_reveal_confirm_after = Some(reveal_now + Duration::from_millis(240));
             ctx.request_repaint_after(Duration::from_millis(16));
             if !still_cloaked {
                 win32::activate_window(self.gui_hwnd);
@@ -7382,31 +7660,30 @@ impl App {
             || (self.gui_hwnd != 0
                 && (win32::is_minimized(self.gui_hwnd)
                     || !win32::is_window_visible(self.gui_hwnd)));
-        // v459-proven contract: the extra WGPU top-level surface exists only
-        // while the ordinary floating panel is physically present and the main
-        // GUI is not itself topmost.  Do not create a tiny always-on fallback
-        // when the panel is disabled: that was a v505 experiment, not part of
-        // the known-good pre-v465 behavior.
+        // v850: keep the proven WGPU composition surface alive even when the
+        // *visible* operation panel is disabled. Radeon field reports showed
+        // panel_show=false reducing FPS or freezing immediately after scaling
+        // started. The old condition withdrew the compositor anchor together
+        // with the GDI panel. Keep the same full-size v459 anchor instead of a
+        // tiny fallback; hidden-panel mode makes it alpha=0 and hit-test
+        // transparent without changing its extended window styles.
+        let panel_ui_requested = self.panel_visible && self.settings.panel_show;
+        let panel_ui_visible = panel_ui_requested
+            && (win32::is_window_visible(self.panel_hwnd) || self.panel_gdi_reveal_pending);
         let active = status.running
+            && !status.stopping
             && !gui_background
             && (!self.settings.gui_topmost || self.gui_topmost_off_pending)
             && overlay_valid
             && panel_valid
-            && self.panel_visible
-            && self.settings.panel_show
-            && (win32::is_window_visible(self.panel_hwnd) || self.panel_gdi_reveal_pending);
+            && self.panel_placed_for_run;
 
         if !active {
             // If capture/panel state changed before an OFF transition could
             // need an anchor, the overlay no longer requires the composition
             // bridge. Commit the requested ordinary GUI state directly.
             if self.gui_topmost_off_pending
-                && (!status.running
-                    || status.stopping
-                    || !overlay_valid
-                    || !panel_valid
-                    || !self.panel_visible
-                    || !self.settings.panel_show)
+                && (!status.running || status.stopping || !overlay_valid || !panel_valid)
             {
                 self.commit_gui_topmost_off("anchor-became-unneeded");
             }
@@ -7502,8 +7779,9 @@ impl App {
             if let Some(hwnd) = win32::find_own_window(TITLE) {
                 self.compositor_anchor_hwnd = hwnd;
                 self.compositor_anchor_state_sent = None;
+                win32::install_compositor_keepalive_input_passthrough(hwnd);
                 log::info!(
-                    "compositor-keepalive-anchor-created: hwnd={:#x} backend=eframe-wgpu contract=v459-normal-top-level",
+                    "compositor-keepalive-anchor-created: hwnd={:#x} backend=eframe-wgpu contract=v459-normal-top-level input=wndproc-hit-transparent",
                     hwnd
                 );
             }
@@ -7514,13 +7792,17 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
         }
+        win32::install_compositor_keepalive_input_passthrough(anchor);
 
         // Keep the composition surface alive in lurk mode, and also keep it
-        // transparent while a full panel reveal is being prepared.  The old
-        // v512 ordering made this backing layer opaque before the GDI host, so
-        // a dark/offset second layer could be seen for one composition frame.
+        // transparent while a full panel reveal is being prepared, or when the
+        // visible operation panel is disabled. The old v512 ordering made this
+        // backing layer opaque before the GDI host, so a dark/offset second
+        // layer could be seen for one composition frame.
         let anchor_lurk = self.panel_chip_lurking && !self.panel_bar_shown;
-        let anchor_must_stay_transparent = anchor_lurk || self.panel_gdi_reveal_pending;
+        let keepalive_only = !panel_ui_requested;
+        let anchor_must_stay_transparent =
+            anchor_lurk || self.panel_gdi_reveal_pending || keepalive_only;
         if anchor_must_stay_transparent {
             if !win32::is_window_layered(anchor) {
                 win32::set_window_alpha(anchor, 0);
@@ -7539,7 +7821,7 @@ impl App {
         if !win32::window_is_above(anchor, status.overlay_hwnd) {
             win32::place_below(status.overlay_hwnd, anchor);
         }
-        if !win32::window_is_above(self.panel_hwnd, anchor) {
+        if panel_ui_requested && !win32::window_is_above(self.panel_hwnd, anchor) {
             win32::place_below(anchor, self.panel_hwnd);
         }
         if !win32::is_window_visible(anchor) {
@@ -7552,7 +7834,8 @@ impl App {
         // has completed that commit, make the already-covered WGPU anchor
         // opaque underneath it and wait for one DWM boundary.  Front layer
         // first, backing layer second: there is never an exposed WGPU rectangle.
-        if !anchor_lurk
+        if panel_ui_requested
+            && !anchor_lurk
             && !self.panel_gdi_reveal_pending
             && win32::is_window_visible(self.panel_hwnd)
             && win32::window_is_above(self.panel_hwnd, anchor)
@@ -7565,24 +7848,31 @@ impl App {
                 self.panel_hwnd,
                 anchor
             );
-        } else if !anchor_lurk
+        } else if panel_ui_requested
+            && !anchor_lurk
             && !self.panel_gdi_reveal_pending
             && !win32::is_window_layered(anchor)
         {
-            // Normal steady state: preserve the proven opaque v459 surface.
+            // Normal visible-panel steady state: preserve the proven opaque
+            // v459 surface. Hidden-panel keepalive stays alpha=0/layered.
         }
 
         // The anchor is now fully placed, visible, topmost and covered by the
         // GDI panel. Only at this boundary may a staged GUI-TOPMOST OFF request
         // demote the root GUI. DWM therefore sees one stable composition change
         // instead of "GUI down -> create anchor -> restack".
+        let anchor_front_ready = if keepalive_only {
+            true
+        } else {
+            !anchor_lurk
+                && !self.panel_gdi_reveal_pending
+                && win32::window_is_above(self.panel_hwnd, anchor)
+                && !win32::is_window_layered(anchor)
+        };
         if self.gui_topmost_off_pending
-            && !anchor_lurk
-            && !self.panel_gdi_reveal_pending
             && win32::is_window_visible(anchor)
             && win32::window_is_above(anchor, status.overlay_hwnd)
-            && win32::window_is_above(self.panel_hwnd, anchor)
-            && !win32::is_window_layered(anchor)
+            && anchor_front_ready
         {
             self.commit_gui_topmost_off("anchor-prepared-before-demote");
             win32::sync_panel_composition_with_dwm();
@@ -7601,12 +7891,13 @@ impl App {
         if self.compositor_anchor_state_sent != Some(state) {
             self.compositor_anchor_state_sent = Some(state);
             log::info!(
-                "compositor-keepalive-anchor: active=true contract=v459 hwnd={:#x} panel={:#x} overlay={:#x} anchor_above_overlay={} panel_above_anchor={} rect={:?} present_ms={:.2}",
+                "compositor-keepalive-anchor: active=true contract=v459 mode={} hwnd={:#x} panel={:#x} overlay={:#x} anchor_above_overlay={} panel_above_anchor={} rect={:?} present_ms={:.2}",
+                if keepalive_only { "panel-hidden" } else { "panel-visible" },
                 anchor,
                 self.panel_hwnd,
                 status.overlay_hwnd,
                 win32::window_is_above(anchor, status.overlay_hwnd),
-                win32::window_is_above(self.panel_hwnd, anchor),
+                panel_ui_visible && win32::window_is_above(self.panel_hwnd, anchor),
                 win32::window_rect(anchor),
                 anchor_present_ms,
             );
@@ -7857,6 +8148,7 @@ impl App {
             Elevated,
             FullscreenCaptureNotice,
             ResizeScale,
+            FilterParams,
             Hotkey,
             FilterPicker,
             SaveAs,
@@ -7872,6 +8164,8 @@ impl App {
             Some(Kind::FullscreenCaptureNotice)
         } else if self.resize_scale_editor.is_some() {
             Some(Kind::ResizeScale)
+        } else if self.glsl_param_editor.is_some() {
+            Some(Kind::FilterParams)
         } else if self.hotkey_editor_open {
             Some(Kind::Hotkey)
         } else if self.filter_picker_open {
@@ -7915,6 +8209,10 @@ impl App {
                 [400.0, 280.0],
             ),
             Kind::ResizeScale => (tr(lang, "リサイズ倍率", "Resize scale"), [340.0, 225.0]),
+            Kind::FilterParams => (
+                tr(lang, "フィルター調整", "Filter settings"),
+                [520.0, 560.0],
+            ),
             Kind::Hotkey => (
                 tr(lang, "ショートカット編集", "Edit Shortcut"),
                 [430.0, 340.0],
@@ -7961,6 +8259,9 @@ impl App {
         let mut elevated_cancel = false;
         let mut resize_apply = false;
         let mut resize_cancel = false;
+        let mut filter_params_changed = false;
+        let mut filter_params_reset = false;
+        let mut filter_params_close = false;
         let mut resize_value = self
             .resize_scale_editor
             .map(|(_, value)| value)
@@ -8089,6 +8390,32 @@ impl App {
                                     "0.25～4.00（初期値 0.75）",
                                     "0.25–4.00 (default 0.75)",
                                 ));
+                            }
+                            Kind::FilterParams => {
+                                if let Some(editor) = self.glsl_param_editor.as_mut() {
+                                    ui.label(
+                                        egui::RichText::new(&editor.title)
+                                            .strong()
+                                            .size(12.0),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(i18n::text(
+                                            lang,
+                                            "glsl.params.live_help",
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
+                                    );
+                                    ui.add_space(6.0);
+                                    let mvutensils_editor = editor.title == "MVUtensils-Neo";
+                                    for param in &mut editor.params {
+                                        filter_params_changed |= render_filter_param_row(
+                                            ui,
+                                            param,
+                                            mvutensils_editor,
+                                        );
+                                    }
+                                }
                             }
                             Kind::Hotkey => {
                                 let captured = capture_hotkey_candidate(&dialog_ctx);
@@ -8241,6 +8568,24 @@ impl App {
                                     resize_cancel = true;
                                 }
                             }
+                            Kind::FilterParams => {
+                                if control_row_button(
+                                    ui,
+                                    i18n::text(lang, "glsl.params.reset"),
+                                )
+                                .clicked()
+                                {
+                                    filter_params_reset = true;
+                                }
+                                if control_row_button(
+                                    ui,
+                                    i18n::text(lang, "common.close"),
+                                )
+                                .clicked()
+                                {
+                                    filter_params_close = true;
+                                }
+                            }
                             Kind::Hotkey => {
                                 if control_row_button(ui, tr(lang, "保存", "Save")).clicked() {
                                     hotkey_save = true;
@@ -8364,6 +8709,46 @@ impl App {
                     } else {
                         self.resize_scale_editor = Some((index, value));
                     }
+                }
+            }
+            Kind::FilterParams => {
+                if filter_params_reset {
+                    if let Some(editor) = self.glsl_param_editor.as_mut() {
+                        for param in &mut editor.params {
+                            param.value = param.default.clamp(param.min, param.max);
+                        }
+                        filter_params_changed = true;
+                    }
+                }
+                if filter_params_changed {
+                    let update = self.glsl_param_editor.as_ref().and_then(|editor| {
+                        (editor.index < self.chain.len()).then(|| {
+                            (
+                                editor.index,
+                                editor
+                                    .params
+                                    .iter()
+                                    .map(|param| (param.name.clone(), param.value))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                    });
+                    if let Some((index, params)) = update {
+                        let path = self.chain[index].path.clone();
+                        for (name, value) in params {
+                            self.chain[index].params.insert(name, value);
+                        }
+                        log::info!(
+                            "glsl-param-edit: index={} path={} source=mini-dialog-host live={}",
+                            index,
+                            path,
+                            self.running()
+                        );
+                        self.apply_live();
+                    }
+                }
+                if filter_params_close {
+                    self.glsl_param_editor = None;
                 }
             }
             Kind::Hotkey => {
@@ -8793,9 +9178,7 @@ impl eframe::App for App {
                 .tray_hidden_stop_close_guard_until
                 .is_some_and(|deadline| now <= deadline)
         {
-            log::warn!(
-                "task-tray-resident-guard: root-close-cancelled source=hidden-capture-stop"
-            );
+            log::warn!("task-tray-resident-guard: root-close-cancelled source=hidden-capture-stop");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
@@ -8829,9 +9212,10 @@ impl eframe::App for App {
             );
         }
 
-        // v555: the existing GLSL overload detector remains the sole authority.
-        // Once it has armed a deadline, keep the warning readable for the full
-        // grace period and then enter the exact same Stop path as the user's
+        // v555/v836: the GLSL guard still owns responsiveness protection, but
+        // v836 arms this deadline only for a second-stage critical stall. Once
+        // armed, keep the warning readable for the full grace period and then
+        // enter the exact same Stop path as the user's
         // normal Stop button. Engine::send(Cmd::Stop) therefore retains all of
         // the proven immediate cursor/source/overlay recovery and provider
         // cancellation behavior.
@@ -8983,9 +9367,10 @@ impl eframe::App for App {
             win32::hide_overload_notice_gdi();
         }
 
-        // Low-spec GLSL protection is intentionally visible. v555 keeps the
-        // established overload thresholds unchanged, but a proven overload now
-        // enters a six-second readable warning grace and then the ordinary Stop route. During
+        // Low-spec GLSL protection remains active at the established Soft/Hard
+        // admission thresholds. v836 shows this warning only when Hard overload
+        // also crosses the stricter critical-stall threshold; that case enters
+        // a six-second readable warning grace and then the ordinary Stop route. During
         // the grace the engine holds the last complete filtered frame whenever
         // that is semantics-safe, so cursor/GUI/DWM recovery gets GPU headroom.
         if self.settings.ui_mode != UiMode::Mini && running && status.glsl_overload_notice_latched {
@@ -10534,6 +10919,22 @@ impl eframe::App for App {
                 {
                     settings_changed = true;
                 }
+                if ink_centered_checkbox(
+                    ui,
+                    &mut self.settings.load_detection,
+                    tr(lang, "負荷検知", "Load Detection"),
+                )
+                    .on_hover_text(tr(
+                        lang,
+                        "ON: 深刻な高負荷が続いた場合に保護停止します。OFF: 自動停止だけを無効にし、再生は継続します。",
+                        "ON: stop capture after sustained critical overload. OFF: disable only automatic Stop and keep playback running.",
+                    ))
+                    .changed()
+                {
+                    self.engine
+                        .send(Cmd::SetLoadDetection(self.settings.load_detection));
+                    settings_changed = true;
+                }
                 // A fixed capture resolution defines the raw/pre-crop capture canvas;
                 // client-only capture is mandatory while a resolution is selected.
                 // Keep the user's manual setting untouched underneath the forced
@@ -11084,6 +11485,7 @@ impl eframe::App for App {
                             });
                         let glsl_param_editable = spec_kind == StageKind::Glsl
                             && self.glsl_param_paths.contains(&self.chain[i].path);
+                        let mvutensils_param_editable = spec_kind == StageKind::Mvutensils;
                         let dragging_this = matches!(self.drag, Some((2, di, _, true)) if di == i);
                         let row = ui.horizontal(|ui| {
                             ui.label(
@@ -11106,12 +11508,14 @@ impl eframe::App for App {
                             }
                             // grab zone: from the name up to just left of the
                             // buttons (long-press to start moving)
-                            let btn_zone =
-                                if is_resize_shader_path(&spec.path) || glsl_param_editable {
-                                    165.0
-                                } else {
-                                    130.0
-                                };
+                            let btn_zone = if is_resize_shader_path(&spec.path)
+                                || glsl_param_editable
+                                || mvutensils_param_editable
+                            {
+                                165.0
+                            } else {
+                                130.0
+                            };
                             let grab_w = (ui.available_width() - btn_zone).max(60.0);
                             let (rect, grab) = ui.allocate_exact_size(
                                 egui::vec2(grab_w, 24.0),
@@ -11144,7 +11548,7 @@ impl eframe::App for App {
                                         if pen_edit_button(ui, i18n::text(lang, "resize.edit")) {
                                             edit_resize = Some(i);
                                         }
-                                    } else if glsl_param_editable {
+                                    } else if glsl_param_editable || mvutensils_param_editable {
                                         if pen_edit_button(ui, i18n::text(lang, "glsl.params.edit"))
                                         {
                                             edit_glsl = Some(i);
@@ -11262,39 +11666,47 @@ impl eframe::App for App {
                 if let Some(i) = edit_glsl
                     && let Some(spec) = self.chain.get(i)
                 {
-                    let resolved = resolve_path(&self.app_dir, &spec.path);
-                    match UserShader::load(resolved.to_string_lossy().as_ref()) {
-                        Ok(mut shader) if !shader.params.is_empty() => {
-                            for param in &mut shader.params {
-                                if let Some(value) = spec.params.get(&param.name) {
-                                    param.value = value.clamp(param.min, param.max);
+                    if spec.kind == StageKind::Mvutensils {
+                        self.glsl_param_editor = Some(GlslParamEditor {
+                            index: i,
+                            title: chidescaler_neo::render::mvutensils_neo::FILTER_NAME.into(),
+                            params: mvutensils_editor_params(spec),
+                        });
+                    } else {
+                        let resolved = resolve_path(&self.app_dir, &spec.path);
+                        match UserShader::load(resolved.to_string_lossy().as_ref()) {
+                            Ok(mut shader) if !shader.params.is_empty() => {
+                                for param in &mut shader.params {
+                                    if let Some(value) = spec.params.get(&param.name) {
+                                        param.value = value.clamp(param.min, param.max);
+                                    }
                                 }
+                                let editor_title = shader.name();
+                                let editor_params = shader.params;
+                                log::info!(
+                                    "glsl-param-editor-open: index={} path={} params={:?}",
+                                    i,
+                                    spec.path,
+                                    editor_params
+                                        .iter()
+                                        .map(|param| (param.name.as_str(), param.value))
+                                        .collect::<Vec<_>>()
+                                );
+                                self.glsl_param_editor = Some(GlslParamEditor {
+                                    index: i,
+                                    title: editor_title,
+                                    params: editor_params,
+                                });
                             }
-                            let editor_title = shader.name();
-                            let editor_params = shader.params;
-                            log::info!(
-                                "glsl-param-editor-open: index={} path={} params={:?}",
-                                i,
-                                spec.path,
-                                editor_params
-                                    .iter()
-                                    .map(|param| (param.name.as_str(), param.value))
-                                    .collect::<Vec<_>>()
-                            );
-                            self.glsl_param_editor = Some(GlslParamEditor {
-                                index: i,
-                                title: editor_title,
-                                params: editor_params,
-                            });
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            log::warn!(
-                                "glsl-param-editor-open-failed: index={} path={} error={}",
-                                i,
-                                spec.path,
-                                error
-                            );
+                            Ok(_) => {}
+                            Err(error) => {
+                                log::warn!(
+                                    "glsl-param-editor-open-failed: index={} path={} error={}",
+                                    i,
+                                    spec.path,
+                                    error
+                                );
+                            }
                         }
                     }
                 }
@@ -11538,10 +11950,26 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.preset_3"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut values.preset, 0, i18n::text(lang, "dlssnr.preset_default"));
-                                                ui.selectable_value(&mut values.preset, 1, i18n::text(lang, "dlssnr.preset_1"));
-                                                ui.selectable_value(&mut values.preset, 2, i18n::text(lang, "dlssnr.preset_2"));
-                                                ui.selectable_value(&mut values.preset, 3, i18n::text(lang, "dlssnr.preset_3"));
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    0,
+                                                    i18n::text(lang, "dlssnr.preset_default"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    1,
+                                                    i18n::text(lang, "dlssnr.preset_1"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    2,
+                                                    i18n::text(lang, "dlssnr.preset_2"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.preset,
+                                                    3,
+                                                    i18n::text(lang, "dlssnr.preset_3"),
+                                                );
                                             });
                                     });
                                     if values.preset != old_preset {
@@ -11560,34 +11988,59 @@ impl eframe::App for App {
                                                 _ => i18n::text(lang, "dlssnr.style_default"),
                                             })
                                             .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut values.style, 0, i18n::text(lang, "dlssnr.style_default"));
-                                                ui.selectable_value(&mut values.style, 1, i18n::text(lang, "dlssnr.style_natural"));
-                                                ui.selectable_value(&mut values.style, 2, i18n::text(lang, "dlssnr.style_cinematic"));
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    0,
+                                                    i18n::text(lang, "dlssnr.style_default"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    1,
+                                                    i18n::text(lang, "dlssnr.style_natural"),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut values.style,
+                                                    2,
+                                                    i18n::text(lang, "dlssnr.style_cinematic"),
+                                                );
                                             });
                                         values_changed |= values.style != before;
                                     });
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.intensity")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.local_tone")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.intensity")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.local_tone")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.local_structure,
+                                                0.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.skin_structure, -1.0..=1.0)
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.skin_structure,
+                                                -1.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.skin_structure")),
-                                    )
-                                    .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
-                                    .changed();
+                                        )
+                                        .on_hover_text(i18n::text(lang, "dlssnr.skin_default_help"))
+                                        .changed();
                                     ui.horizontal(|ui| {
                                         values_changed |= ink_centered_checkbox(
                                             ui,
@@ -11601,7 +12054,10 @@ impl eframe::App for App {
                                             &mut values.ui_correction,
                                             i18n::text(lang, "dlssnr.ui_correction"),
                                         )
-                                        .on_hover_text(i18n::text(lang, "dlssnr.ui_correction_help"))
+                                        .on_hover_text(i18n::text(
+                                            lang,
+                                            "dlssnr.ui_correction_help",
+                                        ))
                                         .changed();
                                     });
                                     ui.label(
@@ -11610,25 +12066,37 @@ impl eframe::App for App {
                                             .weak(),
                                     );
                                 } else {
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.intensity, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.intensity")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
-                                            .fixed_decimals(2)
-                                            .text(i18n::text(lang, "dlssnr.local_tone")),
-                                    ).changed();
-                                    values_changed |= ui.add(
-                                        egui::Slider::new(&mut values.local_structure, 0.0..=1.0)
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.intensity, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.intensity")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut values.local_tone, 0.0..=1.0)
+                                                .fixed_decimals(2)
+                                                .text(i18n::text(lang, "dlssnr.local_tone")),
+                                        )
+                                        .changed();
+                                    values_changed |= ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut values.local_structure,
+                                                0.0..=1.0,
+                                            )
                                             .fixed_decimals(2)
                                             .text(i18n::text(lang, "dlssnr.local_structure")),
-                                    ).changed();
+                                        )
+                                        .changed();
                                     ui.label(
-                                        egui::RichText::new(i18n::text(lang, "dlssnr.update_pack_advanced"))
-                                            .size(10.5)
-                                            .weak(),
+                                        egui::RichText::new(i18n::text(
+                                            lang,
+                                            "dlssnr.update_pack_advanced",
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
                                     );
                                 }
                             });
@@ -11636,9 +12104,12 @@ impl eframe::App for App {
                         ui.separator();
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
+                            if control_row_button(ui, i18n::text(lang, "glsl.params.reset"))
+                                .clicked()
+                            {
                                 let preset = values.preset.min(3);
-                                values = chidescaler_neo::core::dlssnr::factory_presets()[preset as usize];
+                                values = chidescaler_neo::core::dlssnr::factory_presets()
+                                    [preset as usize];
                                 values_changed = true;
                             }
                             if self.dlssnr_advanced_options_supported
@@ -11662,9 +12133,7 @@ impl eframe::App for App {
                     .get_or_insert_with(chidescaler_neo::core::dlssnr::new_spec);
                 chidescaler_neo::core::dlssnr::set_options(spec, values);
                 self.apply_live();
-                log::info!(
-                    "dlssnr-gui-options-live: values={values:?} action=immediate-update"
-                );
+                log::info!("dlssnr-gui-options-live: values={values:?} action=immediate-update");
             }
             if save_requested {
                 let index = values.preset.min(3) as usize;
@@ -11698,6 +12167,19 @@ impl eframe::App for App {
                 editor.title,
                 i18n::text(lang, "glsl.params.title_suffix")
             );
+            // The MVUtensils editor has many more controls than ordinary GLSL
+            // shaders. Constrain only the parameter body to the current viewport
+            // and keep Reset/Close outside the ScrollArea so Basic mode can always
+            // reach every parameter without changing the normal desktop layout.
+            let viewport_height = ctx
+                .input(|input| input.viewport().inner_rect.map(|rect| rect.height()))
+                .unwrap_or(BASIC_DEFAULT_SIZE[1]);
+            // Keep the footer reachable even at Basic minimum height, elevated
+            // Windows DPI, or after switching modes while this editor is open.
+            // Only the parameter body scrolls; Reset/Close remain outside it.
+            const FILTER_PARAM_EDITOR_CHROME_RESERVE: f32 = 210.0;
+            let params_max_height =
+                (viewport_height - FILTER_PARAM_EDITOR_CHROME_RESERVE).max(56.0);
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
@@ -11709,77 +12191,17 @@ impl eframe::App for App {
                             .weak(),
                     );
                     ui.add_space(6.0);
-                    for param in &mut editor.params {
-                        let label = if param.desc.trim().is_empty() {
-                            param.name.as_str()
-                        } else {
-                            param.desc.as_str()
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(label);
-                            let response = match param.ty {
-                                ParamTy::Int
-                                | ParamTy::Uint
-                                | ParamTy::Define
-                                | ParamTy::ConstInt
-                                | ParamTy::ConstUint => {
-                                    let min = if param.min.is_finite() {
-                                        param.min
-                                    } else {
-                                        -1_000_000.0
-                                    };
-                                    let max = if param.max.is_finite() {
-                                        param.max
-                                    } else {
-                                        1_000_000.0
-                                    };
-                                    ui.add(
-                                        egui::DragValue::new(&mut param.value)
-                                            .range(min..=max)
-                                            .speed(1.0)
-                                            .fixed_decimals(0),
-                                    )
-                                }
-                                ParamTy::Float | ParamTy::ConstFloat => {
-                                    if param.min.is_finite() && param.max.is_finite() {
-                                        ui.add(
-                                            egui::Slider::new(
-                                                &mut param.value,
-                                                param.min..=param.max,
-                                            )
-                                            .show_value(true),
-                                        )
-                                    } else {
-                                        ui.add(
-                                            egui::DragValue::new(&mut param.value)
-                                                .speed(0.01)
-                                                .fixed_decimals(3),
-                                        )
-                                    }
-                                }
-                            };
-                            if response.changed() {
-                                match param.ty {
-                                    ParamTy::Int
-                                    | ParamTy::Uint
-                                    | ParamTy::Define
-                                    | ParamTy::ConstInt
-                                    | ParamTy::ConstUint => {
-                                        param.value = param.value.round();
-                                    }
-                                    ParamTy::Float | ParamTy::ConstFloat => {}
-                                }
-                                param.value = param.value.clamp(param.min, param.max);
-                                values_changed = true;
+                    let mvutensils_editor = editor.title == "MVUtensils-Neo";
+                    egui::ScrollArea::vertical()
+                        .id_salt("filter_param_editor_scroll")
+                        .max_height(params_max_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for param in &mut editor.params {
+                                values_changed |=
+                                    render_filter_param_row(ui, param, mvutensils_editor);
                             }
-                            ui.label(
-                                egui::RichText::new(&param.name)
-                                    .monospace()
-                                    .size(9.5)
-                                    .weak(),
-                            );
                         });
-                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if control_row_button(ui, i18n::text(lang, "glsl.params.reset")).clicked() {
@@ -12713,6 +13135,7 @@ mod app_tests {
             "Elevated",
             "FullscreenCaptureNotice",
             "ResizeScale",
+            "FilterParams",
             "Hotkey",
             "FilterPicker",
             "SaveAs",
@@ -12766,9 +13189,7 @@ mod app_tests {
     fn tray_hidden_hotkey_stop_keeps_the_root_application_resident() {
         let main = include_str!("main.rs");
         let hotkeys = include_str!("platform/hotkeys.rs");
-        assert!(hotkeys.contains(
-            "capture_active && background_gui != BackgroundGui::Foreground"
-        ));
+        assert!(hotkeys.contains("capture_active && background_gui != BackgroundGui::Foreground"));
         assert!(hotkeys.contains("request_stop(\"background-global-hotkey\")"));
         assert!(hotkeys.contains("quiesce_panel_for_capture_stop"));
         assert!(hotkeys.contains("wake_background_gui(gui_hwnd)"));
@@ -12893,7 +13314,6 @@ mod app_tests {
         assert!(main.contains("!self.background_hotkey_wake_active()"));
     }
 
-
     #[test]
     fn background_stop_pumps_gui_until_panel_cleanup_is_committed() {
         let main = include_str!("main.rs");
@@ -13010,7 +13430,9 @@ mod app_tests {
         let main = include_str!("main.rs");
         assert!(main.contains("gui_restore_reveal_retry_until"));
         assert!(main.contains("gui_restore_reveal_confirm_after"));
-        assert!(main.contains("gui_control_should_restore(background_intent, minimized, visible, cloaked)"));
+        assert!(main.contains(
+            "gui_control_should_restore(background_intent, minimized, visible, cloaked)"
+        ));
         assert!(main.contains("win32::sync_gui_transition_with_dwm();"));
         assert!(main.contains("self.drive_gui_restore_reveal(ctx);"));
         assert!(main.contains("GUI control: reveal-stable-complete"));
@@ -13554,6 +13976,28 @@ mod app_tests {
         let ordered = stats_rows_in_filter_chain_order(&chain, rows);
         assert_eq!(ordered[0].0, "rife_v4.22_lite_fp16.onnx [DirectML]");
         assert_eq!(ordered[1].0, "2x_AnimeJaNai.onnx [DirectML]");
+    }
+
+    #[test]
+    fn gui_statistics_match_mvutensils_builtin_path_to_single_runtime_row() {
+        let chain = vec![StageSpec {
+            kind: StageKind::Mvutensils,
+            path: "builtin:MVUtensils-Neo".into(),
+            enabled: true,
+            params: Default::default(),
+        }];
+        let rows = vec![(
+            "MVUtensils-Neo".to_string(),
+            StageStat {
+                kind: "mvutensils".into(),
+                ms: 12.5,
+            },
+        )];
+
+        let ordered = stats_rows_in_filter_chain_order(&chain, rows);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].0, "MVUtensils-Neo");
+        assert_eq!(ordered[0].1.ms, 12.5);
     }
 
     #[test]

@@ -91,7 +91,7 @@ impl PresetAspectCorrection {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,
     pub chain: Vec<StageSpec>,
@@ -121,7 +121,7 @@ impl Preset {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PresetFile {
     #[serde(default)]
     pub active: String,
@@ -144,10 +144,38 @@ pub enum PresetEditError {
 impl PresetStore {
     pub fn load(app_dir: &std::path::Path) -> Self {
         let path = app_dir.join("presets.json");
-        let mut data: PresetFile = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let backup_path = app_dir.join("presets.json.bak");
+        let main_text = std::fs::read_to_string(&path).ok();
+        let main_data = main_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<PresetFile>(text).ok());
+        let backup_data = if main_data.is_none() {
+            std::fs::read_to_string(&backup_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<PresetFile>(&text).ok())
+        } else {
+            None
+        };
+        let recovered_from_backup = main_data.is_none() && backup_data.is_some();
+        let mut data = if let Some(data) = main_data {
+            data
+        } else if let Some(data) = backup_data {
+            log::warn!(
+                "preset-load-recovery: main={} backup={} result=backup-restored",
+                path.display(),
+                backup_path.display()
+            );
+            data
+        } else {
+            if main_text.is_some() {
+                log::error!(
+                    "preset-load-failed: main={} backup={} action=factory-defaults",
+                    path.display(),
+                    backup_path.display()
+                );
+            }
+            PresetFile::default()
+        };
         if data.presets.is_empty() {
             data.presets = default_presets();
             data.active = data
@@ -178,25 +206,120 @@ impl PresetStore {
             }
         }
         let store = Self { path, data };
-        if migrated {
+        if migrated || recovered_from_backup {
+            // Repair the primary file immediately after a successful backup
+            // recovery so a second abnormal exit cannot leave only the backup
+            // as the last-known-good copy.
             store.save();
         }
         store
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.data) {
-            let tmp = self.path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &json).is_ok() {
-                if let Err(error) = replace_file(&tmp, &self.path) {
-                    log::error!(
-                        "preset-save-failed: path={} error={error}",
-                        self.path.display()
-                    );
-                    let _ = std::fs::remove_file(tmp);
+    pub fn save(&self) -> bool {
+        use std::io::Write;
+
+        let json = match serde_json::to_string_pretty(&self.data) {
+            Ok(json) => json,
+            Err(error) => {
+                log::error!(
+                    "preset-save-failed: phase=serialize path={} error={error}",
+                    self.path.display()
+                );
+                return false;
+            }
+        };
+        let tmp = self.path.with_extension("json.tmp");
+        let write_synced = |path: &std::path::Path, bytes: &[u8]| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        };
+
+        if let Err(error) = write_synced(&tmp, json.as_bytes()) {
+            log::error!(
+                "preset-save-failed: phase=write-sync path={} tmp={} error={error}",
+                self.path.display(),
+                tmp.display()
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        let replace_with_retry = |source: &std::path::Path, destination: &std::path::Path| {
+            let mut last_error = None;
+            for attempt in 1..=3 {
+                match replace_file(source, destination) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        last_error = Some(error);
+                        if attempt < 3 {
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+                        }
+                    }
                 }
             }
+            Err(last_error.unwrap_or_else(|| {
+                std::io::Error::other("atomic preset replace failed without OS error")
+            }))
+        };
+        if let Err(error) = replace_with_retry(&tmp, &self.path) {
+            log::error!(
+                "preset-save-failed: phase=atomic-replace-retry path={} error={error}",
+                self.path.display()
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return false;
         }
+
+        let verified = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<PresetFile>(&text).ok())
+            .is_some_and(|saved| saved == self.data);
+        if !verified {
+            log::error!(
+                "preset-save-failed: phase=readback-verify path={} action=keep-runtime-state",
+                self.path.display()
+            );
+            return false;
+        }
+
+        // Keep a fully synced last-known-good copy containing the same custom
+        // presets and every StageSpec parameter (including MVUtensils tuning).
+        let backup = self.path.with_extension("json.bak");
+        let backup_tmp = self.path.with_extension("json.bak.tmp");
+        match write_synced(&backup_tmp, json.as_bytes())
+            .and_then(|_| replace_with_retry(&backup_tmp, &backup))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                log::warn!(
+                    "preset-backup-save-failed: path={} error={error}",
+                    backup.display()
+                );
+                let _ = std::fs::remove_file(&backup_tmp);
+            }
+        }
+        let param_count: usize = self
+            .data
+            .presets
+            .iter()
+            .flat_map(|preset| preset.chain.iter())
+            .map(|stage| stage.params.len())
+            .sum();
+        log::info!(
+            "preset-save-verified: path={} presets={} active='{}' stage_params={} backup={} result=success",
+            self.path.display(),
+            self.data.presets.len(),
+            self.data.active,
+            param_count,
+            backup.display()
+        );
+        true
     }
 
     pub fn active(&self) -> Option<&Preset> {
@@ -430,6 +553,34 @@ pub fn discover_filters(app_dir: &std::path::Path) -> Vec<(StageKind, String)> {
     let mut visited = std::collections::HashSet::new();
     for folder in ["shaders", "models", "slangp"] {
         walk(app_dir, &app_dir.join(folder), &mut visited, &mut out);
+    }
+    // Optional GPL backend. It is presented as an ordinary reorderable filter,
+    // never as another global GUI option. Missing/invalid packs stay hidden.
+    match crate::render::mvutensils_neo::PortableBackendLayout::discover(app_dir) {
+        Ok(Some((layout, manifest))) => {
+            match crate::render::mvutensils_neo::PortableBackendLibrary::load(&layout) {
+                Ok(_) => {
+                    log::info!(
+                        "mvutensils-backend-discovery: available=true abi={} path={}",
+                        manifest.backend_abi,
+                        layout.root.display()
+                    );
+                    out.push((StageKind::Mvutensils, "builtin:MVUtensils-Neo".into()));
+                }
+                Err(error) => log::warn!(
+                    "mvutensils-backend-discovery: available=false path={} reason={error}",
+                    layout.root.display()
+                ),
+            }
+        }
+        Ok(None) => log::debug!(
+            "mvutensils-backend-discovery: installed=false path={}",
+            app_dir.join("backends").join("MVUtensils-Neo").display()
+        ),
+        Err(error) => log::warn!(
+            "mvutensils-backend-discovery: available=false path={} reason={error}",
+            app_dir.join("backends").join("MVUtensils-Neo").display()
+        ),
     }
     out
 }
@@ -898,11 +1049,72 @@ mod tests {
             path: path.clone(),
             data: test_store().data,
         };
-        store.save();
+        assert!(store.save());
         let saved: PresetFile =
-            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.active, "A");
+        assert_eq!(saved, store.data);
+        let backup: PresetFile = serde_json::from_str(
+            &std::fs::read_to_string(root.join("presets.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup, store.data);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_and_backup_preserve_mvutensils_style_parameters() {
+        let root = temp_filter_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("presets.json");
+        let mut stage = StageSpec {
+            kind: StageKind::Mvutensils,
+            path: "builtin:MVUtensils-Neo".into(),
+            enabled: true,
+            params: Default::default(),
+        };
+        stage.params.insert("precision".into(), 8.0);
+        stage.params.insert("thsad_y".into(), 1375.0);
+        stage.params.insert("thscd2".into(), 63.0);
+        // MVUtensils uses +Infinity as the normal "unlimited" value for
+        // these limits. v851 wrote it as JSON null, so readback verification
+        // failed and the next launch restored the previous .bak values.
+        stage.params.insert("limit_y".into(), f32::INFINITY);
+        stage.params.insert("limit_c".into(), f32::INFINITY);
+        let data = PresetFile {
+            active: "MVU custom".into(),
+            presets: vec![Preset {
+                name: "MVU custom".into(),
+                chain: vec![stage],
+                aspect_correction: None,
+                crop: None,
+                capture_resolution: None,
+            }],
+        };
+        let store = PresetStore { path, data: data.clone() };
+        assert!(store.save());
+        let persisted_text = std::fs::read_to_string(root.join("presets.json")).unwrap();
+        assert!(persisted_text.contains(r#""limit_y": "Infinity""#));
+        assert!(persisted_text.contains(r#""limit_c": "Infinity""#));
+        let loaded = PresetStore::load(&root);
+        assert_eq!(loaded.data, data);
+        let backup: PresetFile = serde_json::from_str(
+            &std::fs::read_to_string(root.join("presets.json.bak")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(backup, data);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v851_null_mvutensils_limits_recover_as_infinity() {
+        let stage: StageSpec = serde_json::from_str(
+            r#"{"kind":"mvutensils","path":"builtin:MVUtensils-Neo","enabled":true,"params":{"limit_y":null,"limit_c":null,"thsad_y":1375.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(stage.params.get("limit_y"), Some(&f32::INFINITY));
+        assert_eq!(stage.params.get("limit_c"), Some(&f32::INFINITY));
+        assert_eq!(stage.params.get("thsad_y"), Some(&1375.0));
     }
 
     #[test]

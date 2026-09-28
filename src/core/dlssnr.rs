@@ -16,7 +16,6 @@ pub struct DlssNrOptions {
     pub ui_correction: bool,
 }
 
-
 const USER_PRESETS_FILE: &str = "dlssnr_presets.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,10 +206,8 @@ pub fn set_options(spec: &mut StageSpec, values: DlssNrOptions) {
         .insert("local_structure".into(), values.local_structure);
     spec.params
         .insert("skin_structure".into(), values.skin_structure);
-    spec.params.insert(
-        "auto_mask".into(),
-        if values.auto_mask { 1.0 } else { 0.0 },
-    );
+    spec.params
+        .insert("auto_mask".into(), if values.auto_mask { 1.0 } else { 0.0 });
     spec.params.insert(
         "ui_correction".into(),
         if values.ui_correction { 1.0 } else { 0.0 },
@@ -292,7 +289,10 @@ mod tests {
         for (index, values) in presets.iter().enumerate() {
             assert_eq!(values.preset, index as u32);
         }
-        let file = DlssNrPresetFile { version: 1, presets: presets.to_vec() };
+        let file = DlssNrPresetFile {
+            version: 1,
+            presets: presets.to_vec(),
+        };
         let encoded = serde_json::to_string(&file).unwrap();
         let decoded: DlssNrPresetFile = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.presets.len(), 4);
@@ -317,12 +317,14 @@ mod tests {
         let mut changed = DlssNrOptions::default();
         changed.intensity = 0.5;
         set_options(&mut new, changed);
-        assert_eq!(options_only_change(&[old.clone()], &[new.clone()]), Some(changed));
+        assert_eq!(
+            options_only_change(&[old.clone()], &[new.clone()]),
+            Some(changed)
+        );
         new.enabled = false;
         assert_eq!(options_only_change(&[old.clone()], &[new.clone()]), None);
         new.enabled = true;
         new.path = "different".into();
         assert_eq!(options_only_change(&[old], &[new]), None);
     }
-
 }

@@ -95,7 +95,9 @@ fn should_log_neoamd_profile() -> bool {
 }
 
 fn neoamd_run_route_label(flags: Option<u32>) -> String {
-    let Some(flags) = flags else { return "unreported".to_string(); };
+    let Some(flags) = flags else {
+        return "unreported".to_string();
+    };
     let graph = if flags & NEOAMD_RUN_ROUTE_GRAPH_FULL != 0 {
         "graph-full"
     } else if flags & NEOAMD_RUN_ROUTE_GRAPH_COMPUTE != 0 {
@@ -1093,17 +1095,15 @@ impl OnnxStage {
         // NeoAMD inference itself is still owned entirely by the external pack.
         let adapters = crate::platform::gpu::enumerate_adapters_quiet();
         let target = match dml_adapter_id {
-            Some(device_id) => adapters.iter().find(|adapter| adapter.device_id == device_id),
+            Some(device_id) => adapters
+                .iter()
+                .find(|adapter| adapter.device_id == device_id),
             None => {
                 let mut amd = adapters
                     .iter()
                     .filter(|adapter| adapter.vendor_id == NEOAMD_VENDOR_AMD);
                 let first = amd.next();
-                if amd.next().is_some() {
-                    None
-                } else {
-                    first
-                }
+                if amd.next().is_some() { None } else { first }
             }
         };
 
@@ -1281,14 +1281,7 @@ impl OnnxStage {
             .neoamd_session
             .as_mut()
             .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?
-            .run_u8(
-                w,
-                h,
-                inputs,
-                input_pixel_stride,
-                output_pixel_stride,
-                phase,
-            )
+            .run_u8(w, h, inputs, input_pixel_stride, output_pixel_stride, phase)
             .map_err(anyhow::Error::msg);
         match result {
             Ok((ow, oh, bytes)) => {
@@ -1352,7 +1345,6 @@ impl OnnxStage {
             }
         }
     }
-
 
     fn run_neoamd_many_u8(
         &mut self,
@@ -1456,7 +1448,6 @@ impl OnnxStage {
             }
         }
     }
-
 
     pub(crate) fn supports_neoamd_interp_shared_rgba8(&self) -> bool {
         self.provider == OnnxProvider::NeoAMD
@@ -1564,7 +1555,15 @@ impl OnnxStage {
         if log_index < 16 || log_index % 240 == 0 {
             log::debug!(
                 "neoamd-interp-shared-phase: model='{}' phase={:.6} run_ms={:.3} input={}x{} output={}x{} key={} sampled_index={}",
-                self.name, phase, run_ms, w, h, shared.width, shared.height, shared.resource_key, log_index
+                self.name,
+                phase,
+                run_ms,
+                w,
+                h,
+                shared.width,
+                shared.height,
+                shared.resource_key,
+                log_index
             );
         }
         Ok(PreparedNeoAmdSharedOutput {
@@ -1611,8 +1610,7 @@ impl OnnxStage {
         match result {
             Ok(prepared) => {
                 if prepared {
-                    let log_index =
-                        NEOAMD_STREAM_PREP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                    let log_index = NEOAMD_STREAM_PREP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                     if log_index < 8 || log_index % 120 == 0 {
                         log::debug!(
                             "neoamd-interp-stream-prepare: model='{}' input={}x{} frames={} common_ms={:.3} sampled_index={}",
@@ -1662,8 +1660,7 @@ impl OnnxStage {
                     out_ms: 0.0,
                     padded_size: (w.max(0) as usize, h.max(0) as usize),
                 });
-                let log_index =
-                    NEOAMD_STREAM_PHASE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                let log_index = NEOAMD_STREAM_PHASE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if log_index < 16 || log_index % 240 == 0 {
                     log::debug!(
                         "neoamd-interp-stream-phase: model='{}' phase={:.6} run_ms={:.3} input={}x{} output={}x{} sampled_index={}",
@@ -1930,13 +1927,7 @@ impl OnnxStage {
         self.neoamd_session
             .as_mut()
             .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
-            .run_shared_io_fp16(
-                w,
-                h,
-                0.5,
-                io.input.resource_key,
-                io.output.resource_key,
-            )
+            .run_shared_io_fp16(w, h, 0.5, io.input.resource_key, io.output.resource_key)
             .map_err(anyhow::Error::msg)?;
         let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2013,17 +2004,26 @@ impl OnnxStage {
         let pixels = usize::try_from(w)?
             .checked_mul(usize::try_from(h)?)
             .ok_or_else(|| anyhow!("NeoAMD peer-chain input size overflow"))?;
-        anyhow::ensure!(rgba.len() >= pixels * 4, "NeoAMD peer-chain RGBA input buffer too small");
+        anyhow::ensure!(
+            rgba.len() >= pixels * 4,
+            "NeoAMD peer-chain RGBA input buffer too small"
+        );
         let (adapter_luid, shared) = {
-            let session = self.neoamd_session.as_mut().ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            let session = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
             let adapter_luid = session.adapter_luid();
-            let shared = session.prepare_shared_fp16(w, h, 1, 4, 0.5).map_err(anyhow::Error::msg)?;
+            let shared = session
+                .prepare_shared_fp16(w, h, 1, 4, 0.5)
+                .map_err(anyhow::Error::msg)?;
             (adapter_luid, shared)
         };
         self.neoamd_shared_key = Some(shared.resource_key);
         self.neoamd_shared_input_size = Some((w, h));
         if gc.has_external_import(shared.resource_key) {
-            gc.wait_external_buffer_idle(shared.resource_key).map_err(anyhow::Error::msg)?;
+            gc.wait_external_buffer_idle(shared.resource_key)
+                .map_err(anyhow::Error::msg)?;
         }
         let started = Instant::now();
         self.neoamd_session
@@ -2039,14 +2039,17 @@ impl OnnxStage {
             output_size: (shared.width as usize, shared.height as usize),
         });
         self.last_upscale_input_size = Some((w, h));
-        Ok(Some((NeoAmdPeerTensor {
-            key: shared.resource_key,
-            width: shared.width,
-            height: shared.height,
-            byte_len: shared.byte_len,
-            allocation_byte_len: shared.allocation_byte_len,
-            adapter_luid,
-        }, run_ms)))
+        Ok(Some((
+            NeoAmdPeerTensor {
+                key: shared.resource_key,
+                width: shared.width,
+                height: shared.height,
+                byte_len: shared.byte_len,
+                allocation_byte_len: shared.allocation_byte_len,
+                adapter_luid,
+            },
+            run_ms,
+        )))
     }
 
     /// Consume another NeoAMD session's resident NCHW FP16 output directly in
@@ -2062,22 +2065,32 @@ impl OnnxStage {
         }
         let (w, h) = (input.width, input.height);
         let (adapter_luid, output) = {
-            let session = self.neoamd_session.as_mut().ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
+            let session = self
+                .neoamd_session
+                .as_mut()
+                .ok_or_else(|| anyhow!("NeoAMD session is unavailable"))?;
             if session.adapter_luid() != input.adapter_luid {
                 return Ok(None);
             }
             let adapter_luid = session.adapter_luid();
             let output = if self.temporal_frames.is_some() {
-                session.prepare_temporal_shared_io_fp16(w, h).map_err(anyhow::Error::msg)?.output
+                session
+                    .prepare_temporal_shared_io_fp16(w, h)
+                    .map_err(anyhow::Error::msg)?
+                    .output
             } else {
-                session.prepare_shared_io_fp16(w, h, 0.5).map_err(anyhow::Error::msg)?.output
+                session
+                    .prepare_shared_io_fp16(w, h, 0.5)
+                    .map_err(anyhow::Error::msg)?
+                    .output
             };
             (adapter_luid, output)
         };
         self.neoamd_shared_key = Some(output.resource_key);
         self.neoamd_shared_input_size = Some((w, h));
         if gc.has_external_import(output.resource_key) {
-            gc.wait_external_buffer_idle(output.resource_key).map_err(anyhow::Error::msg)?;
+            gc.wait_external_buffer_idle(output.resource_key)
+                .map_err(anyhow::Error::msg)?;
         }
         let started = Instant::now();
         self.neoamd_session
@@ -2093,14 +2106,17 @@ impl OnnxStage {
             output_size: (output.width as usize, output.height as usize),
         });
         self.last_upscale_input_size = Some((w, h));
-        Ok(Some((NeoAmdPeerTensor {
-            key: output.resource_key,
-            width: output.width,
-            height: output.height,
-            byte_len: output.byte_len,
-            allocation_byte_len: output.allocation_byte_len,
-            adapter_luid,
-        }, run_ms)))
+        Ok(Some((
+            NeoAmdPeerTensor {
+                key: output.resource_key,
+                width: output.width,
+                height: output.height,
+                byte_len: output.byte_len,
+                allocation_byte_len: output.allocation_byte_len,
+                adapter_luid,
+            },
+            run_ms,
+        )))
     }
 
     pub(crate) fn neoamd_peer_chain_to_texture(
@@ -2108,12 +2124,16 @@ impl OnnxStage {
         gc: &mut GlContext,
         tensor: NeoAmdPeerTensor,
     ) -> Result<GpuTex> {
-        anyhow::ensure!(self.neoamd_shared_key == Some(tensor.key), "NeoAMD peer-chain owner mismatch");
+        anyhow::ensure!(
+            self.neoamd_shared_key == Some(tensor.key),
+            "NeoAMD peer-chain owner mismatch"
+        );
         if gc.external_device_luid() != Some(tensor.adapter_luid.to_le_bytes()) {
             return Err(anyhow!("NeoAMD peer-chain presentation LUID mismatch"));
         }
         if !gc.has_external_import(tensor.key) {
-            let handle = self.neoamd_session
+            let handle = self
+                .neoamd_session
                 .as_mut()
                 .ok_or_else(|| anyhow!("NeoAMD session disappeared"))?
                 .shared_output_handle(tensor.key)
@@ -2124,10 +2144,12 @@ impl OnnxStage {
                 tensor.byte_len,
                 tensor.allocation_byte_len,
                 tensor.adapter_luid.to_le_bytes(),
-            ).map_err(anyhow::Error::msg)?;
+            )
+            .map_err(anyhow::Error::msg)?;
         }
         let out_started = Instant::now();
-        let texture = gc.external_nchw_f16_to_rgba8(tensor.key, tensor.width, tensor.height)
+        let texture = gc
+            .external_nchw_f16_to_rgba8(tensor.key, tensor.width, tensor.height)
             .map_err(anyhow::Error::msg)?;
         let out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
         if let Some(profile) = self.last_upscale_profile.as_mut() {
@@ -2154,7 +2176,10 @@ impl OnnxStage {
         let pixels = usize::try_from(w)?
             .checked_mul(usize::try_from(h)?)
             .ok_or_else(|| anyhow!("NeoAMD shared input size overflow"))?;
-        anyhow::ensure!(rgba.len() >= pixels * 4, "NeoAMD RGBA input buffer too small");
+        anyhow::ensure!(
+            rgba.len() >= pixels * 4,
+            "NeoAMD RGBA input buffer too small"
+        );
 
         // A geometry change can make the Backend Pack replace its shareable
         // D3D12 resource. Retire the old GL import only after its read fence has
@@ -2226,7 +2251,9 @@ impl OnnxStage {
             .map_err(anyhow::Error::msg)?;
         let run_ms = run_start.elapsed().as_secs_f64() * 1000.0;
         let run_route = neoamd_run_route_label(
-            self.neoamd_session.as_ref().and_then(|session| session.last_run_route())
+            self.neoamd_session
+                .as_ref()
+                .and_then(|session| session.last_run_route()),
         );
         let gpu_ms = self
             .neoamd_session
@@ -2268,10 +2295,18 @@ impl OnnxStage {
                 self.name,
                 run_route,
                 run_ms,
-                gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
-                copy_gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
-                compute_gpu_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
-                host_sync_ms.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
+                gpu_ms
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                copy_gpu_ms
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                compute_gpu_ms
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                host_sync_ms
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
                 reuse_wait_ms,
                 out_ms,
                 reuse_wait_ms + run_ms + out_ms,
@@ -4732,7 +4767,9 @@ impl OnnxStage {
         after_interpolation: bool,
     ) -> Result<Option<GpuTex>> {
         let dml_temporal_gpu_opt_in = matches!(
-            std::env::var("CHIDESCALER_DML_TEMPORAL_GPU").ok().as_deref(),
+            std::env::var("CHIDESCALER_DML_TEMPORAL_GPU")
+                .ok()
+                .as_deref(),
             Some("1") | Some("true") | Some("on") | Some("yes")
         );
         if self.temporal_frames.is_some() && self.interp == InterpKind::None {
@@ -7110,12 +7147,10 @@ impl OnnxStage {
         {
             let history_store = std::mem::take(&mut self.temporal_history);
             let first_ref = history_store.front().map(Vec::as_slice).unwrap_or(&[]);
-            let history_refs: Vec<&[u8]> = std::iter::repeat_n(
-                first_ref,
-                frames.saturating_sub(history_store.len()),
-            )
-            .chain(history_store.iter().map(Vec::as_slice))
-            .collect();
+            let history_refs: Vec<&[u8]> =
+                std::iter::repeat_n(first_ref, frames.saturating_sub(history_store.len()))
+                    .chain(history_store.iter().map(Vec::as_slice))
+                    .collect();
             let native_result = self.run_neoamd_u8(
                 w,
                 h,
@@ -7141,13 +7176,15 @@ impl OnnxStage {
         // Borrow the stable VecDeque storage through packing instead; the ORT
         // tensor owns the packed scratch, so these references can be dropped
         // before provider execution.
-        let first = self.temporal_history.front().map(Vec::as_slice).unwrap_or(&[]);
-        let history: Vec<&[u8]> = std::iter::repeat_n(
-            first,
-            frames.saturating_sub(self.temporal_history.len()),
-        )
-        .chain(self.temporal_history.iter().map(Vec::as_slice))
-        .collect();
+        let first = self
+            .temporal_history
+            .front()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let history: Vec<&[u8]> =
+            std::iter::repeat_n(first, frames.saturating_sub(self.temporal_history.len()))
+                .chain(self.temporal_history.iter().map(Vec::as_slice))
+                .collect();
         let channels = frames * 3;
         let shape = vec![1i64, channels as i64, h as i64, w as i64];
         let pack_start = Instant::now();

@@ -448,7 +448,8 @@ impl NeoDlssNrCreateDesc {
         // Keep ABI v1 and consume only formerly-reserved words. Bridges that
         // predate v710 ignore these values; v710+ bridges key off NRV2 magic.
         desc.reserved[0] = options.style;
-        desc.reserved[1] = (if options.auto_mask { 1 } else { 0 }) | ((if options.ui_correction { 1 } else { 0 }) << 1);
+        desc.reserved[1] = (if options.auto_mask { 1 } else { 0 })
+            | ((if options.ui_correction { 1 } else { 0 }) << 1);
         desc.reserved[2] = options.intensity.to_bits();
         desc.reserved[3] = options.local_tone.to_bits();
         desc.reserved[4] = options.local_structure.to_bits();
@@ -787,10 +788,26 @@ impl DlssNrSession<'_> {
             } else {
                 DLSSNR_EVAL_OPTIONS_V1_SIZE
             },
-            intensity: if advanced { values.intensity } else { legacy_strength(values.intensity) },
-            local_tone: if advanced { values.local_tone } else { legacy_strength(values.local_tone) },
-            local_structure: if advanced { values.local_structure } else { legacy_strength(values.local_structure) },
-            skin_structure: if advanced { values.skin_structure } else { legacy_strength(values.skin_structure) },
+            intensity: if advanced {
+                values.intensity
+            } else {
+                legacy_strength(values.intensity)
+            },
+            local_tone: if advanced {
+                values.local_tone
+            } else {
+                legacy_strength(values.local_tone)
+            },
+            local_structure: if advanced {
+                values.local_structure
+            } else {
+                legacy_strength(values.local_structure)
+            },
+            skin_structure: if advanced {
+                values.skin_structure
+            } else {
+                legacy_strength(values.skin_structure)
+            },
             style: values.style,
             use_auto_mask: if values.auto_mask { 1 } else { 0 },
             ui_correction: if values.ui_correction { 1 } else { 0 },
@@ -836,7 +853,9 @@ impl DlssNrSession<'_> {
         if status == 0 {
             Ok(())
         } else {
-            Err(self.backend.error_string(self.context, status, "attach-shared-rgba8"))
+            Err(self
+                .backend
+                .error_string(self.context, status, "attach-shared-rgba8"))
         }
     }
 
@@ -854,7 +873,9 @@ impl DlssNrSession<'_> {
         );
         let status = unsafe { process(self.context, &desc) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "evaluate-shared"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "evaluate-shared"));
         }
         self.next_frame_index = self.next_frame_index.wrapping_add(1);
         Ok(())

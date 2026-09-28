@@ -186,7 +186,10 @@ fn read_manifest(app_dir: &Path) -> Result<(PathBuf, NeoAmdManifest), NeoAmdAvai
     }
     if !manifest.architecture.eq_ignore_ascii_case("x86_64") {
         return Err(unavailable(
-            format!("unsupported NeoAMD host architecture: {}", manifest.architecture),
+            format!(
+                "unsupported NeoAMD host architecture: {}",
+                manifest.architecture
+            ),
             true,
             Some(manifest),
             Some(backend_dir),
@@ -258,7 +261,9 @@ fn verify_manifest_files(backend_dir: &Path, manifest: &NeoAmdManifest) -> Resul
         }
         let actual = sha256_file(&path)?;
         if !actual.eq_ignore_ascii_case(expected.trim()) {
-            return Err(format!("NeoAMD pack file does not match its manifest: {file}"));
+            return Err(format!(
+                "NeoAMD pack file does not match its manifest: {file}"
+            ));
         }
     }
     Ok(())
@@ -484,13 +489,8 @@ type CreateFn =
     unsafe extern "C" fn(*const NeoAmdCreateDesc, *mut *mut c_void, *mut NeoAmdSessionInfo) -> i32;
 type QueryOutputFn =
     unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *mut NeoAmdOutputDesc) -> i32;
-type RunU8Fn = unsafe extern "C" fn(
-    *mut c_void,
-    *const NeoAmdRunDesc,
-    *const *const u8,
-    *mut u8,
-    u64,
-) -> i32;
+type RunU8Fn =
+    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *const *const u8, *mut u8, u64) -> i32;
 type RunInterpManyU8Fn = unsafe extern "C" fn(
     *mut c_void,
     *const NeoAmdRunDesc,
@@ -501,18 +501,10 @@ type RunInterpManyU8Fn = unsafe extern "C" fn(
     u64,
     u64,
 ) -> i32;
-type PrepareInterpStreamU8Fn = unsafe extern "C" fn(
-    *mut c_void,
-    *const NeoAmdRunDesc,
-    *const *const u8,
-) -> i32;
-type RunInterpStreamPhaseU8Fn = unsafe extern "C" fn(
-    *mut c_void,
-    *const NeoAmdRunDesc,
-    f32,
-    *mut u8,
-    u64,
-) -> i32;
+type PrepareInterpStreamU8Fn =
+    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *const *const u8) -> i32;
+type RunInterpStreamPhaseU8Fn =
+    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, f32, *mut u8, u64) -> i32;
 type PrepareInterpStreamSharedRgba8Fn = unsafe extern "C" fn(
     *mut c_void,
     *const NeoAmdRunDesc,
@@ -521,18 +513,11 @@ type PrepareInterpStreamSharedRgba8Fn = unsafe extern "C" fn(
 ) -> i32;
 type RunInterpStreamPhaseSharedRgba8Fn =
     unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, f32, u64) -> i32;
-type PrepareSharedFp16Fn = unsafe extern "C" fn(
-    *mut c_void,
-    *const NeoAmdRunDesc,
-    *mut NeoAmdSharedOutputDesc,
-) -> i32;
+type PrepareSharedFp16Fn =
+    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *mut NeoAmdSharedOutputDesc) -> i32;
 type GetSharedOutputHandleFn = unsafe extern "C" fn(*mut c_void, u64, *mut u64) -> i32;
-type RunU8SharedFp16Fn = unsafe extern "C" fn(
-    *mut c_void,
-    *const NeoAmdRunDesc,
-    *const *const u8,
-    u64,
-) -> i32;
+type RunU8SharedFp16Fn =
+    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *const *const u8, u64) -> i32;
 type PrepareSharedIoFp16Fn = unsafe extern "C" fn(
     *mut c_void,
     *const NeoAmdRunDesc,
@@ -540,8 +525,7 @@ type PrepareSharedIoFp16Fn = unsafe extern "C" fn(
     *mut NeoAmdSharedOutputDesc,
 ) -> i32;
 type GetSharedInputHandleFn = unsafe extern "C" fn(*mut c_void, u64, *mut u64) -> i32;
-type RunSharedIoFp16Fn =
-    unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, u64, u64) -> i32;
+type RunSharedIoFp16Fn = unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, u64, u64) -> i32;
 type PrepareTemporalSharedIoFp16Fn = unsafe extern "C" fn(
     *mut c_void,
     *const NeoAmdRunDesc,
@@ -654,18 +638,39 @@ impl NeoAmdBackend {
                 query_output: symbol(module, "neoamd_query_output")?,
                 run_u8: symbol(module, "neoamd_run_u8")?,
                 run_interp_many_u8: optional_symbol(module, "neoamd_run_interp_many_u8"),
-                prepare_interp_stream_u8: optional_symbol(module, "neoamd_prepare_interp_stream_u8"),
-                run_interp_stream_phase_u8: optional_symbol(module, "neoamd_run_interp_stream_phase_u8"),
-                prepare_interp_stream_shared_rgba8: optional_symbol(module, "neoamd_prepare_interp_stream_shared_rgba8"),
-                run_interp_stream_phase_shared_rgba8: optional_symbol(module, "neoamd_run_interp_stream_phase_shared_rgba8"),
+                prepare_interp_stream_u8: optional_symbol(
+                    module,
+                    "neoamd_prepare_interp_stream_u8",
+                ),
+                run_interp_stream_phase_u8: optional_symbol(
+                    module,
+                    "neoamd_run_interp_stream_phase_u8",
+                ),
+                prepare_interp_stream_shared_rgba8: optional_symbol(
+                    module,
+                    "neoamd_prepare_interp_stream_shared_rgba8",
+                ),
+                run_interp_stream_phase_shared_rgba8: optional_symbol(
+                    module,
+                    "neoamd_run_interp_stream_phase_shared_rgba8",
+                ),
                 prepare_shared_fp16: optional_symbol(module, "neoamd_prepare_shared_fp16"),
-                get_shared_output_handle: optional_symbol(module, "neoamd_get_shared_output_handle"),
+                get_shared_output_handle: optional_symbol(
+                    module,
+                    "neoamd_get_shared_output_handle",
+                ),
                 run_u8_shared_fp16: optional_symbol(module, "neoamd_run_u8_shared_fp16"),
                 prepare_shared_io_fp16: optional_symbol(module, "neoamd_prepare_shared_io_fp16"),
                 get_shared_input_handle: optional_symbol(module, "neoamd_get_shared_input_handle"),
                 run_shared_io_fp16: optional_symbol(module, "neoamd_run_shared_io_fp16"),
-                prepare_temporal_shared_io_fp16: optional_symbol(module, "neoamd_prepare_temporal_shared_io_fp16"),
-                run_temporal_shared_io_fp16: optional_symbol(module, "neoamd_run_temporal_shared_io_fp16"),
+                prepare_temporal_shared_io_fp16: optional_symbol(
+                    module,
+                    "neoamd_prepare_temporal_shared_io_fp16",
+                ),
+                run_temporal_shared_io_fp16: optional_symbol(
+                    module,
+                    "neoamd_run_temporal_shared_io_fp16",
+                ),
                 run_peer_shared_io_fp16: optional_symbol(module, "neoamd_run_peer_shared_io_fp16"),
                 reset_temporal_history: optional_symbol(module, "neoamd_reset_temporal_history"),
                 release_shared_output: optional_symbol(module, "neoamd_release_shared_output"),
@@ -674,8 +679,14 @@ impl NeoAmdBackend {
                 describe_backend: optional_symbol(module, "neoamd_describe_backend"),
                 get_last_run_route: optional_symbol(module, "neoamd_get_last_run_route"),
                 get_last_image_gpu_ms: optional_symbol(module, "neoamd_get_last_image_gpu_ms"),
-                get_last_image_copy_gpu_ms: optional_symbol(module, "neoamd_get_last_image_copy_gpu_ms"),
-                get_last_image_compute_gpu_ms: optional_symbol(module, "neoamd_get_last_image_compute_gpu_ms"),
+                get_last_image_copy_gpu_ms: optional_symbol(
+                    module,
+                    "neoamd_get_last_image_copy_gpu_ms",
+                ),
+                get_last_image_compute_gpu_ms: optional_symbol(
+                    module,
+                    "neoamd_get_last_image_compute_gpu_ms",
+                ),
             }))
         })();
         if loaded.is_err() {
@@ -872,17 +883,27 @@ impl NeoAmdSession {
             && self.backend.run_temporal_shared_io_fp16.is_some()
     }
 
-    fn shared_surface(desc: NeoAmdSharedOutputDesc, label: &str) -> Result<NeoAmdSharedOutput, String> {
+    fn shared_surface(
+        desc: NeoAmdSharedOutputDesc,
+        label: &str,
+    ) -> Result<NeoAmdSharedOutput, String> {
         if desc.format != NEOAMD_SHARED_NCHW_FP16 || desc.width == 0 || desc.height == 0 {
-            return Err(format!("NeoAMD bridge returned an invalid {label} FP16 surface"));
+            return Err(format!(
+                "NeoAMD bridge returned an invalid {label} FP16 surface"
+            ));
         }
         let minimum = (desc.width as u64)
             .checked_mul(desc.height as u64)
             .and_then(|n| n.checked_mul(3))
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| format!("NeoAMD {label} shared surface size overflow"))?;
-        if desc.byte_len < minimum || desc.allocation_byte_len < desc.byte_len || desc.resource_key == 0 {
-            return Err(format!("NeoAMD {label} shared surface allocation is invalid"));
+        if desc.byte_len < minimum
+            || desc.allocation_byte_len < desc.byte_len
+            || desc.resource_key == 0
+        {
+            return Err(format!(
+                "NeoAMD {label} shared surface allocation is invalid"
+            ));
         }
         Ok(NeoAmdSharedOutput {
             width: desc.width as i32,
@@ -934,11 +955,12 @@ impl NeoAmdSession {
             struct_size: std::mem::size_of::<NeoAmdSharedOutputDesc>() as u32,
             ..NeoAmdSharedOutputDesc::default()
         };
-        let status = unsafe {
-            self.backend.prepare_shared_fp16.unwrap()(self.context, &desc, &mut shared)
-        };
+        let status =
+            unsafe { self.backend.prepare_shared_fp16.unwrap()(self.context, &desc, &mut shared) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "prepare-shared-fp16"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "prepare-shared-fp16"));
         }
         if shared.format != NEOAMD_SHARED_NCHW_FP16 || shared.width == 0 || shared.height == 0 {
             return Err("NeoAMD bridge returned an invalid shared FP16 surface".to_string());
@@ -969,7 +991,9 @@ impl NeoAmdSession {
         let mut raw = 0u64;
         let status = unsafe { function(self.context, resource_key, &mut raw) };
         if status != 0 || raw == 0 {
-            return Err(self.backend.error_string(self.context, status, "shared-output-handle"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "shared-output-handle"));
         }
         Ok(HANDLE(raw as *mut c_void))
     }
@@ -1001,7 +1025,9 @@ impl NeoAmdSession {
             )
         };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "prepare-shared-io-fp16"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "prepare-shared-io-fp16"));
         }
         let input = Self::shared_surface(input, "input")?;
         let output = Self::shared_surface(output, "output")?;
@@ -1063,7 +1089,9 @@ impl NeoAmdSession {
         let mut raw = 0u64;
         let status = unsafe { function(self.context, resource_key, &mut raw) };
         if status != 0 || raw == 0 {
-            return Err(self.backend.error_string(self.context, status, "shared-input-handle"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "shared-input-handle"));
         }
         Ok(HANDLE(raw as *mut c_void))
     }
@@ -1081,16 +1109,12 @@ impl NeoAmdSession {
             .run_shared_io_fp16
             .ok_or_else(|| "NeoAMD shared IO run export is unavailable".to_string())?;
         let desc = Self::run_desc(width, height, 1, 4, 3, phase)?;
-        let status = unsafe {
-            function(
-                self.context,
-                &desc,
-                input_resource_key,
-                output_resource_key,
-            )
-        };
+        let status =
+            unsafe { function(self.context, &desc, input_resource_key, output_resource_key) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "run-shared-io-fp16"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "run-shared-io-fp16"));
         }
         Ok(())
     }
@@ -1107,14 +1131,8 @@ impl NeoAmdSession {
             .run_temporal_shared_io_fp16
             .ok_or_else(|| "NeoAMD TemporalFix shared IO run export is unavailable".to_string())?;
         let desc = Self::run_desc(width, height, 1, 4, 3, 0.5)?;
-        let status = unsafe {
-            function(
-                self.context,
-                &desc,
-                input_resource_key,
-                output_resource_key,
-            )
-        };
+        let status =
+            unsafe { function(self.context, &desc, input_resource_key, output_resource_key) };
         if status != 0 {
             return Err(self.backend.error_string(
                 self.context,
@@ -1138,10 +1156,17 @@ impl NeoAmdSession {
             .ok_or_else(|| "NeoAMD peer shared IO run export is unavailable".to_string())?;
         let desc = Self::run_desc(width, height, 1, 4, 3, 0.5)?;
         let status = unsafe {
-            function(self.context, &desc, source_resource_key, output_resource_key)
+            function(
+                self.context,
+                &desc,
+                source_resource_key,
+                output_resource_key,
+            )
         };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "run-peer-shared-io-fp16"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "run-peer-shared-io-fp16"));
         }
         Ok(())
     }
@@ -1155,11 +1180,9 @@ impl NeoAmdSession {
         };
         let status = unsafe { function(self.context) };
         if status != 0 {
-            return Err(self.backend.error_string(
-                self.context,
-                status,
-                "reset-temporal-history",
-            ));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "reset-temporal-history"));
         }
         Ok(())
     }
@@ -1198,7 +1221,9 @@ impl NeoAmdSession {
         let pointers: Vec<*const u8> = inputs.iter().map(|input| input.as_ptr()).collect();
         let status = unsafe { function(self.context, &desc, pointers.as_ptr(), resource_key) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "run-shared-fp16"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "run-shared-fp16"));
         }
         Ok(())
     }
@@ -1208,7 +1233,9 @@ impl NeoAmdSession {
         label: &str,
     ) -> Result<NeoAmdSharedOutput, String> {
         if desc.format != NEOAMD_SHARED_RGBA8 || desc.width == 0 || desc.height == 0 {
-            return Err(format!("NeoAMD bridge returned an invalid {label} RGBA8 surface"));
+            return Err(format!(
+                "NeoAMD bridge returned an invalid {label} RGBA8 surface"
+            ));
         }
         let minimum = (desc.width as u64)
             .checked_mul(desc.height as u64)
@@ -1218,7 +1245,9 @@ impl NeoAmdSession {
             || desc.allocation_byte_len < desc.byte_len
             || desc.resource_key == 0
         {
-            return Err(format!("NeoAMD {label} RGBA8 surface allocation is invalid"));
+            return Err(format!(
+                "NeoAMD {label} RGBA8 surface allocation is invalid"
+            ));
         }
         Ok(NeoAmdSharedOutput {
             width: desc.width as i32,
@@ -1250,7 +1279,9 @@ impl NeoAmdSession {
         let function = self
             .backend
             .prepare_interp_stream_shared_rgba8
-            .ok_or_else(|| "NeoAMD shared interpolation prepare export is unavailable".to_string())?;
+            .ok_or_else(|| {
+                "NeoAMD shared interpolation prepare export is unavailable".to_string()
+            })?;
         if width <= 0 || height <= 0 || !(inputs.len() == 2 || inputs.len() == 4) {
             return Err("NeoAMD shared interpolation arguments are invalid".to_string());
         }
@@ -1271,9 +1302,11 @@ impl NeoAmdSession {
         };
         let status = unsafe { function(self.context, &desc, pointers.as_ptr(), &mut output) };
         if status != 0 {
-            return Err(self
-                .backend
-                .error_string(self.context, status, "prepare-interp-stream-shared-rgba8"));
+            return Err(self.backend.error_string(
+                self.context,
+                status,
+                "prepare-interp-stream-shared-rgba8",
+            ));
         }
         Self::shared_rgba8_surface(output, "interpolation output").map(Some)
     }
@@ -1299,9 +1332,11 @@ impl NeoAmdSession {
         let desc = Self::run_desc(width, height, input_count, 4, 4, phase)?;
         let status = unsafe { function(self.context, &desc, phase, resource_key) };
         if status != 0 {
-            return Err(self
-                .backend
-                .error_string(self.context, status, "run-interp-stream-phase-shared-rgba8"));
+            return Err(self.backend.error_string(
+                self.context,
+                status,
+                "run-interp-stream-phase-shared-rgba8",
+            ));
         }
         Ok(())
     }
@@ -1348,7 +1383,9 @@ impl NeoAmdSession {
         let pointers: Vec<*const u8> = inputs.iter().map(|input| input.as_ptr()).collect();
         let status = unsafe { function(self.context, &desc, pointers.as_ptr()) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "prepare-interp-stream"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "prepare-interp-stream"));
         }
         Ok(true)
     }
@@ -1383,7 +1420,11 @@ impl NeoAmdSession {
         };
         let status = unsafe { (self.backend.query_output)(self.context, &desc, &mut output) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "query-interp-stream-output"));
+            return Err(self.backend.error_string(
+                self.context,
+                status,
+                "query-interp-stream-output",
+            ));
         }
         let bytes_len = (output.width as usize)
             .checked_mul(output.height as usize)
@@ -1400,7 +1441,9 @@ impl NeoAmdSession {
             )
         };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "run-interp-stream-phase"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "run-interp-stream-phase"));
         }
         Ok((output.width as i32, output.height as i32, bytes))
     }
@@ -1423,7 +1466,10 @@ impl NeoAmdSession {
         if input_pixel_stride < 3 || !(output_pixel_stride == 3 || output_pixel_stride == 4) {
             return Err("NeoAMD multi-phase pixel stride is invalid".to_string());
         }
-        if phases.iter().any(|phase| !phase.is_finite() || !(0.0..=1.0).contains(phase)) {
+        if phases
+            .iter()
+            .any(|phase| !phase.is_finite() || !(0.0..=1.0).contains(phase))
+        {
             return Err("NeoAMD multi-phase timestep is invalid".to_string());
         }
         let pixels = (width as usize)
@@ -1449,7 +1495,9 @@ impl NeoAmdSession {
         };
         let status = unsafe { (self.backend.query_output)(self.context, &desc, &mut output) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "query-multi-output"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "query-multi-output"));
         }
         let logical = (output.width as usize)
             .checked_mul(output.height as usize)
@@ -1476,7 +1524,9 @@ impl NeoAmdSession {
             )
         };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "run-multi-interp"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "run-multi-interp"));
         }
         let mut results = Vec::with_capacity(phases.len());
         for index in 0..phases.len() {
@@ -1534,7 +1584,9 @@ impl NeoAmdSession {
         };
         let status = unsafe { (self.backend.query_output)(self.context, &desc, &mut output) };
         if status != 0 {
-            return Err(self.backend.error_string(self.context, status, "query-output"));
+            return Err(self
+                .backend
+                .error_string(self.context, status, "query-output"));
         }
         if output.width == 0 || output.height == 0 {
             return Err("NeoAMD bridge returned an empty output size".to_string());

@@ -22,6 +22,15 @@ use std::sync::{Arc, Mutex};
 
 const BUILTIN_NEOFLOW_ENABLED: bool = false;
 
+// Optional native providers are expensive enough to benefit materially from
+// warm model/provider sessions, but an unbounded cache can staircase VRAM when
+// users switch models/presets repeatedly.  Keep enough room for a normal heavy
+// Neo chain (the Radeon field report used five NeoAMD ONNX stages) plus a small
+// amount of LRU history.  The currently running chain is never evicted merely
+// to satisfy this number; the hard cap is enforced once sessions become warm
+// cache entries at Stop, and for inactive entries during live chain edits.
+pub(crate) const OPTIONAL_BACKEND_SESSION_CACHE_LIMIT: usize = 8;
+
 thread_local! {
     // v653: zero-resize identity pass used when a cross-GPU DirectML
     // interpolation output has no post-GLSL stages. Vulkan still imports the
@@ -107,6 +116,9 @@ pub enum Stage {
         name: String,
         external_source: Option<Rc<String>>,
     },
+    Mvutensils {
+        options: super::mvutensils_neo::Options,
+    },
 }
 
 /// What the engine uses to synthesize in-between frames.
@@ -130,6 +142,7 @@ impl Stage {
             Stage::Onnx { name, .. } => name,
             Stage::Slangp { name, .. } => name,
             Stage::Flow { name, .. } => name,
+            Stage::Mvutensils { .. } => super::mvutensils_neo::FILTER_NAME,
         }
     }
     pub fn kind(&self) -> StageKind {
@@ -139,13 +152,17 @@ impl Stage {
             Stage::Onnx { .. } => StageKind::Onnx,
             Stage::Slangp { .. } => StageKind::Slangp,
             Stage::Flow { .. } => StageKind::Flow,
+            Stage::Mvutensils { .. } => StageKind::Mvutensils,
         }
     }
     pub fn is_interp(&self) -> bool {
         match self {
             Stage::Flow { .. } => true,
             Stage::Onnx { is_interp, .. } => *is_interp,
-            Stage::Glsl { .. } | Stage::Slangp { .. } | Stage::Dlssnr { .. } => false,
+            Stage::Glsl { .. }
+            | Stage::Slangp { .. }
+            | Stage::Dlssnr { .. }
+            | Stage::Mvutensils { .. } => false,
         }
     }
 
@@ -193,6 +210,10 @@ pub struct StageFactory {
     shaders: HashMap<String, Rc<UserShader>>,
     onnx: HashMap<OnnxCacheKey, (Arc<Mutex<OnnxStage>>, bool)>,
     onnx_lru: VecDeque<OnnxCacheKey>,
+    // Exact cache keys belonging to the most recently constructed active
+    // filter chain.  This lets Stop preserve the just-used chain first, then
+    // spend any remaining cache budget on older LRU entries.
+    last_active_onnx: Vec<OnnxCacheKey>,
 }
 
 impl StageFactory {
@@ -206,6 +227,7 @@ impl StageFactory {
             shaders: HashMap::new(),
             onnx: HashMap::new(),
             onnx_lru: VecDeque::new(),
+            last_active_onnx: Vec::new(),
         }
     }
 
@@ -277,6 +299,8 @@ impl StageFactory {
         let remaining: HashSet<OnnxCacheKey> = onnx.keys().cloned().collect();
         let mut onnx_lru = self.onnx_lru.clone();
         onnx_lru.retain(|key| remaining.contains(key));
+        let mut last_active_onnx = self.last_active_onnx.clone();
+        last_active_onnx.retain(|key| remaining.contains(key));
         let carried_tensorrt = onnx
             .keys()
             .filter(|key| key.preference == OnnxBackendPreference::TensorRT)
@@ -310,6 +334,7 @@ impl StageFactory {
             shaders: self.shaders.clone(),
             onnx,
             onnx_lru,
+            last_active_onnx,
         }
     }
 
@@ -321,6 +346,14 @@ impl StageFactory {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| spec.path.clone());
         match spec.kind {
+            StageKind::Mvutensils => {
+                if spec.path != "builtin:MVUtensils-Neo" {
+                    anyhow::bail!("MVUtensils-Neo must use builtin:MVUtensils-Neo");
+                }
+                let options = super::mvutensils_neo::Options::from_stage_params(&spec.params)
+                    .map_err(|error| anyhow!("MVUtensils-Neo parameters: {error}"))?;
+                Ok(Stage::Mvutensils { options })
+            }
             StageKind::Dlssnr => Ok(Stage::Dlssnr {
                 stage: super::dlssnr_stage::DlssNrStage::new(
                     self.base_dir.clone(),
@@ -475,35 +508,60 @@ impl StageFactory {
     }
 
     fn prune_onnx_to(&mut self, stages: &[Stage]) {
-        let active_paths: HashSet<&str> = stages
+        // Resolve the *exact* cache entries referenced by this chain rather
+        // than matching only by model path.  The same model path can coexist
+        // under different backend/GPU/NeoAccel identities during a live
+        // provider transition; path-only retention can accidentally pin an
+        // inactive provider session and waste VRAM.
+        let mut active: HashSet<OnnxCacheKey> = HashSet::new();
+        for stage in stages {
+            let Stage::Onnx {
+                stage: active_stage,
+                ..
+            } = stage
+            else {
+                continue;
+            };
+            if let Some((key, _)) = self
+                .onnx
+                .iter()
+                .find(|(_key, (cached_stage, _))| Arc::ptr_eq(cached_stage, active_stage))
+            {
+                active.insert(key.clone());
+            }
+        }
+
+        // Preserve active-chain recency explicitly for Stop -> Start.  Keep
+        // LRU order (oldest -> newest) so the restart trimmer can discard the
+        // oldest active entry first only if an unusually large chain exceeds
+        // the hard post-Stop cache cap.
+        self.last_active_onnx = self
+            .onnx_lru
             .iter()
-            .filter_map(|st| match st {
-                Stage::Onnx { key, .. } => Some(key.as_str()),
-                _ => None,
-            })
+            .filter(|key| active.contains(*key))
+            .cloned()
             .collect();
+        for key in &active {
+            if !self.last_active_onnx.contains(key) {
+                self.last_active_onnx.push(key.clone());
+            }
+        }
 
         // DirectML sessions are cheap to recreate and keep the historical
         // single-chain cache policy. Optional native backends are different:
         // TensorRT can have a cold provider-session attach even with a cached
         // engine, while NeoAMD may have already parsed/packed model weights.
-        // Keep a tiny MRU set for the currently selected optional backend so
-        // preset A -> B -> A stays immediate without unbounded VRAM growth.
-        const MAX_OPTIONAL_BACKEND_WARM_SESSIONS: usize = 3;
+        // Pin the complete active chain, then use any remaining bounded budget
+        // for older MRU sessions. This keeps a five-model chain fully warm on
+        // Stop -> Start while still preventing unbounded preset/model growth.
         if !matches!(
             self.onnx_preference,
             OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
         ) {
-            self.onnx
-                .retain(|key, _| active_paths.contains(key.path.as_str()));
+            self.onnx.retain(|key, _| active.contains(key));
         } else {
-            let mut keep: HashSet<OnnxCacheKey> = self
-                .onnx
-                .keys()
-                .filter(|key| active_paths.contains(key.path.as_str()))
-                .cloned()
-                .collect();
-            let target = MAX_OPTIONAL_BACKEND_WARM_SESSIONS.max(keep.len());
+            let mut keep = active.clone();
+            let target = OPTIONAL_BACKEND_SESSION_CACHE_LIMIT.max(keep.len());
             for key in self.onnx_lru.iter().rev() {
                 if keep.len() >= target {
                     break;
@@ -521,12 +579,14 @@ impl StageFactory {
                     self.onnx_preference,
                     self.onnx.len(),
                     dropped,
-                    MAX_OPTIONAL_BACKEND_WARM_SESSIONS
+                    OPTIONAL_BACKEND_SESSION_CACHE_LIMIT
                 );
             }
         }
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
     }
 
     fn evict_onnx_path(&mut self, path: &str) -> usize {
@@ -534,12 +594,15 @@ impl StageFactory {
         self.onnx.retain(|key, _| key.path != path);
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
     pub fn clear_onnx_cache(&mut self) {
         self.onnx.clear();
         self.onnx_lru.clear();
+        self.last_active_onnx.clear();
     }
 
     /// A real source-size change must recreate shape-sensitive DirectML /
@@ -562,6 +625,8 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
@@ -585,6 +650,8 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         let dropped = before.saturating_sub(self.onnx.len());
         if dropped > 0 {
             log::info!(
@@ -601,15 +668,48 @@ impl StageFactory {
     /// session; NeoAMD keeps only its model/packed-weight session (never a
     /// resolution-specific engine). Real backend/GPU changes still clear all.
     pub fn retain_optional_backend_sessions_for_capture_restart(&mut self) -> usize {
+        // First preserve the exact ONNX sessions from the just-finished active
+        // chain.  This is the important Stop -> Start fast path: a five-model
+        // NeoAMD chain can remain fully warm instead of rebuilding two models
+        // under an arbitrary "three sessions" limit.  Any remaining budget is
+        // filled from global MRU history, while the hard total cache cap keeps
+        // repeated model/preset switching from staircasing VRAM indefinitely.
         let before = self.onnx.len();
-        self.onnx.retain(|key, _| {
-            matches!(
+        let mut keep: HashSet<OnnxCacheKey> = HashSet::new();
+
+        // last_active_onnx is oldest -> newest. If an unusually large active
+        // chain itself exceeds the hard cache cap, retain its most-recently
+        // touched entries rather than violating the post-Stop cap.
+        for key in self.last_active_onnx.iter().rev() {
+            if keep.len() >= OPTIONAL_BACKEND_SESSION_CACHE_LIMIT {
+                break;
+            }
+            if matches!(
                 key.preference,
                 OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
-            )
-        });
+            ) && self.onnx.contains_key(key)
+            {
+                keep.insert(key.clone());
+            }
+        }
+
+        for key in self.onnx_lru.iter().rev() {
+            if keep.len() >= OPTIONAL_BACKEND_SESSION_CACHE_LIMIT {
+                break;
+            }
+            if matches!(
+                key.preference,
+                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+            ) && self.onnx.contains_key(key)
+            {
+                keep.insert(key.clone());
+            }
+        }
+        self.onnx.retain(|key, _| keep.contains(key));
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         let kept = self.onnx.len();
         if before != kept || kept > 0 {
             let kept_trt = self
@@ -623,10 +723,12 @@ impl StageFactory {
                 .filter(|key| key.preference == OnnxBackendPreference::NeoAMD)
                 .count();
             log::info!(
-                "onnx-session-restart-cache: kept_tensorrt={} kept_neoamd={} dropped_other={} policy=warm-restart",
+                "onnx-session-restart-cache: kept_tensorrt={} kept_neoamd={} dropped_other={} limit={} last_active={} policy=last-chain-first-then-lru",
                 kept_trt,
                 kept_neoamd,
-                before.saturating_sub(kept)
+                before.saturating_sub(kept),
+                OPTIONAL_BACKEND_SESSION_CACHE_LIMIT,
+                self.last_active_onnx.len()
             );
         }
         kept
@@ -831,6 +933,11 @@ pub struct FilterChain {
     vulkan_resident_batches: Vec<VulkanResidentBatch>,
     dml_vulkan_resident_log_keys: HashSet<u64>,
     dml_vulkan_image_handoff_disabled: bool,
+    // CPU-visible frame kept only for the immediate MVUtensils boundary.
+    // WGC and the ONNX native-output path already own RGBA8; preserving those
+    // bytes avoids a GPU upload followed by an immediate synchronous readback.
+    mvutensils_cpu_boundary_rgba: Vec<u8>,
+    mvutensils_cpu_boundary_size: Option<(i32, i32)>,
 }
 
 fn directml_temporal_limited_size(w: i32, h: i32) -> Option<(i32, i32)> {
@@ -865,6 +972,52 @@ fn log_directml_temporal_height_limit(
 }
 
 impl FilterChain {
+    pub fn mvutensils_stage(&self) -> Option<(usize, &super::mvutensils_neo::Options)> {
+        self.stages
+            .iter()
+            .enumerate()
+            .find_map(|(index, stage)| match stage {
+                Stage::Mvutensils { options } => Some((index, options)),
+                _ => None,
+            })
+    }
+
+    /// CPU Pipeline only helps when MVUtensils can overlap with a regular GPU
+    /// ONNX neighbor. Keep standalone/GLSL-only chains on the exact synchronous
+    /// path so they do not pay an extra queueing frame for no throughput gain.
+    pub fn mvutensils_cpu_pipeline_beneficial(&self, index: usize) -> bool {
+        let regular_onnx = |stage: Option<&Stage>| {
+            matches!(stage, Some(Stage::Onnx { is_interp: false, .. }))
+        };
+        regular_onnx(index.checked_sub(1).and_then(|i| self.stages.get(i)))
+            || regular_onnx(self.stages.get(index + 1))
+    }
+
+    pub fn store_mvutensils_cpu_boundary_copy(&mut self, w: i32, h: i32, rgba: &[u8]) {
+        let need = (w.max(0) as usize).saturating_mul(h.max(0) as usize).saturating_mul(4);
+        if rgba.len() != need {
+            self.mvutensils_cpu_boundary_size = None;
+            return;
+        }
+        self.mvutensils_cpu_boundary_rgba.clear();
+        self.mvutensils_cpu_boundary_rgba.extend_from_slice(rgba);
+        self.mvutensils_cpu_boundary_size = Some((w, h));
+    }
+
+    fn store_mvutensils_cpu_boundary_owned(&mut self, w: i32, h: i32, rgba: Vec<u8>) {
+        self.mvutensils_cpu_boundary_rgba = rgba;
+        self.mvutensils_cpu_boundary_size = Some((w, h));
+    }
+
+    pub fn mvutensils_cpu_boundary(&self, w: i32, h: i32) -> Option<&[u8]> {
+        (self.mvutensils_cpu_boundary_size == Some((w, h)))
+            .then_some(self.mvutensils_cpu_boundary_rgba.as_slice())
+    }
+
+    pub fn clear_mvutensils_cpu_boundary(&mut self) {
+        self.mvutensils_cpu_boundary_size = None;
+    }
+
     /// Empty placeholder used only while an explicit-GPU live interpolation
     /// handoff destroys the old provider generation before constructing the
     /// replacement. Keeping a real DirectML stage alive here would recreate the
@@ -878,6 +1031,8 @@ impl FilterChain {
             vulkan_resident_batches: Vec::new(),
             dml_vulkan_resident_log_keys: HashSet::new(),
             dml_vulkan_image_handoff_disabled: false,
+            mvutensils_cpu_boundary_rgba: Vec::new(),
+            mvutensils_cpu_boundary_size: None,
         }
     }
 
@@ -1001,11 +1156,7 @@ impl FilterChain {
     /// Fail-safe used only when a provider switch committed but no new frame
     /// reached presentation.  Keep NeoAMD inference active while dropping the
     /// fragile shared-output optimization for this generation.
-    pub fn disable_neoamd_shared_output_for_recovery(
-        &mut self,
-        gc: &mut GlContext,
-        reason: &str,
-    ) {
+    pub fn disable_neoamd_shared_output_for_recovery(&mut self, gc: &mut GlContext, reason: &str) {
         for stage in &mut self.stages {
             if let Stage::Onnx { stage, .. } = stage {
                 stage
@@ -1093,10 +1244,7 @@ impl FilterChain {
             .is_some_and(|s| matches!(s, Stage::Dlssnr { stage } if stage.needs_refresh()))
     }
 
-    pub fn set_dlssnr_options(
-        &mut self,
-        values: crate::core::dlssnr::DlssNrOptions,
-    ) -> bool {
+    pub fn set_dlssnr_options(&mut self, values: crate::core::dlssnr::DlssNrOptions) -> bool {
         if let Some(Stage::Dlssnr { stage }) =
             self.dlssnr_index.and_then(|i| self.stages.get_mut(i))
         {
@@ -1530,7 +1678,18 @@ impl FilterChain {
         let result = (|| {
             let input = gc.upload_rgba8(w, h, rgba);
             let final_tex = if let Some(interp_index) = self.interp_index() {
-                let pre = self.process_range(gc, input, out_size, 0, interp_index, None)?;
+                // A provider-switch probe is synthetic and must never advance
+                // MVUtensils history. This also covers chains that contain an
+                // interpolation stage, where the old warmup used the ordinary
+                // range executor and therefore rejected MVUtensils.
+                let has_mvutensils = self.mvutensils_stage().is_some();
+                let pre = if has_mvutensils {
+                    self.process_range_with_frame_tick(
+                        gc, input, out_size, 0, interp_index, None, false,
+                    )?
+                } else {
+                    self.process_range(gc, input, out_size, 0, interp_index, None)?
+                };
                 let rgb = gc.download_rgb8(pre);
                 let (iw, ih, interpolated) = match &mut self.stages[interp_index] {
                     Stage::Onnx { stage, .. } => {
@@ -1541,7 +1700,10 @@ impl FilterChain {
                         stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?
                     }
                     Stage::Flow { .. } => (pre.w(), pre.h(), rgb),
-                    Stage::Glsl { .. } | Stage::Slangp { .. } | Stage::Dlssnr { .. } => {
+                    Stage::Glsl { .. }
+                    | Stage::Slangp { .. }
+                    | Stage::Dlssnr { .. }
+                    | Stage::Mvutensils { .. } => {
                         unreachable!()
                     }
                 };
@@ -1550,14 +1712,32 @@ impl FilterChain {
                     "interpolation warmup returned an invalid image"
                 );
                 let interpolated = gc.upload_rgb8(iw, ih, &interpolated);
-                self.process_range(
-                    gc,
-                    interpolated,
-                    out_size,
-                    interp_index + 1,
-                    self.stages.len(),
-                    None,
-                )?
+                if has_mvutensils {
+                    self.process_range_with_frame_tick(
+                        gc,
+                        interpolated,
+                        out_size,
+                        interp_index + 1,
+                        self.stages.len(),
+                        None,
+                        false,
+                    )?
+                } else {
+                    self.process_range(
+                        gc,
+                        interpolated,
+                        out_size,
+                        interp_index + 1,
+                        self.stages.len(),
+                        None,
+                    )?
+                }
+            } else if self.mvutensils_stage().is_some() {
+                // Backend-switch warmup must prime ONNX providers without
+                // advancing the live temporal MVUtensils history. A refresh
+                // tick treats MVUtensils as a pass-through while still running
+                // every ordinary ONNX/GLSL stage in the candidate chain.
+                self.process_from_with_frame_tick(gc, input, out_size, 0, None, false)?
             } else {
                 self.process(gc, input, out_size, None)?
             };
@@ -1648,6 +1828,8 @@ impl FilterChain {
                 vulkan_resident_batches,
                 dml_vulkan_resident_log_keys: HashSet::new(),
                 dml_vulkan_image_handoff_disabled: false,
+                mvutensils_cpu_boundary_rgba: Vec::new(),
+                mvutensils_cpu_boundary_size: None,
             },
             errors,
         )
@@ -1787,8 +1969,17 @@ impl FilterChain {
         }
         let mut count = 0usize;
         for stage in &self.stages {
-            let Stage::Onnx { stage, is_interp: false, .. } = stage else { break };
-            let guard = stage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Stage::Onnx {
+                stage,
+                is_interp: false,
+                ..
+            } = stage
+            else {
+                break;
+            };
+            let guard = stage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !guard.supports_neoamd_peer_chain() {
                 break;
             }
@@ -1798,7 +1989,10 @@ impl FilterChain {
             return Ok(None);
         }
         let first_temporal = match &self.stages[0] {
-            Stage::Onnx { stage, .. } => stage.lock().unwrap_or_else(|p| p.into_inner()).is_neoamd_temporal_shared_filter(),
+            Stage::Onnx { stage, .. } => stage
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_neoamd_temporal_shared_filter(),
             _ => true,
         };
         if first_temporal {
@@ -1808,7 +2002,8 @@ impl FilterChain {
         let (mut tensor, first_ms, first_name) = match &self.stages[0] {
             Stage::Onnx { name, stage, .. } => {
                 let mut guard = stage.lock().unwrap_or_else(|p| p.into_inner());
-                let Some((tensor, ms)) = guard.process_neoamd_peer_chain_rgba8(gc, w, h, rgba)? else {
+                let Some((tensor, ms)) = guard.process_neoamd_peer_chain_rgba8(gc, w, h, rgba)?
+                else {
                     return Ok(None);
                 };
                 (tensor, ms, format!("{name} [NeoAMD]"))
@@ -1817,7 +2012,9 @@ impl FilterChain {
         };
         let mut timings = vec![(first_name, first_ms)];
         for index in 1..count {
-            let Stage::Onnx { name, stage, .. } = &self.stages[index] else { unreachable!() };
+            let Stage::Onnx { name, stage, .. } = &self.stages[index] else {
+                unreachable!()
+            };
             let mut guard = stage.lock().unwrap_or_else(|p| p.into_inner());
             match guard.process_neoamd_peer_chain_input(gc, tensor) {
                 Ok(Some((next, ms))) => {
@@ -1865,46 +2062,79 @@ impl FilterChain {
         h: i32,
         rgba: &[u8],
     ) -> Result<Option<(GpuTex, String, f64)>> {
-        let Some(Stage::Onnx {
-            name,
-            stage,
-            is_interp: false,
-            ..
-        }) = self.stages.first_mut()
-        else {
-            return Ok(None);
-        };
+        // MVUtensils is a CPU/VapourSynth temporal boundary. Feeding it an
+        // imported DirectML/NeoAMD shared texture forces a synchronous GL
+        // readback immediately after provider completion and can turn an
+        // otherwise fast ONNX stage into a 60-80 ms cross-API stall. Keep the
+        // provider CPU-visible only for this exact adjacent boundary. Other
+        // chains retain the established GPU-resident output path unchanged.
+        let next_is_mvutensils = matches!(self.stages.get(1), Some(Stage::Mvutensils { .. }));
+        self.clear_mvutensils_cpu_boundary();
         let t0 = std::time::Instant::now();
-        let mut stage = stage.lock().unwrap();
-        let metrics_name = match stage.provider {
-            OnnxProvider::TensorRT => format!("{name} [TensorRT]"),
-            OnnxProvider::DirectML => format!("{name} [DirectML]"),
-            OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
-            OnnxProvider::Cuda => format!("{name} [CUDA]"),
-            OnnxProvider::NeoAMD => format!("{name} [NeoAMD]"),
-        };
-        // Let the ordinary GPU chain own over-limit DirectML temporal input so
-        // its Spline36 1080p safety cap is applied before this first stage.
-        // Returning None only bypasses this specialized raw-RGBA fast path.
-        if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some() {
-            return Ok(None);
-        }
-        stage.prepare_tensorrt_input_shape(w, h);
-        super::onnx_stage::mark_tensorrt_model_started(&stage.name);
-        // v687: this compatibility hook is intentionally a no-op. The rejected
-        // temporal-reuse experiment no longer synthesizes frames; NeoAccel now
-        // changes only TensorRT engine precision at session-build time.
-        let tex = if let Some((_ow, _oh, texture)) =
-            stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
-        {
-            texture
-        } else if stage.provider == OnnxProvider::NeoAMD {
-            // Ordinary image models keep the source-aware fused RGBA8 ingress.
-            // TemporalFix v054 is different: its high-throughput contract keeps
-            // TRUE-7 history on the Backend Pack GPU, so even a leading WGC
-            // source must enter through the shared NCHW3 surface instead of
-            // falling back to the CPU-visible seven-frame history path.
-            if stage.is_neoamd_temporal_shared_filter() {
+        // Keep the owned CPU hand-off outside the mutable borrow of self.stages.
+        // v840 stored it while `stage` was still borrowed from self, which made
+        // the Windows release build fail with E0499.
+        let mut pending_mvutensils_boundary: Option<(i32, i32, Vec<u8>)> = None;
+        let (tex, metrics_name) = {
+            let Some(Stage::Onnx {
+                name,
+                stage,
+                is_interp: false,
+                ..
+            }) = self.stages.first_mut()
+            else {
+                return Ok(None);
+            };
+            let mut stage = stage.lock().unwrap();
+            let metrics_name = match stage.provider {
+                OnnxProvider::TensorRT => format!("{name} [TensorRT]"),
+                OnnxProvider::DirectML => format!("{name} [DirectML]"),
+                OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
+                OnnxProvider::Cuda => format!("{name} [CUDA]"),
+                OnnxProvider::NeoAMD => format!("{name} [NeoAMD]"),
+            };
+            // Let the ordinary GPU chain own over-limit DirectML temporal input so
+            // its Spline36 1080p safety cap is applied before this first stage.
+            // Returning None only bypasses this specialized raw-RGBA fast path.
+            if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some() {
+                return Ok(None);
+            }
+            stage.prepare_tensorrt_input_shape(w, h);
+            super::onnx_stage::mark_tensorrt_model_started(&stage.name);
+            // v687: this compatibility hook is intentionally a no-op. The rejected
+            // temporal-reuse experiment no longer synthesizes frames; NeoAccel now
+            // changes only TensorRT engine precision at session-build time.
+            let tex = if next_is_mvutensils {
+                let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                let texture = gc.upload_rgba8(ow, oh, &out);
+                pending_mvutensils_boundary = Some((ow, oh, out));
+                texture
+            } else if let Some((_ow, _oh, texture)) =
+                stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
+            {
+                texture
+            } else if stage.provider == OnnxProvider::NeoAMD {
+                // Ordinary image models keep the source-aware fused RGBA8 ingress.
+                // TemporalFix v054 is different: its high-throughput contract keeps
+                // TRUE-7 history on the Backend Pack GPU, so even a leading WGC
+                // source must enter through the shared NCHW3 surface instead of
+                // falling back to the CPU-visible seven-frame history path.
+                if stage.is_neoamd_temporal_shared_filter() {
+                    let source = gc.upload_rgba8(w, h, rgba);
+                    if let Some(texture) = stage.process_gpu_texture(gc, source)? {
+                        texture
+                    } else {
+                        let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                        gc.upload_rgba8(ow, oh, &out)
+                    }
+                } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba)
+                {
+                    texture
+                } else {
+                    let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                    gc.upload_rgba8(ow, oh, &out)
+                }
+            } else if stage.should_try_tensorrt_gpu_texture(w, h) {
                 let source = gc.upload_rgba8(w, h, rgba);
                 if let Some(texture) = stage.process_gpu_texture(gc, source)? {
                     texture
@@ -1917,23 +2147,14 @@ impl FilterChain {
             } else {
                 let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
                 gc.upload_rgba8(ow, oh, &out)
+            };
+            if stage.complete_tensorrt_input_shape(w, h) {
+                super::onnx_stage::mark_tensorrt_model_completed(&stage.name);
             }
-        } else if stage.should_try_tensorrt_gpu_texture(w, h) {
-            let source = gc.upload_rgba8(w, h, rgba);
-            if let Some(texture) = stage.process_gpu_texture(gc, source)? {
-                texture
-            } else {
-                let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
-                gc.upload_rgba8(ow, oh, &out)
-            }
-        } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba) {
-            texture
-        } else {
-            let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
-            gc.upload_rgba8(ow, oh, &out)
+            (tex, metrics_name)
         };
-        if stage.complete_tensorrt_input_shape(w, h) {
-            super::onnx_stage::mark_tensorrt_model_completed(&stage.name);
+        if let Some((ow, oh, out)) = pending_mvutensils_boundary {
+            self.store_mvutensils_cpu_boundary_owned(ow, oh, out);
         }
         Ok(Some((
             tex,
@@ -3129,6 +3350,15 @@ impl FilterChain {
                 Stage::Flow { .. } => {
                     // handled by the engine (needs two frames)
                 }
+                Stage::Mvutensils { .. } => {
+                    if advance_frame {
+                        anyhow::bail!(
+                            "MVUtensils-Neo temporal stage must be scheduled by the render engine"
+                        );
+                    }
+                    // A refresh-only replay is not a new temporal sample. The
+                    // already-filtered image passes through unchanged.
+                }
                 Stage::Onnx { stage, .. } => {
                     // mpv user-shader OFFSET metadata is meant to be consumed
                     // by the next scaler. ONNX is outside mpv's hook pipeline,
@@ -3286,6 +3516,29 @@ mod tests {
         let mut factory = StageFactory::new(PathBuf::from("."));
         let error = factory.build(&flow_spec("builtin:NeoFlow")).err().unwrap();
         assert!(error.to_string().contains("temporarily disabled"));
+    }
+
+    #[test]
+    fn builds_native_mvutensils_stage_without_loading_a_fake_shader() {
+        let mut factory = StageFactory::new(PathBuf::from("."));
+        let stage = factory
+            .build(&StageSpec {
+                kind: StageKind::Mvutensils,
+                path: "builtin:MVUtensils-Neo".into(),
+                enabled: true,
+                params: std::collections::BTreeMap::from([
+                    ("radius".into(), 4.0),
+                    ("thsad_y".into(), 4000.0),
+                    ("thscd2".into(), 100.0),
+                ]),
+            })
+            .unwrap();
+        let Stage::Mvutensils { options } = stage else {
+            panic!("expected native MVUtensils stage");
+        };
+        assert_eq!(options.degrain.radius, 4);
+        assert_eq!(options.degrain.th_sad[0], 4000);
+        assert_eq!(options.degrain.th_scd2, 100.0);
     }
 
     #[test]

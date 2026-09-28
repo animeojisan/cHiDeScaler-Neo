@@ -1,7 +1,7 @@
 //! Optional RGBA8 transport. Untrusted/vendor GPU code executes outside Neo.
 use super::dlssnr_backend::{DLSSNR_CAP_ZERO_GUIDANCE, DlssNrBackend, detect_dlssnr_backend_pack};
-use crate::core::dlssnr::DlssNrOptions;
 use super::gl::{GlContext, GpuTex};
+use crate::core::dlssnr::DlssNrOptions;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
@@ -12,6 +12,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 use windows::Win32::{
     Foundation::HANDLE,
     Graphics::{
@@ -27,11 +28,9 @@ use windows::Win32::{
     },
 };
 use windows::core::PCWSTR;
-use std::time::{Duration, Instant};
 
 const READY: [u8; 4] = *b"NR03";
 const MAX_BYTES: usize = 256 * 1024 * 1024;
-
 
 static DLSSNR_SHARED_KEY: AtomicU64 = AtomicU64::new(0x4e52_0000_0000_0001);
 
@@ -65,9 +64,13 @@ fn luid_bytes(luid: windows::Win32::Foundation::LUID) -> [u8; 8] {
 fn d3d12_device_for_luid(wanted: [u8; 8]) -> Result<ID3D12Device, String> {
     let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }.map_err(|e| e.to_string())?;
     for index in 0u32.. {
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break; };
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
         let desc = unsafe { adapter.GetDesc1() }.map_err(|e| e.to_string())?;
-        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || luid_bytes(desc.AdapterLuid) != wanted {
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+            || luid_bytes(desc.AdapterLuid) != wanted
+        {
             continue;
         }
         let mut device = None;
@@ -92,7 +95,10 @@ impl SharedRgba8Buffer {
         let byte_len = frame_bytes(width, height)?;
         let luid = luid.to_le_bytes();
         let device = d3d12_device_for_luid(luid)?;
-        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: byte_len as u64,
@@ -100,7 +106,10 @@ impl SharedRgba8Buffer {
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_UNKNOWN,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
@@ -144,7 +153,9 @@ fn duplicate_shared_handle_into_child(source: HANDLE, child_pid: u32) -> Result<
     let source_raw = source.0 as isize;
     let target_process = unsafe { raw_open_process(PROCESS_DUP_HANDLE_RAW, 0, child_pid) };
     if target_process == 0 {
-        unsafe { let _ = raw_close_handle(source_raw); }
+        unsafe {
+            let _ = raw_close_handle(source_raw);
+        }
         return Err("OpenProcess(PROCESS_DUP_HANDLE) failed for DLSSNR worker".into());
     }
     let mut duplicated = 0isize;
@@ -329,24 +340,31 @@ impl Worker {
             Ok(child) => child,
             Err(error) => {
                 if let Some((handle, _)) = shared_request {
-                    unsafe { let _ = raw_close_handle(handle.0 as isize); }
+                    unsafe {
+                        let _ = raw_close_handle(handle.0 as isize);
+                    }
                 }
                 return Err(error.to_string());
             }
         };
         let shared_child = match shared_request {
-            Some((handle, byte_len)) => match duplicate_shared_handle_into_child(handle, child.id()) {
-                Ok(child_handle) => Some((child_handle, byte_len)),
-                Err(error) => {
-                    log::warn!("dlssnr-shared-init: stage=duplicate result=fallback-cpu reason={error}");
-                    None
+            Some((handle, byte_len)) => {
+                match duplicate_shared_handle_into_child(handle, child.id()) {
+                    Ok(child_handle) => Some((child_handle, byte_len)),
+                    Err(error) => {
+                        log::warn!(
+                            "dlssnr-shared-init: stage=duplicate result=fallback-cpu reason={error}"
+                        );
+                        None
+                    }
                 }
-            },
+            }
             None => None,
         };
         let mut input = child.stdin.take().ok_or("missing worker stdin")?;
         let mut output = child.stdout.take().ok_or("missing worker stdout")?;
-        let (jobs, incoming) = mpsc::sync_channel::<(Option<Vec<u8>>, bool, Option<DlssNrOptions>)>(1);
+        let (jobs, incoming) =
+            mpsc::sync_channel::<(Option<Vec<u8>>, bool, Option<DlssNrOptions>)>(1);
         let (completed, replies) = mpsc::sync_channel(1);
         let (input_recycle_tx, input_recycle) = mpsc::sync_channel::<Vec<u8>>(1);
         let (output_recycle, output_recycle_rx) = mpsc::sync_channel::<Vec<u8>>(1);
@@ -358,13 +376,23 @@ impl Worker {
                 // inside this child process. Missing/newer bridge support simply selects CPU.
                 match shared_child {
                     Some((child_handle, byte_len)) => {
-                        input.write_all(&[1]).map_err(|e| format!("shared config: {e}"))?;
-                        input.write_all(&child_handle.to_le_bytes()).map_err(|e| format!("shared handle: {e}"))?;
-                        input.write_all(&byte_len.to_le_bytes()).map_err(|e| format!("shared bytes: {e}"))?;
+                        input
+                            .write_all(&[1])
+                            .map_err(|e| format!("shared config: {e}"))?;
+                        input
+                            .write_all(&child_handle.to_le_bytes())
+                            .map_err(|e| format!("shared handle: {e}"))?;
+                        input
+                            .write_all(&byte_len.to_le_bytes())
+                            .map_err(|e| format!("shared bytes: {e}"))?;
                     }
-                    None => input.write_all(&[0]).map_err(|e| format!("shared config: {e}"))?,
+                    None => input
+                        .write_all(&[0])
+                        .map_err(|e| format!("shared config: {e}"))?,
                 }
-                input.flush().map_err(|e| format!("shared config flush: {e}"))?;
+                input
+                    .flush()
+                    .map_err(|e| format!("shared config flush: {e}"))?;
 
                 let mut ready = [0; 4];
                 output
@@ -374,7 +402,9 @@ impl Worker {
                     return Err("invalid worker handshake".into());
                 }
                 let mut shared_status = [0u8; 1];
-                output.read_exact(&mut shared_status).map_err(|e| format!("shared status: {e}"))?;
+                output
+                    .read_exact(&mut shared_status)
+                    .map_err(|e| format!("shared status: {e}"))?;
                 let shared_active = shared_status[0] != 0;
                 completed
                     .send(Ok(WorkerReply {
@@ -390,7 +420,9 @@ impl Worker {
                 while let Ok((pixels, reset, options_update)) = incoming.recv() {
                     let use_shared = pixels.is_none();
                     if use_shared && !shared_active {
-                        return Err("shared DLSSNR job submitted without active shared transport".into());
+                        return Err(
+                            "shared DLSSNR job submitted without active shared transport".into(),
+                        );
                     }
                     if let Some(ref pixels) = pixels {
                         if pixels.len() != bytes {
@@ -418,11 +450,16 @@ impl Worker {
                                 .map_err(|e| format!("input options: {e}"))?;
                         }
                         input
-                            .write_all(&[u8::from(options.auto_mask), u8::from(options.ui_correction)])
+                            .write_all(&[
+                                u8::from(options.auto_mask),
+                                u8::from(options.ui_correction),
+                            ])
                             .map_err(|e| format!("input options: {e}"))?;
                     }
                     if let Some(pixels) = pixels {
-                        input.write_all(&pixels).map_err(|e| format!("input: {e}"))?;
+                        input
+                            .write_all(&pixels)
+                            .map_err(|e| format!("input: {e}"))?;
                         let _ = input_recycle_tx.try_send(pixels);
                     }
                     input.flush().map_err(|e| format!("input flush: {e}"))?;
@@ -605,12 +642,7 @@ impl DlssNrStage {
         }
     }
 
-    fn fallback_shared(
-        &mut self,
-        gc: &mut GlContext,
-        geometry: (u32, u32, u64),
-        reason: &str,
-    ) {
+    fn fallback_shared(&mut self, gc: &mut GlContext, geometry: (u32, u32, u64), reason: &str) {
         log::warn!(
             "dlssnr-shared-fallback: size={}x{} reason={} action=restart-v742-cpu-bridge",
             geometry.0,
@@ -639,7 +671,10 @@ impl DlssNrStage {
         if let Some(shared) = self.shared_buffer.take() {
             gc.clear_external_buffer_key(shared.key);
         }
-        if self.shared_fallback_geometry.is_some_and(|old| old != geometry) {
+        if self
+            .shared_fallback_geometry
+            .is_some_and(|old| old != geometry)
+        {
             self.shared_fallback_geometry = None;
         }
         self.geometry = Some(geometry);
@@ -681,19 +716,27 @@ impl DlssNrStage {
                             }
                             Err(error) => {
                                 gc.clear_external_buffer_key(candidate.key);
-                                log::warn!("dlssnr-shared-init: stage=worker-handle result=fallback-cpu reason={error}");
+                                log::warn!(
+                                    "dlssnr-shared-init: stage=worker-handle result=fallback-cpu reason={error}"
+                                );
                             }
                         },
                         Err(error) => {
-                            log::warn!("dlssnr-shared-init: stage=gl-import result=fallback-cpu reason={error}");
+                            log::warn!(
+                                "dlssnr-shared-init: stage=gl-import result=fallback-cpu reason={error}"
+                            );
                         }
                     },
                     Err(error) => {
-                        log::warn!("dlssnr-shared-init: stage=gl-handle result=fallback-cpu reason={error}");
+                        log::warn!(
+                            "dlssnr-shared-init: stage=gl-handle result=fallback-cpu reason={error}"
+                        );
                     }
                 },
                 Err(error) => {
-                    log::warn!("dlssnr-shared-init: stage=d3d12-buffer result=fallback-cpu reason={error}");
+                    log::warn!(
+                        "dlssnr-shared-init: stage=d3d12-buffer result=fallback-cpu reason={error}"
+                    );
                 }
             }
         }
@@ -820,7 +863,11 @@ impl DlssNrStage {
 
         if shared_active {
             let Some(key) = self.shared_buffer.as_ref().map(|shared| shared.key) else {
-                self.fallback_shared(gc, geometry, "worker selected shared transport without parent buffer");
+                self.fallback_shared(
+                    gc,
+                    geometry,
+                    "worker selected shared transport without parent buffer",
+                );
                 return source;
             };
             if let Err(error) = gc.wait_external_buffer_idle(key) {
@@ -828,7 +875,9 @@ impl DlssNrStage {
                 return source;
             }
             let pack_started = Instant::now();
-            if let Err(error) = gc.rgba_texture_to_external_rgba8(key, source, source.w(), source.h()) {
+            if let Err(error) =
+                gc.rgba_texture_to_external_rgba8(key, source, source.w(), source.h())
+            {
                 self.fallback_shared(gc, geometry, &error);
                 return source;
             }
@@ -914,7 +963,11 @@ impl DlssNrStage {
                     source
                 }
                 Err(error) => {
-                    self.fallback_shared(gc, geometry, &format!("shared evaluation timeout/disconnect: {error}"));
+                    self.fallback_shared(
+                        gc,
+                        geometry,
+                        &format!("shared evaluation timeout/disconnect: {error}"),
+                    );
                     source
                 }
             }
@@ -977,7 +1030,12 @@ impl DlssNrStage {
                             source.w() as u32 % 64 == 0 && source.h() as u32 % 16 == 0,
                         );
                     }
-                    let _ = self.worker.as_ref().unwrap().output_recycle.try_send(reply.pixels);
+                    let _ = self
+                        .worker
+                        .as_ref()
+                        .unwrap()
+                        .output_recycle
+                        .try_send(reply.pixels);
                     texture
                 }
                 Ok(Err(error)) => {
@@ -1015,10 +1073,16 @@ pub fn run_worker() -> Result<(), String> {
         return Err("explicit GPU identity required".into());
     }
     let parse_u32 = |i: usize, name: &str| -> Result<u32, String> {
-        args[i].to_string_lossy().parse().map_err(|_| format!("invalid {name}"))
+        args[i]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| format!("invalid {name}"))
     };
     let parse_f32 = |i: usize, name: &str| -> Result<f32, String> {
-        args[i].to_string_lossy().parse().map_err(|_| format!("invalid {name}"))
+        args[i]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| format!("invalid {name}"))
     };
     let options = crate::core::dlssnr::sanitize_options(DlssNrOptions {
         preset: parse_u32(4, "preset")?,
@@ -1063,11 +1127,15 @@ pub fn run_worker() -> Result<(), String> {
     let mut output = std::io::stdout().lock();
 
     let mut shared_config = [0u8; 1];
-    input.read_exact(&mut shared_config).map_err(|e| format!("shared config: {e}"))?;
+    input
+        .read_exact(&mut shared_config)
+        .map_err(|e| format!("shared config: {e}"))?;
     let mut shared_active = false;
     if shared_config[0] != 0 {
         let mut raw = [0u8; 16];
-        input.read_exact(&mut raw).map_err(|e| format!("shared config: {e}"))?;
+        input
+            .read_exact(&mut raw)
+            .map_err(|e| format!("shared config: {e}"))?;
         let child_handle = u64::from_le_bytes(raw[0..8].try_into().unwrap());
         let shared_bytes = u64::from_le_bytes(raw[8..16].try_into().unwrap());
         if session.shared_rgba8_available() {
@@ -1083,7 +1151,9 @@ pub fn run_worker() -> Result<(), String> {
                 }
             }
         } else {
-            unsafe { let _ = raw_close_handle(child_handle as isize); }
+            unsafe {
+                let _ = raw_close_handle(child_handle as isize);
+            }
             eprintln!("DLSSNR bridge has no shared RGBA8 extension; CPU fallback");
         }
     }
@@ -1136,15 +1206,23 @@ pub fn run_worker() -> Result<(), String> {
             let gpu = session.last_gpu_timing();
             let values = if let Some(timing) = gpu {
                 [
-                    0u64, backend_us, 0u64, 1u64, timing.frame_index,
-                    timing.input_copy_gpu_us, timing.evaluate_gpu_us,
-                    timing.output_copy_gpu_us, timing.gpu_total_us,
+                    0u64,
+                    backend_us,
+                    0u64,
+                    1u64,
+                    timing.frame_index,
+                    timing.input_copy_gpu_us,
+                    timing.evaluate_gpu_us,
+                    timing.output_copy_gpu_us,
+                    timing.gpu_total_us,
                 ]
             } else {
                 [0u64, backend_us, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64]
             };
             for value in values {
-                output.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+                output
+                    .write_all(&value.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
             }
             output.flush().map_err(|e| e.to_string())?;
         } else {
@@ -1164,8 +1242,12 @@ pub fn run_worker() -> Result<(), String> {
             let crop_started = Instant::now();
             let cropped = crop_rgba8(&processed, work_w, work_h, w, h)?;
             let crop_us = crop_started.elapsed().as_micros() as u64;
-            for value in [pad_us, backend_us, crop_us, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64] {
-                output.write_all(&value.to_le_bytes()).map_err(|e| e.to_string())?;
+            for value in [
+                pad_us, backend_us, crop_us, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+            ] {
+                output
+                    .write_all(&value.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
             }
             output
                 .write_all(cropped.as_ref())
@@ -1176,7 +1258,11 @@ pub fn run_worker() -> Result<(), String> {
         if frames == 1 {
             eprintln!(
                 "Feature 18 Evaluate succeeded transport={}",
-                if shared_active { "d3d12-shared-rgba8" } else { "cpu-rgba8" }
+                if shared_active {
+                    "d3d12-shared-rgba8"
+                } else {
+                    "cpu-rgba8"
+                }
             );
         }
     }
@@ -1210,23 +1296,41 @@ mod tests {
 
     #[test]
     fn reflection_padding_and_crop_preserve_original_pixels() {
-        let input = vec![
-            1, 2, 3, 4, 5, 6, 7, 8,
-            9, 10, 11, 12, 13, 14, 15, 16,
-        ];
+        let input = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let padded = pad_rgba8_reflect(&input, 2, 2, 4, 4).unwrap();
-        assert_eq!(&padded[0..16], &[1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8]);
-        assert_eq!(&padded[16..32], &[9,10,11,12,13,14,15,16,9,10,11,12,13,14,15,16]);
-        assert_eq!(&padded[32..48], &[1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8]);
-        assert_eq!(crop_rgba8(&padded, 4, 4, 2, 2).unwrap().as_ref(), input.as_slice());
+        assert_eq!(
+            &padded[0..16],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            &padded[16..32],
+            &[9, 10, 11, 12, 13, 14, 15, 16, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(
+            &padded[32..48],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            crop_rgba8(&padded, 4, 4, 2, 2).unwrap().as_ref(),
+            input.as_slice()
+        );
     }
 
     #[test]
     fn reflection_padding_handles_single_pixel_axis() {
         let input = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let padded = pad_rgba8_reflect(&input, 1, 2, 4, 4).unwrap();
-        assert_eq!(&padded[0..16], &[1,2,3,4,1,2,3,4,1,2,3,4,1,2,3,4]);
-        assert_eq!(&padded[16..32], &[5,6,7,8,5,6,7,8,5,6,7,8,5,6,7,8]);
-        assert_eq!(crop_rgba8(&padded, 4, 4, 1, 2).unwrap().as_ref(), input.as_slice());
+        assert_eq!(
+            &padded[0..16],
+            &[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            &padded[16..32],
+            &[5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            crop_rgba8(&padded, 4, 4, 1, 2).unwrap().as_ref(),
+            input.as_slice()
+        );
     }
 }

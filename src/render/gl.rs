@@ -595,7 +595,11 @@ impl GlContext {
             .ok_or_else(|| "shared D3D12 buffer is not imported".to_string())?;
         let plane = usize::try_from(plane_width)
             .ok()
-            .and_then(|w| usize::try_from(plane_height).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|w| {
+                usize::try_from(plane_height)
+                    .ok()
+                    .and_then(|h| w.checked_mul(h))
+            })
             .ok_or_else(|| "invalid shared output plane dimensions".to_string())?;
         let snapshot_bytes = plane
             .checked_mul(3)
@@ -616,11 +620,8 @@ impl GlContext {
             let snapshot = unsafe { self.gl.create_buffer().map_err(|error| error.to_string())? };
             unsafe {
                 self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, Some(snapshot));
-                self.gl.buffer_data_size(
-                    glow::COPY_WRITE_BUFFER,
-                    snapshot_size,
-                    glow::STREAM_COPY,
-                );
+                self.gl
+                    .buffer_data_size(glow::COPY_WRITE_BUFFER, snapshot_size, glow::STREAM_COPY);
                 self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
             }
             if let Some(import) = self.external_imports.get_mut(&key) {
@@ -649,9 +650,8 @@ impl GlContext {
                 0,
                 snapshot_size,
             );
-            self.gl.memory_barrier(
-                glow::BUFFER_UPDATE_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT,
-            );
+            self.gl
+                .memory_barrier(glow::BUFFER_UPDATE_BARRIER_BIT | glow::SHADER_STORAGE_BARRIER_BIT);
             self.gl.bind_buffer(glow::COPY_READ_BUFFER, None);
             self.gl.bind_buffer(glow::COPY_WRITE_BUFFER, None);
         }
@@ -691,9 +691,8 @@ impl GlContext {
             .ok()
             .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
             .ok_or_else(|| "invalid shared output dimensions".to_string())?;
-        let fast_pair_unpack = width == plane_width
-            && height == plane_height
-            && visible_pixels % 2 == 0;
+        let fast_pair_unpack =
+            width == plane_width && height == plane_height && visible_pixels % 2 == 0;
         let program = if fast_pair_unpack {
             self.compute_program(EXTERNAL_NCHW_F16_TO_RGBA8_PAIR_PIXELS)?
         } else {
@@ -778,7 +777,9 @@ impl GlContext {
             .map(|item| (item.buffer, item.byte_len))
             .ok_or_else(|| "shared D3D12 RGBA8 buffer is not imported".to_string())?;
         if byte_len < expected {
-            return Err(format!("shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"));
+            return Err(format!(
+                "shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"
+            ));
         }
         let program = self.compute_program(RGBA_TEXTURE_TO_EXTERNAL_RGBA8)?;
         unsafe {
@@ -796,11 +797,8 @@ impl GlContext {
             if let Some(loc) = self.gl.get_uniform_location(program, "height") {
                 self.gl.uniform_1_i32(Some(&loc), height);
             }
-            self.gl.dispatch_compute(
-                (width as u32).div_ceil(16),
-                (height as u32).div_ceil(8),
-                1,
-            );
+            self.gl
+                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(8), 1);
             self.gl.memory_barrier(glow::SHADER_STORAGE_BARRIER_BIT);
             self.gl.finish();
             self.gl.bind_texture(source.target(), None);
@@ -831,7 +829,9 @@ impl GlContext {
             .map(|item| (item.buffer, item.byte_len))
             .ok_or_else(|| "shared D3D12 RGBA8 buffer is not imported".to_string())?;
         if byte_len < expected {
-            return Err(format!("shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"));
+            return Err(format!(
+                "shared D3D12 RGBA8 buffer is too small: {byte_len} < {expected}"
+            ));
         }
         let dest = self.make_tex(width, height, 4, Dtype::U8);
         let program = self.compute_program(EXTERNAL_RGBA8_BUFFER_TO_TEXTURE_ALPHA)?;
@@ -841,7 +841,8 @@ impl GlContext {
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
             self.gl.use_program(Some(program));
             self.gl.active_texture(glow::TEXTURE0);
-            self.gl.bind_texture(source_alpha.target(), Some(source_alpha.tex));
+            self.gl
+                .bind_texture(source_alpha.target(), Some(source_alpha.tex));
             if let Some(loc) = self.gl.get_uniform_location(program, "alpha_tex") {
                 self.gl.uniform_1_i32(Some(&loc), 0);
             }
@@ -860,11 +861,8 @@ impl GlContext {
             if let Some(loc) = self.gl.get_uniform_location(program, "height") {
                 self.gl.uniform_1_i32(Some(&loc), height);
             }
-            self.gl.dispatch_compute(
-                (width as u32).div_ceil(16),
-                (height as u32).div_ceil(8),
-                1,
-            );
+            self.gl
+                .dispatch_compute((width as u32).div_ceil(16), (height as u32).div_ceil(8), 1);
             self.gl.memory_barrier(
                 glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
             );
@@ -1143,7 +1141,11 @@ impl GlContext {
         let elements = pixels
             .checked_mul(3)
             .ok_or_else(|| "shared input element count overflow".to_string())?;
-        let work_items = if fast_pair_pack { pixels / 2 } else { elements.div_ceil(2) };
+        let work_items = if fast_pair_pack {
+            pixels / 2
+        } else {
+            elements.div_ceil(2)
+        };
         unsafe {
             self.gl
                 .bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 0, Some(buffer));
