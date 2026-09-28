@@ -19,6 +19,7 @@ cHiDeScaler-Neo captures a Windows application window and applies real-time GLSL
 * GLSL / ONNX filter chains and presets
 * User-addable ONNX models and mpv-compatible GLSL shaders
 * DirectML ONNX backend
+* Newly developed **NeoAMD** ONNX backend (**1.5–2× faster than DirectML**)
 * Optional TensorRT backend for GeForce RTX 20 / 30 / 40 / 50 Series
 * RIFE / DRBA frame interpolation (x2–x5)
 * FPS limit / duplicate-frame reduction
@@ -80,6 +81,7 @@ cHiDeScaler-Neo は、PC上の任意のウィンドウをリアルタイムに�
 * GLSL / ONNXフィルターチェーンとプリセット
 * ユーザーによるONNXモデル / mpv互換GLSLシェーダーの追加
 * DirectML ONNXバックエンド
+* 新開発のNeoAMD ONNXバックエンド（DirectML比1.5～2倍高速）
 * GeForce RTX 20 / 30 / 40 / 50シリーズ向けオプションTensorRTバックエンド
 * RIFE / DRBA フレーム補間（x2～x5）
 * FPS上限 / 重複フレーム削減
