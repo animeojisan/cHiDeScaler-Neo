@@ -485,11 +485,11 @@
       }
     },
     {
-      "name": "RIFE Lite XS  FG",
+      "name": "NeoRIFE XS  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite50_fp16.onnx",
           "enabled": true
         }
       ],
@@ -508,41 +508,57 @@
       }
     },
     {
-      "name": "RIFE Lite S  FG",
+      "name": "NeoRIFE S  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite75_fp16.onnx",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "RIFE Lite  FG",
+      "name": "NeoRIFE  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_fp16.onnx",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "DRBA v2  FG",
+      "name": "NeoRIFE XS + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
-          "enabled": true
-        }
-      ]
-    },
-    {
-      "name": "RIFE Lite XS + FSRCNNX  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -566,11 +582,11 @@
       }
     },
     {
-      "name": "RIFE Lite S + FSRCNNX  FG",
+      "name": "NeoRIFE S + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -578,14 +594,27 @@
           "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "RIFE Lite + FSRCNNX  FG",
+      "name": "NeoRIFE + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_fp16.onnx",
           "enabled": true
         },
         {
@@ -593,14 +622,27 @@
           "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "RIFE Lite XS + Anime4K  [720p]  FG",
+      "name": "NeoRIFE XS + Anime4K  [720p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -637,11 +679,11 @@
       }
     },
     {
-      "name": "RIFE Lite S + Anime4K  [720p]  FG",
+      "name": "NeoRIFE S + Anime4K  [720p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -662,14 +704,27 @@
           "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "DRBA + Anime4K  [720p]  FG",
+      "name": "NeoRIFE + Anime4K  [720p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_fp16.onnx",
           "enabled": true
         },
         {
@@ -682,34 +737,27 @@
           "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "RIFE Lite + Anime4K  [720p]  FG",
+      "name": "NeoRIFE XS + Anime4K  [1080p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
-          "enabled": true
-        }
-      ]
-    },
-    {
-      "name": "RIFE Lite XS + Anime4K  [1080p]  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -738,11 +786,11 @@
       }
     },
     {
-      "name": "RIFE Lite S + Anime4K  [1080p]  FG",
+      "name": "NeoRIFE S + Anime4K  [1080p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -755,34 +803,27 @@
           "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     },
     {
-      "name": "DRBA + Anime4K  [1080p]  FG",
+      "name": "NeoRIFE + Anime4K  [1080p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/DRBA/distilDRBA_v2_lite_fp16.onnx",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
-          "enabled": true
-        }
-      ]
-    },
-    {
-      "name": "RIFE Lite + Anime4K  [1080p]  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/rife_v4.22_lite_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_fp16.onnx",
           "enabled": true
         },
         {
@@ -795,7 +836,20 @@
           "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
           "enabled": true
         }
-      ]
+      ],
+      "aspect_correction": {
+        "enabled": false,
+        "mode": "manual",
+        "width_scale": 1.0,
+        "height_scale": 1.0
+      },
+      "crop": {
+        "enabled": false,
+        "left": 0,
+        "top": 0,
+        "right": 0,
+        "bottom": 0
+      }
     }
   ]
 }

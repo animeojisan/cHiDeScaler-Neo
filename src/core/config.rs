@@ -23,7 +23,7 @@ pub struct StageSpec {
 /// legitimately uses +Infinity for limits such as `limit_y` / `limit_c`, so
 /// persist only infinities as stable strings while keeping every finite value
 /// in the existing numeric JSON representation. This is backwards-compatible
-/// with presets written by earlier releases.
+/// with all presets written before v852.
 mod stage_param_map {
     use serde::de::{self, MapAccess, Visitor};
     use serde::ser::SerializeMap;
@@ -39,10 +39,7 @@ mod stage_param_map {
         Null(()),
     }
 
-    pub fn serialize<S>(
-        params: &BTreeMap<String, f32>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(params: &BTreeMap<String, f32>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -94,7 +91,7 @@ mod stage_param_map {
                             _ => {
                                 return Err(de::Error::custom(format!(
                                     "invalid non-finite stage parameter '{key}': {token}"
-                                )))
+                                )));
                             }
                         },
                         // serde_json <= v851 serialized non-finite f32 values
@@ -108,7 +105,7 @@ mod stage_param_map {
                         StoredParam::Null(()) => {
                             return Err(de::Error::custom(format!(
                                 "null stage parameter '{key}' is not supported"
-                            )))
+                            )));
                         }
                     };
                     out.insert(key, value);

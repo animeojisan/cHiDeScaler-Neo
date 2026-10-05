@@ -1040,6 +1040,95 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_drop_in_model_and_shader_round_trip_through_presets_json() {
+        let root = temp_filter_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("presets.json");
+        let mut onnx = StageSpec {
+            kind: StageKind::Onnx,
+            path: "models/User Pack/NeoFlow_Custom_User.onnx".into(),
+            enabled: true,
+            params: Default::default(),
+        };
+        onnx.params.insert("strength".into(), 0.75);
+        let glsl = StageSpec {
+            kind: StageKind::Glsl,
+            path: "shaders/User Pack/My Custom Shader.glsl".into(),
+            enabled: false,
+            params: Default::default(),
+        };
+        let data = PresetFile {
+            active: "User drop-ins".into(),
+            presets: vec![Preset {
+                name: "User drop-ins".into(),
+                chain: vec![onnx, glsl],
+                aspect_correction: None,
+                crop: None,
+                capture_resolution: None,
+            }],
+        };
+        let store = PresetStore {
+            path,
+            data: data.clone(),
+        };
+        assert!(store.save());
+        let loaded = PresetStore::load(&root);
+        assert_eq!(loaded.data, data);
+        let saved = &loaded.active().unwrap().chain;
+        assert_eq!(saved[0].path, "models/User Pack/NeoFlow_Custom_User.onnx");
+        assert_eq!(saved[1].path, "shaders/User Pack/My Custom Shader.glsl");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overwrite_active_persists_arbitrary_user_model_and_shader() {
+        let root = temp_filter_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("presets.json");
+        let mut store = PresetStore {
+            path,
+            data: PresetFile {
+                active: "User preset".into(),
+                presets: vec![Preset {
+                    name: "User preset".into(),
+                    chain: vec![],
+                    aspect_correction: None,
+                    crop: None,
+                    capture_resolution: None,
+                }],
+            },
+        };
+        let chain = vec![
+            StageSpec {
+                kind: StageKind::Onnx,
+                path: "models/My Models/custom_interpolator_fp16.onnx".into(),
+                enabled: true,
+                params: Default::default(),
+            },
+            StageSpec {
+                kind: StageKind::Glsl,
+                path: "shaders/My Shaders/custom_filter.glsl".into(),
+                enabled: true,
+                params: Default::default(),
+            },
+        ];
+        assert_eq!(
+            store.overwrite_active_as(
+                "User preset",
+                &chain,
+                PresetAspectCorrection::default(),
+                CaptureCrop::default(),
+                None,
+            ),
+            Ok("User preset".into())
+        );
+        assert!(store.save());
+        let loaded = PresetStore::load(&root);
+        assert_eq!(loaded.active().unwrap().chain, chain);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn save_replaces_an_existing_presets_file() {
         let root = temp_filter_dir();
         std::fs::create_dir_all(&root).unwrap();
@@ -1054,10 +1143,9 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.active, "A");
         assert_eq!(saved, store.data);
-        let backup: PresetFile = serde_json::from_str(
-            &std::fs::read_to_string(root.join("presets.json.bak")).unwrap(),
-        )
-        .unwrap();
+        let backup: PresetFile =
+            serde_json::from_str(&std::fs::read_to_string(root.join("presets.json.bak")).unwrap())
+                .unwrap();
         assert_eq!(backup, store.data);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1091,17 +1179,19 @@ mod tests {
                 capture_resolution: None,
             }],
         };
-        let store = PresetStore { path, data: data.clone() };
+        let store = PresetStore {
+            path,
+            data: data.clone(),
+        };
         assert!(store.save());
         let persisted_text = std::fs::read_to_string(root.join("presets.json")).unwrap();
         assert!(persisted_text.contains(r#""limit_y": "Infinity""#));
         assert!(persisted_text.contains(r#""limit_c": "Infinity""#));
         let loaded = PresetStore::load(&root);
         assert_eq!(loaded.data, data);
-        let backup: PresetFile = serde_json::from_str(
-            &std::fs::read_to_string(root.join("presets.json.bak")).unwrap(),
-        )
-        .unwrap();
+        let backup: PresetFile =
+            serde_json::from_str(&std::fs::read_to_string(root.join("presets.json.bak")).unwrap())
+                .unwrap();
         assert_eq!(backup, data);
         let _ = std::fs::remove_dir_all(root);
     }

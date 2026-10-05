@@ -129,7 +129,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "v0.99.4";
+const BUILD_ID: &str = "20261005-v855-drba-model-preset-cleanup";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -952,9 +952,8 @@ fn main() -> eframe::Result {
     // WGPU/WGL as presentation devices and switches compute backends directly,
     // so a manual GPU change while capture is stopped requires no Neo restart.
     log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
-    // Show the build tag in the title so a still-running older instance is
-    // immediately distinguishable from the executable currently on disk.
-    let build_tag = BUILD_ID.split('-').nth(1).unwrap_or("dev");
+    // Public release title: keep the native title bar stable and free of
+    // internal development/build identifiers. BUILD_ID remains log-only.
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -969,7 +968,7 @@ fn main() -> eframe::Result {
         .with_minimize_button(true)
         .with_maximize_button(false)
         .with_maximized(false)
-        .with_title(format!("cHiDeScaler-Neo [{build_tag}]"))
+        .with_title("cHiDeScaler-Neo")
         .with_visible(!saved.3);
     // restore the remembered window placement (sanity-checked)
     if let Some((w, h)) = saved.1 {
@@ -2335,7 +2334,12 @@ fn build_filter_tree(available: &[(StageKind, String)]) -> FilterNode {
 }
 
 fn is_frozen_neoflow_stage(stage: &StageSpec) -> bool {
-    stage.kind == StageKind::Flow || stage.path.to_ascii_lowercase().contains("neoflow")
+    // Only the dedicated built-in NeoFlow stage is frozen. User drop-in files
+    // are ordinary GLSL/ONNX stages and their filename/path is user-owned; a
+    // path containing "NeoFlow" must never make a saved preset silently lose
+    // that stage on startup or preset selection. Discovery already hides the
+    // known frozen experimental external NeoFlow shader sources by signature.
+    stage.kind == StageKind::Flow
 }
 
 fn log_ui_test_rect(id: &str, response: &egui::Response) {
@@ -2677,8 +2681,7 @@ fn render_filter_param_row(ui: &mut egui::Ui, param: &mut Param, mvutensils: boo
             ParamTy::Float | ParamTy::ConstFloat => {
                 if param.min.is_finite() && param.max.is_finite() {
                     ui.add(
-                        egui::Slider::new(&mut param.value, param.min..=param.max)
-                            .show_value(true),
+                        egui::Slider::new(&mut param.value, param.min..=param.max).show_value(true),
                     )
                 } else {
                     ui.add(
@@ -7892,7 +7895,11 @@ impl App {
             self.compositor_anchor_state_sent = Some(state);
             log::info!(
                 "compositor-keepalive-anchor: active=true contract=v459 mode={} hwnd={:#x} panel={:#x} overlay={:#x} anchor_above_overlay={} panel_above_anchor={} rect={:?} present_ms={:.2}",
-                if keepalive_only { "panel-hidden" } else { "panel-visible" },
+                if keepalive_only {
+                    "panel-hidden"
+                } else {
+                    "panel-visible"
+                },
                 anchor,
                 self.panel_hwnd,
                 status.overlay_hwnd,
@@ -12610,6 +12617,31 @@ impl eframe::App for App {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[test]
+    fn frozen_neoflow_filter_does_not_drop_user_named_onnx_or_glsl() {
+        let builtin = StageSpec {
+            kind: StageKind::Flow,
+            path: "builtin:NeoFlow".into(),
+            enabled: true,
+            params: Default::default(),
+        };
+        let user_onnx = StageSpec {
+            kind: StageKind::Onnx,
+            path: "models/User/NeoFlow_Custom.onnx".into(),
+            enabled: true,
+            params: Default::default(),
+        };
+        let user_glsl = StageSpec {
+            kind: StageKind::Glsl,
+            path: "shaders/User/NeoFlow_Custom.glsl".into(),
+            enabled: true,
+            params: Default::default(),
+        };
+        assert!(is_frozen_neoflow_stage(&builtin));
+        assert!(!is_frozen_neoflow_stage(&user_onnx));
+        assert!(!is_frozen_neoflow_stage(&user_glsl));
+    }
 
     #[test]
     fn every_root_editor_suppresses_native_start_stop_hit_testing() {

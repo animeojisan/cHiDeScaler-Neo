@@ -80,9 +80,6 @@ this repository. Optional DLSSNR support is isolated behind the external
 placed there remains subject to its own applicable license, authorization, and
 redistribution terms.
 
-The developer-only pass-through bridge under
-`backends/dlssnr/reference_stub/` contains no NVIDIA code and performs no
-neural rendering.
 
 Public implementation research used to validate the initial same-resolution,
 zero-guidance architecture includes the MIT-licensed experimental project:
