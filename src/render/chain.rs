@@ -175,6 +175,7 @@ impl Stage {
                     OnnxProvider::MigraphX => "MIGraphX",
                     OnnxProvider::Cuda => "CUDA",
                     OnnxProvider::NeoAMD => "NeoAMD",
+                    OnnxProvider::NeoRTX => "NeoRTX",
                 };
                 format!("{name} [{provider}]")
             }
@@ -195,6 +196,7 @@ struct OnnxCacheKey {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OnnxBackendUsage {
     pub neoamd: usize,
+    pub neortx: usize,
     pub tensorrt: usize,
     pub cuda: usize,
     pub directml: usize,
@@ -307,7 +309,12 @@ impl StageFactory {
             .count();
         let carried_neoamd = onnx
             .keys()
-            .filter(|key| key.preference == OnnxBackendPreference::NeoAMD)
+            .filter(|key| {
+                matches!(
+                    key.preference,
+                    OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
+                )
+            })
             .count();
         if carried_tensorrt > 0 || carried_neoamd > 0 {
             log::info!(
@@ -556,7 +563,9 @@ impl StageFactory {
         // Stop -> Start while still preventing unbounded preset/model growth.
         if !matches!(
             self.onnx_preference,
-            OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+            OnnxBackendPreference::TensorRT
+                | OnnxBackendPreference::NeoAMD
+                | OnnxBackendPreference::NeoRTX
         ) {
             self.onnx.retain(|key, _| active.contains(key));
         } else {
@@ -585,8 +594,7 @@ impl StageFactory {
         }
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx
-            .retain(|key| remaining.contains(key));
+        self.last_active_onnx.retain(|key| remaining.contains(key));
     }
 
     fn evict_onnx_path(&mut self, path: &str) -> usize {
@@ -594,8 +602,7 @@ impl StageFactory {
         self.onnx.retain(|key, _| key.path != path);
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx
-            .retain(|key| remaining.contains(key));
+        self.last_active_onnx.retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
@@ -625,8 +632,7 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx
-            .retain(|key| remaining.contains(key));
+        self.last_active_onnx.retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
@@ -650,8 +656,7 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx
-            .retain(|key| remaining.contains(key));
+        self.last_active_onnx.retain(|key| remaining.contains(key));
         let dropped = before.saturating_sub(self.onnx.len());
         if dropped > 0 {
             log::info!(
@@ -686,7 +691,9 @@ impl StageFactory {
             }
             if matches!(
                 key.preference,
-                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+                OnnxBackendPreference::TensorRT
+                    | OnnxBackendPreference::NeoAMD
+                    | OnnxBackendPreference::NeoRTX
             ) && self.onnx.contains_key(key)
             {
                 keep.insert(key.clone());
@@ -699,7 +706,9 @@ impl StageFactory {
             }
             if matches!(
                 key.preference,
-                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD
+                OnnxBackendPreference::TensorRT
+                    | OnnxBackendPreference::NeoAMD
+                    | OnnxBackendPreference::NeoRTX
             ) && self.onnx.contains_key(key)
             {
                 keep.insert(key.clone());
@@ -708,8 +717,7 @@ impl StageFactory {
         self.onnx.retain(|key, _| keep.contains(key));
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx
-            .retain(|key| remaining.contains(key));
+        self.last_active_onnx.retain(|key| remaining.contains(key));
         let kept = self.onnx.len();
         if before != kept || kept > 0 {
             let kept_trt = self
@@ -720,7 +728,12 @@ impl StageFactory {
             let kept_neoamd = self
                 .onnx
                 .keys()
-                .filter(|key| key.preference == OnnxBackendPreference::NeoAMD)
+                .filter(|key| {
+                    matches!(
+                        key.preference,
+                        OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
+                    )
+                })
                 .count();
             log::info!(
                 "onnx-session-restart-cache: kept_tensorrt={} kept_neoamd={} dropped_other={} limit={} last_active={} policy=last-chain-first-then-lru",
@@ -987,14 +1000,22 @@ impl FilterChain {
     /// path so they do not pay an extra queueing frame for no throughput gain.
     pub fn mvutensils_cpu_pipeline_beneficial(&self, index: usize) -> bool {
         let regular_onnx = |stage: Option<&Stage>| {
-            matches!(stage, Some(Stage::Onnx { is_interp: false, .. }))
+            matches!(
+                stage,
+                Some(Stage::Onnx {
+                    is_interp: false,
+                    ..
+                })
+            )
         };
         regular_onnx(index.checked_sub(1).and_then(|i| self.stages.get(i)))
             || regular_onnx(self.stages.get(index + 1))
     }
 
     pub fn store_mvutensils_cpu_boundary_copy(&mut self, w: i32, h: i32, rgba: &[u8]) {
-        let need = (w.max(0) as usize).saturating_mul(h.max(0) as usize).saturating_mul(4);
+        let need = (w.max(0) as usize)
+            .saturating_mul(h.max(0) as usize)
+            .saturating_mul(4);
         if rgba.len() != need {
             self.mvutensils_cpu_boundary_size = None;
             return;
@@ -1081,7 +1102,7 @@ impl FilterChain {
                 );
                 poisoned.into_inner()
             });
-            if stage.provider != OnnxProvider::NeoAMD {
+            if !stage.provider.is_native_pack() {
                 continue;
             }
             stage.retire_neoamd_shared_output(gc);
@@ -1111,7 +1132,8 @@ impl FilterChain {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .provider
-                        != OnnxProvider::NeoAMD =>
+                        .is_native_pack()
+                        == false =>
                 {
                     Some((
                         index,
@@ -1218,6 +1240,7 @@ impl FilterChain {
                         OnnxProvider::MigraphX => "MIGraphX",
                         OnnxProvider::Cuda => "CUDA",
                         OnnxProvider::NeoAMD => "NeoAMD",
+                        OnnxProvider::NeoRTX => "NeoRTX",
                     };
                     format!("{name} [{provider}]")
                 },
@@ -1587,6 +1610,7 @@ impl FilterChain {
             let stage = stage.lock().unwrap();
             match stage.provider {
                 OnnxProvider::NeoAMD => usage.neoamd += 1,
+                OnnxProvider::NeoRTX => usage.neortx += 1,
                 OnnxProvider::TensorRT => usage.tensorrt += 1,
                 OnnxProvider::Cuda => usage.cuda += 1,
                 OnnxProvider::DirectML | OnnxProvider::MigraphX => usage.directml += 1,
@@ -1621,13 +1645,11 @@ impl FilterChain {
                 stage,
                 is_interp: false,
                 ..
-            }) => {
-                stage
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .provider
-                    == OnnxProvider::NeoAMD
-            }
+            }) => stage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .provider
+                .is_native_pack(),
             _ => false,
         };
         if !first_is_neoamd {
@@ -1685,7 +1707,13 @@ impl FilterChain {
                 let has_mvutensils = self.mvutensils_stage().is_some();
                 let pre = if has_mvutensils {
                     self.process_range_with_frame_tick(
-                        gc, input, out_size, 0, interp_index, None, false,
+                        gc,
+                        input,
+                        out_size,
+                        0,
+                        interp_index,
+                        None,
+                        false,
                     )?
                 } else {
                     self.process_range(gc, input, out_size, 0, interp_index, None)?
@@ -1697,7 +1725,40 @@ impl FilterChain {
                         let frame_count = stage.interp_frames();
                         let frames =
                             std::iter::repeat_n(rgb.as_slice(), frame_count).collect::<Vec<_>>();
-                        stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?
+                        let result = stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?;
+                        // NeoRTX live interpolation uses RGBA shared output and
+                        // separate pair preparation/phase graphs. The RGB CPU
+                        // probe above does not warm either of these resources.
+                        if stage.provider == OnnxProvider::NeoRTX
+                            && stage.supports_neoamd_interp_shared_rgba8()
+                        {
+                            let rgba = gc.download_rgba8(pre);
+                            let live_frames = std::iter::repeat_n(rgba.as_slice(), frame_count)
+                                .collect::<Vec<_>>();
+                            for pass in 1..=3 {
+                                if let Some(shared) = stage
+                                    .prepare_neoamd_interp_stream_shared_rgba8(
+                                        pre.w(),
+                                        pre.h(),
+                                        &live_frames,
+                                    )?
+                                {
+                                    stage.run_neoamd_interp_stream_phase_shared_rgba8(
+                                        pre.w(),
+                                        pre.h(),
+                                        frame_count,
+                                        0.5,
+                                        shared,
+                                    )?;
+                                    log::debug!(
+                                        "neortx-interp-live-prime: pass={pass} size={}x{} route=shared-rgba8",
+                                        pre.w(),
+                                        pre.h()
+                                    );
+                                }
+                            }
+                        }
+                        result
                     }
                     Stage::Flow { .. } => (pre.w(), pre.h(), rgb),
                     Stage::Glsl { .. }
@@ -2006,7 +2067,7 @@ impl FilterChain {
                 else {
                     return Ok(None);
                 };
-                (tensor, ms, format!("{name} [NeoAMD]"))
+                (tensor, ms, format!("{name} [{:?}]", guard.provider))
             }
             _ => return Ok(None),
         };
@@ -2019,7 +2080,7 @@ impl FilterChain {
             match guard.process_neoamd_peer_chain_input(gc, tensor) {
                 Ok(Some((next, ms))) => {
                     tensor = next;
-                    timings.push((format!("{name} [NeoAMD]"), ms));
+                    timings.push((format!("{name} [{:?}]", guard.provider), ms));
                 }
                 Ok(None) => return Ok(None),
                 Err(error) => {
@@ -2092,11 +2153,13 @@ impl FilterChain {
                 OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
                 OnnxProvider::Cuda => format!("{name} [CUDA]"),
                 OnnxProvider::NeoAMD => format!("{name} [NeoAMD]"),
+                OnnxProvider::NeoRTX => format!("{name} [NeoRTX]"),
             };
             // Let the ordinary GPU chain own over-limit DirectML temporal input so
             // its Spline36 1080p safety cap is applied before this first stage.
             // Returning None only bypasses this specialized raw-RGBA fast path.
-            if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some() {
+            if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some()
+            {
                 return Ok(None);
             }
             stage.prepare_tensorrt_input_shape(w, h);
@@ -2113,7 +2176,7 @@ impl FilterChain {
                 stage.try_process_rgba8_neo_texture(gc, w, h, rgba)?
             {
                 texture
-            } else if stage.provider == OnnxProvider::NeoAMD {
+            } else if stage.provider.is_native_pack() {
                 // Ordinary image models keep the source-aware fused RGBA8 ingress.
                 // TemporalFix v054 is different: its high-throughput contract keeps
                 // TRUE-7 history on the Backend Pack GPU, so even a leading WGC
@@ -2127,7 +2190,8 @@ impl FilterChain {
                         let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
                         gc.upload_rgba8(ow, oh, &out)
                     }
-                } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba)
+                } else if let Some((_ow, _oh, texture)) =
+                    stage.process_rgba8_gpu_output(gc, w, h, rgba)
                 {
                     texture
                 } else {
@@ -2142,7 +2206,8 @@ impl FilterChain {
                     let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
                     gc.upload_rgba8(ow, oh, &out)
                 }
-            } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba) {
+            } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba)
+            {
                 texture
             } else {
                 let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;

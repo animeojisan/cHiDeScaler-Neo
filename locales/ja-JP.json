@@ -20,7 +20,7 @@
   "filter.none": "（フィルターがありません）",
   "display.label": "表示:",
   "display.fullscreen": "全画面",
-  "display.windowed": "倍率",
+  "display.windowed": "ウィンドウ",
   "capture.size": "キャプチャ解像度:",
   "panel.keep_visible": "常時表示に戻す",
   "capture.stop_icon": "■ 停止",

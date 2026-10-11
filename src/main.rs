@@ -31,7 +31,9 @@ use chidescaler_neo::platform::tray::{TrayEvent, TrayLabels, TrayThread};
 use chidescaler_neo::platform::win32;
 use chidescaler_neo::render::dlssnr_backend::detect_dlssnr_backend_pack;
 use chidescaler_neo::render::mpv::{Param, ParamTy, UserShader};
-use chidescaler_neo::render::neoamd_backend::{NeoAmdAvailability, detect_neoamd_backend};
+use chidescaler_neo::render::neoamd_backend::{
+    NeoAmdAvailability, detect_neoamd_backend, detect_neortx_backend,
+};
 use chidescaler_neo::render::onnx_backend::{
     TensorRtAvailability, detect_tensorrt_backend, tensorrt_cache_root,
 };
@@ -129,7 +131,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20261005-v855-drba-model-preset-cleanup";
+const BUILD_ID: &str = "20261011-v867-public-0996";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -870,6 +872,15 @@ fn main() -> eframe::Result {
     logging::init();
     install_emergency_cleanup();
     log::info!("cHiDeScaler-Neo build {BUILD_ID}");
+    // Prepare the optional portable backend location before the UI checks packs.
+    let neortx_dir = app_dir().join("backends").join("neortx");
+    if let Err(error) = std::fs::create_dir_all(&neortx_dir) {
+        log::warn!(
+            "NeoRTX backend folder: path={} error={error}",
+            neortx_dir.display()
+        );
+    }
+
     // v617 production-test breadcrumb: record the opt-in as soon as the real
     // GUI process starts, before elevation, settings load, singleton handoff,
     // WGPU/WGL creation, or any Vulkan initialization.  This makes a second-
@@ -952,8 +963,6 @@ fn main() -> eframe::Result {
     // WGPU/WGL as presentation devices and switches compute backends directly,
     // so a manual GPU change while capture is stopped requires no Neo restart.
     log::info!("gpu-preference: portable vendor hints enabled; persistent registry override=false");
-    // Public release title: keep the native title bar stable and free of
-    // internal development/build identifiers. BUILD_ID remains log-only.
     let (default_size, min_size) = match saved.2 {
         UiMode::Mini => (MINI_DEFAULT_SIZE, MINI_MIN_SIZE),
         UiMode::Basic => (BASIC_DEFAULT_SIZE, BASIC_MIN_SIZE),
@@ -3040,6 +3049,7 @@ struct App {
     custom_locales: Vec<i18n::CustomLocale>,
     tensorrt_availability: TensorRtAvailability,
     neoamd_availability: NeoAmdAvailability,
+    neortx_availability: NeoAmdAvailability,
     onnx_backend_selected: OnnxBackendPreference,
     onnx_backend_pending: Option<OnnxBackendPreference>,
     onnx_backend_revision_seen: u64,
@@ -3308,6 +3318,8 @@ impl App {
                 );
             }
         }
+        let neortx_availability =
+            detect_neortx_for_selection(&dir, &gpu_adapters, settings.gpu_adapter_luid, None);
         let neoamd_availability =
             detect_neoamd_for_selection(&dir, &gpu_adapters, settings.gpu_adapter_luid, None);
         if neoamd_availability.installed {
@@ -3342,6 +3354,9 @@ impl App {
         let tensorrt_crop_start_allowed =
             tensorrt_crop_switch_allowed(settings.capture_crop, active_crop);
         let onnx_backend_selected = match settings.onnx_backend {
+            OnnxBackendPreference::NeoRTX if neortx_availability.available => {
+                OnnxBackendPreference::NeoRTX
+            }
             OnnxBackendPreference::NeoAMD if neoamd_availability.available => {
                 OnnxBackendPreference::NeoAMD
             }
@@ -3563,6 +3578,7 @@ impl App {
             custom_locales,
             tensorrt_availability,
             neoamd_availability,
+            neortx_availability,
             onnx_backend_selected,
             onnx_backend_pending: None,
             onnx_backend_revision_seen: 0,
@@ -3698,6 +3714,68 @@ impl App {
                         cache_root,
                     });
                 } else if self.onnx_backend_selected == OnnxBackendPreference::NeoAMD
+                    && mapping_changed
+                {
+                    let cache_root =
+                        tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, None);
+                    self.engine.send(Cmd::SetGpuSelection {
+                        gpu_adapter: gpu::device_id_for_luid(&self.gpu_adapters, Some(actual)),
+                        explicit_gpu_luid: None,
+                        force_vulkan_glsl: false,
+                        backend: self.onnx_backend_selected,
+                        trt_device_id: self.tensorrt_availability.device_id,
+                        cache_root,
+                    });
+                }
+            }
+
+            if requested.is_none()
+                && self.neortx_availability.manifest.is_some()
+                && let Some(actual) = status.render_gpu_luid
+            {
+                let reprobe = detect_neortx_for_selection(
+                    &self.app_dir,
+                    &self.gpu_adapters,
+                    None,
+                    Some(actual),
+                );
+                let mapping_changed = reprobe.available != self.neortx_availability.available
+                    || reprobe.gpu_luid != self.neortx_availability.gpu_luid
+                    || reprobe.gpu_architecture != self.neortx_availability.gpu_architecture;
+                if mapping_changed {
+                    log::info!(
+                        "neortx-auto-reprobe: phase=post-render-gpu requested=Auto actual_gl_luid={actual:016x} available={} arch={} reason='{}'",
+                        reprobe.available,
+                        reprobe.gpu_architecture.as_deref().unwrap_or("unavailable"),
+                        reprobe.reason.as_deref().unwrap_or("none")
+                    );
+                }
+                self.neortx_availability = reprobe;
+                if self.onnx_backend_selected == OnnxBackendPreference::NeoRTX
+                    && !self.neortx_availability.available
+                {
+                    log::warn!(
+                        "neortx-auto-reprobe: active=NeoRTX result=unavailable action=DirectML reason='{}'",
+                        self.neortx_availability
+                            .reason
+                            .as_deref()
+                            .unwrap_or("Auto render GPU is not NeoRTX compatible")
+                    );
+                    self.settings.onnx_backend = OnnxBackendPreference::DirectML;
+                    self.onnx_backend_selected = OnnxBackendPreference::DirectML;
+                    self.onnx_backend_pending = None;
+                    save_settings(&self.app_dir, &self.settings);
+                    let cache_root =
+                        tensorrt_cache_root(&self.app_dir, &self.tensorrt_availability, None);
+                    self.engine.send(Cmd::SetGpuSelection {
+                        gpu_adapter: gpu::device_id_for_luid(&self.gpu_adapters, Some(actual)),
+                        explicit_gpu_luid: None,
+                        force_vulkan_glsl: false,
+                        backend: OnnxBackendPreference::DirectML,
+                        trt_device_id: self.tensorrt_availability.device_id,
+                        cache_root,
+                    });
+                } else if self.onnx_backend_selected == OnnxBackendPreference::NeoRTX
                     && mapping_changed
                 {
                     let cache_root =
@@ -4079,6 +4157,18 @@ impl App {
                 self.onnx_backend_pending = None;
             }
             self.tensorrt_availability = new_tensorrt;
+            self.neortx_availability = detect_neortx_for_selection(
+                &self.app_dir,
+                &self.gpu_adapters,
+                requested,
+                render_gpu_luid,
+            );
+            if backend == OnnxBackendPreference::NeoRTX && !self.neortx_availability.available {
+                backend = OnnxBackendPreference::DirectML;
+                self.settings.onnx_backend = backend;
+                self.onnx_backend_selected = backend;
+                self.onnx_backend_pending = None;
+            }
             self.neoamd_availability = new_neoamd;
             self.settings.gpu_adapter_luid = requested;
             self.settings.gpu_force_vulkan = force_vulkan_glsl;
@@ -4112,6 +4202,9 @@ impl App {
 
     fn request_onnx_backend_switch(&mut self, backend: OnnxBackendPreference) {
         if backend == OnnxBackendPreference::TensorRT && !self.tensorrt_availability.available {
+            return;
+        }
+        if backend == OnnxBackendPreference::NeoRTX && !self.neortx_availability.available {
             return;
         }
         if backend == OnnxBackendPreference::NeoAMD && !self.neoamd_availability.available {
@@ -4615,6 +4708,9 @@ impl App {
         if neoamd_option_visible(&self.neoamd_availability) {
             cadence_labels.push("NeoAMD");
         }
+        if neoamd_option_visible(&self.neortx_availability) {
+            cadence_labels.push("NeoRTX");
+        }
         if tensorrt_option_visible(&self.tensorrt_availability) {
             cadence_labels.push(tr(lang, "TensorRT（準備中）", "TensorRT (preparing)"));
         }
@@ -4948,8 +5044,12 @@ impl App {
         {
             mode = ScaleMode::Auto;
         }
-        if ink_centered_selectable_label(ui, mode == ScaleMode::Fixed, tr(lang, "倍率", "Windowed"))
-            .clicked()
+        if ink_centered_selectable_label(
+            ui,
+            mode == ScaleMode::Fixed,
+            tr(lang, "ウィンドウ", "Windowed"),
+        )
+        .clicked()
         {
             mode = ScaleMode::Fixed;
         }
@@ -10319,7 +10419,7 @@ impl eframe::App for App {
                     let label_width: f32 = [
                         tr(lang, "表示:", "Display:"),
                         tr(lang, "全画面", "Fullscreen"),
-                        tr(lang, "倍率", "Windowed"),
+                        tr(lang, "ウィンドウ", "Windowed"),
                         tr(lang, "キャプチャ解像度:", "Capture size:"),
                     ]
                     .into_iter()
@@ -10823,6 +10923,53 @@ impl eframe::App for App {
                     if let Some(neoamd_on) = requested_neoamd {
                         self.request_onnx_backend_switch(if neoamd_on {
                             OnnxBackendPreference::NeoAMD
+                        } else {
+                            OnnxBackendPreference::DirectML
+                        });
+                    }
+                }
+
+                if neoamd_option_visible(&self.neortx_availability) {
+                    let backend_switching =
+                        self.onnx_backend_pending.is_some() || status.onnx_backend_switching;
+                    let mut neortx_on =
+                        self.onnx_backend_selected == OnnxBackendPreference::NeoRTX;
+                    let response = ink_centered_checkbox_enabled(
+                        ui,
+                        !backend_switching,
+                        &mut neortx_on,
+                        "NeoRTX",
+                    )
+                    .on_hover_text({
+                        let mut help = tr(lang, "NVIDIA Tensor Coreで実行。未対応モデルはDirectMLへ戻ります。", "NVIDIA Tensor Core inference. Unsupported models fall back to DirectML.").to_owned();
+                        if let Some(arch) = self.neortx_availability.gpu_architecture.as_deref() {
+                            help.push('\n');
+                            help.push_str(&i18n::format_text(
+                                lang,
+                                "neoamd.architecture",
+                                &[("arch", arch.to_string())],
+                            ));
+                        }
+                        if status.onnx_directml_fallbacks > 0 {
+                            help.push('\n');
+                            help.push_str(&i18n::format_text(
+                                lang,
+                                "neoamd.directml_fallback_count",
+                                &[("count", status.onnx_directml_fallbacks.to_string())],
+                            ));
+                        }
+                        help
+                    });
+                    let requested_neortx = if response.changed() {
+                        Some(neortx_on)
+                    } else if response.clicked() {
+                        Some(self.onnx_backend_selected != OnnxBackendPreference::NeoRTX)
+                    } else {
+                        None
+                    };
+                    if let Some(neortx_on) = requested_neortx {
+                        self.request_onnx_backend_switch(if neortx_on {
+                            OnnxBackendPreference::NeoRTX
                         } else {
                             OnnxBackendPreference::DirectML
                         });
@@ -14342,4 +14489,34 @@ mod app_tests {
             "helper order must settle before the OFF cloak is retained"
         );
     }
+}
+
+fn detect_neortx_for_selection(
+    app_dir: &std::path::Path,
+    adapters: &[GpuAdapter],
+    requested_luid: Option<u64>,
+    render_luid: Option<u64>,
+) -> NeoAmdAvailability {
+    if let Some(requested) = requested_luid {
+        return detect_neortx_backend(app_dir, Some(requested));
+    }
+    if let Some(render) = render_luid {
+        if gpu::adapter_for_luid(adapters, Some(render))
+            .is_some_and(|adapter| adapter.vendor_id == 0x10DE)
+        {
+            return detect_neortx_backend(app_dir, Some(render));
+        }
+        let mut availability = detect_neortx_backend(app_dir, None);
+        if availability.installed {
+            availability.available = false;
+            availability.gpu_luid = None;
+            availability.gpu_architecture = None;
+            availability.reason = Some(
+                "Auto GPU is not using an NVIDIA presentation adapter; explicitly select an supported NVIDIA GPU to use NeoRTX"
+                    .to_string(),
+            );
+        }
+        return availability;
+    }
+    detect_neortx_backend(app_dir, None)
 }

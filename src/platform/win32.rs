@@ -2767,8 +2767,9 @@ pub fn activate_other_instance(title: &str) {
             if pid != ctx.pid {
                 let mut buf = [0u16; 64];
                 let n = GetWindowTextW(hwnd, &mut buf);
-                // PREFIX match keeps singleton handoff compatible with older
-                // development builds that may have appended a build tag.
+                // PREFIX match: titles carry a build tag ("cHiDeScaler-Neo
+                // build tag so which build is running is visible at a glance;
+                // an old instance with a different tag must still be found
                 let got = &buf[..n.max(0) as usize];
                 if got.len() >= ctx.title.len() && got[..ctx.title.len()] == ctx.title[..] {
                     ctx.found = hwnd.0 as isize;

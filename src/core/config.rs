@@ -207,6 +207,7 @@ pub enum OnnxBackendPreference {
     DirectML,
     TensorRT,
     NeoAMD,
+    NeoRTX,
 }
 
 /// Legacy HDR-to-SDR profile values retained only for settings-file compatibility.

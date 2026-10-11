@@ -487,6 +487,7 @@ pub struct Status {
     pub onnx_backend_error: Option<String>,
     pub onnx_backend_revision: u64,
     pub onnx_neoamd_stages: usize,
+    pub onnx_neortx_stages: usize,
     pub onnx_tensorrt_stages: usize,
     pub onnx_cuda_stages: usize,
     pub onnx_directml_fallbacks: usize,
@@ -4938,7 +4939,8 @@ fn beam_async_onnx_stage(
         crate::render::onnx_stage::OnnxProvider::TensorRT => Some("TensorRT"),
         crate::render::onnx_stage::OnnxProvider::MigraphX
         | crate::render::onnx_stage::OnnxProvider::Cuda
-        | crate::render::onnx_stage::OnnxProvider::NeoAMD => None,
+        | crate::render::onnx_stage::OnnxProvider::NeoAMD
+        | crate::render::onnx_stage::OnnxProvider::NeoRTX => None,
     })?;
     Some((stage, metric_name, provider_name))
 }
@@ -5816,6 +5818,7 @@ fn apply_chain_update(
         let mut state = status.lock().unwrap();
         state.chain_errors = errs;
         state.onnx_neoamd_stages = usage.neoamd;
+        state.onnx_neortx_stages = usage.neortx;
         state.onnx_tensorrt_stages = usage.tensorrt;
         state.onnx_cuda_stages = usage.cuda;
         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -6055,6 +6058,7 @@ fn switch_onnx_backend(
         state.onnx_backend_switching = false;
         state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
         state.onnx_neoamd_stages = 0;
+        state.onnx_neortx_stages = 0;
         state.onnx_tensorrt_stages = 0;
         state.onnx_cuda_stages = 0;
         state.onnx_directml_fallbacks = 0;
@@ -6126,7 +6130,9 @@ fn switch_onnx_backend(
         if result.is_ok()
             && matches!(
                 backend,
-                OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML
+                OnnxBackendPreference::NeoAMD
+                    | OnnxBackendPreference::NeoRTX
+                    | OnnxBackendPreference::DirectML
             )
             && !candidate_chain.has_interp()
         {
@@ -6156,7 +6162,10 @@ fn switch_onnx_backend(
         // retire only generic warmup bridge resources, then prime the exact
         // live ingress.  This executes only at a provider switch.
         if result.is_ok()
-            && backend == OnnxBackendPreference::NeoAMD
+            && matches!(
+                backend,
+                OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
+            )
             && !candidate_chain.has_interp()
         {
             let retired = candidate_chain.rearm_neoamd_live_ingress_after_generic_warmup(gc);
@@ -6298,6 +6307,40 @@ fn switch_onnx_backend(
         gc.recycle(old);
         s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
     }
+    // Prime the actual interpolation route after the old worker and its
+    // bridges have been drained. Keep the warmed candidate resources alive.
+    if backend == OnnxBackendPreference::NeoRTX
+        && candidate_chain.has_interp()
+        && !s.frame.hdr
+        && !s.frame.data.is_empty()
+    {
+        let preserve = s.last_tex.into_iter().collect::<Vec<_>>();
+        let out_size = s
+            .last_tex
+            .map(|t| (t.w(), t.h()))
+            .unwrap_or((s.frame.w, s.frame.h));
+        if let Err(error) = candidate_chain.warmup_candidate(
+            gc,
+            s.frame.w,
+            s.frame.h,
+            &s.frame.data,
+            out_size,
+            &preserve,
+        ) {
+            candidate_chain.prepare_gpu_transition(gc);
+            let mut state = status.lock().unwrap();
+            state.onnx_backend_switching = false;
+            state.onnx_backend_error = Some(format!("{error:#}"));
+            state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
+            log::error!(
+                "onnx-backend-switch-rollback: post-drain NeoRTX interpolation prime failed: {error:#}"
+            );
+            return false;
+        }
+        log::info!(
+            "neortx-interp-switch-boundary: old-worker=drained old-bridge=retired live-route=primed"
+        );
+    }
     s.chain = candidate_chain;
     s.chain_specs = specs.to_vec();
     *factory = candidate_factory;
@@ -6312,7 +6355,9 @@ fn switch_onnx_backend(
     // fully dropped, without changing the steady-state kernels.
     if matches!(
         backend,
-        OnnxBackendPreference::NeoAMD | OnnxBackendPreference::DirectML
+        OnnxBackendPreference::NeoAMD
+            | OnnxBackendPreference::NeoRTX
+            | OnnxBackendPreference::DirectML
     ) && !s.chain.has_interp()
     {
         // Preserve the last visible image as ordinary CPU RGBA while the target
@@ -6389,9 +6434,9 @@ fn switch_onnx_backend(
         (previous, backend),
         (
             OnnxBackendPreference::DirectML,
-            OnnxBackendPreference::NeoAMD
+            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
         ) | (
-            OnnxBackendPreference::NeoAMD,
+            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX,
             OnnxBackendPreference::DirectML
         )
     ) && restart_wgc_epoch_for_backend_switch(s);
@@ -6459,6 +6504,7 @@ fn switch_onnx_backend(
         state.onnx_backend_error = None;
         state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
         state.onnx_neoamd_stages = usage.neoamd;
+        state.onnx_neortx_stages = usage.neortx;
         state.onnx_tensorrt_stages = usage.tensorrt;
         state.onnx_cuda_stages = usage.cuda;
         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -8725,8 +8771,7 @@ fn engine_main(
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
-                        let kept =
-                            factory.retain_optional_backend_sessions_for_capture_restart();
+                        let kept = factory.retain_optional_backend_sessions_for_capture_restart();
                         log::info!(
                             "onnx-session-stop-cache: action=retain-last-chain-then-lru kept={} limit={} bridge_resources=retired source=wake-for-stop",
                             kept,
@@ -9027,6 +9072,7 @@ fn engine_main(
                                 s.src_was_topmost || s.source_monitor_fullscreen,
                             ));
                             g.onnx_neoamd_stages = usage.neoamd;
+                            g.onnx_neortx_stages = usage.neortx;
                             g.onnx_tensorrt_stages = usage.tensorrt;
                             g.onnx_cuda_stages = usage.cuda;
                             g.onnx_directml_fallbacks = usage.directml_fallback;
@@ -9745,7 +9791,8 @@ fn engine_main(
                         let mut state = status
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let deadline_cancelled = state.glsl_overload_auto_stop_deadline.take().is_some();
+                        let deadline_cancelled =
+                            state.glsl_overload_auto_stop_deadline.take().is_some();
                         let notice_cleared = state.glsl_overload_notice_latched;
                         state.glsl_overload_notice_latched = false;
                         if deadline_cancelled || notice_cleared {
@@ -12382,6 +12429,7 @@ fn engine_main(
                     {
                         let mut state = status.lock().unwrap();
                         state.onnx_neoamd_stages = usage.neoamd;
+                        state.onnx_neortx_stages = usage.neortx;
                         state.onnx_tensorrt_stages = usage.tensorrt;
                         state.onnx_cuda_stages = usage.cuda;
                         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -15084,7 +15132,9 @@ fn engine_main(
                         );
                     } else {
                         if !s.frame.hdr
-                            && s.chain.mvutensils_stage().is_some_and(|(index, _)| index == 0)
+                            && s.chain
+                                .mvutensils_stage()
+                                .is_some_and(|(index, _)| index == 0)
                         {
                             s.chain.store_mvutensils_cpu_boundary_copy(
                                 s.frame.w,
@@ -16536,6 +16586,7 @@ fn stop_session(
     g.source_live_fullscreen = false;
     g.capture_resolution_resize_intent = None;
     g.onnx_neoamd_stages = 0;
+    g.onnx_neortx_stages = 0;
     g.onnx_tensorrt_stages = 0;
     g.onnx_cuda_stages = 0;
     g.onnx_directml_fallbacks = 0;
@@ -18577,11 +18628,14 @@ fn process_and_present_from_impl(
                             })
                             .and_then(|(layout, _)| {
                                 crate::render::mvutensils_neo::PortableBackendLibrary::load(&layout)
-                                    .and_then(|library| library.create_session(&layout, &runtime_options))
+                                    .and_then(|library| {
+                                        library.create_session(&layout, &runtime_options)
+                                    })
                             });
                         match created {
                             Ok(runtime) => {
-                                let variant = runtime.variant().unwrap_or_else(|| "unknown".to_string());
+                                let variant =
+                                    runtime.variant().unwrap_or_else(|| "unknown".to_string());
                                 log::info!(
                                     "MVUtensils-Neo runtime active: stage={} radius={} internal_precision={}bit analysis_precision={}bit cpu_pipeline={} highres_fast={} variant={}",
                                     stage_index,
@@ -18609,7 +18663,8 @@ fn process_and_present_from_impl(
                         // reports the true cost and makes cross-API stalls
                         // obvious instead of hiding them outside stage stats.
                         let stage_started = Instant::now();
-                        let cached_cpu = s.chain.mvutensils_cpu_boundary(width as i32, height as i32);
+                        let cached_cpu =
+                            s.chain.mvutensils_cpu_boundary(width as i32, height as i32);
                         let downloaded;
                         let rgba: &[u8] = if let Some(bytes) = cached_cpu {
                             bytes
@@ -18648,7 +18703,11 @@ fn process_and_present_from_impl(
                                     profile.mvtools_ms,
                                     profile.convert_out_ms,
                                     profile.total_ms,
-                                    if used_cached_cpu { "cpu-direct" } else { "gl-readback" },
+                                    if used_cached_cpu {
+                                        "cpu-direct"
+                                    } else {
+                                        "gl-readback"
+                                    },
                                     runtime_options.degrain.async_pipeline
                                 );
                             }
@@ -18670,7 +18729,9 @@ fn process_and_present_from_impl(
                                     let stage_ms = if runtime_options.degrain.async_pipeline {
                                         backend_profile
                                             .map(|profile| profile.total_ms + upload_ms)
-                                            .unwrap_or_else(|| stage_started.elapsed().as_secs_f64() * 1000.0)
+                                            .unwrap_or_else(|| {
+                                                stage_started.elapsed().as_secs_f64() * 1000.0
+                                            })
                                     } else {
                                         stage_started.elapsed().as_secs_f64() * 1000.0
                                     };

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use half::f16;
 use ort::{
     AsPointer,
+    ep::ArbitrarilyConfigurableExecutionProvider,
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
     session::{IoBinding, RunOptions, Session, builder::GraphOptimizationLevel},
     value::{
@@ -745,6 +746,13 @@ pub enum OnnxProvider {
     TensorRT,
     Cuda,
     NeoAMD,
+    NeoRTX,
+}
+
+impl OnnxProvider {
+    pub fn is_native_pack(self) -> bool {
+        matches!(self, Self::NeoAMD | Self::NeoRTX)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -969,6 +977,7 @@ impl OnnxStage {
                 Self::load_directml(path, dml_adapter_id)
             }
             OnnxBackendPreference::NeoAMD => Self::load_neoamd(path, dml_adapter_id, app_dir),
+            OnnxBackendPreference::NeoRTX => Self::load_neortx(path, dml_adapter_id, app_dir),
             OnnxBackendPreference::TensorRT => {
                 let device_id =
                     trt_device_id.ok_or_else(|| anyhow!("TensorRT CUDA device is unavailable"))?;
@@ -1220,8 +1229,143 @@ impl OnnxStage {
         Ok(stage)
     }
 
+    fn load_neortx(path: &Path, dml_adapter_id: Option<i32>, app_dir: &Path) -> Result<Self> {
+        // Resolve the AMD adapter before creating DirectML metadata/fallback so
+        // an Auto configuration with one AMD GPU plus another vendor does not
+        // accidentally bind the fallback ORT session to a different device.
+        // NeoRTX inference itself is still owned entirely by the external pack.
+        let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+        let target = match dml_adapter_id {
+            Some(device_id) => adapters
+                .iter()
+                .find(|adapter| adapter.device_id == device_id),
+            None => {
+                let mut amd = adapters
+                    .iter()
+                    .filter(|adapter| adapter.vendor_id == 0x10DE);
+                let first = amd.next();
+                if amd.next().is_some() { None } else { first }
+            }
+        };
+
+        // A ready DirectML stage is retained as the immediate fail-safe. If a
+        // valid AMD target is known, bind that fallback to the same adapter.
+        let fallback_adapter = target
+            .filter(|adapter| adapter.vendor_id == 0x10DE)
+            .map(|adapter| adapter.device_id)
+            .or(dml_adapter_id);
+        let mut stage = Self::load_directml(path, fallback_adapter)?;
+
+        let Some(target) = target else {
+            stage.fallback_reason = Some(
+                "NeoRTX could not resolve one unambiguous NVIDIA compute adapter; DirectML retained"
+                    .to_string(),
+            );
+            return Ok(stage);
+        };
+        if target.vendor_id != 0x10DE {
+            stage.fallback_reason = Some(format!(
+                "NeoRTX requires NVIDIA Ampere or newer; selected GPU '{}' is not NVIDIA",
+                target.name
+            ));
+            return Ok(stage);
+        }
+        let backend = match NeoAmdBackend::load_neortx_from_app_dir(app_dir) {
+            Ok(backend) => backend,
+            Err(error) => {
+                stage.fallback_reason = Some(format!(
+                    "NeoRTX Backend Pack unavailable; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let adapter = match backend.query_adapter(target.luid) {
+            Ok(info) => info,
+            Err(error) => {
+                stage.fallback_reason = Some(format!(
+                    "NeoRTX rejected selected GPU; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let architecture = adapter.architecture_string();
+        let required_caps = NEOAMD_CAP_DYNAMIC_RESOLUTION
+            | NEOAMD_CAP_FP16_NATIVE
+            | NEOAMD_CAP_GFX12_WMMA
+            | NEOAMD_CAP_STRUCTURAL_ROUTING;
+        if adapter.vendor_id != 0x10DE
+            || !matches!(
+                architecture.as_str(),
+                "sm_80" | "sm_86" | "sm_89" | "sm_120"
+            )
+            || adapter.capabilities & required_caps != required_caps
+        {
+            stage.fallback_reason = Some(format!(
+                "NeoRTX unsupported GPU/backend capabilities (arch='{architecture}', caps=0x{:x}); DirectML retained",
+                adapter.capabilities
+            ));
+            return Ok(stage);
+        }
+        let session = match backend.create_session(path, target.luid) {
+            Ok(session) => session,
+            Err(error) => {
+                // Unsupported/ambiguous graphs deliberately land here. The
+                // pack performs structural routing; Neo does not special-case
+                // model names, file hashes or node names.
+                stage.fallback_reason = Some(format!(
+                    "NeoRTX graph not accepted; DirectML retained: {error}"
+                ));
+                return Ok(stage);
+            }
+        };
+        let info = session.info();
+        let host_kind = if stage.interp != InterpKind::None {
+            NEOAMD_SESSION_INTERPOLATION
+        } else if stage.temporal_frames.is_some() {
+            NEOAMD_SESSION_TEMPORAL
+        } else {
+            NEOAMD_SESSION_IMAGE
+        };
+        if info.kind != host_kind {
+            stage.fallback_reason = Some(format!(
+                "NeoRTX session contract mismatch (pack kind {}, host kind {}); DirectML retained",
+                info.kind, host_kind
+            ));
+            return Ok(stage);
+        }
+        if host_kind == NEOAMD_SESSION_TEMPORAL
+            && stage.temporal_frames != Some(info.temporal_frames as usize)
+        {
+            stage.fallback_reason = Some(format!(
+                "NeoRTX temporal-frame contract mismatch (pack {}, model {:?}); DirectML retained",
+                info.temporal_frames, stage.temporal_frames
+            ));
+            return Ok(stage);
+        }
+        stage.provider = OnnxProvider::NeoRTX;
+        stage.provider_desc = format!(
+            "NeoRTX {}{}",
+            architecture,
+            backend
+                .description()
+                .map(|value| format!(" / {value}"))
+                .unwrap_or_default()
+        );
+        stage.fallback_reason = None;
+        stage.neoamd_session = Some(session);
+        log::info!(
+            "neortx-session-ready: model={} gpu='{}' luid={:016x} arch={} kind={} dynamic_resolution=true engine_cache=false",
+            path.display(),
+            target.name,
+            target.luid,
+            architecture,
+            info.kind
+        );
+        Ok(stage)
+    }
+
     fn disable_neoamd_after_runtime_failure(&mut self, reason: &str) {
-        if self.provider != OnnxProvider::NeoAMD {
+        if !matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             return;
         }
         log::warn!(
@@ -1450,7 +1594,7 @@ impl OnnxStage {
     }
 
     pub(crate) fn supports_neoamd_interp_shared_rgba8(&self) -> bool {
-        self.provider == OnnxProvider::NeoAMD
+        matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && matches!(&self.interp, InterpKind::RifeV1 { .. } | InterpKind::Drba)
             && !self.neoamd_shared_disabled
             && self
@@ -1582,7 +1726,7 @@ impl OnnxStage {
     }
 
     pub(crate) fn supports_neoamd_interp_stream(&self) -> bool {
-        self.provider == OnnxProvider::NeoAMD
+        matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && matches!(&self.interp, InterpKind::RifeV1 { .. } | InterpKind::Drba)
             && self
                 .neoamd_session
@@ -1641,7 +1785,7 @@ impl OnnxStage {
         phase: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(
-            self.provider == OnnxProvider::NeoAMD,
+            matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX),
             "NeoAMD interpolation stream provider is no longer active"
         );
         let started = Instant::now();
@@ -1685,13 +1829,13 @@ impl OnnxStage {
     }
 
     pub(crate) fn is_neoamd_temporal_shared_filter(&self) -> bool {
-        self.provider == OnnxProvider::NeoAMD
+        matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && self.temporal_frames.is_some()
             && self.should_try_neoamd_gpu_texture()
     }
 
     pub(crate) fn should_try_neoamd_gpu_texture(&self) -> bool {
-        self.provider == OnnxProvider::NeoAMD
+        matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && !self.neoamd_shared_disabled
             && self.fp16
             && self.interp == InterpKind::None
@@ -1975,7 +2119,7 @@ impl OnnxStage {
     }
 
     pub(crate) fn supports_neoamd_peer_chain(&self) -> bool {
-        self.provider == OnnxProvider::NeoAMD
+        matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && !self.neoamd_shared_disabled
             && self.fp16
             && self.interp == InterpKind::None
@@ -2165,7 +2309,7 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Result<Option<(i32, i32, GpuTex)>> {
-        if self.provider != OnnxProvider::NeoAMD
+        if !matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             || self.neoamd_shared_disabled
             || !self.fp16
             || self.interp != InterpKind::None
@@ -2386,8 +2530,15 @@ impl OnnxStage {
             .map(|(_, channels, height, width)| format!("_profile-{channels}x{height}x{width}"))
             .unwrap_or_default();
         let precision_variant = if explicit_qdq { "_qdq-int8-v1" } else { "" };
+        let cumsum_workaround = tensorrt_temporalfix_cumsum_workaround(source_path)
+            || tensorrt_temporalfix_cumsum_workaround(engine_model_path);
+        let accuracy_variant = if cumsum_workaround {
+            "_cumsum-cuda-v2-shapes"
+        } else {
+            ""
+        };
         let cache_variant = format!(
-            "builder-{builder_level}_workspace-{}mb_fp16-1{precision_variant}{profile_variant}",
+            "builder-{builder_level}_workspace-{}mb_fp16-1{precision_variant}{profile_variant}{accuracy_variant}",
             workspace_mb
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "default".into())
@@ -2439,7 +2590,22 @@ impl OnnxStage {
             .with_detailed_build_log(explicit_qdq)
             .with_force_sequential_engine_build(true)
             .with_builder_optimization_level(builder_level);
-        if let Some((input_name, channels, height, width)) = profile {
+        if cumsum_workaround {
+            // TensorRT 10.x can mix axes across CumSum layers. TemporalFix uses
+            // them to construct sampling grids; corrupted grids produce NaNs
+            // and a black right border. Keep convolutions in TensorRT, and run
+            // only CumSum with the already-enabled CUDA execution provider.
+            tensorrt = tensorrt.with_arbitrary_config("trt_op_types_to_exclude", "CumSum");
+            log::info!(
+                "tensorrt-cumsum-workaround: model={} excluded=CumSum provider=CUDA cache=cumsum-cuda-v2-shapes",
+                engine_model_path.display()
+            );
+        }
+        // CumSum partitioning introduces additional dynamic subgraph inputs.
+        // ORT derives all their profiles from runtime tensors; a main-input-only
+        // explicit profile would make these otherwise valid partitions fail.
+        if let Some((input_name, channels, height, width)) = profile.filter(|_| !cumsum_workaround)
+        {
             let shapes = format!("{input_name}:1x{channels}x{height}x{width}");
             tensorrt = tensorrt
                 .with_profile_min_shapes(shapes.clone())
@@ -2975,7 +3141,7 @@ impl OnnxStage {
             self.temporal_history.clear();
             self.temporal_history_stride = 0;
             self.temporal_size = None;
-            if self.provider == OnnxProvider::NeoAMD {
+            if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
                 if let Some(session) = self.neoamd_session.as_mut() {
                     if let Err(error) = session.reset_temporal_history() {
                         log::warn!(
@@ -3312,7 +3478,10 @@ impl OnnxStage {
                     mode,
                 )
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => Ok(None),
+            OnnxProvider::MigraphX
+            | OnnxProvider::Cuda
+            | OnnxProvider::NeoAMD
+            | OnnxProvider::NeoRTX => Ok(None),
         };
         match result {
             Ok(Some(fence)) => {
@@ -3519,7 +3688,10 @@ impl OnnxStage {
                 drop(provider_outputs);
                 bridge.padded_size
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => {
+            OnnxProvider::MigraphX
+            | OnnxProvider::Cuda
+            | OnnxProvider::NeoAMD
+            | OnnxProvider::NeoRTX => {
                 anyhow::bail!("unsupported interpolation backend")
             }
         };
@@ -3564,7 +3736,10 @@ impl OnnxStage {
                         .collect::<Vec<_>>(),
                 )
             }
-            OnnxProvider::MigraphX | OnnxProvider::Cuda | OnnxProvider::NeoAMD => {
+            OnnxProvider::MigraphX
+            | OnnxProvider::Cuda
+            | OnnxProvider::NeoAMD
+            | OnnxProvider::NeoRTX => {
                 anyhow::bail!("unsupported interpolation backend")
             }
         };
@@ -3840,7 +4015,7 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_u8(w, h, frames, 3, 3, t) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
@@ -3889,7 +4064,7 @@ impl OnnxStage {
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
         anyhow::ensure!(!frames.is_empty(), "no frames");
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_u8(w, h, frames, 4, 3, t) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
@@ -3934,7 +4109,7 @@ impl OnnxStage {
         frames: &[&[u8]],
         ts: &[f32],
     ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_many_u8(w, h, frames, 4, 3, ts) {
                 Ok(Some(results)) => return Ok(results),
                 Ok(None) => {
@@ -4744,18 +4919,20 @@ impl OnnxStage {
                 self.process_dml_gpu_texture(gc, input_texture, after_interpolation)
             }
             OnnxProvider::TensorRT => self.process_tensorrt_gpu_texture(gc, input_texture),
-            OnnxProvider::NeoAMD => match self.process_neoamd_gpu_texture(gc, input_texture) {
-                Ok(output) => Ok(output),
-                Err(error) => {
-                    self.retire_neoamd_shared_output(gc);
-                    self.neoamd_shared_disabled = true;
-                    log::warn!(
-                        "NeoAMD full GPU-resident IO disabled for '{}'; CPU-visible NeoAMD path retained: {error:#}",
-                        self.name
-                    );
-                    Ok(None)
+            OnnxProvider::NeoAMD | OnnxProvider::NeoRTX => {
+                match self.process_neoamd_gpu_texture(gc, input_texture) {
+                    Ok(output) => Ok(output),
+                    Err(error) => {
+                        self.retire_neoamd_shared_output(gc);
+                        self.neoamd_shared_disabled = true;
+                        log::warn!(
+                            "NeoAMD full GPU-resident IO disabled for '{}'; CPU-visible NeoAMD path retained: {error:#}",
+                            self.name
+                        );
+                        Ok(None)
+                    }
                 }
-            },
+            }
             OnnxProvider::MigraphX | OnnxProvider::Cuda => Ok(None),
         }
     }
@@ -6687,7 +6864,7 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Option<(i32, i32, GpuTex)> {
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             return match self.process_neoamd_rgba8_gpu_output(gc, w, h, rgba) {
                 Ok(output) => output,
                 Err(error) => {
@@ -7060,7 +7237,7 @@ impl OnnxStage {
         reason: &str,
     ) {
         self.retire_neoamd_shared_output(gc);
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             self.neoamd_shared_disabled = true;
             log::warn!(
                 "NeoAMD GPU-resident output disabled for transition recovery: model='{}' reason={} fallback=cpu-visible-neoamd",
@@ -7142,7 +7319,7 @@ impl OnnxStage {
         // `run_neoamd_u8` does not own/modify temporal_history; restore it before
         // handling success/fallback. The DirectML retry below still materializes
         // an owned snapshot only when NeoAMD actually fails.
-        if self.provider == OnnxProvider::NeoAMD
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX)
             && self.neoamd_temporal_rejected_size != Some((w, h))
         {
             let history_store = std::mem::take(&mut self.temporal_history);
@@ -7351,7 +7528,7 @@ impl OnnxStage {
         if let Some(frames) = self.temporal_frames {
             return self.process_temporal_u8_strided(w, h, pixels, stride, output_stride, frames);
         }
-        if self.provider == OnnxProvider::NeoAMD {
+        if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_u8(w, h, &[pixels], stride, output_stride, 0.5) {
                 Ok(result) => return Ok(result),
                 Err(error) => {
@@ -9232,6 +9409,14 @@ fn tensorrt_sync_mode() -> TensorRtSyncMode {
     }
 }
 
+fn tensorrt_temporalfix_cumsum_workaround(model: &Path) -> bool {
+    model.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("temporalfix")
+    })
+}
+
 fn tensorrt_builder_level() -> u8 {
     std::env::var("CHIDESCALER_TRT_BUILDER_LEVEL")
         .ok()
@@ -9843,10 +10028,109 @@ fn mark_tensorrt_cache_ready(cache_dir: &Path) {
     }
 }
 
+fn temporalfix_shape_hints(bytes: &[u8]) -> Option<&'static [u8]> {
+    match format!("{:x}", Sha256::digest(bytes)).as_str() {
+        "90deed0d4b672c918e112a760107455a9a1689db22b5b45311b23953ab3dd35f" => Some(include_bytes!(
+            "../../assets/onnx-shape-hints/temporalfix-s1-cumsum.bin"
+        )),
+        "9d6c7f6f3d63ebe5b4db0d715f9760c949d7dc1fe8142fce48ccfedcca62a477" => Some(include_bytes!(
+            "../../assets/onnx-shape-hints/temporalfix-s2-cumsum.bin"
+        )),
+        _ => None,
+    }
+}
+fn onnx_wire_varint(bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes
+            .get(*offset)
+            .ok_or_else(|| anyhow!("truncated ONNX protobuf"))?;
+        *offset += 1;
+        anyhow::ensure!(shift != 63 || byte <= 1, "ONNX varint overflow");
+        value |= u64::from(byte & 127) << shift;
+        if byte & 128 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(anyhow!("invalid ONNX protobuf varint"))
+}
+// Preserve every operator and weight byte while adding inferred value_info.
+fn append_onnx_graph_metadata(bytes: &[u8], hints: &[u8]) -> Result<Vec<u8>> {
+    let mut offset = 0;
+    let mut graph = None;
+    while offset < bytes.len() {
+        let start = offset;
+        let key = onnx_wire_varint(bytes, &mut offset)?;
+        anyhow::ensure!(key >> 3 != 0, "invalid ONNX field");
+        match key & 7 {
+            0 => {
+                onnx_wire_varint(bytes, &mut offset)?;
+            }
+            1 => {
+                offset = offset
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow!("ONNX offset overflow"))?;
+            }
+            2 => {
+                let len = usize::try_from(onnx_wire_varint(bytes, &mut offset)?)?;
+                let end = offset
+                    .checked_add(len)
+                    .ok_or_else(|| anyhow!("ONNX length overflow"))?;
+                if key >> 3 == 7 {
+                    anyhow::ensure!(graph.is_none(), "duplicate ONNX graph");
+                    graph = Some((start, offset, end));
+                }
+                offset = end;
+            }
+            5 => {
+                offset = offset
+                    .checked_add(4)
+                    .ok_or_else(|| anyhow!("ONNX offset overflow"))?;
+            }
+            _ => return Err(anyhow!("unsupported ONNX wire type")),
+        }
+        anyhow::ensure!(offset <= bytes.len(), "truncated ONNX field");
+    }
+    let (start, payload, end) = graph.ok_or_else(|| anyhow!("ONNX graph missing"))?;
+    let mut out = Vec::with_capacity(bytes.len() + hints.len() + 10);
+    out.extend_from_slice(&bytes[..start]);
+    out.push(0x3a);
+    let mut len = (end - payload)
+        .checked_add(hints.len())
+        .ok_or_else(|| anyhow!("ONNX graph length overflow"))?;
+    while len >= 128 {
+        out.push((len as u8 & 127) | 128);
+        len >>= 7;
+    }
+    out.push(len as u8);
+    out.extend_from_slice(&bytes[payload..end]);
+    out.extend_from_slice(hints);
+    out.extend_from_slice(&bytes[end..]);
+    Ok(out)
+}
+
 fn stage_tensorrt_model(model: &Path, cache_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(cache_dir)?;
     let staged = cache_dir.join("model.onnx");
-    let source_len = std::fs::metadata(model)?.len();
+    let patched = if tensorrt_temporalfix_cumsum_workaround(model) {
+        let bytes = std::fs::read(model)?;
+        if let Some(hints) = temporalfix_shape_hints(&bytes) {
+            log::info!(
+                "tensorrt-shape-hints: model={} metadata_bytes={}",
+                model.display(),
+                hints.len()
+            );
+            Some(append_onnx_graph_metadata(&bytes, hints)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let source_len = patched
+        .as_ref()
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(std::fs::metadata(model)?.len());
     if std::fs::metadata(&staged).is_ok_and(|metadata| metadata.len() == source_len) {
         log::info!(
             "tensorrt-model-stage: source={} staged={} reused=true",
@@ -9856,7 +10140,11 @@ fn stage_tensorrt_model(model: &Path, cache_dir: &Path) -> Result<PathBuf> {
         return Ok(staged);
     }
     let temporary = cache_dir.join("model.onnx.tmp");
-    std::fs::copy(model, &temporary)?;
+    if let Some(bytes) = patched {
+        std::fs::write(&temporary, bytes)?;
+    } else {
+        std::fs::copy(model, &temporary)?;
+    }
     if staged.exists() {
         std::fs::remove_file(&staged)?;
     }
@@ -9964,6 +10252,18 @@ fn out_dims(dims: &[i64]) -> Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn temporalfix_cumsum_workaround_is_scoped_to_temporalfix_models() {
+        assert!(super::tensorrt_temporalfix_cumsum_workaround(
+            std::path::Path::new("models/TemporalFix/temporalfix_s2_v1_op18_fp16.onnx")
+        ));
+        assert!(super::tensorrt_temporalfix_cumsum_workaround(
+            std::path::Path::new("TemporalFix_S1.ONNX")
+        ));
+        assert!(!super::tensorrt_temporalfix_cumsum_workaround(
+            std::path::Path::new("models/NeoRIFE_fp16.onnx")
+        ));
+    }
     use super::*;
 
     #[test]
@@ -10189,5 +10489,61 @@ mod tests {
         assert_eq!(temporal_history_slot_order(5, 3, 3), vec![0, 0, 0, 1, 2]);
         assert_eq!(temporal_history_slot_order(5, 5, 0), vec![0, 1, 2, 3, 4]);
         assert_eq!(temporal_history_slot_order(5, 5, 2), vec![2, 3, 4, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod temporalfix_shape_metadata_tests {
+    use super::*;
+    #[test]
+    fn shipped_temporalfix_models_stage_with_complete_shape_metadata() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/TemporalFix");
+        let cache =
+            std::env::temp_dir().join(format!("Neo-v859-shape-test-{}", std::process::id()));
+        for filename in [
+            "temporalfix_s1_v1.1_op18_fp16.onnx",
+            "temporalfix_s2_v1_op18_fp16.onnx",
+        ] {
+            let model = root.join(filename);
+            let original = std::fs::read(&model).unwrap();
+            let hints = temporalfix_shape_hints(&original).expect("shipped model fingerprint");
+            let expected = append_onnx_graph_metadata(&original, hints).unwrap();
+            let target = stage_tensorrt_model(&model, &cache.join(filename)).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), expected);
+            assert_eq!(
+                stage_tensorrt_model(&model, &cache.join(filename)).unwrap(),
+                target
+            );
+            assert_eq!(std::fs::read(&model).unwrap(), original);
+            println!("STAGED_ONNX {}", target.display());
+        }
+    }
+    #[test]
+    fn shape_metadata_preserves_graph_and_other_fields() {
+        // Model ir_version, graph with an opaque payload, producer_name.
+        let original = [0x08, 0x09, 0x3a, 0x03, 0x08, 0x07, 0x01, 0x12, 0x01, b'x'];
+        let patched = append_onnx_graph_metadata(&original, &[0x6a, 0x01, 0x42]).unwrap();
+        assert_eq!(
+            patched,
+            [
+                0x08, 0x09, 0x3a, 0x06, 0x08, 0x07, 0x01, 0x6a, 0x01, 0x42, 0x12, 0x01, b'x'
+            ]
+        );
+        assert_eq!(
+            append_onnx_graph_metadata(&original, &[]).unwrap(),
+            original
+        );
+        assert!(temporalfix_shape_hints(&original).is_none());
+    }
+    #[test]
+    fn shape_metadata_rejects_truncated_and_ambiguous_graphs() {
+        for invalid in [
+            &[0x3a, 0x04, 0x01][..],
+            &[0x80][..],
+            &[0x3a, 0, 0x3a, 0][..],
+            &[0x08, 0x01][..],
+        ] {
+            assert!(append_onnx_graph_metadata(invalid, &[1]).is_err());
+        }
     }
 }

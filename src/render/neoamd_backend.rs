@@ -623,8 +623,17 @@ impl NeoAmdBackend {
             )
         }
         .map_err(|error| format!("{} could not be loaded: {error}", bridge_path.display()))?;
+        let rtx = backend_dir.file_name().is_some_and(|name| name == "neortx");
+        let export = |name: &str| {
+            if rtx {
+                name.replacen("neoamd_", "neortx_", 1)
+            } else {
+                name.to_string()
+            }
+        };
         let loaded = (|| unsafe {
-            let get_api_version: GetApiVersionFn = symbol(module, "neoamd_get_api_version")?;
+            let get_api_version: GetApiVersionFn =
+                symbol(module, &export("neoamd_get_api_version"))?;
             let actual = get_api_version();
             if actual != NEOAMD_BRIDGE_ABI {
                 return Err(format!(
@@ -633,59 +642,77 @@ impl NeoAmdBackend {
             }
             Ok(Arc::new(Self {
                 module,
-                query_adapter: symbol(module, "neoamd_query_adapter")?,
-                create: symbol(module, "neoamd_create_session")?,
-                query_output: symbol(module, "neoamd_query_output")?,
-                run_u8: symbol(module, "neoamd_run_u8")?,
-                run_interp_many_u8: optional_symbol(module, "neoamd_run_interp_many_u8"),
+                query_adapter: symbol(module, &export("neoamd_query_adapter"))?,
+                create: symbol(module, &export("neoamd_create_session"))?,
+                query_output: symbol(module, &export("neoamd_query_output"))?,
+                run_u8: symbol(module, &export("neoamd_run_u8"))?,
+                run_interp_many_u8: optional_symbol(module, &export("neoamd_run_interp_many_u8")),
                 prepare_interp_stream_u8: optional_symbol(
                     module,
-                    "neoamd_prepare_interp_stream_u8",
+                    &export("neoamd_prepare_interp_stream_u8"),
                 ),
                 run_interp_stream_phase_u8: optional_symbol(
                     module,
-                    "neoamd_run_interp_stream_phase_u8",
+                    &export("neoamd_run_interp_stream_phase_u8"),
                 ),
                 prepare_interp_stream_shared_rgba8: optional_symbol(
                     module,
-                    "neoamd_prepare_interp_stream_shared_rgba8",
+                    &export("neoamd_prepare_interp_stream_shared_rgba8"),
                 ),
                 run_interp_stream_phase_shared_rgba8: optional_symbol(
                     module,
-                    "neoamd_run_interp_stream_phase_shared_rgba8",
+                    &export("neoamd_run_interp_stream_phase_shared_rgba8"),
                 ),
-                prepare_shared_fp16: optional_symbol(module, "neoamd_prepare_shared_fp16"),
+                prepare_shared_fp16: optional_symbol(module, &export("neoamd_prepare_shared_fp16")),
                 get_shared_output_handle: optional_symbol(
                     module,
-                    "neoamd_get_shared_output_handle",
+                    &export("neoamd_get_shared_output_handle"),
                 ),
-                run_u8_shared_fp16: optional_symbol(module, "neoamd_run_u8_shared_fp16"),
-                prepare_shared_io_fp16: optional_symbol(module, "neoamd_prepare_shared_io_fp16"),
-                get_shared_input_handle: optional_symbol(module, "neoamd_get_shared_input_handle"),
-                run_shared_io_fp16: optional_symbol(module, "neoamd_run_shared_io_fp16"),
+                run_u8_shared_fp16: optional_symbol(module, &export("neoamd_run_u8_shared_fp16")),
+                prepare_shared_io_fp16: optional_symbol(
+                    module,
+                    &export("neoamd_prepare_shared_io_fp16"),
+                ),
+                get_shared_input_handle: optional_symbol(
+                    module,
+                    &export("neoamd_get_shared_input_handle"),
+                ),
+                run_shared_io_fp16: optional_symbol(module, &export("neoamd_run_shared_io_fp16")),
                 prepare_temporal_shared_io_fp16: optional_symbol(
                     module,
-                    "neoamd_prepare_temporal_shared_io_fp16",
+                    &export("neoamd_prepare_temporal_shared_io_fp16"),
                 ),
                 run_temporal_shared_io_fp16: optional_symbol(
                     module,
-                    "neoamd_run_temporal_shared_io_fp16",
+                    &export("neoamd_run_temporal_shared_io_fp16"),
                 ),
-                run_peer_shared_io_fp16: optional_symbol(module, "neoamd_run_peer_shared_io_fp16"),
-                reset_temporal_history: optional_symbol(module, "neoamd_reset_temporal_history"),
-                release_shared_output: optional_symbol(module, "neoamd_release_shared_output"),
-                destroy: symbol(module, "neoamd_destroy_session")?,
-                last_error: symbol(module, "neoamd_last_error")?,
-                describe_backend: optional_symbol(module, "neoamd_describe_backend"),
-                get_last_run_route: optional_symbol(module, "neoamd_get_last_run_route"),
-                get_last_image_gpu_ms: optional_symbol(module, "neoamd_get_last_image_gpu_ms"),
+                run_peer_shared_io_fp16: optional_symbol(
+                    module,
+                    &export("neoamd_run_peer_shared_io_fp16"),
+                ),
+                reset_temporal_history: optional_symbol(
+                    module,
+                    &export("neoamd_reset_temporal_history"),
+                ),
+                release_shared_output: optional_symbol(
+                    module,
+                    &export("neoamd_release_shared_output"),
+                ),
+                destroy: symbol(module, &export("neoamd_destroy_session"))?,
+                last_error: symbol(module, &export("neoamd_last_error"))?,
+                describe_backend: optional_symbol(module, &export("neoamd_describe_backend")),
+                get_last_run_route: optional_symbol(module, &export("neoamd_get_last_run_route")),
+                get_last_image_gpu_ms: optional_symbol(
+                    module,
+                    &export("neoamd_get_last_image_gpu_ms"),
+                ),
                 get_last_image_copy_gpu_ms: optional_symbol(
                     module,
-                    "neoamd_get_last_image_copy_gpu_ms",
+                    &export("neoamd_get_last_image_copy_gpu_ms"),
                 ),
                 get_last_image_compute_gpu_ms: optional_symbol(
                     module,
-                    "neoamd_get_last_image_compute_gpu_ms",
+                    &export("neoamd_get_last_image_compute_gpu_ms"),
                 ),
             }))
         })();
@@ -701,6 +728,15 @@ impl NeoAmdBackend {
         let (backend_dir, manifest) = read_manifest(app_dir).map_err(|a| {
             a.reason
                 .unwrap_or_else(|| "NeoAMD Backend Pack is unavailable".to_string())
+        })?;
+        verify_manifest_files(&backend_dir, &manifest)?;
+        Self::load(&backend_dir, &manifest)
+    }
+
+    pub fn load_neortx_from_app_dir(app_dir: &Path) -> Result<Arc<Self>, String> {
+        let (backend_dir, manifest) = read_neortx_manifest(app_dir).map_err(|a| {
+            a.reason
+                .unwrap_or_else(|| "NeoRTX Backend Pack is unavailable".to_string())
         })?;
         verify_manifest_files(&backend_dir, &manifest)?;
         Self::load(&backend_dir, &manifest)
@@ -1631,6 +1667,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn neortx_rejects_corrupt_pack_before_loading_native_code() {
+        let app = std::env::temp_dir().join(format!("neortx-manifest-test-{}", std::process::id()));
+        let pack = app.join("backends/neortx");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(pack.join("neo_rtx_backend.dll"), b"invalid-dll").unwrap();
+        let manifest = serde_json::json!({
+            "backend_api":1,"bridge_abi":1,"name":"NeoRTX test",
+            "architecture":"x86_64","provider":"NeoRTX","bridge":"neo_rtx_backend.dll",
+            "supported_gpu_architectures":["sm_120"],
+            "file_sha256":{"neo_rtx_backend.dll":"0000000000000000000000000000000000000000000000000000000000000000"}
+        });
+        std::fs::write(
+            pack.join("backend.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let state = detect_neortx_backend(&app, None);
+        assert!(state.installed);
+        assert!(!state.available);
+        assert!(state.reason.unwrap().contains("manifest"));
+        std::fs::remove_dir_all(app).unwrap();
+    }
+
+    #[test]
     fn manifest_defaults_to_canonical_bridge_name() {
         let manifest: NeoAmdManifest = serde_json::from_str(&format!(
             r#"{{"backend_api":{NEOAMD_BACKEND_API},"name":"test","architecture":"x86_64","bridge_abi":{NEOAMD_BRIDGE_ABI},"supported_gpu_architectures":["gfx1200","gfx1201"]}}"#
@@ -1663,5 +1723,224 @@ mod tests {
             .unwrap();
         assert!(!create.contains("width:"));
         assert!(!create.contains("height:"));
+    }
+}
+
+fn read_neortx_manifest(app_dir: &Path) -> Result<(PathBuf, NeoAmdManifest), NeoAmdAvailability> {
+    let backend_dir = app_dir.join("backends").join("neortx");
+    let manifest_path = backend_dir.join("backend.json");
+    if !manifest_path.is_file() {
+        return Err(unavailable(
+            "NeoRTX Backend Pack is not installed",
+            false,
+            None,
+            Some(backend_dir),
+        ));
+    }
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(unavailable(
+                format!("NeoRTX backend.json could not be read: {error}"),
+                true,
+                None,
+                Some(backend_dir),
+            ));
+        }
+    };
+    let json = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let manifest: NeoAmdManifest = match serde_json::from_slice(json) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(unavailable(
+                format!("NeoRTX backend.json is invalid: {error}"),
+                true,
+                None,
+                Some(backend_dir),
+            ));
+        }
+    };
+    if manifest.bridge != "neo_rtx_backend.dll" || manifest.provider != "NeoRTX" {
+        return Err(unavailable(
+            "NeoRTX requires its own bridge and provider",
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    if manifest.backend_api != NEOAMD_BACKEND_API {
+        return Err(unavailable(
+            format!(
+                "NeoRTX backend API {} is incompatible (expected {})",
+                manifest.backend_api, NEOAMD_BACKEND_API
+            ),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    if manifest.bridge_abi != NEOAMD_BRIDGE_ABI {
+        return Err(unavailable(
+            format!(
+                "NeoRTX bridge ABI {} is incompatible (expected {})",
+                manifest.bridge_abi, NEOAMD_BRIDGE_ABI
+            ),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    if !manifest.architecture.eq_ignore_ascii_case("x86_64") {
+        return Err(unavailable(
+            format!(
+                "unsupported NeoRTX host architecture: {}",
+                manifest.architecture
+            ),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    if !manifest
+        .supported_gpu_architectures
+        .iter()
+        .any(|arch| matches!(arch.as_str(), "sm_80" | "sm_86" | "sm_89" | "sm_120"))
+    {
+        return Err(unavailable(
+            "NeoRTX pack does not declare a supported NVIDIA Tensor Core architecture",
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    let bridge = match safe_manifest_relative_path(&manifest.bridge) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(unavailable(error, true, Some(manifest), Some(backend_dir)));
+        }
+    };
+    if !backend_dir.join(&bridge).is_file() {
+        return Err(unavailable(
+            format!("NeoRTX bridge is missing: {}", manifest.bridge),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        ));
+    }
+    for file in &manifest.required_files {
+        let relative = match safe_manifest_relative_path(file) {
+            Ok(path) => path,
+            Err(error) => {
+                return Err(unavailable(error, true, Some(manifest), Some(backend_dir)));
+            }
+        };
+        if !backend_dir.join(&relative).is_file() {
+            return Err(unavailable(
+                format!("required NeoRTX pack file is missing: {file}"),
+                true,
+                Some(manifest),
+                Some(backend_dir),
+            ));
+        }
+    }
+    Ok((backend_dir, manifest))
+}
+
+fn selected_nvidia_luid(selected_luid: Option<u64>) -> Result<u64, String> {
+    let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+    if let Some(luid) = selected_luid {
+        let adapter = adapters
+            .iter()
+            .find(|adapter| adapter.luid == luid)
+            .ok_or_else(|| format!("selected GPU LUID {luid:016x} is unavailable"))?;
+        if adapter.vendor_id != 0x10DE {
+            return Err(format!(
+                "selected GPU '{}' is not an NVIDIA GPU",
+                adapter.name
+            ));
+        }
+        return Ok(luid);
+    }
+    let mut amd = adapters
+        .iter()
+        .filter(|adapter| adapter.vendor_id == 0x10DE);
+    let first = amd
+        .next()
+        .ok_or_else(|| "no NVIDIA GPU is available for NeoRTX".to_string())?;
+    if amd.next().is_some() {
+        return Err("Auto GPU is ambiguous across multiple NVIDIA adapters".to_string());
+    }
+    Ok(first.luid)
+}
+
+pub fn detect_neortx_backend(app_dir: &Path, selected_luid: Option<u64>) -> NeoAmdAvailability {
+    let (backend_dir, manifest) = match read_neortx_manifest(app_dir) {
+        Ok(value) => value,
+        Err(availability) => return availability,
+    };
+    if let Err(error) = verify_manifest_files(&backend_dir, &manifest) {
+        return unavailable(error, true, Some(manifest), Some(backend_dir));
+    }
+    let gpu_luid = match selected_nvidia_luid(selected_luid) {
+        Ok(luid) => luid,
+        Err(error) => return unavailable(error, true, Some(manifest), Some(backend_dir)),
+    };
+    let backend = match NeoAmdBackend::load(&backend_dir, &manifest) {
+        Ok(backend) => backend,
+        Err(error) => return unavailable(error, true, Some(manifest), Some(backend_dir)),
+    };
+    let info = match backend.query_adapter(gpu_luid) {
+        Ok(info) => info,
+        Err(error) => return unavailable(error, true, Some(manifest), Some(backend_dir)),
+    };
+    let architecture = info.architecture_string();
+    if info.vendor_id != 0x10DE
+        || !matches!(
+            architecture.as_str(),
+            "sm_80" | "sm_86" | "sm_89" | "sm_120"
+        )
+    {
+        return unavailable(
+            format!("selected NVIDIA GPU is not a supported Tensor Core target ({architecture})"),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        );
+    }
+    let required_caps = NEOAMD_CAP_DYNAMIC_RESOLUTION
+        | NEOAMD_CAP_FP16_NATIVE
+        | NEOAMD_CAP_GFX12_WMMA
+        | NEOAMD_CAP_STRUCTURAL_ROUTING;
+    if info.capabilities & required_caps != required_caps {
+        return unavailable(
+            format!(
+                "NeoRTX bridge is missing required Tensor Core production capabilities (reported=0x{:x}, required=0x{:x})",
+                info.capabilities, required_caps
+            ),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        );
+    }
+    if !manifest
+        .supported_gpu_architectures
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&architecture))
+    {
+        return unavailable(
+            format!("NeoRTX pack does not list the detected architecture {architecture}"),
+            true,
+            Some(manifest),
+            Some(backend_dir),
+        );
+    }
+    NeoAmdAvailability {
+        installed: true,
+        available: true,
+        reason: None,
+        gpu_luid: Some(gpu_luid),
+        gpu_architecture: Some(architecture),
+        manifest: Some(manifest),
+        backend_dir: Some(backend_dir),
     }
 }
