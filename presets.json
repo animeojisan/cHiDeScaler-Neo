@@ -489,7 +489,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite50_fp16.onnx",
           "enabled": true
         }
       ],
@@ -512,7 +512,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite75_fp16.onnx",
           "enabled": true
         }
       ],
@@ -535,7 +535,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_fp16.onnx",
           "enabled": true
         }
       ],
@@ -577,34 +577,11 @@
       }
     },
     {
-      "name": "NeoRIFE 1.2  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_2_fp16.onnx",
-          "enabled": true
-        }
-      ],
-      "aspect_correction": {
-        "enabled": false,
-        "mode": "manual",
-        "width_scale": 1.0,
-        "height_scale": 1.0
-      },
-      "crop": {
-        "enabled": false,
-        "left": 0,
-        "top": 0,
-        "right": 0,
-        "bottom": 0
-      }
-    },
-    {
       "name": "NeoRIFE XS + FSRCNNX  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -632,7 +609,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -660,7 +637,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_fp16.onnx",
           "enabled": true
         },
         {
@@ -712,39 +689,11 @@
       }
     },
     {
-      "name": "NeoRIFE 1.2 + FSRCNNX  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_2_fp16.onnx",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/FSRCNNX/FSRCNNX_x2_16_0_4_1.glsl",
-          "enabled": true
-        }
-      ],
-      "aspect_correction": {
-        "enabled": false,
-        "mode": "manual",
-        "width_scale": 1.0,
-        "height_scale": 1.0
-      },
-      "crop": {
-        "enabled": false,
-        "left": 0,
-        "top": 0,
-        "right": 0,
-        "bottom": 0
-      }
-    },
-    {
       "name": "NeoRIFE XS + Anime4K  [720p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -785,7 +734,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -826,7 +775,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_fp16.onnx",
           "enabled": true
         },
         {
@@ -888,44 +837,11 @@
       }
     },
     {
-      "name": "NeoRIFE 1.2 + Anime4K  [720p]  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_2_fp16.onnx",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
-          "enabled": true
-        }
-      ],
-      "aspect_correction": {
-        "enabled": false,
-        "mode": "manual",
-        "width_scale": 1.0,
-        "height_scale": 1.0
-      },
-      "crop": {
-        "enabled": false,
-        "left": 0,
-        "top": 0,
-        "right": 0,
-        "bottom": 0
-      }
-    },
-    {
       "name": "NeoRIFE XS + Anime4K  [1080p]  FG",
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite50_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite50_fp16.onnx",
           "enabled": true
         },
         {
@@ -958,7 +874,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_Lite75_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_Lite75_fp16.onnx",
           "enabled": true
         },
         {
@@ -991,7 +907,7 @@
       "chain": [
         {
           "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_5_fp16.onnx",
+          "path": "models/RIFE/NeoRIFE_v1_6_fp16.onnx",
           "enabled": true
         },
         {
@@ -1025,39 +941,6 @@
         {
           "kind": "onnx",
           "path": "models/RIFE/NeoRIFE_fp16.onnx",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Restore_CNN_M.glsl",
-          "enabled": true
-        },
-        {
-          "kind": "glsl",
-          "path": "shaders/Anime4K/Anime4K_Upscale_CNN_x2_M.glsl",
-          "enabled": true
-        }
-      ],
-      "aspect_correction": {
-        "enabled": false,
-        "mode": "manual",
-        "width_scale": 1.0,
-        "height_scale": 1.0
-      },
-      "crop": {
-        "enabled": false,
-        "left": 0,
-        "top": 0,
-        "right": 0,
-        "bottom": 0
-      }
-    },
-    {
-      "name": "NeoRIFE 1.2+ Anime4K  [1080p]  FG",
-      "chain": [
-        {
-          "kind": "onnx",
-          "path": "models/RIFE/NeoRIFE_v1_2_fp16.onnx",
           "enabled": true
         },
         {

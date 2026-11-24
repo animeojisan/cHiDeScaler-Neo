@@ -6116,6 +6116,7 @@ fn interp_pair_is_contiguous(
     cadence_period: Option<f64>,
     arrival_interval: f64,
     directml_drba_preserve_forward_gaps: bool,
+    fps_cap: Option<u32>,
 ) -> bool {
     let Some(pair_dt) = pair_dt.filter(|dt| dt.is_finite() && *dt >= 0.0) else {
         return true;
@@ -6137,7 +6138,10 @@ fn interp_pair_is_contiguous(
     let limit = baseline
         .map(|period| (period * 4.0).clamp(0.1, 0.2))
         .unwrap_or(0.2);
-    pair_dt <= limit
+    // Rejected captures still refresh the arrival watchdog. Its short interval
+    // must not turn an intentional low-rate cap into a timeline break.
+    let cap_tolerance = fps_cap.filter(|cap| *cap > 0).map_or(0.0, |cap| 2.0 / cap as f64);
+    pair_dt <= limit.max(cap_tolerance)
 }
 
 #[derive(Clone, Copy)]
@@ -15646,6 +15650,7 @@ fn engine_main(
                             s.cadence.period_s(),
                             s.arrival_interval,
                             directml_drba,
+                            s.fps_cap,
                         )
                     {
                         log::info!(
@@ -22881,35 +22886,37 @@ mod tests {
 
     #[test]
     fn interpolation_accepts_normal_and_coalesced_video_pairs() {
+        assert!(interp_pair_is_contiguous(Some(0.133), None, 0.022, false, Some(8)));
+        assert!(!interp_pair_is_contiguous(Some(0.5), None, 0.022, false, Some(8)));
         assert!(interp_pair_is_contiguous(
             Some(1.0 / 24.0),
             Some(1.0 / 24.0),
             1.0 / 24.0,
-            false,
+            false, None,
         ));
         assert!(interp_pair_is_contiguous(
             Some(2.0 / 24.0),
             Some(1.0 / 24.0),
             1.0 / 24.0,
-            false,
+            false, None,
         ));
         assert!(interp_pair_is_contiguous(
             Some(2.0 / 24.0),
             Some(1.0 / 24.0),
             1.0 / 24.0,
-            true,
+            true, None,
         ));
         assert!(interp_pair_is_contiguous(
             Some(0.300),
             Some(1.0 / 24.0),
             1.0 / 24.0,
-            true,
+            true, None,
         ));
         assert!(!interp_pair_is_contiguous(
             Some(0.800),
             Some(1.0 / 24.0),
             1.0 / 24.0,
-            true,
+            true, None,
         ));
     }
 
@@ -22919,9 +22926,9 @@ mod tests {
             Some(0.783),
             Some(1.0 / 24.0),
             0.113,
-            false,
+            false, None,
         ));
-        assert!(!interp_pair_is_contiguous(Some(4.7), None, 4.7, false));
+        assert!(!interp_pair_is_contiguous(Some(4.7), None, 4.7, false, None));
     }
 
     #[test]

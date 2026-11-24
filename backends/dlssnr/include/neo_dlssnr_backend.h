@@ -25,6 +25,7 @@
 #define NEO_DLSSNR_CAP_USER_RUNTIME_SELECTION (1ull << 4)
 #define NEO_DLSSNR_CAP_EVAL_OPTIONS           (1ull << 5)
 #define NEO_DLSSNR_CAP_ADVANCED_OPTIONS       (1ull << 6)
+#define NEO_DLSSNR_CAP_GPU_TIMING              (1ull << 7)
 
 // The first 20 bytes are the original eval-options-v1 contract. Newer bridges may
 // append/read the optional tail when struct_size is large enough; ABI stays 1.
@@ -64,6 +65,19 @@ typedef struct NeoDlssNrFrameDesc {
     uint32_t reserved[6];
 } NeoDlssNrFrameDesc;
 
+// Optional ABI-v1 diagnostic tail. Values are populated only on sampled frames
+// (first frame and every 120th frame) so timestamp queries do not burden the
+// steady-state path. All times are microseconds.
+typedef struct NeoDlssNrGpuTiming {
+    uint32_t struct_size;
+    uint32_t valid;
+    uint64_t frame_index;
+    uint64_t input_copy_gpu_us;
+    uint64_t evaluate_gpu_us;
+    uint64_t output_copy_gpu_us;
+    uint64_t gpu_total_us;
+} NeoDlssNrGpuTiming;
+
 // Required ABI-v1 exports. Return 0 on success. Nonzero always means Neo should
 // bypass DLSSNR and keep the original frame. No bridge function may terminate
 // the host process.
@@ -77,6 +91,15 @@ NEO_DLSSNR_EXPORT int32_t neo_dlssnr_process_rgba8(
     uint32_t input_stride,
     uint8_t* output_rgba8,
     uint32_t output_stride);
+// Optional ABI-v1 GPU-resident extension. `shared_handle` is a HANDLE value
+// already duplicated into the worker process. The bridge opens it as a D3D12
+// BUFFER containing tightly packed RGBA8 and closes the HANDLE after attach.
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_attach_shared_rgba8(
+    void* context, uint64_t shared_handle, uint64_t byte_len);
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_process_shared_rgba8(
+    void* context, const NeoDlssNrFrameDesc* desc);
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_get_last_gpu_timing(
+    void* context, NeoDlssNrGpuTiming* timing_out);
 NEO_DLSSNR_EXPORT int32_t neo_dlssnr_reset_history(void* context);
 NEO_DLSSNR_EXPORT void neo_dlssnr_destroy(void* context);
 NEO_DLSSNR_EXPORT uint32_t neo_dlssnr_last_error(

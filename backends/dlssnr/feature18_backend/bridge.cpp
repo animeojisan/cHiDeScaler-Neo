@@ -34,6 +34,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -553,6 +554,13 @@ struct Context {
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_event = nullptr;
     uint64_t fence_value = 0;
+    // v744: sampled GPU timestamps. They are optional diagnostics and never
+    // participate in the success/failure contract of Feature 18 processing.
+    ComPtr<ID3D12QueryHeap> timing_heap;
+    ComPtr<ID3D12Resource> timing_readback;
+    const uint64_t* mapped_timing = nullptr;
+    uint64_t timestamp_frequency = 0;
+    NeoDlssNrGpuTiming last_gpu_timing{};
 
     ComPtr<ID3D12Resource> input;
     ComPtr<ID3D12Resource> output;
@@ -560,9 +568,14 @@ struct Context {
     ComPtr<ID3D12Resource> depth;
     ComPtr<ID3D12Resource> upload;
     ComPtr<ID3D12Resource> readback;
+    // v743+: optional cross-process RGBA8 staging buffer. Opened from a HANDLE
+    // duplicated into the isolated worker. It remains in COMMON whenever GL owns it.
+    ComPtr<ID3D12Resource> shared_rgba8;
+    uint64_t shared_rgba8_bytes = 0;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT input_fp{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_fp{};
     uint8_t* mapped_upload = nullptr;
+    const uint8_t* mapped_readback = nullptr;
 
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
@@ -631,7 +644,51 @@ struct Context {
             0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.ReleaseAndGetAddressOf()));
         if (FAILED(hr)) return fail_hr("Create D3D12 command objects", hr);
         fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        return fence_event != nullptr || fail("CreateEventW for D3D12 fence failed");
+        if (!fence_event) return fail("CreateEventW for D3D12 fence failed");
+        create_timing_resources_best_effort();
+        return true;
+    }
+
+    void create_timing_resources_best_effort() noexcept {
+        timestamp_frequency = 0;
+        mapped_timing = nullptr;
+        timing_heap.Reset();
+        timing_readback.Reset();
+        last_gpu_timing = {};
+        if (!device || !queue) return;
+        UINT64 frequency = 0;
+        if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0) return;
+        D3D12_QUERY_HEAP_DESC q{};
+        q.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        q.Count = 4;
+        if (FAILED(device->CreateQueryHeap(&q, IID_PPV_ARGS(timing_heap.ReleaseAndGetAddressOf())))) {
+            timing_heap.Reset();
+            return;
+        }
+        const auto heap = heap_properties(D3D12_HEAP_TYPE_READBACK);
+        const auto desc = buffer_desc(sizeof(uint64_t) * 4ull);
+        if (FAILED(device->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(timing_readback.ReleaseAndGetAddressOf())))) {
+            timing_heap.Reset();
+            timing_readback.Reset();
+            return;
+        }
+        D3D12_RANGE read_range{0, sizeof(uint64_t) * 4};
+        void* mapped = nullptr;
+        if (FAILED(timing_readback->Map(0, &read_range, &mapped)) || !mapped) {
+            timing_heap.Reset();
+            timing_readback.Reset();
+            return;
+        }
+        mapped_timing = static_cast<const uint64_t*>(mapped);
+        timestamp_frequency = frequency;
+    }
+
+    uint64_t timing_us(uint64_t begin, uint64_t end) const noexcept {
+        if (!timestamp_frequency || end < begin) return 0;
+        const long double ticks = static_cast<long double>(end - begin);
+        return static_cast<uint64_t>((ticks * 1000000.0L / static_cast<long double>(timestamp_frequency)) + 0.5L);
     }
 
     bool create_texture(DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags,
@@ -680,8 +737,16 @@ struct Context {
         rows = 0; row_bytes = 0; total = 0;
         d = output->GetDesc();
         device->GetCopyableFootprints(&d, 0, 1, 0, &output_fp, &rows, &row_bytes, &total);
-        return create_buffer(total, D3D12_HEAP_TYPE_READBACK,
-                             D3D12_RESOURCE_STATE_COPY_DEST, readback);
+        if (!create_buffer(total, D3D12_HEAP_TYPE_READBACK,
+                           D3D12_RESOURCE_STATE_COPY_DEST, readback)) return false;
+        // READBACK heaps may remain persistently mapped. This removes one
+        // Map/Unmap pair per frame without changing synchronization or format.
+        D3D12_RANGE full_read{0, static_cast<SIZE_T>(total)};
+        mapped = nullptr;
+        hr = readback->Map(0, &full_read, &mapped);
+        if (FAILED(hr) || !mapped) return fail_hr("Map persistent Feature 18 output", hr);
+        mapped_readback = static_cast<const uint8_t*>(mapped);
+        return true;
     }
 
     bool wait_queue() {
@@ -774,6 +839,14 @@ struct Context {
         if (!zero_texture(motion.Get(), zero_motion) || !zero_texture(depth.Get(), zero_depth)) return false;
         result = safe_create(snippet_create, list.Get(), params, &feature, &seh);
         if (seh || !ngx_ok(result) || !feature) return fail_ngx("Feature 18 CreateFeature", result, seh);
+        // Zero Guidance never changes after creation. Keep these textures in the
+        // shader-readable state across evaluations instead of round-tripping
+        // COMMON <-> NON_PIXEL_SHADER_RESOURCE every frame.
+        D3D12_RESOURCE_BARRIER guidance_ready[]{
+            transition(motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        list->ResourceBarrier(static_cast<UINT>(std::size(guidance_ready)), guidance_ready);
         if (!execute_wait()) return false;
         return true;
     }
@@ -807,12 +880,8 @@ struct Context {
                         uint8_t* dst, uint32_t output_stride) {
         const uint32_t row = width * 4u;
         if (!dst || output_stride < row) return fail("Invalid RGBA8 output stride");
-        const uint64_t bytes = static_cast<uint64_t>(output_fp.Footprint.RowPitch) * height;
-        D3D12_RANGE read_range{0, static_cast<SIZE_T>(bytes)};
-        void* mapped = nullptr;
-        HRESULT hr = readback->Map(0, &read_range, &mapped);
-        if (FAILED(hr) || !mapped) return fail_hr("Map Feature 18 output", hr);
-        const auto* base = static_cast<const uint8_t*>(mapped);
+        if (!mapped_readback) return fail("Feature 18 output readback is not mapped");
+        const auto* base = mapped_readback;
         for (uint32_t y = 0; y < height; ++y) {
             const auto* src_row = base + static_cast<size_t>(y) * output_fp.Footprint.RowPitch;
             auto* dst_row = dst + static_cast<size_t>(y) * output_stride;
@@ -823,8 +892,114 @@ struct Context {
                 for (uint32_t x = 0; x < width; ++x) dst_row[x * 4u + 3u] = in_row[x * 4u + 3u];
             }
         }
-        D3D12_RANGE no_write{0, 0};
-        readback->Unmap(0, &no_write);
+        return true;
+    }
+
+    bool attach_shared_rgba8(HANDLE handle, uint64_t byte_len) {
+        if (!initialized || !device) {
+            if (handle) CloseHandle(handle);
+            return fail("DLSSNR session is not initialized for shared RGBA8 attach");
+        }
+        if (!handle || handle == INVALID_HANDLE_VALUE) return fail("Invalid shared RGBA8 handle");
+        ComPtr<ID3D12Resource> opened;
+        const HRESULT hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(opened.ReleaseAndGetAddressOf()));
+        CloseHandle(handle);
+        if (FAILED(hr) || !opened) return fail_hr("OpenSharedHandle RGBA8", hr);
+        const auto desc = opened->GetDesc();
+        const uint64_t required = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ull;
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width < required || byte_len < required)
+            return fail("Shared RGBA8 resource is too small or is not a D3D12 buffer");
+        // The zero-copy transport deliberately starts with modes whose packed RGBA8 row
+        // already satisfies D3D12's 256-byte placed-footprint rule. Other geometries
+        // stay on v742's proven reflected-pad CPU bridge until a padded GPU pack path is added.
+        if (input_fp.Footprint.RowPitch != width * 4u || output_fp.Footprint.RowPitch != width * 4u)
+            return fail("Shared RGBA8 requires a 256-byte-aligned logical row");
+        shared_rgba8 = std::move(opened);
+        shared_rgba8_bytes = byte_len;
+        last_error.clear();
+        return true;
+    }
+
+    bool process_shared(const NeoDlssNrFrameDesc* frame) {
+        if (!initialized || !feature || !params || !shared_rgba8)
+            return fail("DLSSNR shared RGBA8 session is not initialized");
+        if (!frame || frame->struct_size < sizeof(NeoDlssNrFrameDesc) ||
+            frame->width != width || frame->height != height)
+            return fail("Frame geometry does not match DLSSNR shared session");
+        if (!reset_list()) return false;
+
+        const bool sample_timing = timing_heap && timing_readback && mapped_timing && timestamp_frequency &&
+                                   (frame->frame_index == 0 || ((frame->frame_index + 1) % 120ull) == 0);
+        last_gpu_timing = {};
+        if (sample_timing) list->EndQuery(timing_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+        auto shared_to_source = transition(shared_rgba8.Get(), D3D12_RESOURCE_STATE_COMMON,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &shared_to_source);
+        D3D12_TEXTURE_COPY_LOCATION input_dst{}; input_dst.pResource = input.Get();
+        input_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION input_src{}; input_src.pResource = shared_rgba8.Get();
+        input_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        input_src.PlacedFootprint = input_fp;
+        list->CopyTextureRegion(&input_dst, 0, 0, 0, &input_src, nullptr);
+
+        D3D12_RESOURCE_BARRIER before[]{
+            transition(input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            transition(output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        };
+        list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
+        if (sample_timing) list->EndQuery(timing_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+        DWORD seh = 0;
+        const bool reset = reset_pending || frame->reset_history != 0;
+        if (!safe_set_eval_params(params, input.Get(), output.Get(), motion.Get(), depth.Get(),
+                                  width, height, reset, &options, &seh)) {
+            list->Close();
+            return fail_ngx("Set Feature 18 shared evaluate parameters", NVSDK_NGX_Result_FAIL_PlatformError, seh);
+        }
+        const auto result = safe_evaluate(snippet_evaluate, list.Get(), feature, params, &seh);
+        if (seh || !ngx_ok(result)) {
+            list->Close();
+            return fail_ngx("Feature 18 shared EvaluateFeature", result, seh);
+        }
+        if (sample_timing) list->EndQuery(timing_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+
+        auto out_to_copy = transition(output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+        auto shared_to_dest = transition(shared_rgba8.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                         D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_RESOURCE_BARRIER output_copy_barriers[]{out_to_copy, shared_to_dest};
+        list->ResourceBarrier(static_cast<UINT>(std::size(output_copy_barriers)), output_copy_barriers);
+        D3D12_TEXTURE_COPY_LOCATION out_dst{}; out_dst.pResource = shared_rgba8.Get();
+        out_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        out_dst.PlacedFootprint = output_fp;
+        D3D12_TEXTURE_COPY_LOCATION out_src{}; out_src.pResource = output.Get();
+        out_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&out_dst, 0, 0, 0, &out_src, nullptr);
+
+        D3D12_RESOURCE_BARRIER after[]{
+            transition(input.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+            transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            transition(shared_rgba8.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+        };
+        list->ResourceBarrier(static_cast<UINT>(std::size(after)), after);
+        if (sample_timing) {
+            list->EndQuery(timing_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 3);
+            list->ResolveQueryData(timing_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 4,
+                                   timing_readback.Get(), 0);
+        }
+        if (!execute_wait()) return false;
+        if (sample_timing) {
+            last_gpu_timing.struct_size = sizeof(NeoDlssNrGpuTiming);
+            last_gpu_timing.valid = 1;
+            last_gpu_timing.frame_index = frame->frame_index;
+            last_gpu_timing.input_copy_gpu_us = timing_us(mapped_timing[0], mapped_timing[1]);
+            last_gpu_timing.evaluate_gpu_us = timing_us(mapped_timing[1], mapped_timing[2]);
+            last_gpu_timing.output_copy_gpu_us = timing_us(mapped_timing[2], mapped_timing[3]);
+            last_gpu_timing.gpu_total_us = timing_us(mapped_timing[0], mapped_timing[3]);
+        }
+        reset_pending = false;
+        last_error.clear();
         return true;
     }
 
@@ -845,8 +1020,6 @@ struct Context {
         D3D12_RESOURCE_BARRIER before[]{
             transition(input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            transition(motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            transition(depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         };
         list->ResourceBarrier(static_cast<UINT>(std::size(before)), before);
 
@@ -875,8 +1048,6 @@ struct Context {
         D3D12_RESOURCE_BARRIER after[]{
             transition(input.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
             transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-            transition(motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-            transition(depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
         };
         list->ResourceBarrier(static_cast<UINT>(std::size(after)), after);
         if (!execute_wait() || !download_rgba8(src, input_stride, dst, output_stride)) return false;
@@ -908,8 +1079,12 @@ struct Context {
             safe_shutdown(static_cast<ShutdownFn>(&NVSDK_NGX_D3D12_Shutdown1), device.Get(), &seh);
         }
         core_initialized = false;
+        if (mapped_timing && timing_readback) { D3D12_RANGE no_write{0, 0}; timing_readback->Unmap(0, &no_write); mapped_timing = nullptr; }
+        if (mapped_readback && readback) { D3D12_RANGE no_write{0, 0}; readback->Unmap(0, &no_write); mapped_readback = nullptr; }
         if (mapped_upload && upload) { upload->Unmap(0, nullptr); mapped_upload = nullptr; }
         if (fence_event) { CloseHandle(fence_event); fence_event = nullptr; }
+        shared_rgba8.Reset(); shared_rgba8_bytes = 0;
+        timing_readback.Reset(); timing_heap.Reset(); timestamp_frequency = 0; last_gpu_timing = {};
         readback.Reset(); upload.Reset(); depth.Reset(); motion.Reset(); output.Reset(); input.Reset();
         fence.Reset(); list.Reset(); allocator.Reset(); queue.Reset(); device.Reset();
         initialized = false;
@@ -950,19 +1125,20 @@ NEO_DLSSNR_EXPORT int32_t neo_dlssnr_select_runtime(const uint16_t* path) {
 }
 
 NEO_DLSSNR_EXPORT uint64_t neo_dlssnr_get_capabilities(void) {
-    return NEO_DLSSNR_CAP_ZERO_GUIDANCE | NEO_DLSSNR_CAP_USER_RUNTIME_SELECTION |
-           NEO_DLSSNR_CAP_EVAL_OPTIONS | NEO_DLSSNR_CAP_ADVANCED_OPTIONS;
+    return NEO_DLSSNR_CAP_ZERO_GUIDANCE | NEO_DLSSNR_CAP_D3D12_SHARED_TEXTURE |
+           NEO_DLSSNR_CAP_USER_RUNTIME_SELECTION | NEO_DLSSNR_CAP_EVAL_OPTIONS |
+           NEO_DLSSNR_CAP_ADVANCED_OPTIONS | NEO_DLSSNR_CAP_GPU_TIMING;
 }
 
 NEO_DLSSNR_EXPORT uint32_t neo_dlssnr_describe_backend(char* buffer, uint32_t capacity) {
     try {
-        std::string text = "Neo Feature 18 D3D12 backend; zero-guidance; runtime=";
+        std::string text = "Neo Feature 18 D3D12 backend; zero-guidance; shared-rgba8; runtime=";
         const auto path = choose_runtime_path();
         text += path.empty() ? std::string("unresolved") : path.filename().string();
         return copy_string(text, buffer, capacity);
     } catch (...) {
         return copy_string(
-            "Neo Feature 18 D3D12 backend; zero-guidance; runtime=unresolved",
+            "Neo Feature 18 D3D12 backend; zero-guidance; shared-rgba8; runtime=unresolved",
             buffer,
             capacity);
     }
@@ -1032,6 +1208,54 @@ NEO_DLSSNR_EXPORT int32_t neo_dlssnr_process_rgba8(
     } catch (...) {
         ctx->fail("DLSSNR evaluate unknown exception");
         return 23;
+    }
+}
+
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_attach_shared_rgba8(
+    void* raw, uint64_t shared_handle, uint64_t byte_len) {
+    auto* ctx = static_cast<Context*>(raw);
+    if (!ctx || shared_handle == 0) { set_global_error("Invalid shared RGBA8 attach argument"); return 24; }
+    try {
+        std::scoped_lock execution(g_runtime_mutex);
+        std::scoped_lock local(ctx->mutex);
+        return ctx->attach_shared_rgba8(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(shared_handle)), byte_len) ? 0 : 25;
+    } catch (const std::exception& e) {
+        ctx->fail(std::string("DLSSNR shared attach exception: ") + e.what());
+        return 26;
+    } catch (...) {
+        ctx->fail("DLSSNR shared attach unknown exception");
+        return 27;
+    }
+}
+
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_process_shared_rgba8(
+    void* raw, const NeoDlssNrFrameDesc* desc) {
+    auto* ctx = static_cast<Context*>(raw);
+    if (!ctx || !desc) { set_global_error("Null argument passed to DLSSNR shared evaluate"); return 28; }
+    try {
+        std::scoped_lock execution(g_runtime_mutex);
+        std::scoped_lock local(ctx->mutex);
+        return ctx->process_shared(desc) ? 0 : 29;
+    } catch (const std::exception& e) {
+        ctx->fail(std::string("DLSSNR shared evaluate exception: ") + e.what());
+        return 32;
+    } catch (...) {
+        ctx->fail("DLSSNR shared evaluate unknown exception");
+        return 33;
+    }
+}
+
+NEO_DLSSNR_EXPORT int32_t neo_dlssnr_get_last_gpu_timing(
+    void* raw, NeoDlssNrGpuTiming* timing_out) {
+    auto* ctx = static_cast<Context*>(raw);
+    if (!ctx || !timing_out || timing_out->struct_size < sizeof(NeoDlssNrGpuTiming)) return 34;
+    try {
+        std::scoped_lock local(ctx->mutex);
+        *timing_out = ctx->last_gpu_timing;
+        timing_out->struct_size = sizeof(NeoDlssNrGpuTiming);
+        return 0;
+    } catch (...) {
+        return 35;
     }
 }
 
