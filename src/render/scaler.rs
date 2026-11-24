@@ -305,3 +305,14 @@ fn run(
     gc.unbind_target();
     tgt
 }
+
+/// Exact top-left crop / right-bottom edge extension; no resampling.
+pub fn crop_edge(gc:&mut GlContext,src:GpuTex,w:i32,h:i32)->Result<GpuTex> {
+    const FRAG:&str="#version 330\nin vec2 v_uv;out vec4 frag;uniform sampler2D tex;\nvoid main(){ivec2 p=min(ivec2(gl_FragCoord.xy),textureSize(tex,0)-ivec2(1));frag=texelFetch(tex,p,0);}";
+    let program=gc.program(FRAG).map_err(|e|anyhow!(e))?;
+    let out=gc.make_tex(w,h,src.comps(),src.key.dtype);gc.bind_target(out);
+    unsafe{let gl=&gc.gl;gl.memory_barrier(glow::ALL_BARRIER_BITS);gl.use_program(Some(program));gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D,Some(src.tex));gl.uniform_1_i32(gl.get_uniform_location(program,"tex").as_ref(),0);
+        gl.bind_vertex_array(Some(gc.quad_vao));gl.draw_arrays(glow::TRIANGLE_STRIP,0,4);gl.bind_vertex_array(None);gl.memory_barrier(glow::ALL_BARRIER_BITS);
+    }gc.unbind_target();Ok(out)
+}

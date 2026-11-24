@@ -16,7 +16,7 @@ use std::sync::Arc;
 use windows::Win32::{
     Foundation::{FreeLibrary, HANDLE, HMODULE},
     System::LibraryLoader::{
-        GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
         LoadLibraryExW,
     },
 };
@@ -505,6 +505,13 @@ type PrepareInterpStreamU8Fn =
     unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, *const *const u8) -> i32;
 type RunInterpStreamPhaseU8Fn =
     unsafe extern "C" fn(*mut c_void, *const NeoAmdRunDesc, f32, *mut u8, u64) -> i32;
+// v978: optional NeoAMD v135 core export for extra interpolation output slots.
+type PrepareInterpSharedRingSlotFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const NeoAmdRunDesc,
+    u32,
+    *mut NeoAmdSharedOutputDesc,
+) -> i32;
 type PrepareInterpStreamSharedRgba8Fn = unsafe extern "C" fn(
     *mut c_void,
     *const NeoAmdRunDesc,
@@ -624,16 +631,9 @@ impl NeoAmdBackend {
         }
         .map_err(|error| format!("{} could not be loaded: {error}", bridge_path.display()))?;
         let rtx = backend_dir.file_name().is_some_and(|name| name == "neortx");
-        let export = |name: &str| {
-            if rtx {
-                name.replacen("neoamd_", "neortx_", 1)
-            } else {
-                name.to_string()
-            }
-        };
+        let export = |name: &str| if rtx { name.replacen("neoamd_", "neortx_", 1) } else { name.to_string() };
         let loaded = (|| unsafe {
-            let get_api_version: GetApiVersionFn =
-                symbol(module, &export("neoamd_get_api_version"))?;
+            let get_api_version: GetApiVersionFn = symbol(module, &export("neoamd_get_api_version"))?;
             let actual = get_api_version();
             if actual != NEOAMD_BRIDGE_ABI {
                 return Err(format!(
@@ -669,14 +669,8 @@ impl NeoAmdBackend {
                     &export("neoamd_get_shared_output_handle"),
                 ),
                 run_u8_shared_fp16: optional_symbol(module, &export("neoamd_run_u8_shared_fp16")),
-                prepare_shared_io_fp16: optional_symbol(
-                    module,
-                    &export("neoamd_prepare_shared_io_fp16"),
-                ),
-                get_shared_input_handle: optional_symbol(
-                    module,
-                    &export("neoamd_get_shared_input_handle"),
-                ),
+                prepare_shared_io_fp16: optional_symbol(module, &export("neoamd_prepare_shared_io_fp16")),
+                get_shared_input_handle: optional_symbol(module, &export("neoamd_get_shared_input_handle")),
                 run_shared_io_fp16: optional_symbol(module, &export("neoamd_run_shared_io_fp16")),
                 prepare_temporal_shared_io_fp16: optional_symbol(
                     module,
@@ -686,26 +680,14 @@ impl NeoAmdBackend {
                     module,
                     &export("neoamd_run_temporal_shared_io_fp16"),
                 ),
-                run_peer_shared_io_fp16: optional_symbol(
-                    module,
-                    &export("neoamd_run_peer_shared_io_fp16"),
-                ),
-                reset_temporal_history: optional_symbol(
-                    module,
-                    &export("neoamd_reset_temporal_history"),
-                ),
-                release_shared_output: optional_symbol(
-                    module,
-                    &export("neoamd_release_shared_output"),
-                ),
+                run_peer_shared_io_fp16: optional_symbol(module, &export("neoamd_run_peer_shared_io_fp16")),
+                reset_temporal_history: optional_symbol(module, &export("neoamd_reset_temporal_history")),
+                release_shared_output: optional_symbol(module, &export("neoamd_release_shared_output")),
                 destroy: symbol(module, &export("neoamd_destroy_session"))?,
                 last_error: symbol(module, &export("neoamd_last_error"))?,
                 describe_backend: optional_symbol(module, &export("neoamd_describe_backend")),
                 get_last_run_route: optional_symbol(module, &export("neoamd_get_last_run_route")),
-                get_last_image_gpu_ms: optional_symbol(
-                    module,
-                    &export("neoamd_get_last_image_gpu_ms"),
-                ),
+                get_last_image_gpu_ms: optional_symbol(module, &export("neoamd_get_last_image_gpu_ms")),
                 get_last_image_copy_gpu_ms: optional_symbol(
                     module,
                     &export("neoamd_get_last_image_copy_gpu_ms"),
@@ -1347,6 +1329,50 @@ impl NeoAmdSession {
         Self::shared_rgba8_surface(output, "interpolation output").map(Some)
     }
 
+    /// v978: request extra cooperative RGBA8 output slot `slot` (1..7) with the
+    /// geometry of the current slot-0 interpolation output. Returns Ok(None)
+    /// when the loaded Backend Pack has no such export (pre-v135) or the
+    /// session is not a native NeoAMD session; callers then keep one buffer.
+    pub fn prepare_interp_shared_ring_slot(
+        &mut self,
+        width: i32,
+        height: i32,
+        slot: u32,
+    ) -> Result<Option<NeoAmdSharedOutput>, String> {
+        if !self.supports_interp_stream_shared_rgba8() || !(1..8).contains(&slot) {
+            return Ok(None);
+        }
+        // Common (ONNX fallback) sessions are tagged with the low pointer bit
+        // by the compatibility bridge and are not core sessions.
+        if (self.context as usize) & 1 != 0 {
+            return Ok(None);
+        }
+        let function: Option<PrepareInterpSharedRingSlotFn> = unsafe {
+            optional_symbol(self.backend.module, "neoamd_prepare_interp_shared_ring_slot").or_else(|| {
+                GetModuleHandleW(windows::core::w!("neo_amd_backend_core.dll"))
+                    .ok()
+                    .and_then(|core| optional_symbol(core, "neoamd_prepare_interp_shared_ring_slot"))
+            })
+        };
+        let Some(function) = function else {
+            return Ok(None);
+        };
+        let desc = Self::run_desc(width, height, 2, 4, 4, 0.5)?;
+        let mut output = NeoAmdSharedOutputDesc {
+            struct_size: std::mem::size_of::<NeoAmdSharedOutputDesc>() as u32,
+            ..NeoAmdSharedOutputDesc::default()
+        };
+        let status = unsafe { function(self.context, &desc, slot, &mut output) };
+        if status != 0 {
+            return Err(self.backend.error_string(
+                self.context,
+                status,
+                "prepare-interp-shared-ring-slot",
+            ));
+        }
+        Self::shared_rgba8_surface(output, "interpolation ring output").map(Some)
+    }
+
     pub fn run_interp_stream_phase_shared_rgba8(
         &mut self,
         width: i32,
@@ -1678,11 +1704,7 @@ mod tests {
             "supported_gpu_architectures":["sm_120"],
             "file_sha256":{"neo_rtx_backend.dll":"0000000000000000000000000000000000000000000000000000000000000000"}
         });
-        std::fs::write(
-            pack.join("backend.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(pack.join("backend.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
         let state = detect_neortx_backend(&app, None);
         assert!(state.installed);
         assert!(!state.available);
@@ -1726,6 +1748,7 @@ mod tests {
     }
 }
 
+
 fn read_neortx_manifest(app_dir: &Path) -> Result<(PathBuf, NeoAmdManifest), NeoAmdAvailability> {
     let backend_dir = app_dir.join("backends").join("neortx");
     let manifest_path = backend_dir.join("backend.json");
@@ -1761,12 +1784,7 @@ fn read_neortx_manifest(app_dir: &Path) -> Result<(PathBuf, NeoAmdManifest), Neo
         }
     };
     if manifest.bridge != "neo_rtx_backend.dll" || manifest.provider != "NeoRTX" {
-        return Err(unavailable(
-            "NeoRTX requires its own bridge and provider",
-            true,
-            Some(manifest),
-            Some(backend_dir),
-        ));
+        return Err(unavailable("NeoRTX requires its own bridge and provider", true, Some(manifest), Some(backend_dir)));
     }
     if manifest.backend_api != NEOAMD_BACKEND_API {
         return Err(unavailable(
@@ -1846,6 +1864,7 @@ fn read_neortx_manifest(app_dir: &Path) -> Result<(PathBuf, NeoAmdManifest), Neo
     Ok((backend_dir, manifest))
 }
 
+
 fn selected_nvidia_luid(selected_luid: Option<u64>) -> Result<u64, String> {
     let adapters = crate::platform::gpu::enumerate_adapters_quiet();
     if let Some(luid) = selected_luid {
@@ -1854,10 +1873,7 @@ fn selected_nvidia_luid(selected_luid: Option<u64>) -> Result<u64, String> {
             .find(|adapter| adapter.luid == luid)
             .ok_or_else(|| format!("selected GPU LUID {luid:016x} is unavailable"))?;
         if adapter.vendor_id != 0x10DE {
-            return Err(format!(
-                "selected GPU '{}' is not an NVIDIA GPU",
-                adapter.name
-            ));
+            return Err(format!("selected GPU '{}' is not an NVIDIA GPU", adapter.name));
         }
         return Ok(luid);
     }
@@ -1872,6 +1888,7 @@ fn selected_nvidia_luid(selected_luid: Option<u64>) -> Result<u64, String> {
     }
     Ok(first.luid)
 }
+
 
 pub fn detect_neortx_backend(app_dir: &Path, selected_luid: Option<u64>) -> NeoAmdAvailability {
     let (backend_dir, manifest) = match read_neortx_manifest(app_dir) {
@@ -1895,10 +1912,7 @@ pub fn detect_neortx_backend(app_dir: &Path, selected_luid: Option<u64>) -> NeoA
     };
     let architecture = info.architecture_string();
     if info.vendor_id != 0x10DE
-        || !matches!(
-            architecture.as_str(),
-            "sm_80" | "sm_86" | "sm_89" | "sm_120"
-        )
+        || !matches!(architecture.as_str(), "sm_80" | "sm_86" | "sm_89" | "sm_120")
     {
         return unavailable(
             format!("selected NVIDIA GPU is not a supported Tensor Core target ({architecture})"),

@@ -2287,6 +2287,26 @@ pub struct MultiPassGlUploadResult {
     pub first_frame_active: bool,
 }
 
+/// GPU-only RGBA8 handoff. The producer has finished its Vulkan fence before
+/// returning; the consumer owns this NT handle and must synchronize before
+/// the same runtime writes the next frame into the buffer.
+pub struct MultiPassSharedRgbaResult {
+    pub handle: HANDLE,
+    pub resource_key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: usize,
+    pub luid: u64,
+}
+
+impl Drop for MultiPassSharedRgbaResult {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct RuntimeKey {
     luid: u64,
@@ -4876,7 +4896,7 @@ impl VulkanMultiPassRuntime {
     /// still authoritative, so GL never samples a partially written frame.
     /// Unlike `process_external_nchw`, this does not clone the complete
     /// readback allocation into a temporary Vec before uploading it.
-    fn process_external_nchw_to_gl(
+    fn prepare_external_nchw_command(
         &mut self,
         shared_key: u64,
         shared_handle: isize,
@@ -4884,8 +4904,7 @@ impl VulkanMultiPassRuntime {
         padded_width: u32,
         padded_height: u32,
         fp16: bool,
-        gc: &mut GlContext,
-    ) -> Result<MultiPassGlUploadResult> {
+    ) -> Result<vk::CommandBuffer> {
         let element_bytes = if fp16 { 2usize } else { 4usize };
         let required = (padded_width as usize)
             .checked_mul(padded_height as usize)
@@ -4940,6 +4959,90 @@ impl VulkanMultiPassRuntime {
                 imported.initial_command_buffer
             }
         };
+        Ok(external_command)
+    }
+
+    /// Diagnostic GPU-only endpoint for the eventual Vulkan overlay. It uses
+    /// the same imported DirectML input and RGBA pack command as the GL path,
+    /// but never allocates a host readback for this frame.
+    fn process_external_nchw_to_shared_rgba(
+        &mut self,
+        shared_key: u64,
+        shared_handle: isize,
+        byte_len: usize,
+        padded_width: u32,
+        padded_height: u32,
+        fp16: bool,
+    ) -> Result<MultiPassSharedRgbaResult> {
+        anyhow::ensure!(
+            self.external_rgba_output.is_some(),
+            "external RGBA output unavailable"
+        );
+        let external_command = self.prepare_external_nchw_command(
+            shared_key,
+            shared_handle,
+            byte_len,
+            padded_width,
+            padded_height,
+            fp16,
+        )?;
+        let main_command = if self.image_initialized {
+            self.steady_external_input_output_command_buffer
+        } else {
+            self.initial_external_input_output_command_buffer
+        };
+        unsafe {
+            self.device
+                .reset_fences(&[self.fence])
+                .context("vkResetFences shared RGBA output failed")?;
+            let commands = [external_command, main_command];
+            let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+            self.device
+                .queue_submit(self.queue, &submits, self.fence)
+                .context("vkQueueSubmit shared RGBA output failed")?;
+        }
+        self.submission_in_flight = true;
+        let waited = unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, 1_000_000_000)
+        };
+        if waited.is_ok() {
+            self.submission_in_flight = false;
+        }
+        waited.context("shared RGBA output timed out")?;
+        self.image_initialized = true;
+        let output = self
+            .external_rgba_output
+            .as_ref()
+            .expect("checked external output");
+        Ok(MultiPassSharedRgbaResult {
+            handle: output.shared_handle()?,
+            resource_key: output.key,
+            width: self.output_width,
+            height: self.output_height,
+            byte_len: self.output_byte_count,
+            luid: self.requested_luid,
+        })
+    }
+
+    fn process_external_nchw_to_gl(
+        &mut self,
+        shared_key: u64,
+        shared_handle: isize,
+        byte_len: usize,
+        padded_width: u32,
+        padded_height: u32,
+        fp16: bool,
+        gc: &mut GlContext,
+    ) -> Result<MultiPassGlUploadResult> {
+        let external_command = self.prepare_external_nchw_command(
+            shared_key,
+            shared_handle,
+            byte_len,
+            padded_width,
+            padded_height,
+            fp16,
+        )?;
         let call_started = Instant::now();
         let sync_started = Instant::now();
         let external_output_key = self.prepare_external_rgba_output_for_gl(gc);
@@ -5863,6 +5966,67 @@ pub fn process_d3d12_nchw_to_gl(
     })
 }
 
+/// Diagnostic DirectML -> Vulkan -> shared RGBA8 output without CPU pixels.
+/// The returned NT handle owns a reference to the D3D12-backed buffer; a
+/// future presenter must consume it before the runtime overwrites that slot.
+#[allow(clippy::too_many_arguments)]
+pub fn process_d3d12_nchw_to_shared_rgba(
+    requested_luid: u64,
+    shader: &UserShader,
+    input_width: u32,
+    input_height: u32,
+    output_ref_width: u32,
+    output_ref_height: u32,
+    shared_key: u64,
+    shared_handle: isize,
+    shared_byte_len: usize,
+    padded_width: u32,
+    padded_height: u32,
+    fp16: bool,
+) -> Result<Option<MultiPassSharedRgbaResult>> {
+    if !production_requested() || !production_shader_admitted(shader) {
+        return Ok(None);
+    }
+    let key = RuntimeKey {
+        luid: requested_luid,
+        input_width: input_width.max(1),
+        input_height: input_height.max(1),
+        output_ref_width: output_ref_width.max(1),
+        output_ref_height: output_ref_height.max(1),
+        shader_hash: shader_runtime_hash(shader),
+    };
+    MULTIPASS_RUNTIMES.with(|slot| -> Result<Option<MultiPassSharedRgbaResult>> {
+        let mut cache = slot.borrow_mut();
+        if !cache.runtimes.contains_key(&key) {
+            let plan = build_multipass_plan(
+                shader,
+                key.input_width,
+                key.input_height,
+                key.output_ref_width,
+                key.output_ref_height,
+            )?;
+            let runtime = VulkanMultiPassRuntime::create(key.clone(), plan)?;
+            cache.prepare_insert(&key);
+            cache.runtimes.insert(key.clone(), runtime);
+        }
+        cache.touch(&key);
+        let runtime = cache
+            .runtimes
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("shared RGBA runtime missing"))?;
+        runtime
+            .process_external_nchw_to_shared_rgba(
+                shared_key,
+                shared_handle,
+                shared_byte_len,
+                padded_width.max(1),
+                padded_height.max(1),
+                fp16,
+            )
+            .map(Some)
+    })
+}
+
 /// v665 DirectML D3D12 shared NCHW -> Vulkan sequence -> OpenGL path.
 ///
 /// v664 could import DirectML directly only when the following GLSL range
@@ -5997,5 +6161,79 @@ pub fn process_d3d12_nchw_sequence_to_gl(
                 Ok(None)
             }
         }
+    })
+}
+
+/// Keep a DirectML NCHW input and an admitted multi-shader sequence on the
+/// selected Vulkan GPU, returning a shareable RGBA8 buffer for presentation.
+#[allow(clippy::too_many_arguments)]
+pub fn process_d3d12_nchw_sequence_to_shared_rgba(
+    requested_luid: u64,
+    shaders: &[&UserShader],
+    input_width: u32,
+    input_height: u32,
+    output_ref_width: u32,
+    output_ref_height: u32,
+    shared_key: u64,
+    shared_handle: isize,
+    shared_byte_len: usize,
+    padded_width: u32,
+    padded_height: u32,
+    fp16: bool,
+) -> Result<Option<MultiPassSharedRgbaResult>> {
+    if shaders.len() < 2
+        || !production_requested()
+        || shaders.iter().any(|shader| !production_shader_admitted(shader))
+    {
+        return Ok(None);
+    }
+    let mut sequence_hasher = DefaultHasher::new();
+    "NeoVulkanSequenceV664".hash(&mut sequence_hasher);
+    shaders.len().hash(&mut sequence_hasher);
+    for shader in shaders {
+        shader_runtime_hash(shader).hash(&mut sequence_hasher);
+    }
+    let key = RuntimeKey {
+        luid: requested_luid,
+        input_width: input_width.max(1),
+        input_height: input_height.max(1),
+        output_ref_width: output_ref_width.max(1),
+        output_ref_height: output_ref_height.max(1),
+        shader_hash: sequence_hasher.finish(),
+    };
+    if multipass_failed_keys().lock().unwrap().contains(&key)
+        || d3d12_import_failed_keys().lock().unwrap().contains(&key)
+    {
+        return Ok(None);
+    }
+    MULTIPASS_RUNTIMES.with(|slot| -> Result<Option<MultiPassSharedRgbaResult>> {
+        let mut cache = slot.borrow_mut();
+        if !cache.runtimes.contains_key(&key) {
+            let plan = build_multipass_sequence_plan(
+                shaders,
+                key.input_width,
+                key.input_height,
+                key.output_ref_width,
+                key.output_ref_height,
+            )?;
+            let runtime = VulkanMultiPassRuntime::create(key.clone(), plan)?;
+            cache.prepare_insert(&key);
+            cache.runtimes.insert(key.clone(), runtime);
+        }
+        cache.touch(&key);
+        let runtime = cache
+            .runtimes
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("Vulkan shared RGBA sequence runtime missing"))?;
+        runtime
+            .process_external_nchw_to_shared_rgba(
+                shared_key,
+                shared_handle,
+                shared_byte_len,
+                padded_width.max(1),
+                padded_height.max(1),
+                fp16,
+            )
+            .map(Some)
     })
 }

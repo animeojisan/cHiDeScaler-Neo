@@ -5,6 +5,9 @@
 //! unavailable. Any NCHW image model (Compact/ESRGAN/CUGAN...) works drop-in;
 //! fp16 vs fp32 is detected from the model input.
 
+#[path = "rife_dml_split.rs"]
+mod rife_dml_split;
+
 use anyhow::{Context, Result, anyhow};
 use half::f16;
 use ort::{
@@ -59,6 +62,7 @@ use crate::core::config::OnnxBackendPreference;
 use crate::render::{
     cuda_interop::{CudaSharedBuffer, cuda_shared_stats},
     gl::{GlContext, GpuTex, InterpAuxPlane},
+    neoarc_backend::NeoArcSession,
     neoamd_backend::{
         NEOAMD_CAP_D3D12_SHARED_BUFFER, NEOAMD_CAP_DYNAMIC_RESOLUTION, NEOAMD_CAP_FP16_NATIVE,
         NEOAMD_CAP_GFX12_WMMA, NEOAMD_CAP_STRUCTURAL_ROUTING, NEOAMD_RUN_ROUTE_DIRECT,
@@ -68,7 +72,8 @@ use crate::render::{
     },
     onnx_accel::{
         Decision as NeoDecision, NeoAccelState, analyze_local_image_model, compare_output_patch,
-        crop_rgba8, extract_output_patch, neoaccel_enabled, write_output_patch,
+        crop_rgba8, extract_output_patch, inspect_local_image_model, inspect_rtmosr_image_model,
+        inspect_spanf3_image_model, neoaccel_enabled, write_output_patch,
     },
 };
 
@@ -551,6 +556,27 @@ pub fn finish_tensorrt_build_progress() {
 /// deeper internal downsampling pyramid than regular v4 models.
 const RIFE_PAD_MULTIPLE: usize = 128;
 
+static DIRECTML_RIFE_BOOST: OnceLock<AtomicBool> = OnceLock::new();
+
+fn directml_rife_boost_setting() -> &'static AtomicBool {
+    DIRECTML_RIFE_BOOST.get_or_init(|| {
+        AtomicBool::new(std::env::var("CHIDESCALER_DML_RIFE_BOOST").is_ok_and(|value| value == "1"))
+    })
+}
+
+pub fn set_directml_rife_boost(enabled: bool) {
+    directml_rife_boost_setting().store(enabled, Ordering::Relaxed);
+}
+
+/// v947: true when the most recently prepared DirectML pair runs the RIFE
+/// boost split (one shared motion pass per pair). The engine's overload
+/// admission must then treat the pair cost as mostly fixed, not per midpoint.
+static DML_RIFE_SPLIT_PAIR: AtomicBool = AtomicBool::new(false);
+
+pub fn last_prepared_pair_uses_rife_split() -> bool {
+    DML_RIFE_SPLIT_PAIR.load(Ordering::Relaxed)
+}
+
 /// Initialize the ONNX runtime from a specific dll path (once per process).
 /// Looks for onnxruntime.dll next to the exe, then in ./backends/.
 pub fn init_onnx() -> std::result::Result<(), String> {
@@ -639,8 +665,33 @@ impl Drop for TensorRtDiagnosticDir {
 pub struct OnnxStage {
     pub name: String,
     source_path: PathBuf,
+    /// v971: original FP32-IO RIFE model when DirectML runs an FP16-IO bridge
+    /// of it (`source_path` then points at the cached bridge). Boost graphs are
+    /// split from this original and bridged, keeping the FP32 motion state.
+    dml_half_bridge_source: Option<PathBuf>,
     fallback_dml_adapter: Option<i32>,
     session: Session,
+    /// Shape symbols of a dynamic DirectML RIFE input (batch, height, width).
+    dml_rife_symbols: Option<[String; 3]>,
+    dml_rife_shape: Option<(i32, i32)>,
+    dml_host_interp_binding: Option<((usize, usize), IoBinding)>,
+    dml_rife_cached_session: Option<((i32, i32), Session)>,
+    dml_rife_specialization_disabled: bool,
+    dml_rife_native_rejected: std::collections::HashSet<(i32, i32)>,
+    dml_image_symbols: Option<[String; 3]>,
+    dml_wgl_converter: Option<super::dml_gl_bridge::Converter>,
+    dml_wgl_disabled: bool,
+    dml_drba_sequential_logged: bool,
+    dml_wgl_last_geometry: Option<((i32,i32),(usize,usize))>,
+    dml_wgl_input_converter: Option<super::dml_gl_bridge::Converter>,
+    dml_wgl_input_failed: Option<(i32,i32)>,
+    dml_image_device_luid: Option<Option<u64>>,
+    dml_image_budget_retry: Option<Instant>,
+    dml_image_dynamic_session: Option<Session>,
+    /// One previous small fixed geometry for quick 128↔256 style resizes.
+    dml_image_cached_fixed_session: Option<((i32, i32), Session)>,
+    dml_image_shape: Option<(i32, i32)>,
+    dml_image_specialization_disabled: bool,
     run_options: Arc<CancelableRunOptions>,
     tensorrt_diagnostic_dir: Option<TensorRtDiagnosticDir>,
     in_name: String,
@@ -648,6 +699,9 @@ pub struct OnnxStage {
     fp16: bool,
     scratch_f32: Vec<f32>,
     scratch_f16: Vec<f16>,
+    neoarc_pair_input: Vec<f16>,
+    neoarc_pair_reuse: bool,
+    neoarc_pair_packed: bool,
     /// (pw, ph, channels, aux) of the constant planes (timestep grids /
     /// multiplier planes) already present in the scratch buffer — they only
     /// depend on the padded size, so refilling them per frame was pure waste
@@ -663,7 +717,11 @@ pub struct OnnxStage {
     /// reuse as frame identity on slow/asynchronous secondary-GPU sessions.
     cross_gpu_rife_full_repack_logged: bool,
     last_interp_profile: Option<InterpProfile>,
+    interp_gpu_diag: GpuInterpDiagnostics,
     last_upscale_profile: Option<UpscaleProfile>,
+    image_diag_last_log: Option<Instant>,
+    image_diag_samples: std::collections::VecDeque<[f64;4]>,
+    image_diag_shape: Option<(i32,i32)>,
     last_upscale_input_size: Option<(i32, i32)>,
     direct_output: Option<DmlDirectOutput>,
     direct_input: Option<DmlDirectInput>,
@@ -671,14 +729,41 @@ pub struct OnnxStage {
     direct_output_disabled: bool,
     neoamd_shared_disabled: bool,
     neoamd_shared_key: Option<u64>,
+    /// v978: extra NeoAMD interpolation output slots (Backend Pack v135+),
+    /// tied to the slot-0 key in `neoamd_interp_ring_base`.
+    neoamd_interp_ring: Vec<crate::render::neoamd_backend::NeoAmdSharedOutput>,
+    neoamd_interp_ring_base: Option<u64>,
+    neoamd_interp_ring_unavailable: bool,
     neoamd_shared_input_key: Option<u64>,
     neoamd_shared_input_size: Option<(i32, i32)>,
     tensorrt_device_id: Option<i32>,
     neoamd_session: Option<NeoAmdSession>,
+    neoarc_session: Option<NeoArcSession>,
+    neoarc_interp_gl: Option<NeoArcInterpGl>,
     tensorrt_gpu_bridge: Option<TensorRtGpuBridge>,
     tensorrt_temporal_bridge: Option<TensorRtTemporalGpuBridge>,
     tensorrt_interp_bridge: Option<TensorRtInterpGpuBridge>,
     dml_interp_bridge: Option<DmlInterpGpuBridge>,
+    /// v933: FraZerion pair batch (models exported with `frazerion.pair_batch=1`).
+    dml_pair_batch: Option<DmlPairBatch>,
+    dml_pair_batch_capable: bool,
+    dml_pair_batch_rows: usize,
+    dml_pair_batch_failed: bool,
+    dml_pair_batch_logged: bool,
+    dml_pair_batch_skip_logged: bool,
+    dml_split: Option<DmlSplit>,
+    dml_split_paths: Option<(PathBuf, PathBuf)>,
+    // v937: trunk/head graphs embedded in the model's own metadata (one .onnx file, no sidecars)
+    dml_split_embedded: Option<std::sync::Arc<(Vec<u8>, Vec<u8>)>>,
+    dml_split_state_channels: usize,
+    dml_rife_boost: bool,
+    fused_host_boost: Vec<((i32, i32, usize), Session)>,
+    fused_host_failed: bool,
+    dml_host_boost: Option<((i32, i32), Session, Session)>,
+    dml_split_failed: bool,
+    dml_split_logged: bool,
+    dml_wgl_interp_bridge: Option<DmlWglInterpBridge>,
+    dml_wgl_interp_failed: bool,
     /// Cross-GPU fallback: CPU-packed RIFE input still enters DirectML normally,
     /// but completed outputs stay in app-owned shareable D3D12 buffers so the
     /// same selected GPU can hand them directly to Vulkan without a CPU readback.
@@ -700,6 +785,10 @@ pub struct OnnxStage {
     /// Temporal restoration models concatenate N RGB frames on the channel
     /// axis (for example 15ch=5 frames, 21ch=7 frames).
     temporal_frames: Option<usize>,
+    neoarc_temporal_packed: bool,
+    dml_temporal_cursor: Option<usize>,
+    dml_temporal_mirror: bool,
+    neoarc_gl_history_active: bool,
     temporal_history: VecDeque<Vec<u8>>,
     /// Pixel stride stored in temporal_history (3=RGB, 4=RGBA). NeoAMD accepts
     /// both, so production no longer repacks every live RGBA frame to a newly
@@ -733,6 +822,11 @@ pub struct OnnxStage {
 
 impl Drop for OnnxStage {
     fn drop(&mut self) {
+        // Retire OpenCL/OpenVINO before Rust drops the earlier DirectML Session field.
+        // The Intel driver can otherwise wait while tearing down overlapping APIs.
+        self.retire_neoarc_gl();
+        self.neoarc_interp_gl.take();
+        self.neoarc_session.take();
         if let Some(cache_dir) = &self.tensorrt_cache_dir {
             unregister_tensorrt_cache(cache_dir);
         }
@@ -784,12 +878,33 @@ pub struct InterpProfile {
     pub padded_size: (usize, usize),
 }
 
+struct NeoArcInterpGl {
+    io: super::neoarc_backend::GlInterpIo,
+    boost_attempted: bool,
+    capacity:usize,
+    size: (i32,i32),
+    padded: (i32,i32),
+    context: (isize,isize),
+    frames: Vec<u32>,
+    phases: Vec<f32>,
+    outputs: Vec<(String,GpuTex)>,
+    /// v985: GL pixel buffers (RGBA FP16) the endpoints are copied into, so
+    /// OpenCL reads buffers instead of GL images (Intel stalls 5-9 ms in the
+    /// first kernel enqueue that reads acquired GL images). Empty = image path.
+    input_buffers: Vec<glow::Buffer>,
+    buffer_input_failed: bool,
+    /// v992: compute pass that writes the endpoints into `input_buffers`.
+    endpoint_program: Option<glow::Program>,
+    endpoint_compute_failed: bool,
+}
+
 /// Stable description of one GPU-resident interpolation output slot.
 /// The render thread can import a completed slot without locking the ONNX
 /// stage while the worker continues computing later, distinct timesteps.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreparedInterpGpuOutput {
     pub(crate) key: u64,
+    pub(crate) texture: Option<GpuTex>,
     pub(crate) size: (i32, i32),
     pub(crate) padded: (i32, i32),
     pub(crate) fp16: bool,
@@ -916,6 +1031,227 @@ fn resolve_dml_gl_interop_mode(
 }
 
 impl OnnxStage {
+    pub(crate) fn metrics_provider_label(&self) -> &'static str {
+        if self.neoarc_session.is_some() { return "NeoARC"; }
+        match self.provider {
+            OnnxProvider::TensorRT => "TensorRT",
+            OnnxProvider::DirectML => "DirectML",
+            OnnxProvider::MigraphX => "MIGraphX",
+            OnnxProvider::Cuda => "CUDA",
+            OnnxProvider::NeoAMD => "NeoAMD",
+            OnnxProvider::NeoRTX => "NeoRTX",
+        }
+    }
+    /// Diagnostic timing without the extra Vulkan and CPU reference passes.
+    pub fn probe_shared_output_timing(
+        &mut self,
+        width: i32,
+        height: i32,
+    ) -> Result<Option<UpscaleProfile>> {
+        let pixels = usize::try_from(width)?
+            .checked_mul(usize::try_from(height)?)
+            .ok_or_else(|| anyhow!("probe dimensions overflow"))?;
+        anyhow::ensure!(pixels <= 1024 * 1024, "probe dimensions too large");
+        let mut rgba = vec![0u8; pixels * 4];
+        for (i, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            pixel[0] = (i % 251) as u8;
+            pixel[1] = ((i / 3) % 241) as u8;
+            pixel[2] = ((i / 7) % 239) as u8;
+            pixel[3] = 255;
+        }
+        let Some(_) = self.process_rgba8_dml_shared_output(width, height, &rgba)? else {
+            return Ok(None);
+        };
+        Ok(self.last_upscale_profile)
+    }
+
+    /// Run a CPU RGBA8 input through DirectML and leave the final RGBA8 image
+    /// in a shareable GPU buffer for a Vulkan presenter. No output readback or
+    /// GL upload occurs here. Input packing is still CPU-side.
+    pub fn process_rgba8_to_shared_rgba(
+        &mut self,
+        width: i32,
+        height: i32,
+        rgba: &[u8],
+        shader: &crate::render::mpv::UserShader,
+        output_ref_size: Option<(i32, i32)>,
+    ) -> Result<Option<crate::render::vulkan_multipass::MultiPassSharedRgbaResult>> {
+        let Some((shared, _)) = self.process_rgba8_dml_shared_output(width, height, rgba)? else {
+            return Ok(None);
+        };
+        let output_ref_size = output_ref_size.unwrap_or(shared.size);
+        crate::render::vulkan_multipass::process_d3d12_nchw_to_shared_rgba(
+            u64::from_le_bytes(shared.luid),
+            shader,
+            shared.size.0 as u32,
+            shared.size.1 as u32,
+            output_ref_size.0.max(1) as u32,
+            output_ref_size.1.max(1) as u32,
+            shared.key,
+            shared.handle.0 as isize,
+            shared.byte_len,
+            shared.padded.0 as u32,
+            shared.padded.1 as u32,
+            shared.fp16,
+        )
+    }
+
+    /// Diagnostic readback of the same DirectML tensor is returned solely
+    /// for pixel comparison; the shared output itself stays on GPU.
+    pub fn probe_shared_rgba_output(
+        &mut self,
+        width: i32,
+        height: i32,
+        frame_seed: u8,
+    ) -> Result<
+        Option<(
+            crate::render::vulkan_multipass::MultiPassSharedRgbaResult,
+            Vec<u8>,
+        )>,
+    > {
+        let pixels = usize::try_from(width)?
+            .checked_mul(usize::try_from(height)?)
+            .ok_or_else(|| anyhow!("probe dimensions overflow"))?;
+        anyhow::ensure!(pixels <= 1024 * 1024, "probe dimensions too large");
+        let mut rgba = vec![0u8; pixels * 4];
+        for (i, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            pixel[0] = ((i + frame_seed as usize * 37) % 251) as u8;
+            pixel[1] = ((i / 3 + frame_seed as usize * 29) % 241) as u8;
+            pixel[2] = ((i / 7 + frame_seed as usize * 17) % 239) as u8;
+            pixel[3] = 255;
+        }
+        let shader = crate::render::mpv::UserShader::parse(
+            "NeoArcDiagnosticIdentity.glsl",
+            "//!HOOK RGB\n//!BIND HOOKED\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n",
+        );
+        let Some(output) = self.process_rgba8_to_shared_rgba(width, height, &rgba, &shader, None)? else {
+            return Ok(None);
+        };
+        let state = self
+            .direct_output
+            .as_ref()
+            .ok_or_else(|| anyhow!("DirectML shared output state disappeared"))?;
+        let shared = PreparedDmlSharedOutput {
+            key: state.key,
+            handle: state.shared_handle()?,
+            byte_len: state.byte_len,
+            heap_byte_len: state.heap_byte_len,
+            luid: state.luid,
+            size: (i32::try_from(state.dims[3])?, i32::try_from(state.dims[2])?),
+            padded: (i32::try_from(state.dims[3])?, i32::try_from(state.dims[2])?),
+            fp16: true,
+        };
+        let reference = crate::render::vulkan_multipass::process_d3d12_nchw(
+            u64::from_le_bytes(shared.luid),
+            &shader,
+            shared.size.0 as u32,
+            shared.size.1 as u32,
+            shared.size.0 as u32,
+            shared.size.1 as u32,
+            shared.key,
+            shared.handle.0 as isize,
+            shared.byte_len,
+            shared.padded.0 as u32,
+            shared.padded.1 as u32,
+            shared.fp16,
+        )?
+        .ok_or_else(|| anyhow!("Vulkan diagnostic reference unavailable"))?;
+        Ok(Some((output, reference.output_rgba8)))
+    }
+
+    /// Diagnostic inference through the production DirectML shared-output path.
+    /// The returned NT handle remains owned here and is closed before return.
+    pub fn probe_shared_output(
+        &mut self,
+        width: i32,
+        height: i32,
+    ) -> Result<Option<(u64, usize, f64, u64, u8)>> {
+        let pixels = usize::try_from(width)?
+            .checked_mul(usize::try_from(height)?)
+            .ok_or_else(|| anyhow!("probe dimensions overflow"))?;
+        anyhow::ensure!(pixels <= 1024 * 1024, "probe dimensions too large");
+        let mut rgba = vec![0u8; pixels * 4];
+        for (i, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+            pixel[0] = (i % 251) as u8;
+            pixel[1] = ((i / 3) % 241) as u8;
+            pixel[2] = ((i / 7) % 239) as u8;
+            pixel[3] = 255;
+        }
+        let Some((shared, ms)) = self.process_rgba8_dml_shared_output(width, height, &rgba)? else {
+            return Ok(None);
+        };
+        crate::render::vulkan_gpu::probe_existing_d3d12_buffer_import(
+            u64::from_le_bytes(shared.luid),
+            shared.handle.0 as isize,
+            shared.byte_len,
+        )?;
+        let shader = crate::render::mpv::UserShader::parse(
+            "NeoArcDiagnosticIdentity.glsl",
+            "//!HOOK RGB\n//!BIND HOOKED\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n",
+        );
+        let image = crate::render::vulkan_multipass::process_d3d12_nchw(
+            u64::from_le_bytes(shared.luid),
+            &shader,
+            shared.size.0 as u32,
+            shared.size.1 as u32,
+            shared.size.0 as u32,
+            shared.size.1 as u32,
+            shared.key,
+            shared.handle.0 as isize,
+            shared.byte_len,
+            shared.padded.0 as u32,
+            shared.padded.1 as u32,
+            shared.fp16,
+        )?
+        .ok_or_else(|| anyhow!("Vulkan shared output conversion unavailable"))?;
+        anyhow::ensure!(
+            image.output_rgba8.len() == shared.size.0 as usize * shared.size.1 as usize * 4,
+            "Vulkan output size mismatch"
+        );
+        let input_shape = Shape::new([1i64, 3, height as i64, width as i64]);
+        let input = TensorRef::from_array_view((input_shape, &*self.scratch_f16)).map_err(oerr)?;
+        let outputs = self
+            .session
+            .run_with_options(
+                ort::inputs![self.in_name.as_str() => input],
+                self.run_options.armed()?,
+            )
+            .map_err(oerr)?;
+        let reference = outputs
+            .get(self.out_name.as_str())
+            .ok_or_else(|| anyhow!("DirectML reference output missing"))?;
+        let (_, values) = reference.try_extract_tensor::<f16>().map_err(oerr)?;
+        let plane = shared.size.0 as usize * shared.size.1 as usize;
+        anyhow::ensure!(
+            values.len() >= plane * 3,
+            "DirectML reference shape mismatch"
+        );
+        let lut = f16_unorm_to_u8_lut();
+        let mut maximum_error = 0u8;
+        for pixel in 0..plane {
+            for channel in 0..3 {
+                let expected = lut[values[channel * plane + pixel].to_bits() as usize];
+                let actual = image.output_rgba8[pixel * 4 + channel];
+                maximum_error = maximum_error.max(actual.abs_diff(expected));
+            }
+        }
+        anyhow::ensure!(
+            maximum_error <= 2,
+            "Vulkan shared image differs from DirectML reference: max u8 error {maximum_error}"
+        );
+        let checksum = image
+            .output_rgba8
+            .iter()
+            .fold(0u64, |sum, &v| sum.wrapping_add(v as u64));
+        Ok(Some((
+            u64::from_le_bytes(shared.luid),
+            shared.byte_len,
+            ms,
+            checksum,
+            maximum_error,
+        )))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_on_adapter(path, None)
     }
@@ -974,10 +1310,11 @@ impl OnnxStage {
                         path.display()
                     );
                 }
-                Self::load_directml(path, dml_adapter_id)
+                Self::load_directml_arc_bridged(path, dml_adapter_id, app_dir)
             }
             OnnxBackendPreference::NeoAMD => Self::load_neoamd(path, dml_adapter_id, app_dir),
             OnnxBackendPreference::NeoRTX => Self::load_neortx(path, dml_adapter_id, app_dir),
+            OnnxBackendPreference::NeoArc => Self::load_neoarc(path, dml_adapter_id, app_dir),
             OnnxBackendPreference::TensorRT => {
                 let device_id =
                     trt_device_id.ok_or_else(|| anyhow!("TensorRT CUDA device is unavailable"))?;
@@ -1058,13 +1395,16 @@ impl OnnxStage {
     }
 
     fn load_directml(path: &Path, adapter_id: Option<i32>) -> Result<Self> {
+        Self::load_directml_level(path, adapter_id, None)
+    }
+
+    /// `level` overrides the graph optimization (v993: NeoArc loads its
+    /// signature-only DirectML session unoptimized; 360-480 ms -> less).
+    fn load_directml_level(path: &Path, adapter_id: Option<i32>, level: Option<GraphOptimizationLevel>) -> Result<Self> {
         init_onnx().map_err(|e| anyhow!(e))?;
-        let graph_optimization = match std::env::var("CHIDESCALER_DML_GRAPH_OPT").ok().as_deref() {
-            Some("disable") => GraphOptimizationLevel::Disable,
-            Some("basic") => GraphOptimizationLevel::Level1,
-            Some("extended") => GraphOptimizationLevel::Level2,
-            _ => GraphOptimizationLevel::All,
-        };
+        // Keep Auto on ORT's high-performance selection. Pinning every model to
+        // Arc also changes interpolation sessions and has regressed playback.
+        let graph_optimization = level.unwrap_or_else(|| dml_graph_optimization(path));
         log::info!("directml-graph-optimization: level={graph_optimization:?}");
         let directml = match adapter_id {
             Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
@@ -1095,6 +1435,524 @@ impl OnnxStage {
             None,
             false,
         )
+    }
+
+    /// v971: DirectML graph tuning for interpolation models on Intel Arc.
+    /// 1. ConvTranspose(4x4,s2,p1) -> Conv3x3 + DepthToSpace (exact weights;
+    ///    see `rife_dml_split::dml_convtranspose_rewrite`). Off with
+    ///    CHIDESCALER_DML_CONVT=off.
+    /// 2. FP32-IO seven-channel RIFE models (Lite50/Lite75) could not enter
+    ///    the GPU-resident WGL route, whose exchange buffers are FP16. They
+    ///    fell back to the host route: CPU capture map, CPU NCHW packing,
+    ///    upload, readback and re-upload every pair. Run an FP16-IO bridge
+    ///    instead (one Cast at each end; weights, internal operators and the
+    ///    FP32 motion state unchanged). Off with CHIDESCALER_DML_HALF_BRIDGE=off.
+    /// Any failure keeps the original model.
+    fn load_directml_arc_bridged(path: &Path, adapter_id: Option<i32>, app_dir: &Path) -> Result<Self> {
+        if std::env::var("CHIDESCALER_DML_HALF_BRIDGE").ok().as_deref() == Some("off") {
+            return Self::load_directml(path, adapter_id);
+        }
+        let arc_target = {
+            let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+            let is_arc = |gpu: &&crate::platform::gpu::GpuAdapter| gpu.vendor_id == 0x8086 && gpu.name.contains("Arc");
+            match adapter_id {
+                Some(id) => adapters.iter().find(|gpu| gpu.device_id == id).is_some_and(|gpu| is_arc(&gpu)),
+                None => {
+                    // Auto uses ORT's high-performance adapter; only bridge when
+                    // that is unambiguously the single Arc discrete GPU.
+                    let mut arc = adapters.iter().filter(is_arc);
+                    arc.next().is_some() && arc.next().is_none()
+                }
+            }
+        };
+        if !arc_target {
+            return Self::load_directml(path, adapter_id);
+        }
+        struct Tuned { session: PathBuf, split: Option<PathBuf>, convt: usize, identity: usize, bridge: bool }
+        let tuned = (|| -> Result<Option<Tuned>> {
+            let bytes = std::fs::read(path)?;
+            // Seven-channel RIFE only. DRBA gained ~1 ms (3.7%) but showed a
+            // local 8-bit difference of 55 on the B570, so it stays original.
+            // Image models are classified by their Conv structure elsewhere.
+            if rife_dml_split::input_channels(&bytes).ok().flatten() != Some(7)
+                || bytes.windows(15).any(|w| w == b"frazerion.split")
+            {
+                return Ok(None);
+            }
+            let Ok(half) = rife_dml_split::input_is_half(&bytes) else { return Ok(None) };
+            let graph_off = std::env::var("CHIDESCALER_DML_CONVT").ok().as_deref() == Some("off");
+            let (rewritten, convt) = if graph_off {
+                (bytes.clone(), 0)
+            } else {
+                rife_dml_split::dml_convtranspose_rewrite(&bytes)?
+            };
+            let (rewritten, identity) = if graph_off {
+                (rewritten, 0)
+            } else {
+                rife_dml_split::dml_identity_rewrite(&rewritten)?
+            };
+            let bridge = !half
+                && std::env::var("CHIDESCALER_DML_HALF_BRIDGE").ok().as_deref() != Some("off");
+            if convt == 0 && identity == 0 && !bridge {
+                return Ok(None);
+            }
+            use sha2::Digest;
+            let cache = app_dir.join("cache/directml/arc-tuned-v1");
+            let key = format!("{:x}", sha2::Sha256::digest(&bytes));
+            // Always compare contents: a truncated or edited cache file is
+            // never trusted merely because it exists.
+            let store = |name: String, data: &[u8]| -> Result<PathBuf> {
+                let target = cache.join(name);
+                if std::fs::read(&target).ok().as_deref() != Some(data) {
+                    std::fs::create_dir_all(&cache)?;
+                    let tmp = target.with_extension(format!("{}.tmp", std::process::id()));
+                    std::fs::write(&tmp, data)?;
+                    if let Err(error) = std::fs::rename(&tmp, &target) {
+                        let _ = std::fs::remove_file(&tmp);
+                        if std::fs::read(&target).ok().as_deref() != Some(data) {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                Ok(target)
+            };
+            let split = if bridge { Some(store(format!("{key}-split.onnx"), &rewritten)?) } else { None };
+            let session_bytes = if bridge { rife_dml_split::half_bridge(&rewritten, true)? } else { rewritten };
+            let session = store(format!("{key}.onnx"), &session_bytes)?;
+            Ok(Some(Tuned { session, split, convt, identity, bridge }))
+        })();
+        let tuned = match tuned {
+            Ok(Some(tuned)) => tuned,
+            Ok(None) => return Self::load_directml(path, adapter_id),
+            Err(error) => {
+                log::warn!("directml-arc-graph: model={} result=skipped reason={error:#}", path.display());
+                return Self::load_directml(path, adapter_id);
+            }
+        };
+        match Self::load_directml(&tuned.session, adapter_id) {
+            Ok(mut stage)
+                if stage.interp != InterpKind::None
+                    && (!tuned.bridge || (stage.fp16 && matches!(stage.interp, InterpKind::RifeV1 { channels: 7 }))) =>
+            {
+                stage.name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                stage.dml_half_bridge_source = tuned.split;
+                log::info!(
+                    "directml-arc-graph: model={} convtranspose_rewritten={} identity_removed={} io_bridge_fp16={} route={}",
+                    stage.name,
+                    tuned.convt,
+                    tuned.identity,
+                    tuned.bridge,
+                    if tuned.bridge { "gpu-resident-eligible" } else { "unchanged" }
+                );
+                Ok(stage)
+            }
+            Ok(_) => {
+                log::warn!("directml-arc-graph: model={} result=unexpected-signature action=original", path.display());
+                Self::load_directml(path, adapter_id)
+            }
+            Err(error) => {
+                log::warn!("directml-arc-graph: model={} result=session-failed reason={error:#} action=original", path.display());
+                Self::load_directml(path, adapter_id)
+            }
+        }
+    }
+
+    /// v971: boost trunk/head graphs. A bridged FP32 model is split from its
+    /// original (layout detection is per original precision) and only the
+    /// exchange tensors are bridged. Returns whether the state is FP16.
+    fn dml_split_graphs(&self, h: i64, w: i64) -> Result<(Vec<u8>, Vec<u8>, bool)> {
+        if let Some(original) = &self.dml_half_bridge_source {
+            let bytes = std::fs::read(original)?;
+            let (trunk, head) = rife_dml_split::split(&bytes, h, w, false)?;
+            Ok((
+                rife_dml_split::half_bridge(&trunk, false)?,
+                rife_dml_split::half_bridge(&head, true)?,
+                false,
+            ))
+        } else {
+            let bytes = std::fs::read(&self.source_path)?;
+            let (trunk, head) = rife_dml_split::split(&bytes, h, w, self.fp16)?;
+            Ok((trunk, head, self.fp16))
+        }
+    }
+
+    fn load_neoarc(path: &Path, adapter_id: Option<i32>, app_dir: &Path) -> Result<Self> {
+        let load_started = Instant::now();
+        // v993: the DirectML session of a NeoArc stage only supplies the model
+        // signature (and a degraded fallback), so it is created unoptimized.
+        // Any branch that really runs DirectML reloads it with optimization.
+        // Measured: Disable did not shorten creation (DirectML init dominates),
+        // so it stays opt-in (CHIDESCALER_NEOARC_DML_META=light) and the normal
+        // optimized session is kept.
+        let light = std::env::var("CHIDESCALER_NEOARC_DML_META").ok().as_deref() == Some("light");
+        let mut stage = if light {
+            Self::load_directml_level(path, adapter_id, Some(GraphOptimizationLevel::Disable))?
+        } else {
+            Self::load_directml(path, adapter_id)?
+        };
+        let dml_session_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+        let dml_fallback = |reason: String| -> Result<Self> {
+            let mut fallback = Self::load_directml(path, adapter_id)?;
+            fallback.fallback_reason = Some(reason);
+            Ok(fallback)
+        };
+        let is_image = stage.interp == InterpKind::None && stage.temporal_frames.is_none()
+            && stage.session.inputs().len() == 1 && stage.session.outputs().len() == 1
+            && parse_channels(&format!("{}", stage.session.inputs()[0].dtype())) == Some(3);
+        let is_temporal = stage.interp == InterpKind::None && stage.temporal_frames.is_some()
+            && stage.session.inputs().len() == 1 && stage.session.outputs().len() == 1
+            && parse_channels(&format!("{}", stage.session.outputs()[0].dtype())) == Some(3);
+        let float_rife = !stage.fp16 && stage.dml_rife_boost
+            && matches!(stage.interp, InterpKind::RifeV1 { channels: 7 });
+        if !(matches!(stage.interp, InterpKind::RifeV1 { channels: 7 } | InterpKind::Drba) || is_image || is_temporal)
+            || (!stage.fp16 && !float_rife) {
+            let reason = "NeoArc requires FP16 NCHW RGB SISR, seven-channel RIFE fourteen-channel DRBA or multi-frame RGB temporal restoration; DirectML retained".to_string();
+            if light { return dml_fallback(reason); }
+            stage.fallback_reason = Some(reason);
+            return Ok(stage);
+        }
+        let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+        let target = adapter_id
+            .and_then(|id| adapters.iter().find(|gpu| gpu.device_id == id))
+            .or_else(|| {
+                let mut arc = adapters.iter().filter(|gpu|
+                    gpu.vendor_id == 0x8086 && gpu.name.contains("Arc"));
+                let first = arc.next();
+                if arc.next().is_none() { first } else { None }
+            });
+        if !target.is_some_and(|gpu| gpu.vendor_id == 0x8086 && gpu.name.contains("Arc")) {
+            let reason = "NeoArc needs one selected Intel Arc GPU; DirectML retained".to_string();
+            if light { return dml_fallback(reason); }
+            stage.fallback_reason = Some(reason);
+            return Ok(stage);
+        }
+        // v973: seven-channel RIFE runs the ConvTranspose/identity-tuned graph on
+        // OpenVINO too (NeoRIFE v1.6 720p: 11.6 -> 9.7 ms, both stable-FP16).
+        // Same IO precision as the original; any failure keeps the original.
+        let rife7 = matches!(stage.interp, InterpKind::RifeV1 { channels: 7 });
+        let tuned_started = Instant::now();
+        let tuned = if rife7 && std::env::var("CHIDESCALER_NEOARC_CONVT").ok().as_deref() != Some("off") {
+            match neoarc_tuned_rife_graph_memo(app_dir, path) {
+                Ok(tuned) => tuned,
+                Err(error) => {
+                    log::warn!("neoarc-arc-graph: model={} result=skipped reason={error:#}", stage.name);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tuned_ms = tuned_started.elapsed().as_secs_f64() * 1000.0;
+        let bridge_started = Instant::now();
+        // The OpenVINO input for a RIFE graph: FP16 as is, FP32 through the
+        // half bridge. When the original's input was found unstable in plain
+        // FP16, the tuned input starts on the stabilized graph as well.
+        let neoarc_input = |source: &Path| -> Result<PathBuf> {
+            if float_rife {
+                // v993: memoized per source identity (see `memo_derived`).
+                memo_derived(source, "neoarc-half-bridge", || {
+                    let bytes = std::fs::read(source)?;
+                    anyhow::ensure!(!rife_dml_split::input_is_half(&bytes)?, "expected FP32 RIFE input");
+                    let wrapped = rife_dml_split::half_bridge(&bytes, true)?;
+                    Ok(Some((super::neoarc_backend::cache_rife_bridge(app_dir, source, &wrapped)?, 0, 0)))
+                })?
+                .map(|(output, _, _)| output)
+                .ok_or_else(|| anyhow!("half bridge produced no graph"))
+            } else {
+                Ok(source.to_path_buf())
+            }
+        };
+        let rife_input = if rife7 {
+            (|| -> Result<PathBuf> {
+                let original = neoarc_input(path)?;
+                if float_rife { log::info!("neoarc-rife-half-bridge: model={}", stage.name); }
+                let Some((tuned_path, convt, identity)) = tuned.as_ref() else { return Ok(original) };
+                let candidate = neoarc_input(tuned_path)?;
+                let inherited = super::neoarc_backend::inherit_stable_fp16(app_dir, &original, &candidate)?;
+                log::info!(
+                    "neoarc-arc-graph: model={} convtranspose_rewritten={} identity_removed={} stable_fp16_inherited={}",
+                    stage.name, convt, identity, inherited
+                );
+                Ok(candidate)
+            })()
+        } else {
+            Ok(path.to_path_buf())
+        };
+        let bridge_ms = bridge_started.elapsed().as_secs_f64() * 1000.0;
+        let session_started = Instant::now();
+        let session_result = if is_image { NeoArcSession::load_image(app_dir, path) }
+            else if is_temporal { NeoArcSession::load_temporal(app_dir, path, stage.temporal_frames.unwrap()) }
+            else if stage.interp == InterpKind::Drba { NeoArcSession::load_drba(app_dir, path) }
+            else { rife_input.and_then(|input| NeoArcSession::load(app_dir, &input)) };
+        log::info!("neoarc-load-timing: model={} dml_session_ms={:.1} tuned_graph_ms={:.1} bridge_ms={:.1} neoarc_session_ms={:.1}",
+            stage.name, dml_session_ms, tuned_ms, bridge_ms, session_started.elapsed().as_secs_f64() * 1000.0);
+        match session_result {
+            Ok(session) => {
+                stage.neoarc_session = Some(session);
+                stage.provider_desc = "NeoARC GPU".into();
+                stage.fallback_reason = None;
+                // Boost graphs are split from the same tuned graph.
+                if let Some((tuned_path, _, _)) = tuned { stage.source_path = tuned_path; }
+                log::info!("neoarc-session-ready: model={} adapter={} transport=CPU-visible validation=per-shape",
+                    stage.name, adapter_id.unwrap_or_default());
+            }
+            Err(error) if tuned.is_some() => {
+                log::warn!("neoarc-arc-graph: model={} result=session-failed reason={error:#} action=original", stage.name);
+                match neoarc_input(path).and_then(|input| NeoArcSession::load(app_dir, &input)) {
+                    Ok(session) => {
+                        stage.neoarc_session = Some(session);
+                        stage.provider_desc = "NeoARC GPU".into();
+                        stage.fallback_reason = None;
+                    }
+                    Err(error) => {
+                        let reason = format!("NeoArc runtime unavailable; DirectML retained: {error:#}");
+                        if light { return dml_fallback(reason); }
+                        stage.fallback_reason = Some(reason);
+                    }
+                }
+            }
+            Err(error) => {
+                let reason = format!("NeoArc runtime unavailable; DirectML retained: {error:#}");
+                if light { return dml_fallback(reason); }
+                stage.fallback_reason = Some(reason);
+            }
+        }
+        Ok(stage)
+    }
+
+
+    /// Keep the dynamic session for resize recovery. Eligibility comes from
+    /// the ONNX graph and tensor signature, independent of the filename.
+    fn ensure_dml_local_image_shape(&mut self, width: i32, height: i32) {
+        if self.provider != OnnxProvider::DirectML {
+            return;
+        }
+        let Some(symbols) = self.dml_image_symbols.clone() else {
+            return;
+        };
+        if let Some(shape) = self.dml_image_shape {
+            if shape != (width, height) {
+                self.direct_output = None;
+                if let Some((cached_shape, cached)) = self.dml_image_cached_fixed_session.take() {
+                    if cached_shape == (width, height) {
+                        let old_fixed = std::mem::replace(&mut self.session, cached);
+                        if cache_dml_image_shape(shape) {
+                            self.dml_image_cached_fixed_session = Some((shape, old_fixed));
+                        }
+                        self.dml_image_shape = Some(cached_shape);
+                        log::info!(
+                            "directml-local-image-shape: model={} reused cached {}x{} session",
+                            self.name,
+                            width,
+                            height
+                        );
+                        return;
+                    }
+                }
+                if let Some(dynamic) = self.dml_image_dynamic_session.take() {
+                    let old_fixed = std::mem::replace(&mut self.session, dynamic);
+                    if cache_dml_image_shape(shape) {
+                        self.dml_image_cached_fixed_session = Some((shape, old_fixed));
+                    }
+                }
+                self.dml_image_shape = None;
+                // Restore the dynamic session for this frame. Once the new
+                // geometry repeats, it may be specialized again; permanently
+                // disabling it would leave Arc on the slower dynamic graph
+                // after any ordinary resize.
+                self.dml_image_specialization_disabled = false;
+                log::info!(
+                    "directml-compact-shape: resize to {}x{}; restored dynamic session",
+                    width,
+                    height
+                );
+            }
+            return;
+        }
+        if self.dml_image_specialization_disabled
+            || std::env::var("CHIDESCALER_DML_IMAGE_SHAPE").ok().as_deref() == Some("off")
+            || width < 16
+            || height < 16
+            // Keep a bounded video-resolution specialization. The original
+            // dynamic session remains available for resize recovery.
+            || i64::from(width) * i64::from(height) > std::env::var("CHIDESCALER_DML_IMAGE_MAX_PIXELS").ok().and_then(|s|s.parse::<i64>().ok()).filter(|n|*n>0&&*n<=3840*2160).unwrap_or(1920*1080)
+        {
+            return;
+        }
+        let verified_shared = self
+            .direct_output
+            .as_ref()
+            .is_some_and(|output| intel_arc_luid(u64::from_le_bytes(output.luid)));
+        let verified_normal = self.last_upscale_input_size == Some((width, height))
+            && self
+                .fallback_dml_adapter
+                .is_some_and(intel_arc_device_id);
+        // Auto selection must be verified from the session's actual D3D12
+        // device, rather than assuming the first/highest-VRAM DXGI adapter.
+        let mut verified_auto=false;
+        if !verified_shared && !verified_normal && self.fallback_dml_adapter.is_none()
+            && self.last_upscale_input_size==Some((width,height)) {
+            if self.dml_image_device_luid.is_none(){
+                self.dml_image_device_luid=Some(match dml_session_luid(&self.session){
+                    Ok(luid)=>{log::info!("directml-session-device: model={} luid={luid:016x} intel_arc={} source=provider-allocation host_pixels=0",self.name,intel_arc_luid(luid));Some(luid)},
+                    Err(error)=>{log::debug!("directml-session-device-unavailable: model={} reason={error:#}",self.name);None}
+                });
+            }
+            verified_auto=self.dml_image_device_luid.flatten().is_some_and(intel_arc_luid);
+        }
+        if !verified_shared && !verified_normal && !verified_auto {return;}
+        if i64::from(width)*i64::from(height)>512*512 {
+            if self.dml_image_budget_retry.is_some_and(|last|last.elapsed()<Duration::from_secs(2)){return;}
+            let luid=self.direct_output.as_ref().map(|o|u64::from_le_bytes(o.luid))
+                .or(self.dml_image_device_luid.flatten())
+                .or_else(||self.fallback_dml_adapter.and_then(|id|intel_arc_adapters().iter().find(|a|a.0==id).map(|a|a.1)));
+            if !luid.is_some_and(|luid|dml_image_shape_budget(luid,width,height)){
+                self.dml_image_budget_retry=Some(Instant::now());return;
+            }
+            self.dml_image_budget_retry=None;
+        }
+        let graph_optimization = dml_graph_optimization(&self.source_path);
+        let directml = match self.fallback_dml_adapter {
+            Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
+            None => ort::ep::DirectML::default().with_performance_preference(
+                ort::ep::directml::PerformancePreference::HighPerformance,
+            ),
+        };
+        let built = (|| -> Result<Session> {
+            let mut builder = Session::builder()
+                .map_err(oerr)?
+                .with_optimization_level(graph_optimization)
+                .map_err(oerr)?
+                .with_execution_providers([directml.build()])
+                .map_err(oerr)?
+                .with_memory_pattern(false)
+                .map_err(oerr)?;
+            for (symbol, value) in [
+                (&symbols[0], 1),
+                (&symbols[1], i64::from(height)),
+                (&symbols[2], i64::from(width)),
+            ] {
+                if !symbol.is_empty() {
+                    builder = builder
+                        .with_dimension_override(symbol, value)
+                        .map_err(oerr)?;
+                }
+            }
+            builder.commit_from_file(&self.source_path).map_err(oerr)
+        })();
+        match built {
+            Ok(fixed) => {
+                self.direct_output = None;
+                self.dml_image_dynamic_session = Some(std::mem::replace(&mut self.session, fixed));
+                self.dml_image_shape = Some((width, height));
+                log::info!(
+                    "directml-local-image-shape: model={} fixed {}x{} on Intel Arc",
+                    self.name,
+                    width,
+                    height
+                );
+            }
+            Err(error) => {
+                self.dml_image_specialization_disabled = true;
+                log::warn!(
+                    "directml-local-image-shape: fixed session unavailable; dynamic session retained: {error:#}"
+                );
+            }
+        }
+    }
+
+    /// Compile the first playback geometry once so ORT can fold RIFE's shape
+    /// arithmetic and DirectML can fuse the resulting fixed-size graph.
+    /// A resolution change returns to the dynamic session safely.
+    fn ensure_dml_rife_shape(&mut self, width: i32, height: i32) -> Result<()> {
+        if self.provider != OnnxProvider::DirectML
+            || std::env::var("CHIDESCALER_DML_RIFE_SHAPE").ok().as_deref() == Some("off")
+            || self.dml_rife_specialization_disabled
+            || self.dml_rife_shape == Some((width, height))
+        {
+            return Ok(());
+        }
+        self.dml_host_interp_binding = None;
+        let Some(symbols) = self.dml_rife_symbols.clone() else {
+            return Ok(());
+        };
+        if self.dml_rife_cached_session.as_ref().is_some_and(|(size, _)| *size == (width, height)) {
+            let (_, cached) = self.dml_rife_cached_session.take().unwrap();
+            let previous = std::mem::replace(&mut self.session, cached);
+            self.dml_rife_cached_session = self.dml_rife_shape.map(|size| (size, previous));
+            self.dml_rife_shape = Some((width, height));
+            log::info!("directml-rife-shape: model={} input={}x{} fixed=true result=cache-hit",
+                self.name, width, height);
+            return Ok(());
+        }
+        let graph_optimization = dml_graph_optimization(&self.source_path);
+        let directml = match self.fallback_dml_adapter {
+            Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
+            None => ort::ep::DirectML::default().with_performance_preference(
+                ort::ep::directml::PerformancePreference::HighPerformance,
+            ),
+        };
+        let mut builder = Session::builder()
+            .map_err(oerr)?
+            .with_optimization_level(graph_optimization)
+            .map_err(oerr)?
+            .with_execution_providers([directml.build()])
+            .map_err(oerr)?
+            .with_memory_pattern(false)
+            .map_err(oerr)?;
+        if !symbols[0].is_empty() {
+            builder = builder
+                .with_dimension_override(&symbols[0], 1)
+                .map_err(oerr)?
+        }
+        builder = builder
+            .with_dimension_override(&symbols[1], i64::from(height))
+            .map_err(oerr)?
+            .with_dimension_override(&symbols[2], i64::from(width))
+            .map_err(oerr)?;
+        match builder.commit_from_file(&self.source_path).map_err(oerr) {
+            Ok(session) => {
+                let previous = std::mem::replace(&mut self.session, session);
+                self.dml_rife_cached_session = self.dml_rife_shape.map(|size| (size, previous));
+                self.dml_rife_shape = Some((width, height));
+                log::info!(
+                    "directml-rife-shape: model={} input={}x{} fixed=true result=ok",
+                    self.name, width, height,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.dml_rife_specialization_disabled = true;
+                log::warn!(
+                    "directml-rife-shape: model={} input={}x{} fixed=true result=dynamic-fallback reason={error:#}",
+                    self.name,
+                    width,
+                    height
+                );
+                // The old fixed session cannot serve a new resolution. Rebuild
+                // the original dynamic DirectML path before accepting frames.
+                if self.dml_rife_shape.is_some() {
+                    let directml = match self.fallback_dml_adapter {
+                        Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
+                        None => ort::ep::DirectML::default().with_performance_preference(
+                            ort::ep::directml::PerformancePreference::HighPerformance,
+                        ),
+                    };
+                    let dynamic = Session::builder().map_err(oerr)?
+                        .with_optimization_level(graph_optimization).map_err(oerr)?
+                        .with_execution_providers([directml.build()]).map_err(oerr)?
+                        .with_memory_pattern(false).map_err(oerr)?
+                        .commit_from_file(&self.source_path).map_err(oerr)?;
+                    self.session = dynamic;
+                    self.dml_rife_cached_session = None;
+                    self.dml_rife_shape = None;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn load_neoamd(path: &Path, dml_adapter_id: Option<i32>, app_dir: &Path) -> Result<Self> {
@@ -1664,6 +2522,57 @@ impl OnnxStage {
         }
     }
 
+    /// v978: slot 0 plus up to `want - 1` extra cooperative output slots with
+    /// the same geometry. Returns only slot 0 when the Backend Pack has no ring
+    /// export or allocation fails, so callers keep the serialized v977 contract.
+    pub(crate) fn neoamd_interp_ring_outputs(
+        &mut self,
+        w: i32,
+        h: i32,
+        base: crate::render::neoamd_backend::NeoAmdSharedOutput,
+        want: usize,
+    ) -> Vec<crate::render::neoamd_backend::NeoAmdSharedOutput> {
+        let want = want.clamp(1, 8);
+        if self.neoamd_interp_ring_base != Some(base.resource_key) {
+            // A new slot-0 allocation released every previous ring slot.
+            self.neoamd_interp_ring.clear();
+            self.neoamd_interp_ring_base = Some(base.resource_key);
+        }
+        if want > 1 && !self.neoamd_interp_ring_unavailable {
+            while self.neoamd_interp_ring.len() + 1 < want {
+                let slot = (self.neoamd_interp_ring.len() + 1) as u32;
+                let result = match self.neoamd_session.as_mut() {
+                    Some(session) => session.prepare_interp_shared_ring_slot(w, h, slot),
+                    None => Ok(None),
+                };
+                match result {
+                    Ok(Some(extra)) if extra.width == base.width && extra.height == base.height => {
+                        self.neoamd_interp_ring.push(extra);
+                    }
+                    Ok(Some(_)) => {
+                        self.neoamd_interp_ring_unavailable = true;
+                        log::warn!("neoamd-interp-ring-disabled: model='{}' reason=geometry-mismatch", self.name);
+                        break;
+                    }
+                    Ok(None) => {
+                        self.neoamd_interp_ring_unavailable = true;
+                        log::info!("neoamd-interp-ring-unavailable: model='{}' reason=backend-without-ring-export mode=single-buffer", self.name);
+                        break;
+                    }
+                    Err(error) => {
+                        self.neoamd_interp_ring_unavailable = true;
+                        log::warn!("neoamd-interp-ring-disabled: model='{}' slot={} reason={error}", self.name, slot);
+                        break;
+                    }
+                }
+            }
+        }
+        let mut outputs = Vec::with_capacity(want);
+        outputs.push(base);
+        outputs.extend(self.neoamd_interp_ring.iter().take(want - 1).copied());
+        outputs
+    }
+
     pub(crate) fn run_neoamd_interp_stream_phase_shared_rgba8(
         &mut self,
         w: i32,
@@ -1732,6 +2641,11 @@ impl OnnxStage {
                 .neoamd_session
                 .as_ref()
                 .is_some_and(|session| session.supports_interp_stream_u8())
+    }
+
+    pub(crate) fn supports_neoarc_interp_stream(&self) -> bool {
+        self.neoarc_session.is_some()
+            && matches!(&self.interp, InterpKind::RifeV1 { .. } | InterpKind::Drba)
     }
 
     pub(crate) fn prepare_neoamd_interp_stream_rgba8(
@@ -2815,6 +3729,59 @@ impl OnnxStage {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let input_channels = parse_channels(&format!("{}", session.inputs()[0].dtype()));
+        let dml_rife_symbols =
+            if provider == OnnxProvider::DirectML && matches!(&interp, InterpKind::RifeV1 { .. }) {
+                match session.inputs()[0].dtype() {
+                    ort::value::ValueType::Tensor {
+                        dimension_symbols, ..
+                    } if dimension_symbols.len() == 4
+                        && !dimension_symbols[2].is_empty()
+                        && !dimension_symbols[3].is_empty() =>
+                    {
+                        Some([
+                            dimension_symbols[0].clone(),
+                            dimension_symbols[2].clone(),
+                            dimension_symbols[3].clone(),
+                        ])
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        let dml_image_symbols = if provider == OnnxProvider::DirectML
+            && fp16
+            && interp == InterpKind::None
+            && session.inputs().len() == 1
+            && session.outputs().len() == 1
+            && parse_channels(&format!("{}", session.inputs()[0].dtype())) == Some(3)
+            && parse_channels(&format!("{}", session.outputs()[0].dtype())) == Some(3)
+            && (inspect_local_image_model(path)
+                .ok()
+                .flatten()
+                .is_some_and(|plan| matches!(plan.conv_count, 10 | 18))
+                || inspect_spanf3_image_model(path).unwrap_or(false)
+                || inspect_rtmosr_image_model(path).unwrap_or(false)
+                || std::env::var("NEO_DML_STRUCTURAL_PROBE").ok().as_deref() == Some("1"))
+        {
+            match session.inputs()[0].dtype() {
+                ort::value::ValueType::Tensor {
+                    dimension_symbols, ..
+                } if dimension_symbols.len() == 4
+                    && !dimension_symbols[2].is_empty()
+                    && !dimension_symbols[3].is_empty() =>
+                {
+                    Some([
+                        dimension_symbols[0].clone(),
+                        dimension_symbols[2].clone(),
+                        dimension_symbols[3].clone(),
+                    ])
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let temporal_frames = input_channels
             .filter(|channels| *channels >= 9 && *channels % 3 == 0)
             .map(|channels| channels / 3);
@@ -2826,6 +3793,103 @@ impl OnnxStage {
         if let Some(frames) = temporal_frames {
             provider_desc.push_str(&format!(" + temporal-{frames}f"));
         }
+        // v933: FraZerion exports that assume one source pair per batch (all phases in one call).
+        // v934: opt-in only (CHIDESCALER_DML_PAIR_BATCH=on). The presentation clock is causal: the first
+        // in-between is due when the pair arrives, so finishing all phases together delays that first
+        // output by the whole batch (v933 measured ~76fps at 1080p x5 and ~110fps at 720p x5).
+        let dml_pair_batch_capable = provider == OnnxProvider::DirectML
+            && fp16
+            && std::env::var("CHIDESCALER_DML_PAIR_BATCH").ok().as_deref() == Some("on")
+            && session
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.custom("frazerion.pair_batch"))
+                .as_deref()
+                == Some("1");
+        // DirectML GridSample writes at most 2^23 output pixels per call; the model warps full-size
+        // images in `frazerion.warp_rows` row bands, which bounds how many phases one call may hold.
+        let dml_pair_batch_rows = session
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.custom("frazerion.warp_rows"))
+            .and_then(|rows| rows.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        if dml_pair_batch_capable {
+            log::info!("frazerion-pair-batch: capable model={name} warp_rows={dml_pair_batch_rows}");
+        }
+        // v936: channels of the trunk -> head state (8 for V24, 12 with the 1/2-size stage of V25+)
+        let dml_split_state_channels = session
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.custom("frazerion.state_channels"))
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|c| (1..=64).contains(c))
+            .unwrap_or(8);
+        // v935: FraZerion trunk/head sidecars (see DmlSplit). CHIDESCALER_DML_SPLIT=off disables.
+        let dml_split_paths = if provider == OnnxProvider::DirectML
+            && fp16
+            && std::env::var("CHIDESCALER_DML_SPLIT").ok().as_deref() != Some("off")
+            && session
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.custom("frazerion.split"))
+                .as_deref()
+                == Some("1")
+        {
+            let trunk = PathBuf::from(format!("{}.trunk", path.display()));
+            let head = PathBuf::from(format!("{}.head", path.display()));
+            if trunk.is_file() && head.is_file() {
+                log::info!("frazerion-split: capable model={name} state_channels={dml_split_state_channels}");
+                Some((trunk, head))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // v937: no sidecar files -> trunk/head embedded in the model itself (metadata frazerion.trunk_b64 /
+        // frazerion.head_b64, base64 ONNX). Sidecar files, when present, keep priority (v935 behaviour).
+        let dml_split_embedded = if dml_split_paths.is_none()
+            && provider == OnnxProvider::DirectML
+            && fp16
+            && std::env::var("CHIDESCALER_DML_SPLIT").ok().as_deref() != Some("off")
+        {
+            let meta = session.metadata().ok();
+            let split = meta.as_ref().and_then(|m| m.custom("frazerion.split")).as_deref() == Some("1");
+            let trunk = meta.as_ref().and_then(|m| m.custom("frazerion.trunk_b64"));
+            let head = meta.as_ref().and_then(|m| m.custom("frazerion.head_b64"));
+            match (split, trunk, head) {
+                (true, Some(t), Some(h)) => match (decode_base64(&t), decode_base64(&h)) {
+                    (Some(t), Some(h)) => {
+                        log::info!(
+                            "frazerion-split: capable model={name} state_channels={dml_split_state_channels} source=embedded trunk={}B head={}B",
+                            t.len(),
+                            h.len()
+                        );
+                        Some(std::sync::Arc::new((t, h)))
+                    }
+                    _ => {
+                        log::warn!("frazerion-split: embedded graphs unreadable model={name} action=single-model");
+                        None
+                    }
+                },
+                (true, _, _) => {
+                    log::warn!("frazerion-split: sidecars missing model={name} action=single-model");
+                    None
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let dml_rife_boost = provider == OnnxProvider::DirectML
+            && input_channels == Some(7)
+            && in_name == "input"
+            && out_name == "output"
+            && dml_split_paths.is_none()
+            && dml_split_embedded.is_none()
+            && std::env::var("CHIDESCALER_DML_SPLIT").ok().as_deref() != Some("off");
         let run_options = CancelableRunOptions::new()?;
         if onnx_cancel_requested() {
             // A Stop can arrive while Session::commit_from_file is still
@@ -2836,8 +3900,28 @@ impl OnnxStage {
         let stage = Self {
             name,
             source_path: path.to_path_buf(),
+            dml_half_bridge_source: None,
             fallback_dml_adapter,
             session,
+            dml_rife_symbols,
+            dml_rife_shape: None,
+            dml_host_interp_binding: None,
+            dml_rife_cached_session: None,
+            dml_rife_specialization_disabled: false,
+            dml_rife_native_rejected: std::collections::HashSet::new(),
+            dml_image_symbols,
+            dml_wgl_converter: None,
+            dml_wgl_disabled: false,
+            dml_drba_sequential_logged: false,
+            dml_wgl_last_geometry: None,
+            dml_wgl_input_converter: None,
+            dml_wgl_input_failed: None,
+            dml_image_device_luid: None,
+            dml_image_budget_retry: None,
+            dml_image_dynamic_session: None,
+            dml_image_cached_fixed_session: None,
+            dml_image_shape: None,
+            dml_image_specialization_disabled: false,
             run_options,
             tensorrt_diagnostic_dir,
             in_name,
@@ -2845,13 +3929,20 @@ impl OnnxStage {
             fp16,
             scratch_f32: Vec::new(),
             scratch_f16: Vec::new(),
+            neoarc_pair_input: Vec::new(),
+            neoarc_pair_reuse: false,
+            neoarc_pair_packed: false,
             pack_const_key: None,
             pack_t_cached: None,
             pack_frame_key: None,
             pack_second_ptr: None,
             cross_gpu_rife_full_repack_logged: false,
             last_interp_profile: None,
+            interp_gpu_diag: GpuInterpDiagnostics::default(),
             last_upscale_profile: None,
+            image_diag_last_log: None,
+            image_diag_samples: std::collections::VecDeque::new(),
+            image_diag_shape: None,
             last_upscale_input_size: None,
             direct_output: None,
             direct_input: None,
@@ -2859,14 +3950,37 @@ impl OnnxStage {
             direct_output_disabled: false,
             neoamd_shared_disabled: false,
             neoamd_shared_key: None,
+            neoamd_interp_ring: Vec::new(),
+            neoamd_interp_ring_base: None,
+            neoamd_interp_ring_unavailable: false,
             neoamd_shared_input_key: None,
             neoamd_shared_input_size: None,
             tensorrt_device_id: None,
             neoamd_session: None,
+            neoarc_session: None,
+            neoarc_interp_gl: None,
             tensorrt_gpu_bridge: None,
             tensorrt_temporal_bridge: None,
             tensorrt_interp_bridge: None,
             dml_interp_bridge: None,
+            dml_pair_batch: None,
+            dml_pair_batch_capable,
+            dml_pair_batch_rows,
+            dml_pair_batch_failed: false,
+            dml_pair_batch_logged: false,
+            dml_pair_batch_skip_logged: false,
+            dml_split: None,
+            dml_split_paths,
+            dml_split_embedded,
+            dml_split_state_channels,
+            dml_rife_boost,
+            fused_host_boost: Vec::new(),
+            fused_host_failed: std::env::var("CHIDESCALER_DML_FUSED_PAIR").as_deref()==Ok("off"),
+            dml_host_boost: None,
+            dml_split_failed: false,
+            dml_split_logged: false,
+            dml_wgl_interp_bridge: None,
+            dml_wgl_interp_failed: false,
             dml_cpu_interp_shared_outputs: [Vec::new(), Vec::new()],
             dml_cpu_interp_shared_disabled: false,
             neoamd_drba_slow_streak: 0,
@@ -2877,6 +3991,10 @@ impl OnnxStage {
             input_channels,
             neo_accel,
             temporal_frames,
+            neoarc_temporal_packed: false,
+            dml_temporal_cursor: None,
+            dml_temporal_mirror: std::env::var("CHIDESCALER_DML_TEMPORAL_MIRROR").as_deref()!=Ok("off"),
+            neoarc_gl_history_active: false,
             temporal_history: VecDeque::new(),
             temporal_history_stride: 0,
             temporal_size: None,
@@ -2904,12 +4022,13 @@ impl OnnxStage {
     /// high-resolution safety cap without relying on a specific model name.
     pub fn is_directml_temporal_filter(&self) -> bool {
         self.provider == OnnxProvider::DirectML
+            && self.neoarc_session.is_none()
             && self.temporal_frames.is_some()
             && self.interp == InterpKind::None
     }
 
     pub fn supports_dml_gl_bridge(&self) -> bool {
-        self.provider == OnnxProvider::DirectML
+        self.provider == OnnxProvider::DirectML && self.neoarc_session.is_none()
     }
 
     fn has_tensorrt_engine_cache(&self) -> bool {
@@ -3134,11 +4253,19 @@ impl OnnxStage {
     }
 
     pub fn finalize_provider_after_warmup(&mut self) {
+        // Each successful stateless pass has already released its GL images.
+        // Keep the validated executable and bindings across the remaining passes.
+        // Shape/context changes are handled by prepare_gl_rgb before the next run.
+        let warmed_image = self.temporal_frames.is_none() && self.interp == InterpKind::None
+            && self.neoarc_session.as_ref().is_some_and(|s| s.gl_rgb_import_stats().is_some());
+        if !warmed_image { self.retire_neoarc_gl(); }
+        if let Some(session)=self.neoarc_session.as_mut(){session.reset_rife_validation();}
         // Warm-up frames are synthetic provider priming, not live temporal
         // history. Stop/Start begins with an empty TRUE-N window; live provider
         // switching must do the same while retaining warmed sessions/Graphs.
         if self.temporal_frames.is_some() {
             self.temporal_history.clear();
+            self.neoarc_temporal_packed = false;
             self.temporal_history_stride = 0;
             self.temporal_size = None;
             if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
@@ -3250,6 +4377,9 @@ impl OnnxStage {
     }
 
     pub fn reset_backend_runtime_state(&mut self) {
+        self.dml_host_interp_binding = None;
+        self.retire_neoarc_gl();
+        if let Some(session)=self.neoarc_session.as_mut(){session.reset_rife_validation();}
         self.pack_const_key = None;
         self.pack_t_cached = None;
         self.pack_frame_key = None;
@@ -3259,12 +4389,18 @@ impl OnnxStage {
         self.last_upscale_profile = None;
         self.last_upscale_input_size = None;
         self.temporal_history.clear();
+        self.neoarc_temporal_packed = false;
         self.temporal_history_stride = 0;
         self.temporal_size = None;
         // Keep a TemporalFix runtime rejection scoped to its W/H across a
         // filter OFF -> ON cache reuse. Do not resurrect the experimental DML
         // temporal shared bridge merely because the chain generation changed.
         self.direct_output_disabled = self.temporal_frames.is_some();
+        self.dml_wgl_disabled=false;
+        self.dml_drba_sequential_logged=false;
+        if self.dml_wgl_interp_failed{self.interp_gpu_path_disabled=false;self.dml_wgl_interp_failed=false;}
+        self.dml_wgl_input_failed=None;
+        self.dml_wgl_last_geometry=None;
         // An interop error is a per-generation condition. Explicit backend/model
         // transitions retire the old shared resource first, so allow the next
         // generation to probe GPU-resident NeoAMD again instead of permanently
@@ -3279,12 +4415,58 @@ impl OnnxStage {
         self.tensorrt_gpu_unsupported_logged = false;
     }
 
+    pub fn neoarc_precision_for_shape(&self,w:usize,h:usize)->Option<&'static str> {
+        self.neoarc_session.as_ref().map(|session|{let(w,h)=if self.interp==InterpKind::Drba{((w+63)/64*64,(h+63)/64*64)}else{(w,h)};session.precision_for_shape(w,h)})
+    }
     pub fn last_interp_profile(&self) -> Option<InterpProfile> {
         self.last_interp_profile
     }
 
     pub fn last_upscale_profile(&self) -> Option<UpscaleProfile> {
         self.last_upscale_profile
+    }
+
+    pub(crate) fn log_image_pipeline(&mut self, input_size: (i32, i32), input_bytes: usize,
+        output_size: (i32, i32), host_output_bytes: usize, stage_wall_ms: f64) {
+        if self.temporal_frames.is_some() || self.interp != InterpKind::None || !crate::logging::diagnostics_enabled(){return;}
+        if self.provider==OnnxProvider::DirectML&&self.neoarc_session.is_none(){
+            if self.image_diag_shape!=Some(input_size){self.image_diag_samples.clear();self.image_diag_shape=Some(input_size);}
+            if let Some(p)=self.last_upscale_profile{
+                if self.image_diag_samples.len()==120{self.image_diag_samples.pop_front();}
+                self.image_diag_samples.push_back([p.pack_ms,p.run_ms,p.out_ms,stage_wall_ms]);
+            }
+        }
+        if self.image_diag_last_log.is_some_and(|last| last.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        let first_sample = self.image_diag_last_log.is_none();
+        self.image_diag_last_log = Some(Instant::now());
+        if !self.image_diag_samples.is_empty()&&self.provider==OnnxProvider::DirectML&&self.neoarc_session.is_none(){
+            let quantile=|column:usize,q:f64|{let mut v:Vec<f64>=self.image_diag_samples.iter().map(|r|r[column]).collect();v.sort_by(f64::total_cmp);v[((v.len()-1)as f64*q).round()as usize]};
+            log::info!("directml-image-window: model={} input={}x{} samples={} fixed_shape={} total_p50_ms={:.3} total_p95_ms={:.3} total_max_ms={:.3} pack_p50_ms={:.3} infer_p50_ms={:.3} infer_p95_ms={:.3} output_p50_ms={:.3} timing=cpu-wall-with-transfers frame_omission=false",
+                self.name,input_size.0,input_size.1,self.image_diag_samples.len(),self.dml_image_shape==Some(input_size),quantile(3,0.5),quantile(3,0.95),quantile(3,1.),quantile(0,0.5),quantile(1,0.5),quantile(1,0.95),quantile(2,0.5));
+        }
+        if let Some(profile) = self.last_upscale_profile {
+            let accounted = profile.pack_ms + profile.run_ms + profile.out_ms;
+            log::info!("sisr-pipeline: model='{}' provider={} input={}x{} output={}x{} first_sample={} pack_ms={:.3} infer_call_ms={:.3} output_convert_ms={:.3} stage_wall_ms={:.3} unattributed_wall_ms={:.3} input_host_bytes={} output_host_bytes={} capture_storage=host end_to_end_gpu_resident=false timing=cpu-wall infer_includes_transfer=true",
+                self.name, self.metrics_provider_label(), input_size.0, input_size.1,
+                output_size.0, output_size.1, first_sample, profile.pack_ms, profile.run_ms,
+                profile.out_ms, stage_wall_ms, (stage_wall_ms - accounted).max(0.0),
+                input_bytes, host_output_bytes);
+        } else {
+            log::info!("sisr-pipeline: model='{}' provider={} input={}x{} output={}x{} first_sample={} profile_valid=false stage_wall_ms={:.3} input_host_bytes={} output_host_bytes={} capture_storage=host end_to_end_gpu_resident=false timing=cpu-wall",
+                self.name, self.metrics_provider_label(), input_size.0, input_size.1,
+                output_size.0, output_size.1, first_sample, stage_wall_ms, input_bytes, host_output_bytes);
+        }
+    }
+
+    pub(crate) fn reset_image_profile(&mut self) {
+        // FilterChain clears per-frame telemetry before dispatch. Preserve the
+        // last completed shape separately: telemetry is not route capability.
+        if let (Some(input),Some(profile))=(self.last_upscale_input_size,self.last_upscale_profile){
+            self.dml_wgl_last_geometry=Some((input,profile.output_size));
+        }
+        self.last_upscale_profile=None;
     }
 
     pub fn reset_interp_pack_cache(&mut self) {
@@ -3318,7 +4500,19 @@ impl OnnxStage {
         matches!(self.interp, InterpKind::Drba)
     }
 
+    /// v994: a NeoArc GL interpolation bridge will be built on the next pair
+    /// (compile + validation, seconds on a first start). The engine keeps the
+    /// overlay hidden meanwhile so the live source stays visible instead of
+    /// a frozen first frame.
+    pub fn neoarc_interp_bridge_pending(&self) -> bool {
+        self.neoarc_session.is_some() && self.supports_interp_gpu() && self.neoarc_interp_gl.is_none()
+    }
+
     pub fn supports_interp_gpu(&self) -> bool {
+        if self.neoarc_session.is_some() {
+            return !self.interp_gpu_path_disabled && matches!(self.interp,InterpKind::RifeV1{channels:7}|InterpKind::Drba)
+                && std::env::var("CHIDESCALER_NEOARC_INTERP_GL").ok().as_deref()!=Some("off");
+        }
         !matches!(
             std::env::var("CHIDESCALER_INTERP_GPU").ok().as_deref(),
             Some("disable")
@@ -3331,6 +4525,26 @@ impl OnnxStage {
                 self.provider,
                 OnnxProvider::TensorRT | OnnxProvider::DirectML
             )
+    }
+
+    /// Use the existing owned-output cooperative slots on verified Arc DML
+    /// CPU fallback sessions. Leave other adapters and shared routes alone.
+    pub fn supports_arc_dml_cpu_stream(&self) -> bool {
+        if self.provider != OnnxProvider::DirectML || !self.interp_gpu_path_disabled
+            || self.neoarc_session.is_some()
+            || !matches!(self.interp, InterpKind::RifeV1 { .. }) {
+            return false;
+        }
+        match self.fallback_dml_adapter {
+            Some(id) => intel_arc_device_id(id),
+            None => {
+                static SINGLE_ARC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *SINGLE_ARC.get_or_init(|| {
+                    let adapters = crate::platform::gpu::enumerate_adapters_quiet();
+                    adapters.len() == 1 && intel_arc_device_id(adapters[0].device_id)
+                })
+            }
+        }
     }
 
     pub fn disable_interp_gpu_path(&mut self, reason: &str) {
@@ -3404,8 +4618,42 @@ impl OnnxStage {
         capacity_factor: usize,
         stable_post_handoff: bool,
     ) -> Result<Option<u64>> {
+        self.prepare_interp_gpu_history(gc, frames, timesteps, generation, capacity_factor, stable_post_handoff, &[])
+    }
+
+    pub fn prepare_interp_gpu_history(
+        &mut self,
+        gc: &mut GlContext,
+        frames: &[GpuTex],
+        timesteps: &[f32],
+        generation: u64,
+        capacity_factor: usize,
+        stable_post_handoff: bool,
+        sequences: &[u64],
+    ) -> Result<Option<u64>> {
         if !self.supports_interp_gpu() || timesteps.is_empty() {
             return Ok(None);
+        }
+        if self.neoarc_session.is_some() {
+            match self.prepare_neoarc_interp_gl(gc,frames,timesteps,capacity_factor) {
+                Ok(fence)=>{INTERP_GPU_INPUT_FRAMES.fetch_add(1,Ordering::Relaxed);return Ok(Some(fence));}
+                Err(error)=>{
+                    self.retire_neoarc_interp_gl(gc);self.interp_gpu_path_disabled=true;
+                    log::warn!("neoarc-gl-interp-fallback: model={} reason={error:#} action=validated-rgb-worker",self.name);
+                    INTERP_CPU_FALLBACK_FRAMES.fetch_add(1,Ordering::Relaxed);
+                    if std::env::var("CHIDESCALER_INTERP_GPU").ok().as_deref()==Some("require") {
+                        return Err(anyhow!("NeoArc GPU interpolation required but unavailable: {error:#}"));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        if self.supports_dml_wgl_interp()&&gc.external_device_luid().is_none()&&crate::render::vulkan_gpu::production_selected_luid().is_none(){
+            return match self.prepare_dml_wgl_interp(gc,frames,timesteps,capacity_factor,generation,sequences){
+                Ok(fence)=>{INTERP_GPU_INPUT_FRAMES.fetch_add(1,Ordering::Relaxed);Ok(Some(fence))},
+                Err(error)=>{self.retire_dml_wgl_interp(gc);self.dml_wgl_interp_failed=true;self.interp_gpu_path_disabled=true;INTERP_CPU_FALLBACK_FRAMES.fetch_add(1,Ordering::Relaxed);log::warn!("directml-wgl-interp-fallback: model={} reason={error:#} action=original-host-path",self.name);Ok(None)}
+            };
         }
 
         // v653: DirectML interpolation cannot use the OpenGL external-memory
@@ -3464,8 +4712,10 @@ impl OnnxStage {
             }
             OnnxProvider::DirectML => {
                 let Some(mode) = dml_interp_interop_mode(gc, stable_post_handoff) else {
+                    self.interp_gpu_path_disabled = true;
+                    self.reset_interp_pack_cache();
                     log::info!(
-                        "dml-interp-interop-policy: mode=nonresident reason=explicit-safe-fallback"
+                        "dml-interp-interop-policy: mode=nonresident reason=explicit-safe-fallback action=disable-gpu-path-for-session"
                     );
                     return Ok(None);
                 };
@@ -3543,6 +4793,17 @@ impl OnnxStage {
         &mut self,
         index: usize,
     ) -> Result<(f64, (i32, i32))> {
+        if self.dml_wgl_interp_bridge.is_some(){return self.run_dml_wgl_interp_slot(index);}
+        if let Some(bridge)=self.neoarc_interp_gl.as_mut() {
+            let phase=*bridge.phases.get(index).ok_or_else(||anyhow!("NeoArc shared phase missing"))?;
+            let output=bridge.outputs.get(index).ok_or_else(||anyhow!("NeoArc shared output missing"))?.1;
+            let times=bridge.io.run(&bridge.frames,output.tex.0.get(),phase)?;
+            self.last_interp_profile=Some(InterpProfile{pack_ms:times[0],run_ms:times[1],out_ms:times[2],padded_size:(bridge.padded.0 as usize,bridge.padded.1 as usize)});
+            log::debug!("neoarc-gl-interp-profile: model={} input={}x{} slot={} t={} pack_ms={:.3} run_ms={:.3} output_ms={:.3} host_input_bytes=0 host_output_bytes=0",self.name,bridge.size.0,bridge.size.1,index,phase,times[0],times[1],times[2]);
+            let wall=times.iter().sum();let padded=bridge.padded;let size=bridge.size;
+            self.interp_gpu_diag.record(&self.name,"NeoARC",size,padded,[times[0],times[1],times[2],wall]);
+            return Ok((wall,padded));
+        }
         let started = Instant::now();
         let padded = match self.provider {
             OnnxProvider::TensorRT => {
@@ -3597,6 +4858,17 @@ impl OnnxStage {
                     .unwrap_or((0, 0))
             }
             OnnxProvider::DirectML => {
+                if let Some(bridge) = self.dml_interp_bridge.as_mut() {
+                    bridge.slots_done = bridge.slots_done.max(index + 1);
+                }
+                if let Some(wall_ms) = self.try_dml_pair_batch(index) {
+                    let padded = self.dml_interp_bridge.as_ref().map(|b| b.padded_size).unwrap_or((0, 0));
+                    return Ok((wall_ms, padded));
+                }
+                if let Some(wall_ms) = self.try_dml_split(index) {
+                    let padded = self.dml_interp_bridge.as_ref().map(|b| b.padded_size).unwrap_or((0, 0));
+                    return Ok((wall_ms, padded));
+                }
                 let bridge = self
                     .dml_interp_bridge
                     .as_mut()
@@ -3698,11 +4970,588 @@ impl OnnxStage {
         Ok((started.elapsed().as_secs_f64() * 1000.0, padded))
     }
 
+    /// v933: FraZerion pair batch (see `DmlPairBatch`). Some(wall_ms) when this slot is served by
+    /// the batch (slot 0 runs all phases, later slots are already done); None takes the
+    /// established per-phase path unchanged.
+    fn try_dml_pair_batch(&mut self, index: usize) -> Option<f64> {
+        if !self.dml_pair_batch_capable || self.dml_pair_batch_failed || !self.fp16 {
+            return None;
+        }
+        let bridge = self.dml_interp_bridge.as_ref()?;
+        if bridge.interop_mode != DmlInterpInteropMode::ConservativeCopy || bridge.prepared_count < 2 {
+            return None;
+        }
+        // each phase warps two full-size images; one GridSample call (a row band) holds <= 2^23 pixels
+        let (pw, ph) = bridge.padded_size;
+        let band_pixels = 2 * bridge.prepared_count * pw.max(0) as usize * ph.max(0) as usize
+            / self.dml_pair_batch_rows;
+        if band_pixels > 1 << 23 {
+            if !self.dml_pair_batch_skip_logged {
+                self.dml_pair_batch_skip_logged = true;
+                log::info!(
+                    "frazerion-pair-batch: skipped model={} phases={} padded={}x{} reason=gridsample-limit action=per-phase-directml",
+                    self.name,
+                    bridge.prepared_count,
+                    pw,
+                    ph
+                );
+            }
+            return None;
+        }
+        let serial = bridge.prepare_serial;
+        if index > 0 {
+            let batch = self.dml_pair_batch.as_ref()?;
+            return (batch.done_serial == serial && index < batch.done_count).then_some(0.0);
+        }
+        match self.run_dml_pair_batch() {
+            Ok(wall_ms) => Some(wall_ms),
+            Err(error) => {
+                self.dml_pair_batch_failed = true;
+                self.dml_pair_batch = None;
+                log::warn!(
+                    "frazerion-pair-batch-fallback: model={} reason={error:#} action=per-phase-directml",
+                    self.name
+                );
+                None
+            }
+        }
+    }
+
+    fn build_dml_pair_batch(
+        &mut self,
+        padded: (i32, i32),
+        count: usize,
+        channels: usize,
+    ) -> Result<DmlPairBatch> {
+        let symbols = self
+            .dml_rife_symbols
+            .clone()
+            .ok_or_else(|| anyhow!("model has no dynamic input shape"))?;
+        anyhow::ensure!(!symbols[0].is_empty(), "model batch dimension is fixed");
+        let (device, luid) = {
+            let bridge = self
+                .dml_interp_bridge
+                .as_ref()
+                .ok_or_else(|| anyhow!("DirectML interpolation bridge missing"))?;
+            let output = &bridge
+                .invocations
+                .first()
+                .ok_or_else(|| anyhow!("DirectML interpolation slots missing"))?
+                .output;
+            (output.device.clone(), output.luid)
+        };
+        let directml = match self.fallback_dml_adapter {
+            Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
+            None => ort::ep::DirectML::default().with_performance_preference(
+                ort::ep::directml::PerformancePreference::HighPerformance,
+            ),
+        };
+        let session = Session::builder()
+            .map_err(oerr)?
+            .with_optimization_level(dml_graph_optimization(&self.source_path))
+            .map_err(oerr)?
+            .with_execution_providers([directml.build()])
+            .map_err(oerr)?
+            .with_memory_pattern(false)
+            .map_err(oerr)?
+            .with_dimension_override(&symbols[0], count as i64)
+            .map_err(oerr)?
+            .with_dimension_override(&symbols[1], i64::from(padded.1))
+            .map_err(oerr)?
+            .with_dimension_override(&symbols[2], i64::from(padded.0))
+            .map_err(oerr)?
+            .commit_from_file(&self.source_path)
+            .map_err(oerr)?;
+        let mut input = create_direct_input_channels_typed_state(
+            &device,
+            luid,
+            padded,
+            channels * count,
+            std::mem::size_of::<f16>(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )?;
+        input.dims = [count as i64, channels as i64, padded.1 as i64, padded.0 as i64];
+        let memory = MemoryInfo::new(
+            AllocationDevice::DIRECTML,
+            0,
+            AllocatorType::Device,
+            MemoryType::Default,
+        )?;
+        let input_value = unsafe {
+            TensorRefMut::<f16>::from_raw(memory.clone(), input.allocation, Shape::new(input.dims))?
+        };
+        let mut binding = session.create_binding()?;
+        let input_name = CString::new(self.in_name.as_bytes())?;
+        ort_status(unsafe {
+            (ort::api().BindInput)(binding.ptr().cast_mut(), input_name.as_ptr(), input_value.ptr())
+        })?;
+        binding
+            .bind_output_to_device(self.out_name.clone(), &memory)
+            .map_err(oerr)?;
+        let allocator = Allocator::new(&session, memory)?;
+        let copy = DmlCopyContext::new(&device)?;
+        Ok(DmlPairBatch {
+            key: (padded, count),
+            session,
+            _input_value: input_value,
+            _input_name: input_name,
+            binding,
+            allocator,
+            copy,
+            input,
+            done_serial: 0,
+            done_count: 0,
+        })
+    }
+
+    fn run_dml_pair_batch(&mut self) -> Result<f64> {
+        let started = Instant::now();
+        let (padded, count, channels) = {
+            let bridge = self
+                .dml_interp_bridge
+                .as_ref()
+                .ok_or_else(|| anyhow!("DirectML interpolation bridge missing"))?;
+            (bridge.padded_size, bridge.prepared_count, bridge.channels)
+        };
+        if self.dml_pair_batch.as_ref().is_none_or(|batch| batch.key != (padded, count)) {
+            self.dml_pair_batch = None;
+            let built = self.build_dml_pair_batch(padded, count, channels)?;
+            log::info!(
+                "frazerion-pair-batch: active model={} phases={} padded={}x{} build_ms={:.0}",
+                self.name,
+                count,
+                padded.0,
+                padded.1,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            self.dml_pair_batch = Some(built);
+        }
+        let bridge = self.dml_interp_bridge.as_ref().unwrap();
+        let batch = self.dml_pair_batch.as_mut().unwrap();
+        // 1. the packed phase inputs -> one batch tensor (GPU copies)
+        let slice_in = batch.input.byte_len / count;
+        let mut sources = Vec::with_capacity(count);
+        let mut regions = Vec::with_capacity(count);
+        for (i, invocation) in bridge.invocations.iter().take(count).enumerate() {
+            let safe = invocation
+                .safe_input
+                .as_ref()
+                .ok_or_else(|| anyhow!("DirectML conservative input buffer missing"))?;
+            anyhow::ensure!(safe.byte_len <= slice_in, "pair batch input slice too small");
+            sources.push((safe.resource.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            regions.push((i, 0u64, 0usize, (i * slice_in) as u64, safe.byte_len as u64));
+        }
+        let dests = [(batch.input.resource.clone(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS)];
+        batch.copy.copy_regions_and_wait(&sources, &dests, &regions)?;
+        // 2. one provider call for all phases
+        let run_started = Instant::now();
+        let mut outputs = batch
+            .session
+            .run_binding_with_options(&batch.binding, self.run_options.armed()?)
+            .map_err(oerr)?;
+        batch.binding.synchronize_outputs().map_err(oerr)?;
+        let run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+        let provider = outputs
+            .remove(self.out_name.as_str())
+            .ok_or_else(|| anyhow!("pair batch output missing"))?
+            .downcast::<TensorValueType<f16>>()?;
+        anyhow::ensure!(
+            provider.memory_info().allocation_device().as_str() == "DML",
+            "pair batch output silently fell back to CPU"
+        );
+        let dims: Vec<i64> = provider.shape().iter().copied().collect();
+        anyhow::ensure!(
+            dims == vec![count as i64, 3, padded.1 as i64, padded.0 as i64],
+            "pair batch output shape {dims:?}"
+        );
+        let api = dml_api()?;
+        let mut raw_resource = std::ptr::null_mut();
+        ort_status(unsafe {
+            (api.GetD3D12ResourceFromAllocation)(
+                batch.allocator.ptr().cast_mut(),
+                provider.data_ptr().cast_mut(),
+                &mut raw_resource,
+            )
+        })?;
+        let provider_resource = unsafe { ID3D12Resource::from_raw_borrowed(&raw_resource) }
+            .ok_or_else(|| anyhow!("pair batch output resource is null"))?
+            .clone();
+        // 3. each phase's slice -> that phase's GL-shared output buffer (as the per-phase path)
+        let slice_out = 3 * usize::try_from(padded.0)? * usize::try_from(padded.1)? * std::mem::size_of::<f16>();
+        let mut dests = Vec::with_capacity(count);
+        let mut regions = Vec::with_capacity(count);
+        for (i, invocation) in bridge.invocations.iter().take(count).enumerate() {
+            anyhow::ensure!(invocation.output.byte_len >= slice_out, "pair batch output slot too small");
+            dests.push((invocation.output.resource.clone(), D3D12_RESOURCE_STATE_COMMON));
+            regions.push((0usize, (i * slice_out) as u64, i, 0u64, slice_out as u64));
+        }
+        batch.copy.copy_regions_and_wait(
+            &[(provider_resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)],
+            &dests,
+            &regions,
+        )?;
+        drop(provider);
+        drop(outputs);
+        batch.done_serial = bridge.prepare_serial;
+        batch.done_count = count;
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.last_interp_profile = Some(InterpProfile {
+            pack_ms: 0.0,
+            run_ms,
+            out_ms: wall_ms - run_ms,
+            padded_size: (padded.0 as usize, padded.1 as usize),
+        });
+        if !self.dml_pair_batch_logged {
+            self.dml_pair_batch_logged = true;
+            log::info!(
+                "frazerion-pair-batch: first pair model={} phases={} run_ms={:.2} wall_ms={:.2}",
+                self.name,
+                count,
+                run_ms,
+                wall_ms
+            );
+        }
+        Ok(wall_ms)
+    }
+
+    fn try_dml_split(&mut self, index: usize) -> Option<f64> {
+        let frazerion = self.fp16
+            && (self.dml_split_paths.is_some() || self.dml_split_embedded.is_some());
+        if self.dml_split_failed || !(self.dml_rife_boost || frazerion) {
+            return None;
+        }
+        let bridge = self.dml_interp_bridge.as_ref()?;
+        if bridge.interop_mode != DmlInterpInteropMode::ConservativeCopy
+            || (self.dml_rife_boost && !bridge.rife_boost_for_pair)
+        {
+            return None;
+        }
+        match self.run_dml_split(index) {
+            Ok(wall_ms) => Some(wall_ms),
+            Err(error) => {
+                if self.dml_rife_boost && onnx_cancel_requested() {
+                    return None;
+                }
+                self.dml_split_failed = true;
+                self.dml_split = None;
+                log::warn!(
+                    "{}-split-fallback: model={} reason={error:#} action=single-model-directml",
+                    self.dml_split_label(),
+                    self.name
+                );
+                None
+            }
+        }
+    }
+
+    fn dml_split_label(&self) -> &'static str {
+        if self.dml_rife_boost { "rife-boost" } else { "frazerion" }
+    }
+
+    fn dml_sidecar_session(&self, path: &Path, dims: &[(&str, i64)]) -> Result<Session> {
+        self.dml_split_session(Ok(path), dims)
+    }
+
+    /// v937: one builder for both sources: a sidecar file (v935) or embedded ONNX bytes (one-file models).
+    /// Embedded graphs carry no weights of their own: their initializers are external data in the virtual file
+    /// "neo_main.bin" = the model file's own bytes (offset/length), so the one-file model stays ~3% bigger
+    /// instead of doubling. ORT copies the weights during session creation; the buffer is freed afterwards.
+    fn dml_split_session(
+        &self,
+        source: std::result::Result<&Path, (&[u8], Option<Vec<u8>>)>,
+        dims: &[(&str, i64)],
+    ) -> Result<Session> {
+        let directml = match self.fallback_dml_adapter {
+            Some(device_id) => ort::ep::DirectML::default().with_device_id(device_id),
+            None => ort::ep::DirectML::default().with_performance_preference(
+                ort::ep::directml::PerformancePreference::HighPerformance,
+            ),
+        };
+        let mut builder = Session::builder()
+            .map_err(oerr)?
+            .with_optimization_level(dml_graph_optimization(&self.source_path))
+            .map_err(oerr)?
+            .with_execution_providers([directml.build()])
+            .map_err(oerr)?
+            .with_memory_pattern(false)
+            .map_err(oerr)?;
+        for (name, value) in dims {
+            builder = builder.with_dimension_override(name, *value).map_err(oerr)?;
+        }
+        match source {
+            Ok(path) => builder.commit_from_file(path).map_err(oerr),
+            Err((bytes, main)) => {
+                if let Some(main) = main {
+                    builder = builder
+                        .with_external_initializer_file_in_memory("neo_main.bin", std::borrow::Cow::Owned(main))
+                        .map_err(oerr)?;
+                }
+                builder.commit_from_memory(bytes).map_err(oerr)
+            }
+        }
+    }
+
+    fn build_dml_split(&mut self, padded: (i32, i32)) -> Result<DmlSplit> {
+        let (h, w) = (i64::from(padded.1), i64::from(padded.0));
+        let trunk_dims = [("height", h), ("width", w)];
+        let head_dims = [("batch", 1), ("height", h), ("width", w)];
+        let (trunk, head) = if self.dml_rife_boost {
+            let (trunk, head, _) = self.dml_split_graphs(h, w)?;
+            (
+                self.dml_split_session(Err((&trunk, None)), &[])?,
+                self.dml_split_session(Err((&head, None)), &[])?,
+            )
+        } else if let Some((trunk_path, head_path)) = self.dml_split_paths.clone() {
+            (
+                self.dml_sidecar_session(&trunk_path, &trunk_dims)?,
+                self.dml_sidecar_session(&head_path, &head_dims)?,
+            )
+        } else {
+            let embedded = self
+                .dml_split_embedded
+                .clone()
+                .ok_or_else(|| anyhow!("split graphs missing"))?;
+            let main = std::fs::read(&self.source_path)
+                .map_err(|e| anyhow!("model reread failed {}: {e}", self.source_path.display()))?;
+            (
+                self.dml_split_session(Err((embedded.0.as_slice(), Some(main.clone()))), &trunk_dims)?,
+                self.dml_split_session(Err((embedded.1.as_slice(), Some(main))), &head_dims)?,
+            )
+        };
+        let bridge = self
+            .dml_interp_bridge
+            .as_ref()
+            .ok_or_else(|| anyhow!("DirectML interpolation bridge missing"))?;
+        let first = &bridge
+            .invocations
+            .first()
+            .ok_or_else(|| anyhow!("DirectML interpolation slots missing"))?
+            .output;
+        let (device, luid) = (first.device.clone(), first.luid);
+        let channels = if self.dml_rife_boost { 5 } else { self.dml_split_state_channels };
+        let mut state = create_direct_input_channels_typed_state(
+            &device,
+            luid,
+            padded,
+            channels,
+            if self.fp16 { std::mem::size_of::<f16>() } else { std::mem::size_of::<f32>() },
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )?;
+        state.dims = [1, channels as i64, h, w];
+        let memory = MemoryInfo::new(AllocationDevice::DIRECTML, 0, AllocatorType::Device, MemoryType::Default)?;
+        let tensor = |allocation, dims| -> Result<InterpTensorValue> {
+            let shape = Shape::new(dims);
+            Ok(unsafe {
+                if self.fp16 {
+                    InterpTensorValue::F16(TensorRefMut::from_raw(memory.clone(), allocation, shape)?)
+                } else {
+                    InterpTensorValue::F32(TensorRefMut::from_raw(memory.clone(), allocation, shape)?)
+                }
+            })
+        };
+        let state_value = tensor(state.allocation, state.dims)?;
+        let names: Vec<CString> = ["input", "state", "output"]
+            .iter()
+            .map(|n| CString::new(*n))
+            .collect::<std::result::Result<_, _>>()?;
+        let mut input_values = Vec::new();
+        let mut trunk_bindings = Vec::new();
+        let mut head_bindings = Vec::new();
+        let mut key_ptrs = Vec::new();
+        for invocation in &bridge.invocations {
+            let safe = invocation
+                .safe_input
+                .as_ref()
+                .ok_or_else(|| anyhow!("DirectML conservative input buffer missing"))?;
+            anyhow::ensure!(safe.dims == [1, 7, h, w], "phase input shape {:?}", safe.dims);
+            key_ptrs.push(safe.allocation as usize);
+            let value = tensor(safe.allocation, safe.dims)?;
+            let trunk_binding = trunk.create_binding()?;
+            let head_binding = head.create_binding()?;
+            ort_status(unsafe { (ort::api().BindInput)(trunk_binding.ptr().cast_mut(), names[0].as_ptr(), value.ptr()) })?;
+            ort_status(unsafe { (ort::api().BindOutput)(trunk_binding.ptr().cast_mut(), names[1].as_ptr(), state_value.ptr()) })?;
+            ort_status(unsafe { (ort::api().BindInput)(head_binding.ptr().cast_mut(), names[0].as_ptr(), value.ptr()) })?;
+            ort_status(unsafe { (ort::api().BindInput)(head_binding.ptr().cast_mut(), names[1].as_ptr(), state_value.ptr()) })?;
+            let mut head_binding = head_binding;
+            head_binding.bind_output_to_device("output", &memory).map_err(oerr)?;
+            input_values.push(value);
+            trunk_bindings.push(trunk_binding);
+            head_bindings.push(head_binding);
+        }
+        let head_allocator = Allocator::new(&head, memory)?;
+        Ok(DmlSplit {
+            key: (padded, key_ptrs),
+            trunk,
+            head,
+            trunk_bindings,
+            head_bindings,
+            _input_values: input_values,
+            _state_value: state_value,
+            _names: names,
+            state,
+            head_allocator,
+            trunk_serial: None,
+            midpair_trunks: 0,
+        })
+    }
+
+    /// Build (or reuse) the trunk/head sessions for the current GPU bridge.
+    fn ensure_dml_split(&mut self) -> Result<()> {
+        let started = Instant::now();
+        let (padded, ptrs) = {
+            let bridge = self
+                .dml_interp_bridge
+                .as_ref()
+                .ok_or_else(|| anyhow!("DirectML interpolation bridge missing"))?;
+            let ptrs = bridge
+                .invocations
+                .iter()
+                .map(|inv| inv.safe_input.as_ref().map(|s| s.allocation as usize))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow!("DirectML conservative input buffer missing"))?;
+            (bridge.padded_size, ptrs)
+        };
+        if self.dml_split.as_ref().is_none_or(|split| split.key != (padded, ptrs.clone())) {
+            self.dml_split = None;
+            let built = self.build_dml_split(padded)?;
+            log::info!(
+                "{}-split: active model={} slots={} padded={}x{} build_ms={:.0}",
+                self.dml_split_label(),
+                self.name,
+                ptrs.len(),
+                padded.0,
+                padded.1,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            self.dml_split = Some(built);
+        }
+        Ok(())
+    }
+
+    fn run_dml_split(&mut self, index: usize) -> Result<f64> {
+        let started = Instant::now();
+        self.ensure_dml_split()?;
+        let padded = self.dml_interp_bridge.as_ref().map(|b| b.padded_size).unwrap_or((0, 0));
+        let label = self.dml_split_label();
+        let bridge = self.dml_interp_bridge.as_mut().unwrap();
+        let split = self.dml_split.as_mut().unwrap();
+        anyhow::ensure!(index < split.head_bindings.len(), "split slot {index} missing");
+        // 1. the trunk, once per prepared source pair (it ignores t, any phase input will do)
+        let mut trunk_ms = 0.0;
+        // v949: slot 0 always starts a new source pair, so it always refreshes the
+        // shared state. Relying on prepare_serial alone let a pair reuse the
+        // previous pair's motion when the next prepare interleaved with the
+        // cooperative worker, which presented frames out of time order.
+        let serial_changed = split.trunk_serial != Some(bridge.prepare_serial);
+        if serial_changed && index != 0 {
+            split.midpair_trunks = split.midpair_trunks.saturating_add(1);
+            if split.midpair_trunks <= 8 || split.midpair_trunks % 240 == 0 {
+                log::warn!(
+                    "{label}-split: trunk-midpair model={} slot={} prepare_serial={} count={}",
+                    self.name,
+                    index + 1,
+                    bridge.prepare_serial,
+                    split.midpair_trunks
+                );
+            }
+        }
+        if index == 0 || serial_changed {
+            let t0 = Instant::now();
+            split
+                .trunk
+                .run_binding_with_options(&split.trunk_bindings[index], self.run_options.armed()?)
+                .map_err(oerr)?;
+            split.trunk_bindings[index].synchronize_outputs().map_err(oerr)?;
+            split.trunk_serial = Some(bridge.prepare_serial);
+            trunk_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        // 2. the head for this phase -> the phase's GL-shared output buffer (as the per-phase path)
+        let t1 = Instant::now();
+        let mut outputs = split
+            .head
+            .run_binding_with_options(&split.head_bindings[index], self.run_options.armed()?)
+            .map_err(oerr)?;
+        split.head_bindings[index].synchronize_outputs().map_err(oerr)?;
+        let head_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let provider = outputs
+            .remove("output")
+            .ok_or_else(|| anyhow!("split head output missing"))?;
+        let provider = if self.fp16 {
+            provider.downcast::<TensorValueType<f16>>()?.upcast()
+        } else {
+            provider.downcast::<TensorValueType<f32>>()?.upcast()
+        };
+        anyhow::ensure!(
+            provider.memory_info().allocation_device().as_str() == "DML",
+            "split head output silently fell back to CPU"
+        );
+        let invocation = bridge
+            .invocations
+            .get_mut(index)
+            .ok_or_else(|| anyhow!("DirectML interpolation slot {index} missing"))?;
+        let dims: Vec<i64> = provider.shape().iter().copied().collect();
+        anyhow::ensure!(dims == invocation.output.dims, "split head output shape {dims:?} != {:?}", invocation.output.dims);
+        let api = dml_api()?;
+        let mut raw_resource = std::ptr::null_mut();
+        ort_status(unsafe {
+            (api.GetD3D12ResourceFromAllocation)(
+                split.head_allocator.ptr().cast_mut(),
+                provider.data_ptr().cast_mut(),
+                &mut raw_resource,
+            )
+        })?;
+        let provider_resource = unsafe { ID3D12Resource::from_raw_borrowed(&raw_resource) }
+            .ok_or_else(|| anyhow!("split head output resource is null"))?
+            .clone();
+        let _ = invocation.output.copy.copy_and_wait(
+            &provider_resource,
+            &invocation.output.resource,
+            invocation.output.byte_len,
+        )?;
+        drop(provider);
+        drop(outputs);
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.last_interp_profile = Some(InterpProfile {
+            pack_ms: 0.0,
+            run_ms: trunk_ms + head_ms,
+            out_ms: wall_ms - trunk_ms - head_ms,
+            padded_size: (padded.0 as usize, padded.1 as usize),
+        });
+        if !self.dml_split_logged && trunk_ms == 0.0 {
+            self.dml_split_logged = true;
+            log::info!(
+                "{label}-split: first head-only phase model={} slot={} head_ms={:.2} wall_ms={:.2}",
+                self.name,
+                index + 1,
+                head_ms,
+                wall_ms
+            );
+        } else if trunk_ms > 0.0 && !self.dml_split_logged {
+            log::info!(
+                "{label}-split: trunk model={} slot={} trunk_ms={:.2} head_ms={:.2} wall_ms={:.2}",
+                self.name,
+                index + 1,
+                trunk_ms,
+                head_ms,
+                wall_ms
+            );
+        }
+        Ok(wall_ms)
+    }
+
     pub(crate) fn prepared_interp_gpu_outputs(
         &self,
         count: usize,
         preserve_float_after_dml: bool,
     ) -> Result<Vec<PreparedInterpGpuOutput>> {
+        if let Some(bridge)=self.dml_wgl_interp_bridge.as_ref(){anyhow::ensure!(count<=bridge.slots.len(),"DML WGL output capacity");return Ok(bridge.slots.iter().take(count).map(|slot|PreparedInterpGpuOutput{key:slot.key,texture:None,size:bridge.size,padded:bridge.padded,fp16:true,directml_drba_snapshot_candidate:false,preserve_float:false}).collect());}
+        if let Some(bridge)=self.neoarc_interp_gl.as_ref() {
+            anyhow::ensure!(count<=bridge.outputs.len(),"NeoArc shared output capacity exceeded");
+            return Ok(bridge.outputs.iter().take(count).map(|(_,tex)|PreparedInterpGpuOutput{
+                key:0,texture:Some(*tex),size:bridge.size,padded:bridge.padded,fp16:true,
+                directml_drba_snapshot_candidate:false,preserve_float:false,
+            }).collect());
+        }
         let (size, padded, keys) = match self.provider {
             OnnxProvider::TensorRT => {
                 let bridge = self
@@ -3750,6 +5599,7 @@ impl OnnxStage {
         Ok(keys
             .into_iter()
             .map(|key| PreparedInterpGpuOutput {
+                texture: None,
                 key,
                 size,
                 padded,
@@ -3773,7 +5623,7 @@ impl OnnxStage {
         &self,
         output: PreparedInterpGpuOutput,
     ) -> Result<Option<PreparedDmlSharedOutput>> {
-        if !matches!(self.provider, OnnxProvider::DirectML) {
+        if !matches!(self.provider, OnnxProvider::DirectML)||output.key&DML_WGL_INTERP_KEY!=0 {
             return Ok(None);
         }
         let direct = if let Some(invocation) = self.dml_interp_bridge.as_ref().and_then(|bridge| {
@@ -3818,6 +5668,22 @@ impl OnnxStage {
         gc: &mut GlContext,
         output: PreparedInterpGpuOutput,
     ) -> Result<GpuTex> {
+        if output.key&DML_WGL_INTERP_KEY!=0{
+            let full=gc.copy_dml_interp_image(output.key,output.padded.0,output.padded.1)?;
+            let texture=if output.size==output.padded{full}else{super::scaler::crop_edge(gc,full,output.size.0,output.size.1)?};gc.finish();INTERP_GPU_OUTPUT_FRAMES.fetch_add(1,Ordering::Relaxed);return Ok(texture);
+        }
+        if let Some(texture)=output.texture {
+            // Return a detached GL image; provider slots may be reused by a later pair.
+            let result=if output.size==output.padded{super::scaler::detach_identity(gc,texture)}else{super::scaler::crop_edge(gc,texture,output.size.0,output.size.1)};
+            if result.is_ok(){
+                // Arc CL/GL outputs cross a second ownership boundary when GL
+                // detaches the provider slot. Complete that copy before a later
+                // provider invocation or post chain can recycle either resource.
+                gc.finish();
+                INTERP_GPU_OUTPUT_FRAMES.fetch_add(1,Ordering::Relaxed);
+            }
+            return result;
+        }
         let use_drba_local_snapshot = output.directml_drba_snapshot_candidate
             && output.fp16
             && !output.preserve_float
@@ -3899,7 +5765,8 @@ impl OnnxStage {
             0 | 1 | 2 => 3,
             3 => 5,
             4 => 6,
-            _ => 7,
+            5 => 7,
+            _ => factor.saturating_add(2), // experimental x6..x15 only
         }
     }
 
@@ -4079,7 +5946,7 @@ impl OnnxStage {
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
         let result = if let InterpKind::RifeV1 { channels } = self.interp.clone() {
-            self.rife_multi_strided(w, h, frames, channels, t, 4)
+            self.rife_multi_strided(w, h, frames, channels, t, 4, false)
         } else if self.interp == InterpKind::Drba {
             anyhow::ensure!(frames.len() >= 4, "DRBA needs 4 frames");
             self.drba_strided(w, h, frames, t, 4)
@@ -4109,6 +5976,8 @@ impl OnnxStage {
         frames: &[&[u8]],
         ts: &[f32],
     ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        // NeoArc uses validated sequential phases, including RGB GPU IO. The
+        // former opt-in multi-request shortcut bypassed the phase stability gate.
         if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_many_u8(w, h, frames, 4, 3, ts) {
                 Ok(Some(results)) => return Ok(results),
@@ -4132,7 +6001,16 @@ impl OnnxStage {
                 }
             }
         }
-        if self.interp == InterpKind::Drba && ts.len() > 1 {
+        if self.interp==InterpKind::Drba&&self.neoarc_session.is_none()&&ts.len()>1&&self.provider==OnnxProvider::DirectML&&self.dml_wgl_device_eligible(){
+            // B570: dynamic batch > 1 produced corrupt later phases. Isolate
+            // provider invocations, but pack the four image planes only once
+            // within this call. Never reuse source pixels across source pairs.
+            if !self.dml_drba_sequential_logged{log::info!("directml-drba-phase-isolation: model={} adapter=B570 image_planes=within-call-reuse provider_batch=1 reason=multi-batch-phase-drift",self.name);self.dml_drba_sequential_logged=true;}
+            let mut images=Vec::with_capacity(ts.len());let mut total=InterpProfile::default();
+            for(index,&phase)in ts.iter().enumerate(){images.push(self.drba_strided_cached(w,h,frames,phase,4,index>0)?);if let Some(profile)=self.last_interp_profile{total.pack_ms+=profile.pack_ms;total.run_ms+=profile.run_ms;total.out_ms+=profile.out_ms;total.padded_size=profile.padded_size;}}
+            self.last_interp_profile=Some(total);return Ok(images);
+        }
+        if self.interp == InterpKind::Drba && self.neoarc_session.is_none() && ts.len() > 1 {
             self.ensure_tensorrt_interp_profile_for_size((w, h))?;
             self.prepare_tensorrt_input_shape(w, h);
             mark_tensorrt_model_started(&self.name);
@@ -4148,9 +6026,172 @@ impl OnnxStage {
             }
             return result;
         }
+        if let InterpKind::RifeV1 { channels } = self.interp.clone()
+            && ts.len() > 1
+        {
+            // The phases share one input pair. Reuse image planes only inside
+            // this call, never by pointer identity across asynchronous pairs.
+            let mut outputs = Vec::with_capacity(ts.len());
+            let mut total = InterpProfile::default();
+            let mut complete = true;
+            for (index, &t) in ts.iter().enumerate() {
+                self.last_interp_profile = None;
+                outputs.push(self.rife_multi_strided(w, h, frames, channels, t, 4, index > 0)?);
+                if let Some(profile) = self.last_interp_profile {
+                    total.pack_ms += profile.pack_ms;
+                    total.run_ms += profile.run_ms;
+                    total.out_ms += profile.out_ms;
+                    total.padded_size = profile.padded_size;
+                } else {
+                    complete = false;
+                }
+            }
+            self.last_interp_profile = complete.then_some(total);
+            return Ok(outputs);
+        }
         ts.iter()
             .map(|t| self.process_interp_rgba8(w, h, frames, *t))
             .collect()
+    }
+
+    /// Keep the boost decision fixed even on the single-midpoint pairs of x2.5.
+    pub(crate) fn wants_dml_host_boost(&self, capacity: usize) -> bool {
+        capacity >= 3 && self.dml_rife_boost && !self.dml_split_failed
+            && self.provider == OnnxProvider::DirectML && self.neoarc_session.is_none()
+            && directml_rife_boost_setting().load(Ordering::Relaxed)
+    }
+
+    pub fn process_interp_rgba8_pair(
+        &mut self, w: i32, h: i32, frames: &[&[u8]], phases: &[f32], capacity: usize,
+    ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        if !phases.is_empty() && self.wants_dml_host_boost(capacity) {
+            match self.run_dml_host_boost(w, h, frames, phases) {
+                Ok(output) => return Ok(output),
+                Err(error) if onnx_cancel_requested() => return Err(error),
+                Err(error) => {
+                    self.dml_split_failed = true;
+                    self.dml_host_boost = None;
+                    log::warn!("directml-host-rife-boost-fallback: model={} reason={error:#}", self.name);
+                }
+            }
+        }
+        self.process_interp_many_rgba8(w, h, frames, phases)
+    }
+
+    fn run_fused_host_pair(&mut self,w:i32,h:i32,pw:i32,ph:i32,frames:&[&[u8]],phases:&[f32]) -> Result<Vec<(i32,i32,Vec<u8>)>> {
+        let key=(pw,ph,phases.len());
+        if !self.fused_host_boost.iter().any(|(k,_)| *k==key) {
+            let model=std::fs::read(&self.source_path)?;
+            let bytes=rife_dml_split::fused_host_pair(&model,ph.into(),pw.into(),phases.len())?;
+            let session=self.dml_split_session(Err((&bytes,None)),&[])?;
+            // Fractional cadence alternates between two counts at one resolution.
+            self.fused_host_boost.retain(|(k,_)| (k.0,k.1)==(pw,ph));
+            if self.fused_host_boost.len()>=2 { self.fused_host_boost.remove(0); }
+            self.fused_host_boost.push((key,session));
+            log::info!("directml-fused-pair-ready: model={} size={}x{} phases={} state_host_bytes=0",self.name,pw,ph,phases.len());
+        }
+        self.reset_interp_pack_cache();
+        self.pack_const_key=None;
+        self.pack_t_cached=None;
+        let (pw,ph)=(pw as usize,ph as usize);
+        let t=Instant::now();
+        let input=&mut self.scratch_f32;
+        input.resize(7*pw*ph,0.0);
+        fill_padded_rgb_planes_f32(input,frames,2,w as usize,h as usize,pw,ph,pw*ph,4);
+        let tensor=TensorRef::from_array_view(([1,7,ph,pw],input.as_slice()))?;
+        let times=TensorRef::from_array_view(([phases.len()],phases))?;
+        let pack_ms=t.elapsed().as_secs_f64()*1000.;
+        let session=&mut self.fused_host_boost.iter_mut().find(|(k,_)| *k==key).unwrap().1;
+        let t=Instant::now();
+        let outputs=session.run_with_options(ort::inputs!["input"=>tensor,"phases"=>times],self.run_options.armed()?).map_err(oerr)?;
+        let run_ms=t.elapsed().as_secs_f64()*1000.;
+        let t=Instant::now();
+        let mut result=Vec::with_capacity(phases.len());
+        for i in 0..phases.len() {
+            let name=format!("neo_pair_head_{i}/output");
+            let rgb=outputs.get(name.as_str()).ok_or_else(||anyhow!("missing fused RIFE output {i}"))?;
+            result.push((w,h,interp_output_to_rgb8(rgb,w as usize,h as usize,"DirectML fused boost")?));
+        }
+        self.last_interp_profile=Some(InterpProfile{pack_ms,run_ms,out_ms:t.elapsed().as_secs_f64()*1000.,padded_size:(pw,ph)});
+        Ok(result)
+    }
+
+    fn run_dml_host_boost(
+        &mut self, w: i32, h: i32, frames: &[&[u8]], phases: &[f32],
+    ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        anyhow::ensure!(w > 0 && h > 0 && frames.len() == 2
+            && frames.iter().all(|f| f.len() == w as usize * h as usize * 4), "invalid RIFE pair");
+        let (_, _, (pw, ph)) = self.interp_gpu_layout((w, h))?;
+        if !self.fp16 && !self.fused_host_failed && (1..=4).contains(&phases.len()) {
+            match self.run_fused_host_pair(w,h,pw,ph,frames,phases) {
+                Ok(result) => return Ok(result),
+                Err(error) if onnx_cancel_requested() => return Err(error),
+                Err(error) => {
+                    self.fused_host_failed=true;
+                    self.fused_host_boost.clear();
+                    log::warn!("directml-fused-pair-fallback: model={} reason={error:#}",self.name);
+                }
+            }
+        }
+        if self.dml_host_boost.as_ref().is_none_or(|(size, _, _)| *size != (pw, ph)) {
+            let (trunk, head, _) = self.dml_split_graphs(ph.into(), pw.into())?;
+            let trunk = self.dml_split_session(Err((&trunk, None)), &[])?;
+            let head = self.dml_split_session(Err((&head, None)), &[])?;
+            self.dml_host_boost = Some(((pw, ph), trunk, head));
+            log::info!("directml-host-rife-boost-ready: model={} padded={}x{} fp16={}", self.name, pw, ph, self.fp16);
+        }
+        let (_, trunk, head) = self.dml_host_boost.as_mut().unwrap();
+        let (pw, ph) = (pw as usize, ph as usize);
+        let pn = pw * ph;
+        let shape = [1, 7, ph, pw];
+        let mut profile = InterpProfile { padded_size: (pw, ph), ..Default::default() };
+        let mut result = Vec::with_capacity(phases.len());
+        macro_rules! run_pair {
+            ($scratch:ident, $fill:ident, $phase:expr) => {{
+                let started = Instant::now();
+                let input = &mut self.$scratch;
+                input.resize(7 * pn, Default::default());
+                $fill(input, frames, 2, w as usize, h as usize, pw, ph, pn, 4);
+                input[6*pn..].fill(($phase)(0.5));
+                profile.pack_ms += started.elapsed().as_secs_f64()*1000.0;
+                let started = Instant::now();
+                let tensor = TensorRef::from_array_view((shape, input.as_slice())).map_err(oerr)?;
+                let mut outputs = trunk.run_with_options(ort::inputs!["input" => tensor], self.run_options.armed()?).map_err(oerr)?;
+                let state = outputs.remove("state").ok_or_else(|| anyhow!("RIFE boost state missing"))?;
+                anyhow::ensure!(state.view().downcast::<ort::value::DynTensorValueType>()?.memory_info().is_cpu_accessible(), "RIFE boost state is not host-accessible");
+                profile.run_ms += started.elapsed().as_secs_f64()*1000.0;
+                for &phase in phases {
+                    let started = Instant::now();
+                    input[6*pn..].fill(($phase)(phase));
+                    let tensor = TensorRef::from_array_view((shape, input.as_slice())).map_err(oerr)?;
+                    profile.pack_ms += started.elapsed().as_secs_f64()*1000.0;
+                    let started = Instant::now();
+                    let outputs = head.run_with_options(ort::inputs!["input" => tensor, "state" => &state], self.run_options.armed()?).map_err(oerr)?;
+                    profile.run_ms += started.elapsed().as_secs_f64()*1000.0;
+                    let started = Instant::now();
+                    let output = outputs.get("output").ok_or_else(|| anyhow!("RIFE boost output missing"))?;
+                    result.push((w, h, interp_output_to_rgb8(output, w as usize, h as usize, "DirectML RIFE boost")?));
+                    profile.out_ms += started.elapsed().as_secs_f64()*1000.0;
+                }
+            }};
+        }
+        // A previous canonical call's scratch metadata no longer describes these planes.
+        self.pack_const_key = None;
+        self.pack_t_cached = None;
+        self.pack_frame_key = None;
+        self.pack_second_ptr = None;
+        if self.fp16 {
+            run_pair!(scratch_f16, fill_padded_rgb_planes_f16, f16::from_f32);
+        } else {
+            run_pair!(scratch_f32, fill_padded_rgb_planes_f32, |t| t);
+        }
+        static HOST_BOOST_PAIRS: AtomicU64 = AtomicU64::new(0);
+        let count = HOST_BOOST_PAIRS.fetch_add(1, Ordering::Relaxed);
+        if count < 4 || count % 600 == 0 {
+            log::info!("directml-host-rife-boost: model={} phases={} trunk_runs=1 run_ms={:.3}", self.name, phases.len(), profile.run_ms);
+        }
+        self.last_interp_profile = Some(profile);
+        Ok(result)
     }
 
     /// Cross-GPU DirectML -> Vulkan handoff for RIFE. Input packing intentionally
@@ -4168,6 +6209,7 @@ impl OnnxStage {
         output_bank: usize,
     ) -> Result<Option<Vec<PreparedInterpGpuOutput>>> {
         if self.provider != OnnxProvider::DirectML
+            || self.neoarc_session.is_some()
             || self.dml_cpu_interp_shared_disabled
             || ts.is_empty()
         {
@@ -4197,6 +6239,7 @@ impl OnnxStage {
                     bank.clear();
                 }
             }
+            self.ensure_dml_rife_shape(padded.0, padded.1)?;
 
             let pack_started = Instant::now();
             let mut total_run_ms = 0.0f64;
@@ -4260,10 +6303,12 @@ impl OnnxStage {
                         &self.out_name,
                         &tin,
                         output,
+                        false,
                     )?;
                     total_run_ms += run_ms;
                     total_copy_ms += copy_ms;
                     prepared.push(PreparedInterpGpuOutput {
+                        texture: None,
                         key: output.key,
                         size: (w, h),
                         padded,
@@ -4326,10 +6371,12 @@ impl OnnxStage {
                         &self.out_name,
                         &tin,
                         output,
+                        false,
                     )?;
                     total_run_ms += run_ms;
                     total_copy_ms += copy_ms;
                     prepared.push(PreparedInterpGpuOutput {
+                        texture: None,
                         key: output.key,
                         size: (w, h),
                         padded,
@@ -4914,6 +6961,7 @@ impl OnnxStage {
         input_texture: GpuTex,
         after_interpolation: bool,
     ) -> Result<Option<GpuTex>> {
+        if self.neoarc_session.is_some() { return self.process_neoarc_gl_texture(gc,input_texture); }
         match self.provider {
             OnnxProvider::DirectML => {
                 self.process_dml_gpu_texture(gc, input_texture, after_interpolation)
@@ -4943,6 +6991,8 @@ impl OnnxStage {
         input_texture: GpuTex,
         after_interpolation: bool,
     ) -> Result<Option<GpuTex>> {
+        if self.dml_wgl_disabled&&self.last_upscale_input_size!=Some((input_texture.w(),input_texture.h())){self.dml_wgl_disabled=false;}
+
         let dml_temporal_gpu_opt_in = matches!(
             std::env::var("CHIDESCALER_DML_TEMPORAL_GPU")
                 .ok()
@@ -4976,6 +7026,28 @@ impl OnnxStage {
                 };
             }
             return Ok(None);
+        }
+        // When Intel cannot import a D3D12 GL buffer, retain the legacy
+        // input readback but keep the much larger output on the GPU. This also
+        // covers GLSL -> SISR chains rather than just the leading CPU stage.
+        if gc.external_device_luid().is_none()&&self.fp16&&self.input_channels==Some(3)
+            &&self.interp==InterpKind::None&&!self.dml_wgl_disabled&&input_texture.d()==1
+            &&input_texture.key.dtype!=super::gl::Dtype::U32
+            &&self.dml_wgl_output_requested(input_texture.w(),input_texture.h())&&self.dml_wgl_device_eligible(){
+            if self.dml_wgl_input_failed!=Some((input_texture.w(),input_texture.h()))&&!matches!(std::env::var("CHIDESCALER_DML_WGL_INPUT").ok().as_deref(),Some("off"|"0"|"false"))&&self.direct_output.as_ref().is_some_and(|s|s.input_size==(input_texture.w(),input_texture.h())){
+                match self.process_dml_wgl_gpu_input(gc,input_texture){Ok(output)=>return Ok(Some(output)),Err(error)=>{self.dml_wgl_input_converter.take();if !onnx_cancel_requested(){self.dml_wgl_input_failed=Some((input_texture.w(),input_texture.h()));}log::warn!("directml-wgl-input-fallback: model={} reason={error:#}",self.name);}}
+            }
+            let started=Instant::now();let rgba=gc.download_rgba8(input_texture);
+            let read_ms=started.elapsed().as_secs_f64()*1000.;
+            match self.process_dml_d3d11_output(gc,input_texture.w(),input_texture.h(),&rgba){
+                Ok(Some(output))=>{
+                    if let Some(profile)=self.last_upscale_profile.as_mut(){profile.pack_ms+=read_ms;}
+                    self.log_image_pipeline((input_texture.w(),input_texture.h()),rgba.len(),(output.w(),output.h()),0,started.elapsed().as_secs_f64()*1000.);
+                    return Ok(Some(output));
+                },
+                Ok(None)=>{},
+                Err(error)=>{self.dml_wgl_converter.take();if !onnx_cancel_requested(){self.dml_wgl_disabled=true;log::warn!("directml-wgl-output-fallback: model={} reason={error:#} action=original-texture-path",self.name);}}
+            }
         }
         // The shared-input route stays opt-in for ordinary chains.  For the
         // specific interpolation -> ONNX case, v441 can automatically use the
@@ -5792,6 +7864,267 @@ impl OnnxStage {
         );
     }
 
+    pub(crate) fn supports_dml_wgl_interp(&mut self)->bool{
+        self.provider==OnnxProvider::DirectML&&self.neoarc_session.is_none()&&self.fp16&&!self.interp_gpu_path_disabled&&!self.dml_wgl_interp_failed&&matches!(self.interp,InterpKind::RifeV1{channels:7}|InterpKind::Drba)&&self.dml_wgl_device_eligible()&&std::env::var("CHIDESCALER_DML_WGL_INTERP").ok().as_deref()!=Some("off")
+    }
+    fn retire_dml_wgl_interp(&mut self,gc:&mut GlContext){if let Some(mut bridge)=self.dml_wgl_interp_bridge.take(){gc.finish();bridge.boost.take();for slot in &bridge.slots{gc.clear_dml_interp_image(slot.key);}}}
+    fn run_dml_wgl_interp_slot(&mut self,index:usize)->Result<(f64,(i32,i32))>{
+        let bridge=self.dml_wgl_interp_bridge.as_mut().ok_or_else(||anyhow!("DML WGL bridge missing"))?;let phase=*bridge.phases.get(index).ok_or_else(||anyhow!("DML WGL phase missing"))?;
+        let sources:Vec<_>=bridge.history.iter().map(|(input,_)|input.resource.clone()).collect();let slot=bridge.slots.get_mut(index).ok_or_else(||anyhow!("DML WGL slot missing"))?;let started=Instant::now();
+        // v972: a single-model run with the fused graph reads the history directly.
+        let fused_run=!(bridge.boost_pair&&!bridge.boost_failed)&&bridge.fused.is_some()&&!bridge.fused_failed;
+        if !fused_run{bridge.history[0].1.assemble(&sources,&slot.input.resource,bridge.padded,phase)?;}
+        let pack_ms=started.elapsed().as_secs_f64()*1000.;
+        let mut fused_ms=None;
+        if fused_run{
+            let fused=bridge.fused.as_mut().unwrap();
+            match Self::run_dml_wgl_fused(fused,&bridge.history,bridge.size,index,phase,&self.run_options){
+                Ok(ms)=>fused_ms=Some(ms),
+                Err(error)=>{
+                    // Rebuild this slot's input the original way and continue.
+                    bridge.fused_failed=true;bridge.fused=None;
+                    log::warn!("directml-wgl-fused-input-fallback: model={} reason={error:#} action=assemble-pass",self.name);
+                    bridge.history[0].1.assemble(&sources,&slot.input.resource,bridge.padded,phase)?;
+                }
+            }
+        }
+        // v963: boosted pair -> trunk once (any phase input works, it fixes t=0.5),
+        // then this phase's head straight into the slot's shared output. Any
+        // failure falls back to the single model for the rest of this bridge.
+        let mut boosted=None;
+        if bridge.boost_pair&&!bridge.boost_failed{
+            if let Some(split)=bridge.boost.as_mut(){
+                let run_options=&self.run_options;let trunk_done=bridge.boost_trunk_done;
+                let result=(||->Result<(f64,f64)>{
+                    let started=Instant::now();let mut trunk_ms=0.0;
+                    if !trunk_done{
+                        split.trunk.run_binding_with_options(&split.trunk_bindings[index],run_options.armed()?).map_err(oerr)?;
+                        // The head session must observe the finished state. ORT does not
+                        // promise the trunk's commands are flushed to the shared queue at
+                        // Run end, so keep the wait (v949 ordering lesson).
+                        split.trunk_bindings[index].synchronize_outputs().map_err(oerr)?;
+                        trunk_ms=started.elapsed().as_secs_f64()*1000.;
+                    }
+                    let head_started=Instant::now();
+                    split.head.run_binding_with_options(&split.head_bindings[index],run_options.armed()?).map_err(oerr)?;
+                    split.head_bindings[index].synchronize_outputs().map_err(oerr)?;
+                    Ok((trunk_ms,head_started.elapsed().as_secs_f64()*1000.))
+                })();
+                match result{
+                    Ok((trunk_ms,head_ms))=>{bridge.boost_trunk_done=true;boosted=Some(trunk_ms+head_ms);
+                        static WGL_BOOST_LOGS:AtomicU64=AtomicU64::new(0);let n=WGL_BOOST_LOGS.fetch_add(1,Ordering::Relaxed);
+                        if n<4||n%600==0{log::info!("directml-wgl-rife-boost: model={} slot={} phase={} trunk_ms={:.3} head_ms={:.3} count={}",self.name,index+1,phase,trunk_ms,head_ms,n+1);}}
+                    Err(error)=>{bridge.boost_failed=true;log::warn!("directml-wgl-rife-boost-fallback: model={} reason={error:#} action=single-model-directml",self.name);}
+                }
+            }
+        }
+        let(run_ms,copy_ms)=if let Some(ms)=boosted.or(fused_ms){(ms,0.)}else{
+        let memory=MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?;let tensor=unsafe{TensorRefMut::<f16>::from_raw(memory,slot.input.allocation,Shape::new(slot.input.dims))?};
+        run_cpu_tensor_to_dml_shared_output(&mut self.session,&self.run_options,&self.in_name,&self.out_name,&tensor.view(),&mut slot.output,true)?};
+        let out_start=Instant::now();slot.converter.convert(&slot.output.resource,copy_ms==0.)?;let out_ms=copy_ms+out_start.elapsed().as_secs_f64()*1000.;
+        self.last_interp_profile=Some(InterpProfile{pack_ms:pack_ms+if index==0{bridge.pack_ms}else{0.},run_ms,out_ms,padded_size:(bridge.padded.0 as usize,bridge.padded.1 as usize)});
+        log::debug!("directml-wgl-interp-slot: model={} index={} phase={} pack_ms={:.3} infer_ms={:.3} output_ms={:.3} host_input_bytes=0 host_output_bytes=0",self.name,index,phase,pack_ms,run_ms,out_ms);
+        let wall=started.elapsed().as_secs_f64()*1000.;let padded=bridge.padded;let size=bridge.size;let validated=bridge.validated;
+        if validated{if let Some(p)=self.last_interp_profile{self.interp_gpu_diag.record(&self.name,"DirectML-WGL",size,padded,[p.pack_ms,p.run_ms,p.out_ms,wall]);}}
+        Ok((wall,padded))
+    }
+    fn dml_wgl_split_session(
+        &self,
+        bytes: &[u8],
+        device: &windows::core::IUnknown,
+        queue: &ID3D12CommandQueue,
+    ) -> Result<Session> {
+        let mut builder = Session::builder()
+            .map_err(oerr)?
+            .with_optimization_level(dml_graph_optimization(&self.source_path))
+            .map_err(oerr)?
+            .with_memory_pattern(false)
+            .map_err(oerr)?
+            .with_parallel_execution(false)
+            .map_err(oerr)?;
+        ort_status(unsafe {
+            (dml_api()?.SessionOptionsAppendExecutionProvider_DML1)(
+                builder.ptr().cast_mut(), device.as_raw(), queue.as_raw(),
+            )
+        })?;
+        builder.commit_from_memory(bytes).map_err(oerr)
+    }
+
+    /// v963: build the boost trunk/head for the WGL route's slots (FP16 RIFE only).
+    fn build_dml_wgl_split(&self,padded:(i32,i32))->Result<DmlWglSplit>{
+        let bridge=self.dml_wgl_interp_bridge.as_ref().ok_or_else(||anyhow!("DML WGL bridge missing"))?;
+        let(h,w)=(i64::from(padded.1),i64::from(padded.0));
+        let(trunk_bytes,head_bytes,state_half)=self.dml_split_graphs(h,w)?;
+        let first=&bridge.slots.first().ok_or_else(||anyhow!("DML WGL slots missing"))?.output;
+        let(device,luid)=(first.device.clone(),first.luid);
+        // Both sessions bind resources created by this exact D3D12 device.
+        // Selecting the same adapter again does not guarantee the same device.
+        let(dml_device,queue)=dml_device_and_queue(&device)?;
+        let trunk = self.dml_wgl_split_session(&trunk_bytes, &dml_device, &queue)?;
+        let head = self.dml_wgl_split_session(&head_bytes, &dml_device, &queue)?;
+        // v971: a bridged Lite model keeps its FP32 motion state.
+        let state_bytes=if state_half{std::mem::size_of::<f16>()}else{std::mem::size_of::<f32>()};
+        let mut state=create_direct_input_channels_typed_state(&device,luid,padded,5,state_bytes,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        state.dims=[1,5,h,w];
+        let memory=MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?;
+        let tensor=|allocation:*mut c_void,dims:Vec<i64>|->Result<InterpTensorValue>{Ok(unsafe{InterpTensorValue::F16(TensorRefMut::from_raw(memory.clone(),allocation,Shape::new(dims))?)})};
+        let state_value=if state_half{tensor(state.allocation,state.dims.to_vec())?}
+            else{unsafe{InterpTensorValue::F32(TensorRefMut::from_raw(memory.clone(),state.allocation,Shape::new(state.dims.to_vec()))?)}};
+        let names:Vec<CString>=["input","state","output"].iter().map(|n|CString::new(*n)).collect::<std::result::Result<_,_>>()?;
+        let(mut values,mut trunk_bindings,mut head_bindings)=(Vec::new(),Vec::new(),Vec::new());
+        for slot in &bridge.slots{
+            anyhow::ensure!(slot.input.dims==[1,7,h,w],"WGL phase input shape {:?}",slot.input.dims);
+            anyhow::ensure!(slot.output.dims==vec![1,3,h,w],"WGL phase output shape {:?}",slot.output.dims);
+            let input=tensor(slot.input.allocation,slot.input.dims.to_vec())?;
+            let output=tensor(slot.output.allocation,slot.output.dims.clone())?;
+            let trunk_binding=trunk.create_binding()?;let head_binding=head.create_binding()?;
+            ort_status(unsafe{(ort::api().BindInput)(trunk_binding.ptr().cast_mut(),names[0].as_ptr(),input.ptr())})?;
+            ort_status(unsafe{(ort::api().BindOutput)(trunk_binding.ptr().cast_mut(),names[1].as_ptr(),state_value.ptr())})?;
+            ort_status(unsafe{(ort::api().BindInput)(head_binding.ptr().cast_mut(),names[0].as_ptr(),input.ptr())})?;
+            ort_status(unsafe{(ort::api().BindInput)(head_binding.ptr().cast_mut(),names[1].as_ptr(),state_value.ptr())})?;
+            ort_status(unsafe{(ort::api().BindOutput)(head_binding.ptr().cast_mut(),names[2].as_ptr(),output.ptr())})?;
+            values.push(input);values.push(output);trunk_bindings.push(trunk_binding);head_bindings.push(head_binding);
+        }
+        Ok(DmlWglSplit{trunk,head,trunk_bindings,head_bindings,_values:values,_state_value:state_value,_names:names,_state:state})
+    }
+    /// v972: input-fused single model for the WGL route (see `DmlWglFused`).
+    fn build_dml_wgl_fused(&self)->Result<DmlWglFused>{
+        let bridge=self.dml_wgl_interp_bridge.as_ref().ok_or_else(||anyhow!("DML WGL bridge missing"))?;
+        anyhow::ensure!(bridge.history.len()==2,"WGL fused input needs a two-frame history");
+        let(w,h)=bridge.size;let(pw,ph)=bridge.padded;
+        let bytes=std::fs::read(&self.source_path)?;
+        let graph=rife_dml_split::wgl_fused_input(&bytes,h.into(),w.into(),ph.into(),pw.into())?;
+        let first=&bridge.slots.first().ok_or_else(||anyhow!("DML WGL slots missing"))?.output;
+        let(dml_device,queue)=dml_device_and_queue(&first.device)?;
+        let session=self.dml_wgl_split_session(&graph,&dml_device,&queue)?;
+        for(input,_)in &bridge.history{
+            anyhow::ensure!(input.byte_len>=3*w as usize*h as usize*std::mem::size_of::<f16>(),"WGL history buffer too small");
+        }
+        let memory=MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?;
+        let output_name=CString::new("output")?;
+        let(mut values,mut bindings)=(Vec::new(),Vec::new());
+        for slot in &bridge.slots{
+            anyhow::ensure!(slot.output.dims==vec![1,3,i64::from(ph),i64::from(pw)],"WGL fused output shape {:?}",slot.output.dims);
+            let output=unsafe{InterpTensorValue::F16(TensorRefMut::from_raw(memory.clone(),slot.output.allocation,Shape::new(slot.output.dims.clone()))?)};
+            let binding=session.create_binding()?;
+            ort_status(unsafe{(ort::api().BindOutput)(binding.ptr().cast_mut(),output_name.as_ptr(),output.ptr())})?;
+            values.push(output);bindings.push(binding);
+        }
+        Ok(DmlWglFused{session,bindings,_values:values,names:[CString::new("neo_wgl_a")?,CString::new("neo_wgl_b")?,CString::new("neo_wgl_t")?],_device:dml_device,_queue:queue})
+    }
+
+    fn run_dml_wgl_fused(fused:&mut DmlWglFused,history:&[(DmlDirectInput,super::dml_gl_bridge::Converter)],size:(i32,i32),index:usize,phase:f32,run_options:&CancelableRunOptions)->Result<f64>{
+        let memory=MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?;
+        let dims=[1i64,3,i64::from(size.1),i64::from(size.0)];
+        let a=unsafe{InterpTensorValue::F16(TensorRefMut::from_raw(memory.clone(),history[0].0.allocation,Shape::new(dims))?)};
+        let b=unsafe{InterpTensorValue::F16(TensorRefMut::from_raw(memory,history[1].0.allocation,Shape::new(dims))?)};
+        // Same FP16 bits as the D3D12 assemble pass wrote into the time channel.
+        let time=[f16::from_f32(phase.clamp(0.,1.))];
+        let t=TensorRef::from_array_view(([1usize,1,1,1],&time[..])).map_err(oerr)?;
+        let binding=fused.bindings.get(index).ok_or_else(||anyhow!("WGL fused slot missing"))?;
+        for(name,value)in[(&fused.names[0],a.ptr()),(&fused.names[1],b.ptr()),(&fused.names[2],t.ptr())]{
+            ort_status(unsafe{(ort::api().BindInput)(binding.ptr().cast_mut(),name.as_ptr(),value)})?;
+        }
+        let started=Instant::now();
+        fused.session.run_binding_with_options(binding,run_options.armed()?).map_err(oerr)?;
+        binding.synchronize_outputs().map_err(oerr)?;
+        Ok(started.elapsed().as_secs_f64()*1000.)
+    }
+
+    fn prepare_dml_wgl_interp(&mut self,gc:&mut GlContext,frames:&[GpuTex],phases:&[f32],capacity:usize,generation:u64,sequences:&[u64])->Result<u64>{
+        use windows::Win32::Graphics::OpenGL::{wglGetCurrentContext,wglGetCurrentDC};
+        let need=self.interp_frames();let frames=&frames[frames.len().checked_sub(need).ok_or_else(||anyhow!("DML WGL history incomplete"))?..];let size=(frames[0].w(),frames[0].h());anyhow::ensure!(frames.iter().all(|f|(f.w(),f.h())==size),"DML WGL history extent mismatch");
+        let(channels,_,padded)=self.interp_gpu_layout(size)?;let count=capacity.saturating_sub(1).max(phases.len());let context=(unsafe{wglGetCurrentContext()}.0 as isize,unsafe{wglGetCurrentDC()}.0 as isize);
+        if self.dml_wgl_interp_bridge.as_ref().is_some_and(|b|b.size!=size||b.context!=context||b.slots.len()<count||b.slots.iter().any(|s|!gc.has_dml_interp_image(s.key))){self.retire_dml_wgl_interp(gc);}
+        if self.dml_wgl_interp_bridge.is_none(){
+            self.ensure_dml_rife_shape(padded.0,padded.1)?;let zero=vec![f16::ZERO;padded.0 as usize*padded.1 as usize*channels];let shape=Shape::new([1,channels as i64,padded.1 as i64,padded.0 as i64]);let tensor=TensorRef::from_array_view((shape,zero.as_slice())).map_err(oerr)?;
+            let mut outputs=Vec::new();for _ in 0..count{outputs.push(create_direct_output(&mut self.session,&self.run_options,&self.in_name,&self.out_name,&tensor,padded)?);}
+            let device=outputs[0].device.clone();let luid=outputs[0].luid;anyhow::ensure!(verified_b570_luid(u64::from_le_bytes(luid)),"DML WGL selected device changed");
+            let mut history=Vec::new();for _ in 0..need{history.push((create_direct_input_channels_typed_state(&device,luid,size,3,2,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?,super::dml_gl_bridge::Converter::new(&device,size.0,size.1)?));}
+            let mut slots=Vec::new();for output in outputs{anyhow::ensure!(output.dims==vec![1,3,padded.1 as i64,padded.0 as i64],"DML WGL RGB output required");let input=create_direct_input_channels_typed_state(&device,luid,padded,channels,2,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;let converter=super::dml_gl_bridge::Converter::new(&device,padded.0,padded.1)?;let key=DML_WGL_INTERP_KEY|DIRECT_OUTPUT_KEY.fetch_add(1,Ordering::Relaxed);slots.push(DmlWglInterpSlot{input,output,converter,key});}
+            // Install ownership before registration so partial failure can retire all pins.
+            self.dml_wgl_interp_bridge=Some(DmlWglInterpBridge{packed_keys:Vec::new(),history,slots,size,padded,phases:phases.to_vec(),context,validated:false,pack_ms:0.,boost:None,boost_pair:false,boost_trunk_done:false,boost_failed:false,fused:None,fused_failed:false});
+            for slot in &self.dml_wgl_interp_bridge.as_ref().unwrap().slots{gc.register_dml_interp_image(slot.key,&slot.converter.input_texture()?,padded.0,padded.1)?;}
+        }
+        let started = Instant::now();
+        let bridge = self.dml_wgl_interp_bridge.as_mut().unwrap();
+        let keys: Vec<_> = if sequences.len() == need && frames.iter().all(|f| f.allocation_id != 0) {
+            sequences.iter().zip(frames).map(|(&seq, frame)| (generation, seq, frame.allocation_id)).collect()
+        } else { Vec::new() };
+        // A sliding window retains the actual source frames in engine history.
+        // Pool storage alone is insufficient: it may now hold a different capture.
+        let retained = if bridge.validated && keys.len() == need && bridge.packed_keys.len() == need
+            && keys.windows(2).all(|w| w[0].1 < w[1].1)
+            && bridge.packed_keys[1..] == keys[..need-1] {
+            bridge.history.rotate_left(1);
+            need - 1
+        } else { 0 };
+        for (frame, (input, converter)) in frames.iter().zip(&mut bridge.history).skip(retained) {
+            gc.upload_dml_d3d11(&converter.input_texture()?, *frame)?;
+            converter.pack(&input.resource)?;
+        }
+        bridge.packed_keys = keys;
+        bridge.phases = phases.to_vec();
+        bridge.pack_ms = started.elapsed().as_secs_f64()*1000.;
+        log::debug!("directml-wgl-history: generation={} retained={} uploaded={} pack_ms={:.3}", generation, retained, need-retained, bridge.pack_ms);
+        if !self.dml_wgl_interp_bridge.as_ref().unwrap().validated{
+            // Real-image canonical guard: repeat several distinct phases, without
+            // skipping existing FP16 accuracy requirements. Readback is startup only.
+            let pixels:Vec<_>=frames.iter().map(|f|gc.download_rgba8(*f)).collect();let input:Vec<&[u8]>=pixels.iter().map(Vec::as_slice).collect();let requested=phases.to_vec();
+            for phase in [0.2f32,0.5,0.8]{for _ in 0..2{
+                self.dml_wgl_interp_bridge.as_mut().unwrap().phases=vec![phase];self.run_dml_wgl_interp_slot(0)?;let bridge=self.dml_wgl_interp_bridge.as_ref().unwrap();let full=gc.copy_dml_interp_image(bridge.slots[0].key,padded.0,padded.1)?;let output=if padded==size{full}else{super::scaler::crop_edge(gc,full,size.0,size.1)?};let actual=gc.download_rgb8(output);let(_,_,expected)=self.process_interp_rgba8(size.0,size.1,&input,phase)?;anyhow::ensure!(actual.len()==expected.len(),"DML WGL canonical output extent");let maximum=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(255);let mean=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/actual.len().max(1)as f64;anyhow::ensure!(maximum<=4&&mean<0.5,"DML WGL phase drift phase={phase} max={maximum} mean={mean}");log::info!("directml-wgl-interp-validation: model={} phase={} max_byte={} mean_byte={:.6} canonical=pass repeat=true",self.name,phase,maximum,mean);
+            }}
+            let bridge=self.dml_wgl_interp_bridge.as_mut().unwrap();bridge.validated=true;bridge.phases=requested;log::info!("directml-wgl-interp-ready: model={} input={}x{} padded={}x{} slots={} host_input_bytes=0 host_output_bytes=0 scope=steady-pair validation=phase-repeat-canonical",self.name,size.0,size.1,padded.0,padded.1,bridge.slots.len());
+        }
+        // v972: input fusion for single-model runs. Built once per bridge after
+        // the canonical validation, and kept only if it reproduces the assemble
+        // route on the same history and phases (GPU output, padded RGB8).
+        let want_fused=channels==7&&std::env::var("CHIDESCALER_DML_WGL_FUSED_INPUT").ok().as_deref()!=Some("off");
+        if want_fused&&self.dml_wgl_interp_bridge.as_ref().is_some_and(|b|b.validated&&b.fused.is_none()&&!b.fused_failed){
+            let started=Instant::now();
+            let(requested,boost_pair)={let b=self.dml_wgl_interp_bridge.as_mut().unwrap();let r=(b.phases.clone(),b.boost_pair);b.boost_pair=false;r};
+            let result=(||->Result<(DmlWglFused,u8)>{
+                let mut fused=Some(self.build_dml_wgl_fused()?);let mut worst=0u8;
+                for phase in [0.2f32,0.5,0.8]{
+                    let key={let b=self.dml_wgl_interp_bridge.as_mut().unwrap();b.phases=vec![phase];b.fused=None;b.slots[0].key};
+                    self.run_dml_wgl_interp_slot(0)?;
+                    let image=gc.copy_dml_interp_image(key,padded.0,padded.1)?;let reference=gc.download_rgb8(image);
+                    self.dml_wgl_interp_bridge.as_mut().unwrap().fused=fused.take();
+                    self.run_dml_wgl_interp_slot(0)?;
+                    let b=self.dml_wgl_interp_bridge.as_mut().unwrap();
+                    fused=b.fused.take();
+                    anyhow::ensure!(!b.fused_failed&&fused.is_some(),"fused run failed during verification");
+                    let image=gc.copy_dml_interp_image(key,padded.0,padded.1)?;let actual=gc.download_rgb8(image);
+                    anyhow::ensure!(actual.len()==reference.len(),"fused output extent");
+                    worst=worst.max(actual.iter().zip(&reference).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(255));
+                }
+                Ok((fused.unwrap(),worst))
+            })();
+            let bridge=self.dml_wgl_interp_bridge.as_mut().unwrap();bridge.phases=requested;bridge.boost_pair=boost_pair;
+            match result{
+                Ok((fused,worst)) if worst<=1=>{bridge.fused=Some(fused);log::info!("directml-wgl-fused-input: model={} active=true max_byte_vs_assemble={} build_ms={:.0} assemble_pass=skipped-for-single-model",self.name,worst,started.elapsed().as_secs_f64()*1000.);}
+                Ok((_,worst))=>{bridge.fused_failed=true;log::warn!("directml-wgl-fused-input: model={} active=false reason=mismatch max_byte_vs_assemble={worst} action=assemble-pass",self.name);}
+                Err(error)=>{bridge.fused=None;bridge.fused_failed=true;log::warn!("directml-wgl-fused-input: model={} active=false reason={error:#} action=assemble-pass",self.name);}
+            }
+        }
+        // v963: the canonical validation above always runs the single model. The
+        // boost choice is fixed per prepared pair (x2.5 and up, every pair alike).
+        let want=self.dml_rife_boost&&self.fp16&&channels==7&&capacity>=3
+            &&directml_rife_boost_setting().load(Ordering::Relaxed)
+            &&std::env::var("CHIDESCALER_DML_WGL_BOOST").ok().as_deref()!=Some("off");
+        let needs_build=want&&self.dml_wgl_interp_bridge.as_ref().is_some_and(|b|b.boost.is_none()&&!b.boost_failed);
+        if needs_build{
+            let started=Instant::now();
+            match self.build_dml_wgl_split(padded){
+                Ok(split)=>{let bridge=self.dml_wgl_interp_bridge.as_mut().unwrap();log::info!("directml-wgl-rife-boost-split: active model={} slots={} padded={}x{} build_ms={:.0}",self.name,bridge.slots.len(),padded.0,padded.1,started.elapsed().as_secs_f64()*1000.);bridge.boost=Some(split);}
+                Err(error)=>{if let Some(b)=self.dml_wgl_interp_bridge.as_mut(){b.boost_failed=true;}log::warn!("directml-wgl-rife-boost-fallback: model={} reason={error:#} stage=build action=single-model-directml",self.name);}
+            }
+        }
+        {let bridge=self.dml_wgl_interp_bridge.as_mut().unwrap();bridge.boost_pair=want&&bridge.boost.is_some()&&!bridge.boost_failed;bridge.boost_trunk_done=false;
+         DML_RIFE_SPLIT_PAIR.store(bridge.boost_pair,Ordering::Relaxed);}
+        gc.submit_commands_fence().map_err(anyhow::Error::msg)
+    }
+
     fn process_dml_interp_gpu(
         &mut self,
         gc: &mut GlContext,
@@ -5817,6 +8150,7 @@ impl OnnxStage {
         }) {
             self.retire_dml_interp_gpu_bridge(gc);
         }
+        self.ensure_dml_rife_shape(padded.0, padded.1)?;
         if self.dml_interp_bridge.is_none() {
             let plane = usize::try_from(padded.0)? * usize::try_from(padded.1)?;
             // Shape discovery is initialization-only and contains no source
@@ -6050,6 +8384,11 @@ impl OnnxStage {
                 slot_count,
                 generation,
                 interop_mode,
+                prepared_count: 0,
+                prepare_serial: 0,
+                rife_boost_for_pair: false,
+                slots_done: 0,
+                overlap_count: 0,
             });
             // A driver may reveal the unsafe DSA external-buffer path only
             // during the first import. Rebuild before any GL packing/inference
@@ -6116,8 +8455,67 @@ impl OnnxStage {
                 dml.release_failures
             );
         }
+        // v946: build the RIFE boost split together with the GPU bridge, even
+        // while boost is off. Building it on the first boosted pair stalled
+        // playback for ~0.3 s when boost was switched on mid-stream, and the
+        // presentation stayed visibly wrong afterwards.
+        // v949: only while boost is on, so a boost-off stream is exactly the
+        // pre-boost path (no extra sessions on the GPU bridge).
+        if self.dml_rife_boost
+            && !self.dml_split_failed
+            && interop_mode == DmlInterpInteropMode::ConservativeCopy
+            && capacity_factor >= 3
+            && directml_rife_boost_setting().load(Ordering::Relaxed)
+        {
+            if let Err(error) = self.ensure_dml_split() {
+                if !onnx_cancel_requested() {
+                    self.dml_split_failed = true;
+                    self.dml_split = None;
+                    log::warn!(
+                        "rife-boost-split-fallback: model={} reason={error:#} action=single-model-directml stage=prebuild",
+                        self.name
+                    );
+                }
+            }
+        }
         let bridge = self.dml_interp_bridge.as_mut().unwrap();
+        // v949: a new pair prepared before every phase of the previous pair ran
+        // overwrites inputs that are still pending (suspected cause of frames
+        // shown out of time order). Log it so a field repro can confirm.
+        if bridge.prepare_serial > 0 && bridge.slots_done < bridge.prepared_count {
+            bridge.overlap_count = bridge.overlap_count.saturating_add(1);
+            if bridge.overlap_count <= 16 || bridge.overlap_count % 240 == 0 {
+                log::warn!(
+                    "interp-gpu-prepare-overlap: model={} prepare_serial={} slots_done={} prepared={} boost={} count={}",
+                    self.name, bridge.prepare_serial, bridge.slots_done, bridge.prepared_count,
+                    bridge.rife_boost_for_pair, bridge.overlap_count
+                );
+            }
+        }
+        bridge.slots_done = 0;
         bridge.generation = generation;
+        bridge.prepared_count = timesteps.len().min(bridge.invocations.len());
+        bridge.prepare_serial = bridge.prepare_serial.wrapping_add(1);
+        // Every phase of a prepared pair uses the same setting, even when the
+        // GUI changes it while a cooperative GPU worker is presenting phases.
+        let rife_boost_for_pair = self.dml_rife_boost
+            && !self.dml_split_failed
+            && interop_mode == DmlInterpInteropMode::ConservativeCopy
+            && capacity_factor >= 3
+            && directml_rife_boost_setting().load(Ordering::Relaxed);
+        // v947: a pair with one admitted midpoint used the full model while the
+        // other pairs used the boost, so consecutive pairs alternated between two
+        // different motion estimates (visible pulsing). Every pair of an x3+
+        // stream now uses the same path.
+        DML_RIFE_SPLIT_PAIR.store(rife_boost_for_pair, Ordering::Relaxed);
+        if bridge.rife_boost_for_pair != rife_boost_for_pair {
+            log::info!(
+                "directml-rife-boost-pair: model={} enabled={} generation={} prepare_serial={} phases={} input={}x{} padded={}x{} split_cached={}",
+                self.name, rife_boost_for_pair, generation, bridge.prepare_serial, bridge.prepared_count,
+                size.0, size.1, padded.0, padded.1, self.dml_split.is_some()
+            );
+        }
+        bridge.rife_boost_for_pair = rife_boost_for_pair;
         for (slot, frame) in bridge.history.iter().zip(frames.iter()) {
             (if self.fp16 {
                 gc.pack_interp_rgb_f16(slot.key, *frame, size, padded, 0)
@@ -6201,6 +8599,7 @@ impl OnnxStage {
     }
 
     fn retire_dml_interp_gpu_bridge(&mut self, gc: &mut GlContext) {
+        self.dml_split = None;
         let Some(mut bridge) = self.dml_interp_bridge.take() else {
             return;
         };
@@ -6231,7 +8630,36 @@ impl OnnxStage {
         );
     }
 
+    pub(crate) fn can_retain_neoarc_interp(&self)->bool { self.neoarc_session.is_some()&&self.neoarc_interp_gl.is_some() }
+    /// v985b: called on the render (GL owner) thread after the prepared pair's
+    /// GL fence has signalled and before the job reaches the worker. Moves the
+    /// NeoArc endpoints from the GL pixel buffers into CL-owned memory so the
+    /// worker thread never acquires GL buffers. Failure disables the buffer
+    /// input for later pairs; the current pair keeps a working fallback.
+    pub(crate) fn stage_neoarc_interp_inputs(&mut self) {
+        let Some(bridge)=self.neoarc_interp_gl.as_mut() else {return};
+        if bridge.input_buffers.is_empty()||bridge.buffer_input_failed{return;}
+        match bridge.io.stage_pair_buffers(){
+            Ok(true)=>{}
+            Ok(false)=>{bridge.buffer_input_failed=true;log::warn!("neoarc-gl-buffer-input-disabled: stage=staging reason=unsupported action=gl-image-input-next-pair");}
+            Err(error)=>{bridge.buffer_input_failed=true;log::warn!("neoarc-gl-buffer-input-disabled: stage=staging reason={error:#} action=gl-image-input-next-pair");}
+        }
+    }
+
+    /// Workers and presentation slots have already been drained by the engine.
+    /// A multiplier changes phases, not model shape, precision or GL context.
+    pub fn reset_interp_gpu_for_factor_change(&mut self, gc: &mut GlContext) {
+        if self.neoarc_session.is_some() {
+            if let Some(bridge)=self.neoarc_interp_gl.as_mut() {
+                bridge.frames.clear();bridge.phases.clear();bridge.io.begin_pair();
+                log::info!("neoarc-factor-transition: compiled_bridge=retained pending_frames=cleared validation=retained");
+            }
+        } else { self.retire_interp_gpu_bridges(gc); }
+    }
+
     pub fn retire_interp_gpu_bridges(&mut self, gc: &mut GlContext) {
+        self.retire_dml_wgl_interp(gc);
+        self.retire_neoarc_interp_gl(gc);
         self.retire_tensorrt_interp_gpu_bridge(gc);
         self.retire_dml_interp_gpu_bridge(gc);
     }
@@ -6864,6 +9292,15 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Option<(i32, i32, GpuTex)> {
+        if self.dml_wgl_disabled&&self.last_upscale_input_size!=Some((w,h)){self.dml_wgl_disabled=false;}
+        if self.neoarc_session.is_some() {
+            let input=gc.upload_rgba8(w,h,rgba);
+            return match self.process_neoarc_gl_texture(gc,input) {
+                Ok(Some(output))=>Some((output.w(),output.h(),output)),
+                Ok(None)=>None,
+                Err(error)=>{log::warn!("neoarc-gl-ingress-fallback: model={} reason={error:#}",self.name);None}
+            };
+        }
         if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             return match self.process_neoamd_rgba8_gpu_output(gc, w, h, rgba) {
                 Ok(output) => output,
@@ -6878,11 +9315,22 @@ impl OnnxStage {
                 }
             };
         }
+        // The D3D11/WGL bridge does not require Intel's unsupported
+        // GL_EXT_memory_object_win32 buffer import.
+        if self.provider==OnnxProvider::DirectML&&self.fp16&&self.interp==InterpKind::None&&self.temporal_frames.is_none()
+            &&!self.dml_wgl_disabled&&self.dml_wgl_output_requested(w,h)&&self.dml_wgl_device_eligible() {
+            match self.process_dml_d3d11_output(gc,w,h,rgba){
+                Ok(Some(texture))=>return Some((texture.w(),texture.h(),texture)),
+                Ok(None)=>{},
+                Err(error)=>{self.dml_wgl_converter.take();if !onnx_cancel_requested(){self.dml_wgl_disabled=true;log::warn!("directml-wgl-output-fallback: model={} reason={error:#} action=original-output-path",self.name);}}
+            }
+        }
         if !self.supports_dml_gl_bridge()
             || !self.fp16
             || self.interp != InterpKind::None
             || self.temporal_frames.is_some()
             || self.direct_output_disabled
+            || gc.external_device_luid().is_none()
         {
             return None;
         }
@@ -6923,7 +9371,7 @@ impl OnnxStage {
         h: i32,
         rgba: &[u8],
     ) -> Result<Option<(PreparedDmlSharedOutput, f64)>> {
-        if self.provider != OnnxProvider::DirectML
+        if self.neoarc_session.is_some() || self.provider != OnnxProvider::DirectML
             || !self.fp16
             || self.interp != InterpKind::None
             || self.temporal_frames.is_some()
@@ -6935,6 +9383,7 @@ impl OnnxStage {
             .checked_mul(hu)
             .ok_or_else(|| anyhow!("DirectML shared output input size overflow"))?;
         anyhow::ensure!(rgba.len() >= n * 4, "RGBA input buffer too small");
+        self.ensure_dml_local_image_shape(w, h);
         if self
             .direct_output
             .as_ref()
@@ -6953,16 +9402,7 @@ impl OnnxStage {
         let started = Instant::now();
         let pack_start = Instant::now();
         prepare_len_f16(&mut self.scratch_f16, n * 3);
-        let lut = u8_to_f16_lut();
-        use rayon::prelude::*;
-        self.scratch_f16
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(channel, plane)| {
-                for i in 0..n {
-                    plane[i] = lut[rgba[i * 4 + channel] as usize];
-                }
-            });
+        pack_rgbx_nchw_f16(rgba, wu, hu, 4, &mut self.scratch_f16);
         let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
         let input_shape = Shape::new([1i64, 3, h as i64, w as i64]);
         let input = TensorRef::from_array_view((input_shape, &*self.scratch_f16)).map_err(oerr)?;
@@ -6983,6 +9423,8 @@ impl OnnxStage {
             .direct_output
             .as_mut()
             .ok_or_else(|| anyhow!("DirectML shared output state disappeared"))?;
+        let direct_bind =
+            self.dml_image_symbols.is_some() && verified_b570_luid(u64::from_le_bytes(state.luid));
         let (run_ms, copy_ms) = run_cpu_tensor_to_dml_shared_output(
             &mut self.session,
             &self.run_options,
@@ -6990,6 +9432,7 @@ impl OnnxStage {
             &self.out_name,
             &input,
             state,
+            direct_bind,
         )?;
         let ow = i32::try_from(state.dims[3])?;
         let oh = i32::try_from(state.dims[2])?;
@@ -7026,6 +9469,85 @@ impl OnnxStage {
         Ok(Some((shared, total_ms)))
     }
 
+    pub(crate) fn supports_dml_wgl_capture(&mut self)->bool{
+        self.provider==OnnxProvider::DirectML&&self.neoarc_session.is_none()&&self.fp16&&self.input_channels==Some(3)&&self.interp==InterpKind::None&&self.temporal_frames.is_none()&&self.dml_image_symbols.is_some()&&!self.dml_wgl_disabled&&self.dml_wgl_input_failed!=self.last_upscale_input_size
+            &&self.last_upscale_input_size.is_some_and(|(w,h)|self.dml_wgl_output_requested(w,h))&&self.dml_wgl_device_eligible()
+            &&!matches!(std::env::var("CHIDESCALER_DML_WGL_INPUT").ok().as_deref(),Some("off"|"0"|"false"))
+    }
+
+    fn dml_wgl_device_eligible(&mut self)->bool{
+        if self.fallback_dml_adapter.is_some_and(|id|!intel_arc_device_id(id)){return false;}
+        if self.dml_image_device_luid.is_none(){self.dml_image_device_luid=Some(dml_session_luid(&self.session).ok());}
+        self.dml_image_device_luid.flatten().is_some_and(verified_b570_luid)
+    }
+
+    fn dml_wgl_output_requested(&self,w:i32,h:i32)->bool{
+        match std::env::var("CHIDESCALER_DML_WGL_OUTPUT").ok().as_deref(){
+            Some("off"|"0"|"false")=>false,
+            Some("on"|"1"|"true")=>true,
+            _=>self.dml_image_symbols.is_some()&&self.last_upscale_input_size==Some((w,h))&&self.last_upscale_profile.map(|p|p.output_size)
+                .or_else(||self.dml_wgl_last_geometry.filter(|(input,_)|*input==(w,h)).map(|(_,output)|output))
+                .is_some_and(|(ow,oh)|ow.saturating_mul(oh)>=512*512),
+        }
+    }
+
+    fn process_dml_wgl_gpu_input(&mut self,gc:&mut GlContext,input:GpuTex)->Result<GpuTex>{
+        let size=(input.w(),input.h());let start=Instant::now();
+        let state=self.direct_output.as_ref().ok_or_else(||anyhow!("GPU input needs established output"))?;
+        anyhow::ensure!(state.input_size==size&&state.dims.len()==4&&state.dims[1]==3,"GPU input geometry changed");
+        if self.direct_input.as_ref().is_none_or(|s|s.input_size!=size){self.direct_input=Some(create_direct_input_channels_typed_state(&state.device,state.luid,size,3,2,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?);}
+        if self.dml_wgl_input_converter.as_ref().is_none_or(|c|!c.matches(&state.device,size)){self.dml_wgl_input_converter=Some(super::dml_gl_bridge::Converter::new(&state.device,size.0,size.1)?);}
+        let fresh=!self.dml_wgl_input_converter.as_ref().unwrap().validated_current_context();
+        let converter=self.dml_wgl_input_converter.as_mut().unwrap();let image=converter.input_texture()?;gc.upload_dml_d3d11(&image,input)?;converter.pack(&self.direct_input.as_ref().unwrap().resource)?;
+        let pack_ms=start.elapsed().as_secs_f64()*1000.;let state=self.direct_output.as_mut().unwrap();let gpu_input=self.direct_input.as_ref().unwrap();
+        let memory=MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?;
+        let tensor=unsafe{TensorRefMut::<f16>::from_raw(memory,gpu_input.allocation,Shape::new(gpu_input.dims))?};
+        let(run_ms,copy_ms)=run_cpu_tensor_to_dml_shared_output(&mut self.session,&self.run_options,&self.in_name,&self.out_name,&tensor.view(),state,self.dml_image_symbols.is_some())?;
+        let output_size=(i32::try_from(state.dims[3])?,i32::try_from(state.dims[2])?);
+        if self.dml_wgl_converter.as_ref().is_none_or(|c|!c.matches(&state.device,output_size)){self.dml_wgl_converter=Some(super::dml_gl_bridge::Converter::new(&state.device,output_size.0,output_size.1)?);}
+        let out_start=Instant::now();let image=self.dml_wgl_converter.as_mut().unwrap().convert(&state.resource,copy_ms==0.)?;let(output,_)=gc.copy_dml_d3d11(&image,output_size.0,output_size.1)?;
+        let profile=UpscaleProfile{pack_ms,run_ms,out_ms:copy_ms+out_start.elapsed().as_secs_f64()*1000.,output_size:(output_size.0 as usize,output_size.1 as usize)};
+        if fresh{
+            let rgba=gc.download_rgba8(input);let(ow,oh,expected)=self.process_rgba8_native_output(size.0,size.1,&rgba)?;let actual=gc.download_rgba8(output);
+            anyhow::ensure!((ow,oh)==output_size&&actual.len()==expected.len(),"GPU input validation extent mismatch");let maximum=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(255);let mean=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/actual.len().max(1)as f64;
+            anyhow::ensure!(maximum<=4&&mean<0.5,"GPU input validation drift max={maximum} mean={mean}");self.dml_wgl_input_converter.as_mut().unwrap().mark_validated();log::info!("directml-wgl-input-ready: model={} input={}x{} max_byte={} mean_byte={:.6} steady_input_host_bytes=0 steady_output_host_bytes=0",self.name,size.0,size.1,maximum,mean);
+        }
+        self.last_upscale_profile=Some(profile);self.last_upscale_input_size=Some(size);self.log_image_pipeline(size,0,output_size,0,start.elapsed().as_secs_f64()*1000.);Ok(output)
+    }
+
+    /// Shared GPU output diagnostic and implementation. Input remains CPU RGBA.
+    pub fn process_dml_d3d11_output(&mut self,gc:&mut GlContext,w:i32,h:i32,rgba:&[u8])->Result<Option<GpuTex>>{
+        if self.provider!=OnnxProvider::DirectML||self.neoarc_session.is_some()||!self.fp16||self.interp!=InterpKind::None||self.temporal_frames.is_some(){return Ok(None);}
+        if self.dml_image_device_luid.is_none(){self.dml_image_device_luid=Some(dml_session_luid(&self.session).ok());}
+        if !self.dml_image_device_luid.flatten().is_some_and(verified_b570_luid){return Ok(None);}
+        let Some((shared,_))=self.process_rgba8_dml_shared_output(w,h,rgba)? else{return Ok(None);};
+        let actual_luid=u64::from_le_bytes(shared.luid);self.dml_image_device_luid=Some(Some(actual_luid));
+        if !verified_b570_luid(actual_luid){return Ok(None);}
+        let state=self.direct_output.as_ref().ok_or_else(||anyhow!("DML output disappeared"))?;
+        anyhow::ensure!(state.dims.len()==4&&state.dims[1]==3,"GPU RGB output required");
+        let fresh=self.dml_wgl_converter.as_ref().is_none_or(|c|!c.matches(&state.device,shared.size));
+        if fresh{self.dml_wgl_converter=Some(super::dml_gl_bridge::Converter::new(&state.device,shared.size.0,shared.size.1)?);}
+        let started=Instant::now();let profile=self.last_upscale_profile.ok_or_else(||anyhow!("DML output timings missing"))?;
+        // The existing B570 direct binding leaves UAV state; provider-copy
+        // leaves COMMON. Its measured copy time records the branch taken.
+        let image=self.dml_wgl_converter.as_mut().unwrap().convert(&state.resource,profile.out_ms==0.)?;
+        let(output,_new_import)=gc.copy_dml_d3d11(&image,shared.size.0,shared.size.1)?;
+        self.last_upscale_profile=Some(UpscaleProfile{out_ms:profile.out_ms+started.elapsed().as_secs_f64()*1000.,..profile});
+        if !self.dml_wgl_converter.as_ref().unwrap().validated_current_context(){
+            let validation_started=Instant::now();let saved=self.last_upscale_profile;
+            let (ow,oh,expected)=self.process_rgba8_native_output(w,h,rgba)?;
+            let actual=gc.download_rgba8(output);self.last_upscale_profile=saved;
+            anyhow::ensure!((ow,oh)==shared.size&&actual.len()==expected.len(),"DML WGL canonical extent mismatch");
+            let maximum=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)).max().unwrap_or(255);
+            let mean=actual.iter().zip(&expected).map(|(a,b)|a.abs_diff(*b)as f64).sum::<f64>()/actual.len().max(1)as f64;
+            anyhow::ensure!(maximum<=4&&mean<0.5,"DML WGL canonical drift max={maximum} mean={mean}");
+            self.dml_wgl_converter.as_mut().unwrap().mark_validated();
+            log::info!("directml-wgl-output-validation: model={} canonical=pass max_byte={} mean_byte={:.6} validation_ms={:.3} host_readback=surface-validation-only",self.name,maximum,mean,validation_started.elapsed().as_secs_f64()*1000.);
+        }
+        if fresh{log::info!("directml-wgl-output-ready: model={} output={}x{} transport=D3D12-compute-D3D11-WGL output_host_bytes=0 input=cpu-rgba",self.name,shared.size.0,shared.size.1);}
+        Ok(Some(output))
+    }
+
     fn process_rgba8_gpu_output_inner(
         &mut self,
         gc: &mut GlContext,
@@ -7052,16 +9574,7 @@ impl OnnxStage {
         }
         let pack_start = Instant::now();
         prepare_len_f16(&mut self.scratch_f16, n * 3);
-        let lut = u8_to_f16_lut();
-        use rayon::prelude::*;
-        self.scratch_f16
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(channel, plane)| {
-                for i in 0..n {
-                    plane[i] = lut[rgba[i * 4 + channel] as usize];
-                }
-            });
+        pack_rgbx_nchw_f16(rgba, wu, hu, 4, &mut self.scratch_f16);
         let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
         let input_shape = Shape::new([1i64, 3, h as i64, w as i64]);
         let input = TensorRef::from_array_view((input_shape, &*self.scratch_f16)).map_err(oerr)?;
@@ -7219,6 +9732,10 @@ impl OnnxStage {
         if let Some(key) = input_key {
             gc.clear_external_buffer_key(key);
         }
+        for extra in self.neoamd_interp_ring.drain(..) {
+            gc.clear_external_buffer_key(extra.resource_key);
+        }
+        self.neoamd_interp_ring_base = None;
         if let Some(session) = self.neoamd_session.as_mut() {
             session.release_shared_output();
         }
@@ -7268,6 +9785,118 @@ impl OnnxStage {
         self.direct_output = None;
     }
 
+    pub(crate) fn retire_neoarc_gl(&mut self) {
+        if let Some(session)=self.neoarc_session.as_mut(){session.retire_gl_rgb();}
+        if self.neoarc_gl_history_active {
+            self.temporal_history.clear();self.temporal_size=None;self.temporal_history_stride=0;self.neoarc_temporal_packed=false;
+        }
+        self.neoarc_gl_history_active=false;
+    }
+    fn process_neoarc_gl_texture(&mut self,gc:&mut GlContext,input:GpuTex)->Result<Option<GpuTex>> {
+        let stage_started=Instant::now();
+        use windows::Win32::Graphics::OpenGL::{wglGetCurrentContext,wglGetCurrentDC};
+        if input.d()!=1||input.key.dtype==super::gl::Dtype::U32{return Ok(None);}
+        let Some(session)=self.neoarc_session.as_mut()else{return Ok(None);};
+        let rc=unsafe{wglGetCurrentContext()}.0 as isize;let dc=unsafe{wglGetCurrentDC()}.0 as isize;
+        let dimensions=session.prepare_gl_rgb(usize::try_from(input.w())?,usize::try_from(input.h())?,rc,dc)?;
+        if let Some((ow,oh))=dimensions {
+            let output=gc.make_tex(i32::try_from(ow)?,i32::try_from(oh)?,4,super::gl::Dtype::U8);
+            let wait_started=Instant::now();gc.finish();let gl_input_wait_ms=wait_started.elapsed().as_secs_f64()*1000.0;
+            if let Some(times)=session.run_gl_rgb(input.tex.0.get(),output.tex.0.get(),!self.neoarc_gl_history_active,input.allocation_id,output.allocation_id)? {
+                self.last_upscale_profile=Some(UpscaleProfile{pack_ms:times[0],run_ms:times[1],out_ms:times[2],output_size:(ow,oh)});
+                self.last_upscale_input_size=Some((input.w(),input.h()));
+                self.neoarc_gl_history_active=self.temporal_frames.is_some();
+                let stage_wall_ms=stage_started.elapsed().as_secs_f64()*1000.0;
+                if crate::logging::diagnostics_enabled()&&self.image_diag_last_log.is_none_or(|last|last.elapsed()>=Duration::from_secs(1)){
+                    let first=self.image_diag_last_log.is_none();self.image_diag_last_log=Some(Instant::now());
+                    let cache=session.gl_rgb_import_stats().unwrap_or((false,0,0,0,0));
+                    log::info!("sisr-gpu-pipeline: model={} input={}x{} output={}x{} first_sample={} gl_input_wait_ms={:.3} import_pack_ms={:.3} queued_infer_ms={:.3} convert_release_ms={:.3} stage_wall_ms={:.3} unattributed_wall_ms={:.3} import_cache_enabled={} import_cache_entries={} import_cache_hits={} import_cache_misses={} import_cache_logical_bytes={} stage_host_input_bytes=0 stage_host_output_bytes=0 capture_storage=see-wgc-capture-audit final_handoff=OpenGL",
+                        self.name,input.w(),input.h(),ow,oh,first,gl_input_wait_ms,times[0],times[1],times[2],stage_wall_ms,(stage_wall_ms-gl_input_wait_ms-times.iter().sum::<f64>()).max(0.0),cache.0,cache.1,cache.2,cache.3,cache.4);
+                }
+                log::debug!("neoarc-gl-io-profile: model={} input={}x{} output={}x{} frames={} host_input_bytes=0 host_output_bytes=0 gpu_pack_ms={:.3} run_ms={:.3} gpu_output_ms={:.3} final_handoff=OpenGL capture_storage=see-wgc-capture-audit run_scope=queued-input-plus-infer",
+                    self.name,input.w(),input.h(),ow,oh,self.temporal_frames.unwrap_or(1),times[0],times[1],times[2]);
+                return Ok(Some(output));
+            }
+        }
+        if self.neoarc_gl_history_active {
+            self.temporal_history.clear();self.temporal_size=None;self.temporal_history_stride=0;self.neoarc_temporal_packed=false;
+            self.neoarc_gl_history_active=false;
+            log::warn!("neoarc-gl-temporal-history: model={} action=reset-for-byte-fallback",self.name);
+        }
+        Ok(None)
+    }
+
+    fn try_neoarc_rgb_u8(&mut self, w:i32,h:i32,pixels:&[u8],stride:usize,output_stride:usize,reset:bool)
+        ->Result<Option<(i32,i32,Vec<u8>)>> {
+        let Some(session)=self.neoarc_session.as_mut() else {return Ok(None);};
+        let (wu,hu)=(usize::try_from(w)?,usize::try_from(h)?);
+        let Some((ow,oh,data,times))=session.run_rgb_image(wu,hu,pixels,stride,output_stride,reset)? else {return Ok(None);};
+        self.last_upscale_profile=Some(UpscaleProfile{pack_ms:times[0],run_ms:times[1],out_ms:times[2],output_size:(ow,oh)});
+        self.last_upscale_input_size=Some((w,h));
+        log::debug!("neoarc-rgb-io-profile: model={} input={}x{} output={}x{} frames={} host_upload_bytes={} host_read_bytes={} host_fp16_bytes=0 gpu_pack_ms={:.3} run_ms={:.3} gpu_compact_read_ms={:.3} gpu_resident_end_to_end=false run_scope=queued-input-plus-infer",
+            self.name,w,h,ow,oh,self.temporal_frames.unwrap_or(1),wu*hu*stride,data.len(),times[0],times[1],times[2]);
+        Ok(Some((i32::try_from(ow)?,i32::try_from(oh)?,data)))
+    }
+
+    fn process_neoarc_temporal(&mut self, w: i32, h: i32, pixels: &[u8],
+        stride: usize, output_stride: usize, frames: usize) -> Result<(i32, i32, Vec<u8>)> {
+        use super::neoarc_backend::ImageOutput;
+        use rayon::prelude::*;
+        if let Some(result)=self.try_neoarc_rgb_u8(w,h,pixels,stride,output_stride,self.temporal_history.len()==1)? {
+            self.neoarc_temporal_packed=false;
+            return Ok(result);
+        }
+        let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+        let n = wu.checked_mul(hu).filter(|n| *n > 0).ok_or_else(|| anyhow!("invalid temporal extent"))?;
+        let frame_len = n.checked_mul(3).ok_or_else(|| anyhow!("temporal frame overflow"))?;
+        let total = frame_len.checked_mul(frames).ok_or_else(|| anyhow!("temporal input overflow"))?;
+        let started = Instant::now();
+        let rolling = self.neoarc_temporal_packed && self.scratch_f16.len() == total;
+        prepare_len_f16(&mut self.scratch_f16, total);
+        if rolling {
+            self.scratch_f16.copy_within(frame_len..total, 0);
+            pack_rgbx_nchw_f16(pixels, wu, hu, stride, &mut self.scratch_f16[total-frame_len..]);
+        } else {
+            // A GPU IO failure may occur after several live frames. Rebuild
+            // from the TRUE-N byte history, not N copies of the newest frame.
+            let first=self.temporal_history.front().map(Vec::as_slice).unwrap_or(pixels);
+            let history=std::iter::repeat_n(first,frames.saturating_sub(self.temporal_history.len()))
+                .chain(self.temporal_history.iter().map(Vec::as_slice));
+            for(index,frame) in history.enumerate() {
+                if index>0&&frame.as_ptr()==first.as_ptr(){self.scratch_f16.copy_within(..frame_len,index*frame_len);}
+                else{pack_rgbx_nchw_f16(frame,wu,hu,stride,&mut self.scratch_f16[index*frame_len..(index+1)*frame_len]);}
+            }
+        }
+        self.neoarc_temporal_packed = true;
+        let pack_ms = started.elapsed().as_secs_f64()*1000.0;
+        let run_started = Instant::now();
+        let mut run_ms = 0.0;
+        let mut out_ms = 0.0;
+        let result = self.neoarc_session.as_mut().ok_or_else(|| anyhow!("NeoArc temporal session missing"))?
+            .run_image_with_output(wu, hu, &self.scratch_f16, |ow, oh, output| {
+                run_ms = run_started.elapsed().as_secs_f64()*1000.0;
+                let started = Instant::now();
+                let len = ow.checked_mul(oh).ok_or_else(|| anyhow!("temporal output overflow"))?;
+                let mut data = vec![0u8; len.checked_mul(output_stride).ok_or_else(|| anyhow!("temporal RGB overflow"))?];
+                let lut = f16_unorm_to_u8_lut();
+                data.par_chunks_mut(output_stride).enumerate().for_each(|(i, pixel)| {
+                    for channel in 0..3 { pixel[channel] = match &output {
+                        ImageOutput::F16(values) => lut[values[channel*len+i].to_bits() as usize],
+                        ImageOutput::F32(values) => unit_to_u8(values[channel*len+i]),
+                    }; }
+                    if output_stride == 4 { pixel[3] = 255; }
+                });
+                out_ms = started.elapsed().as_secs_f64()*1000.0;
+                Ok((i32::try_from(ow)?, i32::try_from(oh)?, data))
+            })?;
+        self.last_upscale_profile = Some(UpscaleProfile { pack_ms, run_ms, out_ms,
+            output_size: (usize::try_from(result.0)?, usize::try_from(result.1)?) });
+        self.last_upscale_input_size = Some((w, h));
+        log::debug!("neoarc-temporal-profile: model={} frames={} initialized_frames={} pack=rolling-fp16 new_packed_frames={} pack_ms={:.3} run_ms={:.3} out_ms={:.3} input={}x{} output={}x{} gpu_resident_end_to_end=false",
+            self.name, frames, self.temporal_history.len(), if rolling { 1 } else { frames }, pack_ms, run_ms, out_ms, w, h, result.0, result.1);
+        Ok(result)
+    }
+
     fn process_temporal_u8_strided(
         &mut self,
         w: i32,
@@ -7278,6 +9907,7 @@ impl OnnxStage {
         frames: usize,
     ) -> Result<(i32, i32, Vec<u8>)> {
         use rayon::prelude::*;
+        if self.neoarc_gl_history_active { self.retire_neoarc_gl(); }
         let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
         let n = wu * hu;
         anyhow::ensure!(
@@ -7288,11 +9918,14 @@ impl OnnxStage {
             output_stride == 3 || output_stride == 4,
             "invalid output stride"
         );
+        // Only a completed pack on the preceding call can seed this window.
+        let previous_cursor = self.dml_temporal_cursor.take();
         self.ensure_tensorrt_single_input_profile(frames * 3, (w, h), "temporal-runtime")?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
         if self.temporal_size != Some((w, h)) || self.temporal_history_stride != stride {
             self.temporal_history.clear();
+            self.neoarc_temporal_packed = false;
             self.temporal_history_stride = stride;
             self.temporal_size = Some((w, h));
             if self.neoamd_temporal_rejected_size != Some((w, h)) {
@@ -7310,6 +9943,18 @@ impl OnnxStage {
         current.resize(n * stride, 0);
         current.copy_from_slice(&pixels[..n * stride]);
         self.temporal_history.push_back(current);
+        if self.neoarc_session.is_some() {
+            match self.process_neoarc_temporal(w, h, pixels, stride, output_stride, frames) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!("neoarc-temporal-fallback: model={} reason={error:#} action=DirectML history=retained", self.name);
+                    self.neoarc_session = None;
+                    self.neoarc_temporal_packed = false;
+                    self.provider_desc = "DirectML (NeoARC temporal fallback)".into();
+                    self.fallback_reason = Some(format!("NeoArc temporal: {error:#}"));
+                }
+            }
+        }
         // Native NeoAMD used to clone/repack the complete 7-frame window here.
         // The history now retains the live RGB/RGBA stride and reuses its ring
         // buffers; Backend Pack receives stable references without another Host
@@ -7366,6 +10011,34 @@ impl OnnxStage {
         let shape = vec![1i64, channels as i64, h as i64, w as i64];
         let pack_start = Instant::now();
         let (outputs, pack_ms, run_ms) = if self.fp16 {
+            let plane = 3*n;
+            let window = n*channels;
+            let mirror = self.dml_temporal_mirror && self.provider == OnnxProvider::DirectML
+                && window <= 32*1024*1024 && frames > 1;
+            let offset = if mirror {
+                let cursor = previous_cursor.filter(|_|self.temporal_history.len()>1
+                    && self.scratch_f16.len()==2*window);
+                prepare_len_f16(&mut self.scratch_f16,2*window);
+                let next = if let Some(cursor)=cursor {
+                    let start=cursor*plane;
+                    pack_rgbx_nchw_f16(pixels,wu,hu,stride,&mut self.scratch_f16[start..start+plane]);
+                    self.scratch_f16.copy_within(start..start+plane,window+start);
+                    (cursor+1)%frames
+                } else {
+                    for (i,frame) in history.iter().enumerate() {
+                        let start=i*plane;
+                        if i>0 && frame.as_ptr()==history[0].as_ptr() {
+                            self.scratch_f16.copy_within(..plane,start);
+                        } else {
+                            pack_rgbx_nchw_f16(frame,wu,hu,stride,&mut self.scratch_f16[start..start+plane]);
+                        }
+                    }
+                    self.scratch_f16.copy_within(..window,window);
+                    0
+                };
+                self.dml_temporal_cursor=Some(next);
+                next*plane
+            } else {
             prepare_len_f16(&mut self.scratch_f16, n * channels);
             let lut = u8_to_f16_lut();
             // Pack one complete RGB frame per Rayon task. The old channel-wise
@@ -7386,8 +10059,12 @@ impl OnnxStage {
                         b[i] = lut[frame[src + 2] as usize];
                     }
                 });
+
+
+                0
+            };
             drop(history);
-            let input = TensorRef::from_array_view((shape, &*self.scratch_f16)).map_err(oerr)?;
+            let input = TensorRef::from_array_view((shape,&self.scratch_f16[offset..offset+window])).map_err(oerr)?;
             let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
             let run_start = Instant::now();
             let outputs = self
@@ -7517,6 +10194,51 @@ impl OnnxStage {
         result
     }
 
+    fn process_neoarc_image(&mut self, w: i32, h: i32, pixels: &[u8], stride: usize,
+        output_stride: usize) -> Result<(i32, i32, Vec<u8>)> {
+        use super::neoarc_backend::ImageOutput;
+        use rayon::prelude::*;
+        if let Some(result)=self.try_neoarc_rgb_u8(w,h,pixels,stride,output_stride,false)? {return Ok(result);}
+        let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+        let n = wu.checked_mul(hu).filter(|n| *n > 0)
+            .ok_or_else(|| anyhow!("NeoArc SISR input size invalid"))?;
+        anyhow::ensure!(stride >= 3 && pixels.len() >= n.checked_mul(stride)
+            .ok_or_else(|| anyhow!("NeoArc SISR input overflow"))?, "NeoArc SISR input too short");
+        anyhow::ensure!(matches!(output_stride, 3 | 4), "NeoArc SISR output stride invalid");
+        let pack_started = Instant::now();
+        prepare_len_f16(&mut self.scratch_f16, n.checked_mul(3)
+            .ok_or_else(|| anyhow!("NeoArc SISR plane overflow"))?);
+        pack_rgbx_nchw_f16(pixels, wu, hu, stride, &mut self.scratch_f16);
+        let pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+        let started = Instant::now();
+        let mut run_ms = 0.0;
+        let mut out_ms = 0.0;
+        let result = self.neoarc_session.as_mut().ok_or_else(|| anyhow!("NeoArc SISR session missing"))?
+            .run_image_with_output(wu, hu, &self.scratch_f16, |ow, oh, output| {
+                run_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let out_started = Instant::now();
+                let plane = ow.checked_mul(oh).ok_or_else(|| anyhow!("NeoArc SISR output overflow"))?;
+                let size = plane.checked_mul(output_stride).ok_or_else(|| anyhow!("NeoArc SISR RGB overflow"))?;
+                let (out_w, out_h) = (i32::try_from(ow)?, i32::try_from(oh)?);
+                let mut rgb = vec![0u8; size];
+                let lut = f16_unorm_to_u8_lut();
+                rgb.par_chunks_mut(output_stride).enumerate().for_each(|(i, px)| {
+                    for c in 0..3 {
+                        px[c] = match &output {
+                            ImageOutput::F16(v) => lut[v[c * plane + i].to_bits() as usize],
+                            ImageOutput::F32(v) => unit_to_u8(v[c * plane + i]),
+                        };
+                    }
+                    if output_stride == 4 { px[3] = 255; }
+                });
+                out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
+                Ok((out_w, out_h, rgb))
+            })?;
+        self.last_upscale_profile = Some(UpscaleProfile { pack_ms, run_ms, out_ms,
+            output_size: (usize::try_from(result.0)?, usize::try_from(result.1)?) });
+        Ok(result)
+    }
+
     fn process_u8_strided_once(
         &mut self,
         w: i32,
@@ -7527,6 +10249,17 @@ impl OnnxStage {
     ) -> Result<(i32, i32, Vec<u8>)> {
         if let Some(frames) = self.temporal_frames {
             return self.process_temporal_u8_strided(w, h, pixels, stride, output_stride, frames);
+        }
+        if self.neoarc_session.is_some() && self.interp == InterpKind::None {
+            match self.process_neoarc_image(w, h, pixels, stride, output_stride) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!("neoarc-sisr-fallback: model={} reason={error:#} action=DirectML", self.name);
+                    self.neoarc_session = None;
+                    self.provider_desc = "DirectML (NeoARC SISR fallback)".into();
+                    self.fallback_reason = Some(format!("NeoArc SISR: {error:#}"));
+                }
+            }
         }
         if matches!(self.provider, OnnxProvider::NeoAMD | OnnxProvider::NeoRTX) {
             match self.run_neoamd_u8(w, h, &[pixels], stride, output_stride, 0.5) {
@@ -7541,6 +10274,7 @@ impl OnnxStage {
                 }
             }
         }
+        self.ensure_dml_local_image_shape(w, h);
         self.ensure_tensorrt_single_input_profile(3, (w, h), "image-runtime")?;
         self.prepare_tensorrt_input_shape(w, h);
         mark_tensorrt_model_started(&self.name);
@@ -7561,12 +10295,7 @@ impl OnnxStage {
         let (outputs, pack_ms, run_ms) = if self.fp16 {
             prepare_len_f16(&mut self.scratch_f16, n * 3);
             let x = self.scratch_f16.as_mut_slice();
-            let lut = u8_to_f16_lut();
-            x.par_chunks_mut(n).enumerate().for_each(|(c, plane)| {
-                for i in 0..n {
-                    plane[i] = lut[pixels[i * stride + c] as usize];
-                }
-            });
+            pack_rgbx_nchw_f16(pixels, w as usize, h as usize, stride, x);
             let t = TensorRef::from_array_view((shape, &*x)).map_err(oerr)?;
             let pack_ms = pack_start.elapsed().as_secs_f64() * 1000.0;
             let run_start = std::time::Instant::now();
@@ -7847,6 +10576,56 @@ struct DmlInterpInvocation {
     output: DmlDirectOutput,
 }
 
+const DML_WGL_INTERP_KEY:u64=1u64<<63;
+struct DmlWglInterpSlot{input:DmlDirectInput,output:DmlDirectOutput,converter:super::dml_gl_bridge::Converter,key:u64}
+impl Drop for DmlWglInterpSlot{fn drop(&mut self){self.output.binding.clear();}}
+struct DmlWglInterpBridge{packed_keys:Vec<(u64,u64,u64)>,history:Vec<(DmlDirectInput,super::dml_gl_bridge::Converter)>,slots:Vec<DmlWglInterpSlot>,size:(i32,i32),padded:(i32,i32),phases:Vec<f32>,context:(isize,isize),validated:bool,pack_ms:f64,
+    // v963: RIFE boost on the B570/Arc WGL route (trunk once per pair, head per phase).
+    // The split points into the slots' allocations, so Drop releases it first.
+    boost:Option<DmlWglSplit>,boost_pair:bool,boost_trunk_done:bool,boost_failed:bool,
+    // v972: single-model runs read the history buffers directly (input fusion).
+    fused:Option<DmlWglFused>,fused_failed:bool}
+unsafe impl Send for DmlWglInterpBridge{}
+impl Drop for DmlWglInterpBridge{fn drop(&mut self){self.boost.take();self.fused.take();}}
+
+/// v972: the single model with the 7-channel input assembled inside the graph
+/// (`rife_dml_split::wgl_fused_input`). It binds the planar RGB history
+/// buffers and a one-element phase directly, so the per-slot D3D12 assemble
+/// pass and its CPU fence wait disappear. Outputs go to the slots' buffers.
+struct DmlWglFused{session:Session,bindings:Vec<IoBinding>,_values:Vec<InterpTensorValue>,names:[CString;3],_device:windows::core::IUnknown,_queue:ID3D12CommandQueue}
+
+/// DirectML device and a direct queue on an existing D3D12 device, so a session
+/// can bind resources that this device created.
+fn dml_device_and_queue(device:&ID3D12Device)->Result<(windows::core::IUnknown,ID3D12CommandQueue)>{
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::core::{GUID, HRESULT, IUnknown, PCSTR, w};
+    type CreateDmlDevice = unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT;
+    let module = unsafe { GetModuleHandleW(w!("DirectML.dll"))? };
+    let entry = unsafe { GetProcAddress(module, PCSTR(c"DMLCreateDevice".as_ptr().cast())) }
+        .ok_or_else(|| anyhow!("DMLCreateDevice unavailable"))?;
+    let create: CreateDmlDevice = unsafe { std::mem::transmute(entry) };
+    // IDMLDevice IID from DirectML.h.
+    let iid = GUID::from_u128(0x6dbd6437_96fd_423f_a98c_ae5e7c2a573f);
+    let mut raw = std::ptr::null_mut();
+    unsafe { create(device.as_raw(), 0, &iid, &mut raw).ok()?; }
+    anyhow::ensure!(!raw.is_null(), "DMLCreateDevice returned null");
+    let dml_device = unsafe { IUnknown::from_raw(raw) };
+    let queue = unsafe { device.CreateCommandQueue::<ID3D12CommandQueue>(
+        &D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() },
+    )? };
+    Ok((dml_device, queue))
+}
+
+/// v963: trunk/head sessions bound to the WGL slots' own D3D12 input/output
+/// allocations. The head writes straight into the slot's shared output, so the
+/// existing converter/GL import path is unchanged.
+struct DmlWglSplit{
+    trunk:Session,head:Session,trunk_bindings:Vec<IoBinding>,head_bindings:Vec<IoBinding>,
+    _values:Vec<InterpTensorValue>,_state_value:InterpTensorValue,_names:Vec<CString>,_state:DmlDirectInput,
+}
+impl Drop for DmlWglSplit{fn drop(&mut self){for binding in self.trunk_bindings.iter_mut().chain(self.head_bindings.iter_mut()){binding.clear();}}}
+unsafe impl Send for DmlWglSplit{}
+
 struct DmlInterpGpuBridge {
     history: Vec<DmlDirectInput>,
     invocations: Vec<DmlInterpInvocation>,
@@ -7857,7 +10636,75 @@ struct DmlInterpGpuBridge {
     slot_count: usize,
     generation: u64,
     interop_mode: DmlInterpInteropMode,
+    /// v933: phases packed by the latest prepare and a serial identifying that prepare
+    /// (the FraZerion pair batch runs all of them in one provider call).
+    prepared_count: usize,
+    prepare_serial: u64,
+    rife_boost_for_pair: bool,
+    /// v949 diagnostics: slots executed for the current prepared pair.
+    slots_done: usize,
+    overlap_count: u64,
 }
+
+/// v933 FraZerion pair batch: the in-betweens of one source pair (same frames, different t)
+/// in ONE DirectML call of a batch-K session. The model's shared trunk then runs once per pair
+/// instead of once per phase, and the per-phase provider sync disappears. Only models exported
+/// with `frazerion.pair_batch=1` (they assume every batch item is the same pair) use it; any
+/// failure returns to the per-phase path for the session.
+struct DmlPairBatch {
+    key: ((i32, i32), usize),
+    session: Session,
+    _input_value: TensorRefMut<'static, f16>,
+    _input_name: CString,
+    binding: IoBinding,
+    allocator: Allocator,
+    copy: DmlCopyContext,
+    input: DmlDirectInput,
+    done_serial: u64,
+    done_count: usize,
+}
+
+impl Drop for DmlPairBatch {
+    fn drop(&mut self) {
+        // the binding holds an OrtValue that points into `input`
+        self.binding.clear();
+    }
+}
+
+unsafe impl Send for DmlPairBatch {}
+
+/// v935 FraZerion split: the model's shared trunk (frames only, no t) runs ONCE per source pair and
+/// every phase runs only the per-t head. Sidecar files next to the model (`<model>.onnx.trunk`,
+/// `<model>.onnx.head`, enabled by `frazerion.split=1` in the model) hold the two halves; the trunk
+/// result is one full-size 8-channel tensor that every head call reads. The first in-between is not
+/// delayed (unlike the v933 pair batch): phase 1 = trunk + head, phases 2.. = head only. The single
+/// model file stays the fallback for every other path and for any failure here.
+struct DmlSplit {
+    /// padded size + the phase input allocations the bindings point into
+    key: ((i32, i32), Vec<usize>),
+    trunk: Session,
+    head: Session,
+    trunk_bindings: Vec<IoBinding>,
+    head_bindings: Vec<IoBinding>,
+    _input_values: Vec<InterpTensorValue>,
+    _state_value: InterpTensorValue,
+    _names: Vec<CString>,
+    state: DmlDirectInput,
+    head_allocator: Allocator,
+    trunk_serial: Option<u64>,
+    midpair_trunks: u64,
+}
+
+impl Drop for DmlSplit {
+    fn drop(&mut self) {
+        // the bindings hold OrtValues that point into `state` and the bridge's phase inputs
+        for binding in self.trunk_bindings.iter_mut().chain(self.head_bindings.iter_mut()) {
+            binding.clear();
+        }
+    }
+}
+
+unsafe impl Send for DmlSplit {}
 
 unsafe impl Send for DmlInterpInvocation {}
 unsafe impl Send for DmlInterpGpuBridge {}
@@ -8116,6 +10963,46 @@ impl DmlCopyContext {
         self.wait_submitted(copy_start)
     }
 
+    /// v933: region copies between buffers that each appear once, in the given resting states
+    /// (returned to them afterwards). Regions: (source index, source offset, dest index, dest
+    /// offset, bytes).
+    fn copy_regions_and_wait(
+        &mut self,
+        sources: &[(ID3D12Resource, D3D12_RESOURCE_STATES)],
+        dests: &[(ID3D12Resource, D3D12_RESOURCE_STATES)],
+        regions: &[(usize, u64, usize, u64, u64)],
+    ) -> Result<(f64, f64)> {
+        let copy_start = Instant::now();
+        unsafe {
+            self.allocator.Reset()?;
+            self.list.Reset(
+                &self.allocator,
+                None::<&windows::Win32::Graphics::Direct3D12::ID3D12PipelineState>,
+            )?;
+            for (resource, state) in sources {
+                Self::transition(&self.list, resource, *state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            }
+            for (resource, state) in dests {
+                Self::transition(&self.list, resource, *state, D3D12_RESOURCE_STATE_COPY_DEST);
+            }
+            for &(si, src_offset, di, dst_offset, bytes) in regions {
+                self.list.CopyBufferRegion(&dests[di].0, dst_offset, &sources[si].0, src_offset, bytes);
+            }
+            for (resource, state) in sources {
+                Self::transition(&self.list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE, *state);
+            }
+            for (resource, state) in dests {
+                Self::transition(&self.list, resource, D3D12_RESOURCE_STATE_COPY_DEST, *state);
+            }
+            self.list.Close()?;
+            let command: ID3D12CommandList = self.list.cast()?;
+            self.queue.ExecuteCommandLists(&[Some(command)]);
+            self.value = self.value.saturating_add(1);
+            self.queue.Signal(&self.fence, self.value)?;
+        }
+        self.wait_submitted(copy_start)
+    }
+
     /// Copy GL-packed COMMON buffers into DirectML-private UAV buffers.  The
     /// destination is returned to UAV before ORT starts inference, and the
     /// shared source is returned to COMMON before OpenGL sees it again.
@@ -8261,6 +11148,7 @@ fn create_direct_input_channels_typed_state(
         .ok_or_else(|| anyhow!("input byte size overflow"))?;
     let byte_len = elements
         .checked_mul(element_bytes)
+        .and_then(|n|n.checked_add(3)).map(|n|n&!3)
         .ok_or_else(|| anyhow!("input byte size overflow"))?;
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -8403,6 +11291,8 @@ fn create_direct_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
     let luid = luid_bytes(unsafe { device.GetAdapterLuid() });
     let byte_len = elements
         .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes|bytes.checked_add(3))
+        .map(|bytes|bytes&!3)
         .ok_or_else(|| anyhow!("output byte size overflow"))?;
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -8477,6 +11367,169 @@ fn create_direct_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
     })
 }
 
+// A tiny provider allocation identifies the actual Auto-selected adapter.
+// This never maps or copies frame pixels and all resources are RAII-owned.
+fn dml_session_luid(session:&Session)->Result<u64>{
+    let allocator=Allocator::new(session,MemoryInfo::new(AllocationDevice::DIRECTML,0,AllocatorType::Device,MemoryType::Default)?)?;
+    let mut allocation=allocator.alloc::<u8>(65536)?;let mut resource=std::ptr::null_mut();
+    ort_status(unsafe{(dml_api()?.GetD3D12ResourceFromAllocation)(allocator.ptr().cast_mut(),allocation.as_mut_ptr(),&mut resource)})?;
+    let resource=unsafe{ID3D12Resource::from_raw_borrowed(&resource)}.ok_or_else(||anyhow!("null DirectML device probe resource"))?;
+    let mut device:Option<ID3D12Device>=None;unsafe{resource.GetDevice(&mut device)?};
+    let device=device.ok_or_else(||anyhow!("DirectML device probe missing device"))?;
+    Ok(u64::from_le_bytes(luid_bytes(unsafe{device.GetAdapterLuid()})))
+}
+fn dml_image_shape_budget(luid:u64,w:i32,h:i32)->bool{
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1,IDXGIFactory1,IDXGIAdapter3,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,DXGI_QUERY_VIDEO_MEMORY_INFO};
+    let result=(||->windows::core::Result<bool>{unsafe{
+        let factory:IDXGIFactory1=CreateDXGIFactory1()?;let mut index=0;
+        while let Ok(adapter)=factory.EnumAdapters1(index){index+=1;let desc=adapter.GetDesc1()?;
+            if u64::from_le_bytes(luid_bytes(desc.AdapterLuid))!=luid{continue;}
+            let adapter:IDXGIAdapter3=adapter.cast()?;let mut info=DXGI_QUERY_VIDEO_MEMORY_INFO::default();adapter.QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&mut info)?;
+            let reserve=(w as u64)*(h as u64)*64*2*4+64*1024*1024;
+            let allowed=info.Budget>0&&info.CurrentUsage.saturating_add(reserve)<info.Budget/100*85;
+            log::info!("directml-image-shape-budget: luid={luid:016x} input={w}x{h} usage_bytes={} budget_bytes={} reserve_bytes={} allowed={allowed}",info.CurrentUsage,info.Budget,reserve);
+            return Ok(allowed);
+        }Ok(false)
+    }})();result.unwrap_or(false)
+}
+
+fn verified_b570_luid(luid: u64) -> bool {
+    static B570_LUIDS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    B570_LUIDS
+        .get_or_init(|| {
+            crate::platform::gpu::enumerate_adapters_quiet()
+                .into_iter()
+                .filter(|adapter| adapter.vendor_id == 0x8086 && adapter.name.contains("B570"))
+                .map(|adapter| adapter.luid)
+                .collect()
+        })
+        .contains(&luid)
+}
+
+fn intel_arc_adapters() -> &'static [(i32, u64)] {
+    static ARC_ADAPTERS: std::sync::OnceLock<Vec<(i32, u64)>> = std::sync::OnceLock::new();
+    ARC_ADAPTERS
+        .get_or_init(|| {
+            crate::platform::gpu::enumerate_adapters_quiet()
+                .into_iter()
+                .filter(|adapter| {
+                    adapter.vendor_id == 0x8086
+                        && adapter.name.to_ascii_lowercase().contains("arc")
+                })
+                .map(|adapter| (adapter.device_id, adapter.luid))
+                .collect()
+        })
+}
+
+fn intel_arc_luid(luid: u64) -> bool {
+    intel_arc_adapters().iter().any(|adapter| adapter.1 == luid)
+}
+
+fn intel_arc_device_id(device_id: i32) -> bool {
+    intel_arc_adapters()
+        .iter()
+        .any(|adapter| adapter.0 == device_id)
+}
+
+fn dml_graph_optimization(path: &Path) -> GraphOptimizationLevel {
+    match std::env::var("CHIDESCALER_DML_GRAPH_OPT").ok().as_deref() {
+        Some("disable") => GraphOptimizationLevel::Disable,
+        Some("basic") => GraphOptimizationLevel::Level1,
+        Some("extended") => GraphOptimizationLevel::Level2,
+        Some("all") => GraphOptimizationLevel::All,
+        _ => {
+            let standard_upscaler = inspect_local_image_model(path)
+                .ok()
+                .flatten()
+                .is_some_and(|plan| matches!(plan.conv_count, 10 | 18))
+                || inspect_spanf3_image_model(path).unwrap_or(false)
+                || inspect_rtmosr_image_model(path).unwrap_or(false);
+            if standard_upscaler {
+                GraphOptimizationLevel::Level2
+            } else {
+                GraphOptimizationLevel::All
+            }
+        }
+    }
+}
+
+fn cache_dml_image_shape(shape: (i32, i32)) -> bool {
+    shape.0 > 0
+        && shape.1 > 0
+        && shape.0 as i64 * shape.1 as i64 <= 256 * 256
+        && std::env::var("CHIDESCALER_DML_IMAGE_SHAPE_CACHE")
+            .ok()
+            .as_deref()
+            != Some("off")
+}
+
+/// Write a derived graph under `cache`, trusting an existing file only when
+/// its contents match byte for byte.
+fn store_derived_graph(cache: &Path, name: &str, data: &[u8]) -> Result<PathBuf> {
+    let target = cache.join(name);
+    if std::fs::read(&target).ok().as_deref() != Some(data) {
+        std::fs::create_dir_all(cache)?;
+        let tmp = target.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, data)?;
+        if let Err(error) = std::fs::rename(&tmp, &target) {
+            let _ = std::fs::remove_file(&tmp);
+            if std::fs::read(&target).ok().as_deref() != Some(data) {
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(target)
+}
+
+/// v973: ConvTranspose/identity-tuned copy of a seven-channel RIFE graph for
+/// OpenVINO, with the original's IO precision. None when nothing changes.
+/// v993: in-process memo of derived NeoArc graph files, keyed by the source
+/// file identity (path, length, mtime) and a kind tag. Every model or geometry
+/// switch rebuilds the stage; re-deriving + hashing the same ONNX each time
+/// cost ~0.3 s. An entry is used only while its output file still exists.
+type DerivedKey = (PathBuf, u64, std::time::SystemTime, &'static str);
+fn derived_memo() -> &'static std::sync::Mutex<HashMap<DerivedKey, (PathBuf, usize, usize)>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<DerivedKey, (PathBuf, usize, usize)>>> = std::sync::OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+fn derived_key(path: &Path, kind: &'static str) -> Option<DerivedKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((path.to_path_buf(), meta.len(), meta.modified().ok()?, kind))
+}
+fn memo_derived(path: &Path, kind: &'static str, build: impl FnOnce() -> Result<Option<(PathBuf, usize, usize)>>) -> Result<Option<(PathBuf, usize, usize)>> {
+    let disabled = std::env::var("CHIDESCALER_NEOARC_DERIVED_MEMO").ok().as_deref() == Some("off");
+    let key = if disabled { None } else { derived_key(path, kind) };
+    if let Some(key) = key.as_ref() {
+        if let Some(hit) = derived_memo().lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned() {
+            if hit.0.is_file() { return Ok(Some(hit)); }
+        }
+    }
+    let built = build()?;
+    if let (Some(key), Some(value)) = (key, built.as_ref()) {
+        derived_memo().lock().unwrap_or_else(|e| e.into_inner()).insert(key, value.clone());
+    }
+    Ok(built)
+}
+fn neoarc_tuned_rife_graph_memo(app_dir: &Path, path: &Path) -> Result<Option<(PathBuf, usize, usize)>> {
+    memo_derived(path, "neoarc-tuned", || neoarc_tuned_rife_graph(app_dir, path))
+}
+
+fn neoarc_tuned_rife_graph(app_dir: &Path, path: &Path) -> Result<Option<(PathBuf, usize, usize)>> {
+    let bytes = std::fs::read(path)?;
+    if rife_dml_split::input_channels(&bytes)? != Some(7) || bytes.windows(15).any(|w| w == b"frazerion.split") {
+        return Ok(None);
+    }
+    let (rewritten, convt) = rife_dml_split::dml_convtranspose_rewrite(&bytes)?;
+    let (rewritten, identity) = rife_dml_split::dml_identity_rewrite(&rewritten)?;
+    if convt == 0 && identity == 0 {
+        return Ok(None);
+    }
+    use sha2::Digest;
+    let name = format!("{:x}.onnx", sha2::Sha256::digest(&bytes));
+    let tuned = store_derived_graph(&app_dir.join("cache/neoarc/arc-tuned-v1"), &name, &rewritten)?;
+    Ok(Some((tuned, convt, identity)))
+}
+
 fn run_cpu_tensor_to_dml_shared_output<T: PrimitiveTensorElementType + std::fmt::Debug>(
     session: &mut Session,
     run_options: &CancelableRunOptions,
@@ -8484,6 +11537,7 @@ fn run_cpu_tensor_to_dml_shared_output<T: PrimitiveTensorElementType + std::fmt:
     output_name: &str,
     input: &TensorRef<'_, T>,
     output: &mut DmlDirectOutput,
+    verified_direct_bind: bool,
 ) -> Result<(f64, f64)> {
     let memory = MemoryInfo::new(
         AllocationDevice::DIRECTML,
@@ -8499,6 +11553,68 @@ fn run_cpu_tensor_to_dml_shared_output<T: PrimitiveTensorElementType + std::fmt:
             input.ptr(),
         )
     })?;
+    let direct_bind = match std::env::var("CHIDESCALER_DML_SHARED_DIRECT_BIND")
+        .ok()
+        .as_deref()
+    {
+        Some("0" | "off" | "false") => false,
+        Some("1" | "on" | "true") => true,
+        _ => verified_direct_bind,
+    };
+    if direct_bind {
+        let mut submitted = false;
+        let direct = (|| -> Result<(f64, f64)> {
+            let value = unsafe {
+                TensorRefMut::<T>::from_raw(
+                    memory.clone(),
+                    output.allocation,
+                    Shape::new(output.dims.iter().copied()),
+                )?
+            };
+            let output_c = CString::new(output_name.as_bytes())?;
+            ort_status(unsafe {
+                (ort::api().BindOutput)(
+                    output.binding.ptr().cast_mut(),
+                    output_c.as_ptr(),
+                    value.ptr(),
+                )
+            })?;
+            static DIAGNOSTIC_RUNS:AtomicU64=AtomicU64::new(0);
+            let sample=DIAGNOSTIC_RUNS.fetch_add(1,Ordering::Relaxed)%120==0;
+            let cpu_before=if sample{current_thread_cpu_100ns()}else{None};
+            let started = Instant::now();
+            submitted = true;
+            let result = session
+                .run_binding_with_options(&output.binding, run_options.armed()?)
+                .map_err(oerr)?;
+            let run_call_ms=started.elapsed().as_secs_f64()*1000.;let sync_started=Instant::now();
+            output.binding.synchronize_outputs().map_err(oerr)?;
+            let sync_ms=sync_started.elapsed().as_secs_f64()*1000.;
+            let measured_ms=started.elapsed().as_secs_f64()*1000.;
+            if sample{let cpu_ms=cpu_before.zip(current_thread_cpu_100ns()).map(|(a,b)|b.saturating_sub(a)as f64/10000.).unwrap_or(-1.);log::info!("directml-binding-timing: input={}x{} run_call_ms={:.3} completion_sync_ms={:.3} thread_cpu_ms={:.3} timing=host-wall-includes-gpu-queue-and-os-scheduling pure_gpu_kernel_time=false",output.input_size.0,output.input_size.1,run_call_ms,sync_ms,cpu_ms);}
+            drop(result);
+            Ok((measured_ms, 0.0))
+        })();
+        output.binding.clear();
+        match direct {
+            Ok(timings) => return Ok(timings),
+            Err(error) => {
+                if submitted {
+                    return Err(error);
+                }
+                log::warn!(
+                    "DirectML shared direct bind failed; retrying provider-copy path: {error:#}"
+                );
+                ort_status(unsafe {
+                    (ort::api().BindInput)(
+                        output.binding.ptr().cast_mut(),
+                        input_c.as_ptr(),
+                        input.ptr(),
+                    )
+                })?;
+            }
+        }
+    }
     output
         .binding
         .bind_output_to_device(output_name.to_string(), &memory)
@@ -8551,9 +11667,15 @@ fn run_cpu_tensor_to_dml_shared_output<T: PrimitiveTensorElementType + std::fmt:
 }
 
 fn dml_interp_interop_mode(
-    _gc: &GlContext,
+    gc: &GlContext,
     _stable_post_handoff: bool,
 ) -> Option<DmlInterpInteropMode> {
+    // An OpenGL external-memory bridge cannot be constructed without an
+    // imported device LUID. Intel Windows OpenGL lacks the Win32 import API;
+    // bypass its allocation attempt before the first interpolation frame.
+    if gc.external_device_luid().is_none() {
+        return None;
+    }
     let requested = std::env::var("CHIDESCALER_DML_INTERP_INTEROP")
         .unwrap_or_else(|_| "auto".into())
         .trim()
@@ -8637,10 +11759,139 @@ impl OnnxStage {
         channels: usize,
         t: f32,
     ) -> Result<(i32, i32, Vec<u8>)> {
-        self.rife_multi_strided(w, h, frames, channels, t, 3)
+        self.rife_multi_strided(w, h, frames, channels, t, 3, false)
+    }
+
+    pub(crate) fn set_neoarc_pair_reuse(&mut self, enabled: bool) {
+        self.neoarc_pair_reuse = enabled;
+        self.neoarc_pair_packed = false;
+        if let Some(session) = self.neoarc_session.as_mut() {
+            session.set_pair_reuse(enabled);
+        }
+    }
+
+    fn rife_neoarc_strided(
+        &mut self, w: i32, h: i32, frames: &[&[u8]],
+        channels: usize, t: f32, stride: usize,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        anyhow::ensure!(((frames.len() == 2 && channels == 7) || (frames.len() == 4 && channels == 14)) && stride >= 3,
+            "NeoArc requires two RIFE or four DRBA RGB/RGBA frames");
+        let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+        anyhow::ensure!(wu > 0 && hu > 0, "NeoArc empty frame");
+        // The bundled dynamic RIFE graphs accept the native geometry. The
+        // runtime checks output dimensions and repeat validity per shape.
+        let (pw, ph) = if channels == 14 { (wu.div_ceil(64) * 64, hu.div_ceil(64) * 64) } else { (wu, hu) };
+        if channels==7 {
+            if let Some((rgb,times))=self.neoarc_session.as_mut().ok_or_else(||anyhow!("NeoArc missing"))?.run_rife_rgb(wu,hu,frames,stride,t)? {
+                self.neoarc_pair_packed=false;
+                self.last_interp_profile=Some(InterpProfile{pack_ms:times[0],run_ms:times[1],out_ms:times[2],padded_size:(pw,ph)});
+                log::debug!("neoarc-rife-rgb-profile: input={}x{} host_upload_bytes={} host_read_bytes={} host_fp16_bytes=0 pack_ms={:.3} run_ms={:.3} out_ms={:.3} capture_gpu_resident=false output_gpu_resident=false",w,h,wu*hu*stride*2,rgb.len(),times[0],times[1],times[2]);
+                return Ok((w,h,rgb));
+            }
+        }
+        let frame_count = frames.len();
+        let timestep_channel = frame_count * 3;
+        let plane = pw.checked_mul(ph).ok_or_else(|| anyhow!("NeoArc plane overflow"))?;
+        let pack_started = Instant::now();
+        let input = if self.neoarc_pair_reuse {
+            prepare_len_f16(&mut self.neoarc_pair_input, channels * plane);
+            if !self.neoarc_pair_packed {
+                fill_padded_rgb_planes_f16(&mut self.neoarc_pair_input, frames, frame_count,
+                    wu, hu, pw, ph, plane, stride);
+                self.neoarc_pair_packed = true;
+            }
+            self.neoarc_pair_input.as_mut_slice()
+        } else {
+            prepare_len_f16(&mut self.scratch_f16, channels * plane);
+            let input = self.scratch_f16.as_mut_slice();
+            fill_padded_rgb_planes_f16(input, frames, frame_count, wu, hu, pw, ph, plane, stride);
+            input
+        };
+        input[timestep_channel * plane..(timestep_channel + 1) * plane].fill(f16::from_f32(t.clamp(0.0, 1.0)));
+        if channels == 14 { input[13 * plane..14 * plane].fill(f16::ONE); }
+        let pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+        let precision_before=self.neoarc_session.as_ref().unwrap().precision_for_shape(wu,hu);
+        let run_started = Instant::now();
+        let mut run_ms = 0.0;
+        let mut out_ms = 0.0;
+        let mut rgb8 = self.neoarc_session.as_mut()
+            .ok_or_else(|| anyhow!("NeoArc session unavailable"))?
+            .run_with_output(pw, ph, input, |output| {
+                run_ms = run_started.elapsed().as_secs_f64() * 1000.0;
+                let out_started = Instant::now();
+                let result = nchw_rgb_f16_to_rgb8(output, pw, ph, wu, hu, "NeoArc RIFE");
+                out_ms = out_started.elapsed().as_secs_f64() * 1000.0;
+                result
+            })?;
+        if channels==7 {
+            let validation_started=Instant::now();
+            self.neoarc_session.as_mut().unwrap().prepare_rife_rgb(wu,hu,input,frames,stride);
+            if precision_before!="f32"&&self.neoarc_session.as_ref().unwrap().precision_for_shape(wu,hu)=="f32" {
+                // A rejected optimization must not return its old FP16 frame after
+                // selecting a safer per-shape precision. Recompute the real phase.
+                rgb8=self.neoarc_session.as_mut().unwrap().run_with_output(pw,ph,input,|output|nchw_rgb_f16_to_rgb8(output,pw,ph,wu,hu,"NeoArc RIFE f32 recovery"))?;
+            }
+            run_ms+=validation_started.elapsed().as_secs_f64()*1000.0;
+            // Keep the validated legacy pair cache when falling back. The GPU
+            // fast path invalidates it only after actually processing a frame.
+        }
+        self.last_interp_profile = Some(InterpProfile {
+            pack_ms, run_ms, out_ms,
+            padded_size: (pw, ph),
+        });
+        Ok((w, h, rgb8))
+    }
+
+    fn rife_neoarc_many_rgba8(
+        &mut self, w: i32, h: i32, frames: &[&[u8]], ts: &[f32],
+    ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        anyhow::ensure!(frames.len() == 2 && !ts.is_empty() && ts.len() <= 4,
+            "NeoArc async phases require two RGBA frames and at most four outputs");
+        let (wu, hu) = (usize::try_from(w)?, usize::try_from(h)?);
+        let (pw, ph) = (wu, hu);
+        let plane = pw.checked_mul(ph).ok_or_else(|| anyhow!("NeoArc plane overflow"))?;
+        let pack_started = Instant::now();
+        prepare_len_f16(&mut self.scratch_f16, 7 * plane);
+        let input = self.scratch_f16.as_mut_slice();
+        fill_padded_rgb_planes_f16(input, frames, 2, wu, hu, pw, ph, plane, 4);
+        let pack_ms = pack_started.elapsed().as_secs_f64() * 1000.0;
+        let run_started = Instant::now();
+        let mut out_ms = 0.0;
+        let results = self.neoarc_session.as_mut()
+            .ok_or_else(|| anyhow!("NeoArc session unavailable"))?
+            .run_many_async_with_output(pw, ph, input, ts, |output| {
+                let out_started = Instant::now();
+                let rgb8 = nchw_rgb_f16_to_rgb8(output, pw, ph, wu, hu, "NeoArc RIFE")?;
+                out_ms += out_started.elapsed().as_secs_f64() * 1000.0;
+                Ok((w, h, rgb8))
+            })?;
+        let run_ms = (run_started.elapsed().as_secs_f64() * 1000.0 - out_ms).max(0.0);
+        self.last_interp_profile = Some(InterpProfile {
+            pack_ms, run_ms, out_ms,
+            padded_size: (pw, ph),
+        });
+        Ok(results)
     }
 
     fn rife_multi_strided(
+        &mut self, w: i32, h: i32, frames: &[&[u8]], channels: usize,
+        t: f32, stride: usize, reuse_same_pair_planes: bool,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        let native = self.fp16 && channels == 7 && self.supports_arc_dml_cpu_stream()
+            && !self.dml_rife_native_rejected.contains(&(w, h));
+        let result = self.rife_multi_strided_once(w, h, frames, channels, t, stride,
+            reuse_same_pair_planes, native);
+        if let Err(error) = &result
+            && native && !onnx_cancel_requested() {
+            log::warn!("directml-rife-native-shape: model={} size={}x{} result=rejected reason={error:#} retry=legacy-padding", self.name, w, h);
+            self.dml_rife_native_rejected.insert((w, h));
+            self.reset_interp_pack_cache();
+            return self.rife_multi_strided_once(w, h, frames, channels, t, stride, false, false);
+        }
+        result
+    }
+
+    fn rife_multi_strided_once(
         &mut self,
         w: i32,
         h: i32,
@@ -8648,14 +11899,33 @@ impl OnnxStage {
         channels: usize,
         t: f32,
         stride: usize,
+        reuse_same_pair_planes: bool,
+        native_geometry: bool,
     ) -> Result<(i32, i32, Vec<u8>)> {
+        // The runtime validates previously unstable shapes before accepting
+        // their first output. Runtime failure explicitly retires NeoArc below.
+        if self.neoarc_session.is_some() {
+            match self.rife_neoarc_strided(w, h, frames, channels, t, stride) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!("neoarc-runtime-fallback: model={} reason={error:#} action=DirectML", self.name);
+                    self.neoarc_session = None;
+                    self.provider_desc = "DirectML (NeoARC fallback)".into();
+                    self.fallback_reason = Some(format!("NeoArc runtime failed: {error:#}"));
+                    self.reset_interp_pack_cache();
+                }
+            }
+        }
         let nf = frames.len();
         anyhow::ensure!(stride >= 3, "frame stride too small");
         anyhow::ensure!(channels >= 3 * nf + 1, "model wants more frames");
         let (w, h) = (w as usize, h as usize);
         anyhow::ensure!(w > 0 && h > 0, "empty frame");
-        let pw = w.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE;
-        let ph = h.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE;
+        let (pw, ph) = if native_geometry { (w, h) } else {
+            (w.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE,
+             h.div_ceil(RIFE_PAD_MULTIPLE) * RIFE_PAD_MULTIPLE)
+        };
+        self.ensure_dml_rife_shape(i32::try_from(pw)?, i32::try_from(ph)?)?;
         let pn = pw * ph;
         use rayon::prelude::*;
         let aux = 3 * nf;
@@ -8663,6 +11933,11 @@ impl OnnxStage {
         let pack_t0 = Instant::now();
         let const_key = (pw, ph, channels, aux);
         let frame_key = (w, h, pw, ph, stride);
+        if self.pack_frame_key != Some(frame_key) {
+            log::info!("rife-geometry: model={} provider={} image={}x{} tensor={}x{} padding_pixels={} native_arc_dml={}",
+                self.name, self.metrics_provider_label(), w, h, pw, ph,
+                pw * ph - w * h, native_geometry);
+        }
         let const_ok = self.pack_const_key == Some(const_key);
         let t_ok = const_ok && self.pack_t_cached == Some(t.clamp(0.0, 1.0));
         // v655 correctness guard for explicit cross-GPU compute. The historical
@@ -8692,7 +11967,9 @@ impl OnnxStage {
         let (outputs, pack_ms, run_ms) = if self.fp16 {
             prepare_len_f16(&mut self.scratch_f16, pn * channels);
             let x = self.scratch_f16.as_mut_slice();
-            if reuse_prev {
+            if reuse_same_pair_planes {
+                // Image planes were packed by the preceding phase of this call.
+            } else if reuse_prev {
                 x.copy_within(3 * pn..6 * pn, 0);
                 fill_padded_rgb_frame_f16(x, frames[1], 3, w, h, pw, ph, pn, stride);
             } else {
@@ -8722,6 +11999,34 @@ impl OnnxStage {
             }
             let tin = TensorRef::from_array_view((shape, &*x)).map_err(oerr)?;
             let pack_ms = pack_t0.elapsed().as_secs_f64() * 1000.0;
+            if channels==7 && self.provider==OnnxProvider::DirectML
+                && self.neoarc_session.is_none()
+                && std::env::var("CHIDESCALER_DML_HOST_OUTPUT_REUSE").ok().as_deref()==Some("on") {
+                let run_t0=Instant::now();
+                if self.dml_host_interp_binding.as_ref().is_none_or(|(size,_)|*size!=(pw,ph)) {
+                    let mut binding=self.session.create_binding().map_err(oerr)?;
+                    let output=Tensor::from_array(([1usize,3,ph,pw],vec![f16::ZERO;3*pn])).map_err(oerr)?;
+                    binding.bind_output(self.out_name.as_str(),output).map_err(oerr)?;
+                    self.dml_host_interp_binding=Some(((pw,ph),binding));
+                }
+                let (_,binding)=self.dml_host_interp_binding.as_mut().unwrap();
+                binding.bind_input(self.in_name.as_str(),&tin).map_err(oerr)?;
+                let result=(||->Result<_>{
+                    let outputs=self.session.run_binding_with_options(binding,self.run_options.armed()?).map_err(oerr)?;
+                    binding.synchronize_outputs().map_err(oerr)?;
+                    let run_ms=run_t0.elapsed().as_secs_f64()*1000.0;
+                    let out_started=Instant::now();
+                    let output=outputs.get(self.out_name.as_str()).ok_or_else(||anyhow!("missing reused DirectML output"))?;
+                    let rgb=interp_output_to_rgb8(output,w,h,"reused DirectML output")?;
+                    Ok((rgb,run_ms,out_started.elapsed().as_secs_f64()*1000.0))
+                })();
+                binding.clear_inputs();
+                let(rgb,run_ms,out_ms)=result?;
+                self.last_interp_profile=Some(InterpProfile{pack_ms,run_ms,out_ms,padded_size:(pw,ph)});
+                self.pack_const_key=Some(const_key);self.pack_t_cached=Some(t.clamp(0.0,1.0));
+                self.pack_frame_key=Some(frame_key);self.pack_second_ptr=frames.get(1).map(|frame|frame.as_ptr()as usize);
+                return Ok((w as i32,h as i32,rgb));
+            }
             let run_t0 = Instant::now();
             let outputs = self
                 .session
@@ -8735,7 +12040,9 @@ impl OnnxStage {
         } else {
             prepare_len_f32(&mut self.scratch_f32, pn * channels);
             let x = self.scratch_f32.as_mut_slice();
-            if reuse_prev {
+            if reuse_same_pair_planes {
+                // Image planes were packed by the preceding phase of this call.
+            } else if reuse_prev {
                 x.copy_within(3 * pn..6 * pn, 0);
                 fill_padded_rgb_frame_f32(x, frames[1], 3, w, h, pw, ph, pn, stride);
             } else {
@@ -8814,6 +12121,30 @@ impl OnnxStage {
         t: f32,
         stride: usize,
     ) -> Result<(i32, i32, Vec<u8>)> {
+        self.drba_strided_cached(w,h,frames,t,stride,false)
+    }
+
+    fn drba_strided_cached(
+        &mut self,
+        w: i32,
+        h: i32,
+        frames: &[&[u8]],
+        t: f32,
+        stride: usize,
+        reuse_planes: bool,
+    ) -> Result<(i32, i32, Vec<u8>)> {
+        if self.neoarc_session.is_some() {
+            match self.rife_neoarc_strided(w, h, frames, 14, t, stride) {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    log::warn!("neoarc-runtime-fallback: model={} reason={error:#} action=DirectML", self.name);
+                    self.neoarc_session = None;
+                    self.provider_desc = "DirectML (NeoARC fallback)".into();
+                    self.fallback_reason = Some(format!("NeoArc DRBA runtime failed: {error:#}"));
+                    self.reset_interp_pack_cache();
+                }
+            }
+        }
         anyhow::ensure!(stride >= 3, "frame stride too small");
         let (w, h) = (w as usize, h as usize);
         anyhow::ensure!(w > 0 && h > 0, "empty frame");
@@ -8826,7 +12157,7 @@ impl OnnxStage {
         let (outputs, pack_ms, run_ms) = if self.fp16 {
             prepare_len_f16(&mut self.scratch_f16, pn * channels);
             let x = self.scratch_f16.as_mut_slice();
-            fill_padded_rgb_planes_f16(x, frames, 4, w, h, pw, ph, pn, stride);
+            if !reuse_planes{fill_padded_rgb_planes_f16(x, frames, 4, w, h, pw, ph, pn, stride);}
             x[12 * pn..13 * pn].fill(f16::from_f32(t.clamp(0.0, 1.0)));
             x[13 * pn..14 * pn].fill(f16::from_f32(1.0)); // scale placeholder
             let tin = TensorRef::from_array_view((shape, &*x)).map_err(oerr)?;
@@ -8844,7 +12175,7 @@ impl OnnxStage {
         } else {
             prepare_len_f32(&mut self.scratch_f32, pn * channels);
             let x = self.scratch_f32.as_mut_slice();
-            fill_padded_rgb_planes_f32(x, frames, 4, w, h, pw, ph, pn, stride);
+            if !reuse_planes{fill_padded_rgb_planes_f32(x, frames, 4, w, h, pw, ph, pn, stride);}
             x[12 * pn..13 * pn].fill(t.clamp(0.0, 1.0));
             x[13 * pn..14 * pn].fill(1.0); // scale placeholder
             let tin = TensorRef::from_array_view((shape, &*x)).map_err(oerr)?;
@@ -9005,18 +12336,28 @@ fn fill_padded_rgb_frame_f32(
     stride: usize,
 ) {
     use rayon::prelude::*;
-    x[base * pn..(base + 3) * pn]
-        .par_chunks_mut(pn)
-        .enumerate()
-        .for_each(|(c, plane)| {
-            for y in 0..ph {
-                let sy = y.min(h - 1);
-                for x in 0..pw {
-                    let sx = x.min(w - 1);
-                    plane[y * pw + x] = src[(sy * w + sx) * stride + c] as f32 * (1.0 / 255.0);
+    // A row stays inside one channel. Parallel tiles expose more than three
+    // tasks at HD sizes and keep edge replication outside the pixel loop.
+    let tile = pw * 32;
+    x[base * pn..(base + 3) * pn].par_chunks_mut(pn).enumerate().for_each(|(c, plane)| {
+        plane.par_chunks_mut(tile).enumerate().for_each(|(block, rows)| {
+            for (r, row) in rows.chunks_exact_mut(pw).enumerate() {
+                let y = (block * 32 + r).min(h - 1);
+                let source = &src[y*w*stride..(y+1)*w*stride];
+                let (pixels, edge) = row.split_at_mut(w);
+                if stride == 4 {
+                    for (dst, rgba) in pixels.iter_mut().zip(source.chunks_exact(4)) {
+                        *dst = f32::from(rgba[c]) * (1.0 / 255.0);
+                    }
+                } else {
+                    for (dst, pixel) in pixels.iter_mut().zip(source.chunks_exact(stride)) {
+                        *dst = f32::from(pixel[c]) * (1.0 / 255.0);
+                    }
                 }
+                edge.fill(pixels[w-1]);
             }
         });
+    });
 }
 
 /// u8 -> f16 unorm conversion table: f16::from_f32 per pixel is a software
@@ -9031,6 +12372,42 @@ fn u8_to_f16_lut() -> &'static [f16; 256] {
         }
         t
     })
+}
+
+/// Pack one RGB or RGBA row into all three NCHW planes while the source row is hot
+/// in cache. The previous three-plane loop scanned the same RGBA input three
+/// times and exposed only three tasks to Rayon at any resolution.
+fn pack_rgbx_nchw_f16(src: &[u8], w: usize, h: usize, stride: usize, dst: &mut [f16]) {
+    use rayon::prelude::*;
+    let n = w * h;
+    debug_assert!(stride >= 3 && src.len() >= n * stride && dst.len() >= n * 3);
+    let (red, rest) = dst.split_at_mut(n);
+    let (green, blue) = rest.split_at_mut(n);
+    let lut = u8_to_f16_lut();
+    if n < 64 * 1024 {
+        for (i, pixel) in src[..n * stride].chunks_exact(stride).enumerate() {
+            red[i] = lut[pixel[0] as usize];
+            green[i] = lut[pixel[1] as usize];
+            blue[i] = lut[pixel[2] as usize];
+        }
+        return;
+    }
+    // Group rows so a 256-pixel frame creates tens of Rayon jobs rather
+    // than hundreds; each worker still writes disjoint channel ranges.
+    let chunk_pixels = w * 16;
+    red.par_chunks_mut(chunk_pixels)
+        .zip(green.par_chunks_mut(chunk_pixels))
+        .zip(blue.par_chunks_mut(chunk_pixels))
+        .enumerate()
+        .for_each(|(chunk, ((red, green), blue))| {
+            let start = chunk * chunk_pixels * stride;
+            let pixels = &src[start..start + red.len() * stride];
+            for (i, pixel) in pixels.chunks_exact(stride).enumerate() {
+                red[i] = lut[pixel[0] as usize];
+                green[i] = lut[pixel[1] as usize];
+                blue[i] = lut[pixel[2] as usize];
+            }
+        });
 }
 
 fn f16_unorm_to_u8_lut() -> &'static [u8; 65536] {
@@ -9074,20 +12451,29 @@ fn fill_padded_rgb_frame_f16(
 ) {
     use rayon::prelude::*;
     let lut = u8_to_f16_lut();
-    // Parallelize over rows of all three planes. Three-way plane-only
-    // parallelism left most CPU cores idle at 1080p.
-    x[base * pn..(base + 3) * pn]
-        .par_chunks_mut(pw)
+    debug_assert_eq!(pn, pw * ph);
+    // Read each source row once for all channels, including repeated edge
+    // rows used by RIFE padding. Three separate channel scans waste memory
+    // bandwidth on the CPU-visible DirectML fallback path.
+    let planes = &mut x[base * pn..(base + 3) * pn];
+    let (red, rest) = planes.split_at_mut(pn);
+    let (green, blue) = rest.split_at_mut(pn);
+    red.par_chunks_mut(pw)
+        .zip(green.par_chunks_mut(pw))
+        .zip(blue.par_chunks_mut(pw))
         .enumerate()
-        .for_each(|(i, row)| {
-            let c = i / ph;
-            let sy = (i % ph).min(h - 1);
+        .for_each(|(y, ((red, green), blue))| {
+            let sy = y.min(h - 1);
             let src_row = &src[sy * w * stride..(sy * w + w) * stride];
-            for (dst, px) in row[..w].iter_mut().zip(src_row.chunks_exact(stride)) {
-                *dst = lut[px[c] as usize];
+            for (i, px) in src_row.chunks_exact(stride).enumerate() {
+                red[i] = lut[px[0] as usize];
+                green[i] = lut[px[1] as usize];
+                blue[i] = lut[px[2] as usize];
             }
-            let last = row[w - 1];
-            row[w..].fill(last);
+            let (last_r, last_g, last_b) = (red[w - 1], green[w - 1], blue[w - 1]);
+            red[w..].fill(last_r);
+            green[w..].fill(last_g);
+            blue[w..].fill(last_b);
         });
 }
 
@@ -9210,6 +12596,20 @@ fn nchw_rgb_f16_to_rgb8(
     anyhow::ensure!(v.len() >= 3 * on, "{label} output buffer too short");
     let mut rgb8 = vec![0u8; want_w * want_h * 3];
     let lut = f16_unorm_to_u8_lut();
+    if want_w <= ow && want_h <= oh {
+        rgb8.par_chunks_mut(3 * want_w)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let src = y * ow;
+                for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                    let i = src + x;
+                    px[0] = lut[v[i].to_bits() as usize];
+                    px[1] = lut[v[on + i].to_bits() as usize];
+                    px[2] = lut[v[2 * on + i].to_bits() as usize];
+                }
+            });
+        return Ok(rgb8);
+    }
     rgb8.par_chunks_mut(3 * 8192)
         .enumerate()
         .for_each(|(blk, out)| {
@@ -10242,6 +13642,49 @@ fn oerr<E: std::fmt::Display>(e: E) -> anyhow::Error {
     anyhow!("{e}")
 }
 
+/// v937: standard base64 (RFC 4648, '=' padding, whitespace ignored) for graphs embedded in model metadata.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in text.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        acc = (acc << 6) | value(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod v937_base64_tests {
+    #[test]
+    fn decodes_padded_and_unpadded() {
+        assert_eq!(super::decode_base64("TmVv").unwrap(), b"Neo");
+        assert_eq!(super::decode_base64("TmVvUklGRQ==").unwrap(), b"NeoRIFE");
+        assert_eq!(super::decode_base64("TmVvUklGRTI=").unwrap(), b"NeoRIFE2");
+        assert!(super::decode_base64("Tm!v").is_none());
+    }
+}
+
 fn out_dims(dims: &[i64]) -> Result<(usize, usize)> {
     anyhow::ensure!(
         dims.len() == 4 && dims[1] == 3,
@@ -10252,6 +13695,55 @@ fn out_dims(dims: &[i64]) -> Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn padded_rife_fp16_pack_matches_original_channel_scan() {
+        use super::*;
+        for (w, h, pw, ph, stride, base) in [(3, 2, 8, 4, 3, 0), (17, 7, 32, 16, 4, 3)] {
+            let pn = pw * ph;
+            let src: Vec<u8> = (0..w * h * stride)
+                .map(|i| ((i * 97 + 13) % 256) as u8)
+                .collect();
+            let mut actual = vec![f16::ZERO; (base + 3) * pn];
+            fill_padded_rgb_frame_f16(&mut actual, &src, base, w, h, pw, ph, pn, stride);
+            assert!(actual[..base * pn].iter().all(|v| *v == f16::ZERO));
+            let lut = u8_to_f16_lut();
+            for c in 0..3 {
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let sy = y.min(h - 1);
+                        let sx = x.min(w - 1);
+                        assert_eq!(
+                            actual[(base + c) * pn + y * pw + x],
+                            lut[src[(sy * w + sx) * stride + c] as usize]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgbx_nchw_pack_matches_original_channel_scan() {
+        use super::*;
+        for (w, h, stride) in [(1, 1, 3), (7, 3, 4), (1920, 2, 3), (1024, 128, 4)] {
+            let n = w * h;
+            let rgba: Vec<u8> = (0..n * stride)
+                .map(|i| ((i * 73 + 251) % 256) as u8)
+                .collect();
+            let mut actual = vec![f16::ZERO; n * 3];
+            pack_rgbx_nchw_f16(&rgba, w, h, stride, &mut actual);
+            let lut = u8_to_f16_lut();
+            for channel in 0..3 {
+                for i in 0..n {
+                    assert_eq!(
+                        actual[channel * n + i],
+                        lut[rgba[stride * i + channel] as usize]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn temporalfix_cumsum_workaround_is_scoped_to_temporalfix_models() {
         assert!(super::tensorrt_temporalfix_cumsum_workaround(
@@ -10483,6 +13975,17 @@ mod tests {
     }
 
     #[test]
+    fn high_factor_slots_grow_only_above_legacy_x5() {
+        assert_eq!(OnnxStage::interp_slot_count(2), 3);
+        assert_eq!(OnnxStage::interp_slot_count(3), 5);
+        assert_eq!(OnnxStage::interp_slot_count(4), 6);
+        assert_eq!(OnnxStage::interp_slot_count(5), 7);
+        for factor in 6..=15 {
+            assert!(OnnxStage::interp_slot_count(factor) >= factor);
+        }
+    }
+
+    #[test]
     fn temporal_gpu_history_matches_cpu_front_padding_and_ring_order() {
         assert_eq!(temporal_history_slot_order(5, 1, 1), vec![0, 0, 0, 0, 0]);
         assert_eq!(temporal_history_slot_order(5, 2, 2), vec![0, 0, 0, 0, 1]);
@@ -10546,4 +14049,273 @@ mod temporalfix_shape_metadata_tests {
             assert!(append_onnx_graph_metadata(invalid, &[1]).is_err());
         }
     }
+}
+
+impl OnnxStage {
+    fn retire_neoarc_interp_gl(&mut self,gc:&mut GlContext) {
+        if let Some(mut bridge)=self.neoarc_interp_gl.take() {
+            gc.finish();let keys:Vec<_>=bridge.outputs.iter().map(|(key,_)|key.clone()).collect();
+            // CL imports of these buffers are freed when the bridge IO is parked
+            // or dropped below; the GL names are deleted only after that.
+            let buffers=std::mem::take(&mut bridge.input_buffers);
+            if let Some(program)=bridge.endpoint_program.take(){unsafe{use glow::HasContext;gc.gl.delete_program(program);}}
+            if let Some(session)=self.neoarc_session.as_ref(){session.park_gl_interp(bridge.padded.0 as usize,bridge.padded.1 as usize,bridge.context.0,bridge.context.1,bridge.io);}
+            else{drop(bridge);}
+            for key in keys{gc.remove_persistent_texture(&key);}
+            for buffer in buffers{unsafe{use glow::HasContext;gc.gl.delete_buffer(buffer);}}
+        }
+    }
+    fn prepare_neoarc_interp_gl(&mut self,gc:&mut GlContext,frames:&[GpuTex],phases:&[f32],capacity:usize)->Result<u64> {
+        use windows::Win32::Graphics::OpenGL::{wglGetCurrentContext,wglGetCurrentDC};
+        let required=self.interp_frames();let channels=if required==4{14}else{7};
+        let frames=&frames[frames.len().checked_sub(required).ok_or_else(||anyhow!("NeoArc frame history incomplete"))?..];
+        let size=(frames[0].w(),frames[0].h());
+        anyhow::ensure!(frames.iter().all(|t|(t.w(),t.h())==size),"NeoArc frame geometry differs");
+        let padded=if required==4{((size.0+63)/64*64,(size.1+63)/64*64)}else{size};
+        let context=(unsafe{wglGetCurrentContext()}.0 as isize,unsafe{wglGetCurrentDC()}.0 as isize);
+        let count=capacity.saturating_sub(1).max(phases.len());
+        let want_boost = channels == 7 && capacity >= 3 && directml_rife_boost_setting().load(Ordering::Relaxed)
+            && std::env::var("CHIDESCALER_NEOARC_RIFE_BOOST").ok().as_deref() != Some("off");
+        if self.neoarc_interp_gl.as_ref().is_some_and(|b|b.size!=size||b.context!=context || (want_boost && !b.boost_attempted)) {
+            self.retire_neoarc_interp_gl(gc);
+        }
+        if self.neoarc_interp_gl.is_none() {
+            // v963: RIFE boost graphs from the original ONNX (model IO precision kept).
+            let boost_graphs=if want_boost {
+                let built=(||->Result<(Vec<u8>,Vec<u8>,bool)>{
+                    let bytes=std::fs::read(&self.source_path)?;let fp16=rife_dml_split::input_is_half(&bytes)?;
+                    let (trunk, head) = rife_dml_split::split(&bytes,i64::from(padded.1),i64::from(padded.0),fp16)?;
+                    // v983: plain Lite final stage -> NeoArc may run the head as one kernel.
+                    let native=rife_dml_split::native_head_compatible(&bytes,fp16);
+                    if fp16 { Ok((trunk, head, native)) }
+                    else { Ok((rife_dml_split::half_bridge(&trunk, false)?, rife_dml_split::half_bridge(&head, true)?, native)) }
+                })();
+                match built{Ok(v)=>Some(v),Err(error)=>{log::warn!("neoarc-rife-boost-fallback: model={} reason={error:#} stage=split action=original-gpu-graph",self.name);None}}
+            }else{None};
+            let session=self.neoarc_session.as_mut().ok_or_else(||anyhow!("NeoArc session missing"))?;
+            match boost_graphs{
+                Some((trunk,head,native))=>if let Err(error)=session.set_rife_boost_graphs(padded.0 as usize,padded.1 as usize,&trunk,&head,native){
+                    session.clear_rife_boost();log::warn!("neoarc-rife-boost-fallback: reason={error:#} stage=write action=original-gpu-graph");},
+                None=>session.clear_rife_boost(),
+            }
+            let mut outputs=Vec::new();let id=DIRECT_OUTPUT_KEY.fetch_add(1,Ordering::Relaxed);
+            for index in 0..count {
+                let key=format!("neoarc-interp-{id}-{index}");
+                let tex=gc.persistent_texture(&key,padded.0,padded.1,1,4,super::gl::Dtype::U8,false,glow::CLAMP_TO_EDGE,&[]);
+                outputs.push((key,tex));
+            }
+            // One-time canonical validation only. Steady-state input/output never maps pixels.
+            let n=padded.0 as usize*padded.1 as usize;let mut packed=vec![f16::ONE;channels*n];
+            for(index,frame)in frames.iter().enumerate() {
+                let pixels=gc.download_rgb8(*frame);
+                for channel in 0..3 {for y in 0..padded.1 as usize{for x in 0..padded.0 as usize {
+                    let src=(y.min(size.1 as usize-1)*size.0 as usize+x.min(size.0 as usize-1))*3+channel;
+                    packed[(index*3+channel)*n+y*padded.0 as usize+x]=f16::from_f32(pixels[src]as f32*(1.0/255.0));
+                }}}
+            }
+            gc.finish();let ids:Vec<_>=frames.iter().map(|t|t.tex.0.get()).collect();
+            let io=session.create_gl_interp(padded.0 as usize,padded.1 as usize,context.0,context.1,&packed,&ids,outputs[0].1.tex.0.get());
+            let io=match io {Ok(io)=>io,Err(error)=>{for(key,_)in outputs{gc.remove_persistent_texture(&key);}return Err(error)}};
+            self.neoarc_interp_gl=Some(NeoArcInterpGl{io,boost_attempted:want_boost,capacity,size,padded,context,frames:ids,phases:phases.to_vec(),outputs,input_buffers:Vec::new(),buffer_input_failed:false,endpoint_program:None,endpoint_compute_failed:false});
+        }
+        let bridge=self.neoarc_interp_gl.as_mut().unwrap();
+        // Growing phase capacity does not invalidate compiled tensors or the
+        // completed phase-repeat validation. Old slots keep their ownership.
+        // Fractional cadence can request 3 then 2 then 3 phases while the
+        // user's capacity stays x3. Keep those bounded slots warm; repeatedly
+        // destroying/re-importing the third GL/CL surface caused avoidable
+        // allocation/synchronization pressure. Explicit capacity reductions
+        // still release excess surfaces.
+        if bridge.outputs.len()>count&&capacity<bridge.capacity {
+            for(key,_)in bridge.outputs.drain(count..){gc.remove_persistent_texture(&key);}
+        }
+        bridge.capacity=capacity;
+        if bridge.outputs.len()<count {
+            let id=DIRECT_OUTPUT_KEY.fetch_add(1,Ordering::Relaxed);
+            for index in bridge.outputs.len()..count {
+                let key=format!("neoarc-interp-{id}-{index}");
+                let tex=gc.persistent_texture(&key,padded.0,padded.1,1,4,super::gl::Dtype::U8,false,glow::CLAMP_TO_EDGE,&[]);
+                bridge.outputs.push((key,tex));
+            }
+        }
+        bridge.frames=frames.iter().map(|t|t.tex.0.get()).collect();bridge.phases=phases.to_vec();
+        // A prepare call owns one immutable source pair/window. Never reuse
+        // image planes across prepares, texture IDs, source frames or resizes.
+        let output_ids:Vec<_>=bridge.outputs.iter().take(phases.len()).map(|(_,t)|(t.tex.0.get(),t.allocation_id)).collect();
+        let input_ids:Vec<_>=frames.iter().map(|t|(t.tex.0.get(),t.allocation_id)).collect();
+        // v963: boost choice fixed per pair (x2.5 and up, every pair alike).
+        let boost=want_boost;
+        bridge.io.set_boost(boost);DML_RIFE_SPLIT_PAIR.store(boost&&bridge.io.has_boost(),Ordering::Relaxed);
+        // v985: copy the two endpoints into GL pixel buffers (GPU copy, ordered
+        // before the fence below) and let OpenCL read those buffers.
+        let buffered=channels==7&&!bridge.buffer_input_failed&&bridge.io.supports_buffer_input()
+            &&std::env::var("CHIDESCALER_NEOARC_GL_INPUT").ok().as_deref().map(str::trim)!=Some("image")
+            &&match neoarc_copy_endpoints_to_buffers(gc,bridge,frames){
+                Ok(())=>true,
+                Err(error)=>{bridge.buffer_input_failed=true;log::warn!("neoarc-gl-buffer-input-disabled: stage=copy reason={error:#} action=gl-image-input");false}
+            };
+        let prepared=if buffered{
+            let names:Vec<u32>=bridge.input_buffers.iter().map(|b|b.0.get()).collect();
+            match bridge.io.prepare_pair_buffers(&names,&output_ids){
+                Ok(())=>Ok(()),
+                Err(error)=>{bridge.buffer_input_failed=true;log::warn!("neoarc-gl-buffer-input-disabled: stage=import reason={error:#} action=gl-image-input");bridge.io.prepare_pair(&input_ids,&output_ids)}
+            }
+        }else{bridge.io.prepare_pair(&input_ids,&output_ids)};
+        prepared?;
+        gc.submit_commands_fence().map_err(anyhow::Error::msg)
+    }
+}
+
+
+/// v985: GPU copy of the two RIFE endpoint textures into persistent GL pixel
+/// buffers as RGBA FP16 (exact values of RGBA16F sources; RGBA8 sources become
+/// half(k/255), which the CL quantization maps back to k). Commands are only
+/// queued; the caller's fence orders them before the OpenCL acquire.
+fn neoarc_copy_endpoints_to_buffers(gc:&mut GlContext,bridge:&mut NeoArcInterpGl,frames:&[GpuTex])->Result<()>{
+    use glow::HasContext;
+    anyhow::ensure!(frames.len()==2,"NeoArc buffer input needs two endpoints");
+    let bytes=bridge.size.0 as usize*bridge.size.1 as usize*8;
+    anyhow::ensure!(frames.iter().all(|t|(t.w(),t.h())==bridge.size),"NeoArc buffer input geometry differs");
+    let gl=gc.gl.clone();
+    unsafe{
+        while bridge.input_buffers.len()<2{
+            let buffer=gl.create_buffer().map_err(|e|anyhow!("create GL input buffer: {e}"))?;
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER,Some(buffer));
+            gl.buffer_data_size(glow::PIXEL_PACK_BUFFER,i32::try_from(bytes)?,glow::STREAM_COPY);
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER,None);
+            bridge.input_buffers.push(buffer);
+        }
+        // Drop stale error flags from unrelated earlier GL work.
+        for _ in 0..8{if gl.get_error()==glow::NO_ERROR{break;}}
+        // v992: write the endpoints with a compute shader (texelFetch ->
+        // packHalf2x16) instead of glGetTexImage into a pixel-pack buffer. The
+        // pack path took ~9 ms to complete on Arc (the driver's external
+        // readback of a GL texture); a compute pass reads it like any shader.
+        // Same RGBA FP16 bytes per pixel. Falls back to the pack path.
+        let use_compute=!bridge.endpoint_compute_failed
+            &&std::env::var("CHIDESCALER_NEOARC_ENDPOINT_COPY").ok().as_deref()!=Some("pack");
+        let program=if use_compute{
+            if bridge.endpoint_program.is_none(){
+                match neoarc_endpoint_compute_program(&gl){
+                    Ok(program)=>bridge.endpoint_program=Some(program),
+                    Err(error)=>{bridge.endpoint_compute_failed=true;log::warn!("neoarc-endpoint-compute-disabled: reason={error:#} action=pixel-pack-copy");}
+                }
+            }
+            bridge.endpoint_program
+        }else{None};
+        if let Some(program)=program{
+            gl.use_program(Some(program));
+            let size=gl.get_uniform_location(program,"u_size");let src=gl.get_uniform_location(program,"u_src");
+            gl.uniform_2_i32(size.as_ref(),bridge.size.0,bridge.size.1);gl.uniform_1_i32(src.as_ref(),0);
+            gl.active_texture(glow::TEXTURE0);
+            for(frame,buffer)in frames.iter().zip(bridge.input_buffers.iter()){
+                gl.bind_texture(glow::TEXTURE_2D,Some(frame.tex));
+                gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,0,Some(*buffer));
+                gl.dispatch_compute((bridge.size.0 as u32).div_ceil(16),(bridge.size.1 as u32).div_ceil(16),1);
+            }
+            gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER,0,None);
+            gl.bind_texture(glow::TEXTURE_2D,None);
+            gl.use_program(None);
+        }else{
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT,4);
+            for(frame,buffer)in frames.iter().zip(bridge.input_buffers.iter()){
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER,Some(*buffer));
+                gl.bind_texture(glow::TEXTURE_2D,Some(frame.tex));
+                gl.get_tex_image(glow::TEXTURE_2D,0,glow::RGBA,glow::HALF_FLOAT,glow::PixelPackData::BufferOffset(0));
+            }
+            gl.bind_texture(glow::TEXTURE_2D,None);
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER,None);
+        }
+        let error=gl.get_error();
+        anyhow::ensure!(error==glow::NO_ERROR,"GL endpoint copy error 0x{error:04x}");
+    }
+    Ok(())
+}
+
+/// v992: compute program that stores one RGBA texture as packed FP16 RGBA
+/// (two uints per pixel, little-endian r,g then b,a) into SSBO binding 0.
+fn neoarc_endpoint_compute_program(gl:&glow::Context)->Result<glow::Program>{
+    use glow::HasContext;
+    const SOURCE:&str="#version 430\nlayout(local_size_x=16,local_size_y=16) in;\nuniform sampler2D u_src;\nuniform ivec2 u_size;\nlayout(std430,binding=0) writeonly buffer Endpoint{uvec2 px[];};\nvoid main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(p.x>=u_size.x||p.y>=u_size.y)return;vec4 v=texelFetch(u_src,p,0);px[p.y*u_size.x+p.x]=uvec2(packHalf2x16(v.rg),packHalf2x16(v.ba));}\n";
+    unsafe{
+        let shader=gl.create_shader(glow::COMPUTE_SHADER).map_err(|e|anyhow!("create compute shader: {e}"))?;
+        gl.shader_source(shader,SOURCE);gl.compile_shader(shader);
+        if !gl.get_shader_compile_status(shader){let log=gl.get_shader_info_log(shader);gl.delete_shader(shader);anyhow::bail!("compile endpoint compute: {log}");}
+        let program=gl.create_program().map_err(|e|anyhow!("create compute program: {e}"))?;
+        gl.attach_shader(program,shader);gl.link_program(program);gl.detach_shader(program,shader);gl.delete_shader(shader);
+        if !gl.get_program_link_status(program){let log=gl.get_program_info_log(program);gl.delete_program(program);anyhow::bail!("link endpoint compute: {log}");}
+        Ok(program)
+    }
+}
+
+fn current_thread_cpu_100ns()->Option<u64>{
+    use windows::Win32::{Foundation::FILETIME,System::Threading::{GetCurrentThread,GetThreadTimes}};
+    let(mut creation,mut exit,mut kernel,mut user)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());
+    unsafe{GetThreadTimes(GetCurrentThread(),&mut creation,&mut exit,&mut kernel,&mut user).ok()?;}
+    let ticks=|v:FILETIME|((v.dwHighDateTime as u64)<<32)|v.dwLowDateTime as u64;Some(ticks(kernel).saturating_add(ticks(user)))
+}
+#[derive(Default)]
+struct GpuInterpDiagnostics{key:Option<(&'static str,(i32,i32),(i32,i32))>,rows:Vec<[f64;4]>}
+impl GpuInterpDiagnostics{
+ fn record(&mut self,model:&str,backend:&'static str,input:(i32,i32),tensor:(i32,i32),row:[f64;4]){
+  if !row.iter().all(|v|v.is_finite()&&*v>=0.){return;}
+  let key=(backend,input,tensor);if self.key!=Some(key){self.key=Some(key);self.rows.clear();}
+  self.rows.push(row);if self.rows.len()<120{return;}
+  let q=|col:usize,p:f64|gpu_interp_quantile(&self.rows,col,p);
+  log::info!("interp-gpu-stage-window: model={} backend={} input={}x{} tensor={}x{} samples={} pack_p50_ms={:.3} pack_p95_ms={:.3} infer_p50_ms={:.3} infer_p95_ms={:.3} infer_max_ms={:.3} output_p50_ms={:.3} output_p95_ms={:.3} slot_wall_p50_ms={:.3} slot_wall_p95_ms={:.3} slot_wall_max_ms={:.3} slots_over_20ms={} timing=completed-host-wall-not-pure-gpu pack_includes_owner_input=true slot_wall_excludes_owner_prepare=true display_statistics_unchanged=true",model,backend,input.0,input.1,tensor.0,tensor.1,self.rows.len(),q(0,0.5),q(0,0.95),q(1,0.5),q(1,0.95),q(1,1.),q(2,0.5),q(2,0.95),q(3,0.5),q(3,0.95),q(3,1.),self.rows.iter().filter(|r|r[3]>20.).count());
+  self.rows.clear();
+ }
+}
+fn gpu_interp_quantile(rows:&[[f64;4]],column:usize,p:f64)->f64{let mut values:Vec<_>=rows.iter().map(|r|r[column]).collect();values.sort_by(f64::total_cmp);let i=((values.len()-1)as f64*p).ceil()as usize;values[i]}
+#[cfg(test)]
+mod gpu_interp_diagnostic_tests{
+ use super::*;
+ #[test]fn quantiles_keep_real_tail(){let rows=[[0.,7.,0.,8.],[0.,8.,0.,9.],[0.,30.,0.,31.]];assert_eq!(gpu_interp_quantile(&rows,1,0.5),8.);assert_eq!(gpu_interp_quantile(&rows,1,0.95),30.);}
+ #[test]fn changing_shape_or_backend_does_not_mix_windows(){let mut d=GpuInterpDiagnostics::default();d.record("m","DirectML-WGL",(960,540),(1024,640),[1.;4]);d.record("m","DirectML-WGL",(1280,720),(1280,768),[2.;4]);assert_eq!(d.rows,vec![[2.;4]]);d.record("m","NeoARC",(1280,720),(1280,720),[3.;4]);assert_eq!(d.rows,vec![[3.;4]]);}
+}
+
+
+impl OnnxStage{
+ /// Headless diagnostic of the production detach/worker handshake. Deadlines
+ /// are simulated; this does not operate a player or claim monitor FPS.
+ pub fn diagnostic_paced_gpu_pair(&mut self,gc:&mut GlContext,frames:&[GpuTex],phases:&[f32],factor:usize,period:Duration,early:bool)->Result<(Vec<GpuTex>,Vec<[f64;4]>)>{
+  self.diagnostic_paced_gpu_pair_with_post(gc,frames,phases,factor,period,early,None,(frames[0].w(),frames[0].h()))
+ }
+ pub fn diagnostic_paced_gpu_pair_with_post(&mut self,gc:&mut GlContext,frames:&[GpuTex],phases:&[f32],factor:usize,period:Duration,early:bool,mut post:Option<&mut super::chain::FilterChain>,out_size:(i32,i32))->Result<(Vec<GpuTex>,Vec<[f64;4]>)>{
+  let fence=self.prepare_interp_gpu_textures_with_factor(gc,frames,phases,1,factor,true)?.ok_or_else(||anyhow!("GPU path unavailable"))?;
+  while !gc.poll_commands_fence(fence).map_err(anyhow::Error::msg)?{std::thread::yield_now();}
+  self.stage_neoarc_interp_inputs();
+  let finish_post_first=post.is_some()&&(std::env::var("CHIDESCALER_INTEL_INTERP_POST_READY").ok().as_deref()==Some("on")||(factor==3&&self.dml_wgl_interp_bridge.is_some()&&std::env::var("CHIDESCALER_DML_INTERP_POST_PRIORITY").ok().as_deref()!=Some("off")));
+  let slots=self.prepared_interp_gpu_outputs(phases.len(),false)?;let count=phases.len();let start=Instant::now();
+  let mut tracer=if std::env::var("CHIDESCALER_INTERP_GPU_TIMING_BENCH").ok().as_deref()==Some("on"){Some(super::interp_timing::AsyncInterpTiming::for_probe(gc.gl.clone()))}else{None};
+  std::thread::scope(|scope|->Result<_>{
+   let(ready_tx,ready_rx)=std::sync::mpsc::channel();let(permit_tx,permit_rx)=std::sync::mpsc::channel();
+   let worker=scope.spawn(move||->Result<()>{for index in 0..count{let(run_ms,_)=self.run_prepared_interp_gpu_slot(index)?;ready_tx.send((index,run_ms,start.elapsed().as_secs_f64()*1000.))?;if index+1<count{permit_rx.recv()?;}}Ok(())});
+   let result=(||->Result<_>{let mut images=Vec::new();let mut timings=Vec::new();for index in 0..count{
+    let(done,run_ms,ready_ms)=ready_rx.recv()?;anyhow::ensure!(done==index,"diagnostic slot order");let mut output=Self::finish_prepared_interp_gpu_output(gc,slots[index])?;
+    let deadline=start+period.mul_f64((index+1)as f64);
+    if !early{let prepare=deadline.checked_sub(Duration::from_micros(500)).unwrap_or(deadline);if let Some(wait)=prepare.checked_duration_since(Instant::now()){std::thread::sleep(wait);}}
+    let sample=tracer.as_mut().and_then(|tracer|{tracer.poll();tracer.begin(index as u64,0)});
+    if let Some(chain)=post.as_deref_mut(){output=chain.diagnostic_interp_gpu_suffix(gc,output,out_size)?;}
+    if let Some(id)=sample{tracer.as_mut().unwrap().end(id,true);}
+    unsafe{use glow::HasContext;gc.gl.flush();}
+    if early&&finish_post_first{gc.finish();}
+    if index+1<count{permit_tx.send(())?;}
+    gc.finish();let filtered_ready=start.elapsed().as_secs_f64()*1000.;
+    if let Some(wait)=deadline.checked_duration_since(Instant::now()){std::thread::sleep(wait);}
+    if let Some(id)=sample{tracer.as_mut().unwrap().observe_swap(id);tracer.as_mut().unwrap().poll();}
+    timings.push([run_ms,ready_ms,Instant::now().saturating_duration_since(deadline).as_secs_f64()*1000.,filtered_ready]);images.push(output);
+   }Ok((images,timings))})();drop(permit_tx);drop(ready_rx);
+   let work=worker.join().map_err(|_|anyhow!("diagnostic worker panic"))?;result.and_then(|r|work.map(|_|r))
+  })
+ }
+}
+
+impl OnnxStage{
+ pub fn diagnostic_interp_output_storage_ids(&self)->Vec<(u64,u32)>{
+  if let Some(bridge)=self.neoarc_interp_gl.as_ref(){return bridge.outputs.iter().map(|(_,t)|(t.allocation_id,t.tex.0.get())).collect();}
+  if let Some(bridge)=self.dml_wgl_interp_bridge.as_ref(){return bridge.slots.iter().map(|s|(s.key,0)).collect();}
+  Vec::new()
+ }
 }

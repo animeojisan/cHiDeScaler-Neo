@@ -16,8 +16,14 @@ pub struct StageStat {
 pub struct Snapshot {
     pub stage_order: Vec<String>,
     pub stages: HashMap<String, StageStat>,
+    /// Exact stage selected by the chain's ONNX/Flow interpolation contract.
+    pub interpolation_stage: Option<String>,
     pub total_ms: f64,
     pub present_fps: f64,
+    /// v956: presents per second that shared a display refresh with the next
+    /// present and therefore were never visible (already excluded from
+    /// present_fps).
+    pub present_hidden_fps: f64,
     pub capture_fps: f64,
     /// Timestamp-derived content cadence. Unlike capture_fps, this is not
     /// reduced merely because the render thread was busy.
@@ -38,12 +44,8 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn display_stages(&self) -> Vec<(String, StageStat)> {
         let mut rows = Vec::new();
-        let interp_summary_name = self.stage_order.iter().find_map(|name| {
-            self.stages
-                .get(name)
-                .filter(|st| is_frame_interpolation_summary(name, st))
-                .map(|_| name.clone())
-        });
+        let interp_summary_name = self.interpolation_stage.as_ref()
+            .filter(|name| self.stages.contains_key(*name)).cloned();
         let mut interp_row: Option<(usize, String, StageStat)> = None;
         for name in &self.stage_order {
             let Some(st) = self.stages.get(name) else {
@@ -51,9 +53,11 @@ impl Snapshot {
             };
             let is_interp_summary = interp_summary_name.as_deref() == Some(name.as_str());
             if is_interp_summary || is_frame_interpolation_detail(name) {
-                let label = interp_summary_name
-                    .clone()
-                    .unwrap_or_else(|| "Frame interpolation".to_string());
+                // Internal interpolation probes must not create a second
+                // visible ONNX row while the model summary is unavailable.
+                let Some(label) = interp_summary_name.clone() else {
+                    continue;
+                };
                 let stat = StageStat {
                     kind: st.kind.clone(),
                     ms: st.ms,
@@ -99,18 +103,6 @@ impl Snapshot {
     }
 }
 
-fn is_frame_interpolation_summary(name: &str, _st: &StageStat) -> bool {
-    let lower = name.split(" [").next().unwrap_or(name).to_ascii_lowercase();
-    lower == "neoflow"
-        || (lower.ends_with(".onnx")
-            && (lower.contains("rife")
-                || lower.contains("drba")
-                || lower.contains("interp")
-                || lower.contains("interpolation")
-                || lower.contains("dain")
-                || lower.contains("ifrnet")))
-}
-
 fn is_frame_interpolation_detail(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("frame interpolation")
@@ -130,6 +122,7 @@ struct Inner {
     configured_stage_order: Vec<String>,
     snap: Snapshot,
     presents: u32,
+    hidden_presents: u32,
     captures: u32,
     window_start: Option<std::time::Instant>,
     frame_stage_max_ms: f64,
@@ -177,10 +170,9 @@ impl Metrics {
         }
         g.configured_stage_order = configured.clone();
 
-        g.snap.stages.retain(|name, stat| {
+        g.snap.stages.retain(|name, _stat| {
             configured.iter().any(|current| current == name)
                 || is_frame_interpolation_detail(name)
-                || is_frame_interpolation_summary(name, stat)
         });
         let mut stage_order = configured;
         for name in g.snap.stage_order.clone() {
@@ -192,6 +184,11 @@ impl Metrics {
             }
         }
         g.snap.stage_order = stage_order;
+    }
+
+    pub fn set_interpolation_stage(&self, name: Option<String>) {
+        let mut g = self.inner.lock().unwrap();
+        g.snap.interpolation_stage = name;
     }
 
     pub fn set_enabled(&self, on: bool) {
@@ -423,7 +420,10 @@ impl Metrics {
             Some(t0) => {
                 let dt = now.duration_since(t0).as_secs_f64();
                 if dt >= 1.0 {
-                    g.snap.present_fps = g.presents as f64 / dt;
+                    let hidden = g.hidden_presents.min(g.presents);
+                    g.snap.present_fps = (g.presents - hidden) as f64 / dt;
+                    g.snap.present_hidden_fps = hidden as f64 / dt;
+                    g.hidden_presents = 0;
                     g.snap.capture_fps = g.captures as f64 / dt;
                     g.presents = 0;
                     g.captures = 0;
@@ -449,7 +449,10 @@ impl Metrics {
             Some(t0) => {
                 let dt = now.duration_since(t0).as_secs_f64();
                 if dt >= 1.0 {
-                    g.snap.present_fps = g.presents as f64 / dt;
+                    let hidden = g.hidden_presents.min(g.presents);
+                    g.snap.present_fps = (g.presents - hidden) as f64 / dt;
+                    g.snap.present_hidden_fps = hidden as f64 / dt;
+                    g.hidden_presents = 0;
                     g.snap.capture_fps = g.captures as f64 / dt;
                     g.presents = 0;
                     g.captures = 0;
@@ -457,6 +460,13 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    /// v956: a present that landed in the same display refresh as the
+    /// previous one. Only one of them can be seen, so it is a dropped frame.
+    pub fn present_hidden(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.hidden_presents = g.hidden_presents.saturating_add(1);
     }
 
     pub fn set_note(&self, note: String) {
@@ -642,6 +652,7 @@ mod tests {
     fn display_stages_preserves_directml_provider_suffix() {
         let metrics = Metrics::default();
         metrics.set_enabled(true);
+        metrics.set_interpolation_stage(Some("rife_v4.22_lite_fp16.onnx [DirectML]".to_string()));
 
         metrics.probe("rife_v4.22_lite_fp16.onnx [DirectML]", "onnx", 5.5);
         metrics.probe("Frame interpolation run", "onnx", 5.0);
@@ -656,6 +667,7 @@ mod tests {
     fn display_stages_preserves_neoamd_interpolation_provider_and_gpu_time() {
         let metrics = Metrics::default();
         metrics.set_enabled(true);
+        metrics.set_interpolation_stage(Some("rife_v4.22_lite_fp16.onnx [NeoAMD]".to_string()));
 
         metrics.probe("Frame interpolation", "cpu", 0.9);
         metrics.probe("Frame interpolation run", "onnx", 10.4);
@@ -669,9 +681,24 @@ mod tests {
     }
 
     #[test]
+    fn display_stages_collapse_arbitrarily_named_onnx_interpolation_detail() {
+        let metrics = Metrics::default();
+        metrics.set_enabled(true);
+        metrics.set_interpolation_stage(Some("custom_123.onnx [NeoAMD]".to_string()));
+        metrics.probe("custom_123.onnx [NeoAMD]", "onnx", 8.0);
+        metrics.probe("Frame interpolation", "onnx", 4.5);
+
+        let rows = metrics.snapshot().display_stages();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "custom_123.onnx [NeoAMD]");
+        assert!((rows[0].1.ms - 8.0).abs() < 0.001);
+    }
+
+    #[test]
     fn display_stages_collapse_frame_interpolation_details_to_one_row() {
         let metrics = Metrics::default();
         metrics.set_enabled(true);
+        metrics.set_interpolation_stage(Some("rife_v4.25_lite.onnx [TensorRT]".to_string()));
 
         metrics.probe("interp RGBA->RGB", "cpu", 1.0);
         metrics.probe("Frame interpolation pack", "cpu", 2.0);

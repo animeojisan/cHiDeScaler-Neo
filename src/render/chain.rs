@@ -12,6 +12,7 @@ use super::slangp::SlangStage;
 use super::{vulkan_multipass, vulkan_onepass};
 use crate::core::config::{OnnxBackendPreference, StageKind, StageSpec, resolve_path};
 use anyhow::{Context, Result, anyhow};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
@@ -103,6 +104,7 @@ pub enum Stage {
         // mutex on every render tick serialized GL presentation behind the
         // DirectML RIFE worker and also delayed live chain edits.
         is_interp: bool,
+        metric_label: RefCell<String>,
     },
     /// One externally supplied Libretro Slang preset. Its internal passes are
     /// deliberately kept behind one chain stage/UI item.
@@ -168,16 +170,16 @@ impl Stage {
 
     pub fn metrics_name(&self) -> String {
         match self {
-            Stage::Onnx { name, stage, .. } => {
-                let provider = match stage.lock().unwrap().provider {
-                    OnnxProvider::TensorRT => "TensorRT",
-                    OnnxProvider::DirectML => "DirectML",
-                    OnnxProvider::MigraphX => "MIGraphX",
-                    OnnxProvider::Cuda => "CUDA",
-                    OnnxProvider::NeoAMD => "NeoAMD",
-                    OnnxProvider::NeoRTX => "NeoRTX",
-                };
-                format!("{name} [{provider}]")
+            Stage::Onnx { name, stage, metric_label, .. } => {
+                // Metadata must never wait for a worker's GPU inference.
+                // Refresh when idle so provider fallback labels still update.
+                if let Ok(guard) = stage.try_lock() {
+                    let updated = format!("{name} [{}]", guard.metrics_provider_label());
+                    if *metric_label.borrow() != updated {
+                        *metric_label.borrow_mut() = updated;
+                    }
+                }
+                metric_label.borrow().clone()
             }
             _ => self.name().to_string(),
         }
@@ -191,6 +193,9 @@ struct OnnxCacheKey {
     dml_adapter: Option<i32>,
     trt_device: Option<i32>,
     neo_accel: bool,
+    /// v942: NeoRTX reads the interpolation boost when a session is created,
+    /// so ON and OFF are distinct sessions (toggling back is a cache hit).
+    interp_boost: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,7 +215,7 @@ pub struct StageFactory {
     trt_device_id: Option<i32>,
     trt_cache_root: PathBuf,
     shaders: HashMap<String, Rc<UserShader>>,
-    onnx: HashMap<OnnxCacheKey, (Arc<Mutex<OnnxStage>>, bool)>,
+    onnx: HashMap<OnnxCacheKey, (Arc<Mutex<OnnxStage>>, bool, bool)>,
     onnx_lru: VecDeque<OnnxCacheKey>,
     // Exact cache keys belonging to the most recently constructed active
     // filter chain.  This lets Stop preserve the just-used chain first, then
@@ -309,12 +314,7 @@ impl StageFactory {
             .count();
         let carried_neoamd = onnx
             .keys()
-            .filter(|key| {
-                matches!(
-                    key.preference,
-                    OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
-                )
-            })
+            .filter(|key| matches!(key.preference, OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX))
             .count();
         if carried_tensorrt > 0 || carried_neoamd > 0 {
             log::info!(
@@ -455,14 +455,36 @@ impl StageFactory {
                     preference: self.onnx_preference,
                     dml_adapter: self.gpu_adapter,
                     trt_device: self.trt_device_id,
+                    // v963: NeoArc builds its boost graphs with the GPU bridge, so
+                    // a toggle needs a fresh session exactly like NeoRTX.
+                    // v977: NeoAMD reads NEOAMD_RIFE_PHASE_SHARE at session creation too.
+                    interp_boost: matches!(
+                        self.onnx_preference,
+                        OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoArc | OnnxBackendPreference::NeoAMD
+                    )
+                        && std::env::var("NEORTX_RIFE_PHASE_SHARE").is_ok_and(|v| v == "1"),
                     neo_accel: super::onnx_accel::neoaccel_enabled()
                         && super::onnx_accel::analyze_local_image_model(&path)
                             .ok()
                             .flatten()
                             .is_some(),
                 };
+                // A model can leave NeoArc after a runtime/shape failure, not
+                // only while loading. Do not resurrect that inactive DirectML
+                // fallback through the new NeoArc MRU cache. Active fallback
+                // sessions retain their established live-edit behaviour.
+                if self.onnx_preference == OnnxBackendPreference::NeoArc
+                    && !self.last_active_onnx.contains(&cache_key)
+                    && self.onnx.get(&cache_key).is_some_and(|(stage, _, _)| {
+                        stage.try_lock().map(|stage| stage.metrics_provider_label() != "NeoARC")
+                            .unwrap_or(true)
+                    })
+                {
+                    self.onnx.remove(&cache_key);
+                    log::info!("neoarc-session-cache-rebuild: model={} reason=inactive-fallback-or-busy policy=fresh-session", name);
+                }
                 let (stage, is_interp) = match self.onnx.get(&cache_key) {
-                    Some((s, is_interp)) => {
+                    Some((s, is_interp, _is_neoarc)) => {
                         log::info!(
                             "onnx-session-cache-hit: model={} backend={:?} policy=warm-restart",
                             name,
@@ -479,12 +501,13 @@ impl StageFactory {
                             &self.trt_cache_root,
                             &self.base_dir,
                         )?));
-                        let (is_interp, provider, fallback_reason) = {
+                        let (is_interp, provider, fallback_reason, is_neoarc) = {
                             let stage = s.lock().unwrap();
                             (
                                 stage.interp != super::onnx_stage::InterpKind::None,
                                 stage.provider_desc.clone(),
                                 stage.fallback_reason.clone(),
+                                stage.metrics_provider_label() == "NeoARC",
                             )
                         };
                         log::info!(
@@ -494,16 +517,20 @@ impl StageFactory {
                             is_interp,
                             fallback_reason
                         );
-                        self.onnx.insert(cache_key.clone(), (s.clone(), is_interp));
+                        self.onnx.insert(cache_key.clone(), (s.clone(), is_interp, is_neoarc));
                         (s, is_interp)
                     }
                 };
                 self.touch_onnx_cache_key(&cache_key);
+                let metric_label = RefCell::new(format!(
+                    "{name} [{}]", stage.lock().unwrap().metrics_provider_label()
+                ));
                 Ok(Stage::Onnx {
                     name,
                     key,
                     stage,
                     is_interp,
+                    metric_label,
                 })
             }
         }
@@ -532,7 +559,7 @@ impl StageFactory {
             if let Some((key, _)) = self
                 .onnx
                 .iter()
-                .find(|(_key, (cached_stage, _))| Arc::ptr_eq(cached_stage, active_stage))
+                .find(|(_key, (cached_stage, _, _))| Arc::ptr_eq(cached_stage, active_stage))
             {
                 active.insert(key.clone());
             }
@@ -561,21 +588,27 @@ impl StageFactory {
         // Pin the complete active chain, then use any remaining bounded budget
         // for older MRU sessions. This keeps a five-model chain fully warm on
         // Stop -> Start while still preventing unbounded preset/model growth.
-        if !matches!(
+        let neoarc_cache = self.onnx_preference == OnnxBackendPreference::NeoArc
+            && std::env::var("CHIDESCALER_NEOARC_SESSION_CACHE").ok().as_deref() != Some("off")
+            && super::neoarc_backend::warm_gl_budget();
+        if !neoarc_cache && !matches!(
             self.onnx_preference,
-            OnnxBackendPreference::TensorRT
-                | OnnxBackendPreference::NeoAMD
-                | OnnxBackendPreference::NeoRTX
+            OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
         ) {
             self.onnx.retain(|key, _| active.contains(key));
         } else {
             let mut keep = active.clone();
-            let target = OPTIONAL_BACKEND_SESSION_CACHE_LIMIT.max(keep.len());
+            // NeoArc keeps model/provider sessions only after the old
+            // chain retires its GL bridge. Existing validation/history resets
+            // still run on every reactivation. Never retain a DML fallback.
+            let target = if neoarc_cache { 5 } else { OPTIONAL_BACKEND_SESSION_CACHE_LIMIT }.max(keep.len());
             for key in self.onnx_lru.iter().rev() {
                 if keep.len() >= target {
                     break;
                 }
-                if key.preference == self.onnx_preference && self.onnx.contains_key(key) {
+                let eligible = self.onnx.get(key).is_some_and(|(_, _, is_neoarc)|
+                    !neoarc_cache || *is_neoarc);
+                if key.preference == self.onnx_preference && eligible {
                     keep.insert(key.clone());
                 }
             }
@@ -588,13 +621,14 @@ impl StageFactory {
                     self.onnx_preference,
                     self.onnx.len(),
                     dropped,
-                    OPTIONAL_BACKEND_SESSION_CACHE_LIMIT
+                    target
                 );
             }
         }
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
     }
 
     fn evict_onnx_path(&mut self, path: &str) -> usize {
@@ -602,7 +636,8 @@ impl StageFactory {
         self.onnx.retain(|key, _| key.path != path);
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
@@ -618,7 +653,7 @@ impl StageFactory {
     /// HxW never turns into an implicit per-resolution engine/session build.
     pub fn drop_geometry_sensitive_onnx_sessions(&mut self) -> usize {
         let before = self.onnx.len();
-        self.onnx.retain(|_key, (stage, _)| {
+        self.onnx.retain(|_key, (stage, _, _)| {
             let provider = stage
                 .lock()
                 .unwrap_or_else(|poisoned| {
@@ -632,7 +667,8 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         before.saturating_sub(self.onnx.len())
     }
 
@@ -642,7 +678,7 @@ impl StageFactory {
     /// a fresh ORT/DML provider after the old worker and bridges are retired.
     pub fn drop_directml_sessions(&mut self) -> usize {
         let before = self.onnx.len();
-        self.onnx.retain(|_key, (stage, _)| {
+        self.onnx.retain(|_key, (stage, _, _)| {
             let provider = stage
                 .lock()
                 .unwrap_or_else(|poisoned| {
@@ -656,7 +692,8 @@ impl StageFactory {
         });
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         let dropped = before.saturating_sub(self.onnx.len());
         if dropped > 0 {
             log::info!(
@@ -691,9 +728,7 @@ impl StageFactory {
             }
             if matches!(
                 key.preference,
-                OnnxBackendPreference::TensorRT
-                    | OnnxBackendPreference::NeoAMD
-                    | OnnxBackendPreference::NeoRTX
+                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
             ) && self.onnx.contains_key(key)
             {
                 keep.insert(key.clone());
@@ -706,9 +741,7 @@ impl StageFactory {
             }
             if matches!(
                 key.preference,
-                OnnxBackendPreference::TensorRT
-                    | OnnxBackendPreference::NeoAMD
-                    | OnnxBackendPreference::NeoRTX
+                OnnxBackendPreference::TensorRT | OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
             ) && self.onnx.contains_key(key)
             {
                 keep.insert(key.clone());
@@ -717,7 +750,8 @@ impl StageFactory {
         self.onnx.retain(|key, _| keep.contains(key));
         let remaining: HashSet<OnnxCacheKey> = self.onnx.keys().cloned().collect();
         self.onnx_lru.retain(|key| remaining.contains(key));
-        self.last_active_onnx.retain(|key| remaining.contains(key));
+        self.last_active_onnx
+            .retain(|key| remaining.contains(key));
         let kept = self.onnx.len();
         if before != kept || kept > 0 {
             let kept_trt = self
@@ -728,12 +762,7 @@ impl StageFactory {
             let kept_neoamd = self
                 .onnx
                 .keys()
-                .filter(|key| {
-                    matches!(
-                        key.preference,
-                        OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
-                    )
-                })
+                .filter(|key| matches!(key.preference, OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX))
                 .count();
             log::info!(
                 "onnx-session-restart-cache: kept_tensorrt={} kept_neoamd={} dropped_other={} limit={} last_active={} policy=last-chain-first-then-lru",
@@ -985,6 +1014,14 @@ fn log_directml_temporal_height_limit(
 }
 
 impl FilterChain {
+    pub(crate) fn supports_dml_wgl_capture(&self)->bool{
+        let mut found=false;
+        for stage in &self.stages{match stage{
+            Stage::Onnx{stage,is_interp,..}=>{let mut stage=stage.lock().unwrap();let supported=if *is_interp{stage.supports_dml_wgl_interp()}else{stage.supports_dml_wgl_capture()};if !supported{return false;}found=true;},
+            Stage::Glsl{..}|Stage::Slangp{..}=>{},_=>return false,
+        }}found
+    }
+
     pub fn mvutensils_stage(&self) -> Option<(usize, &super::mvutensils_neo::Options)> {
         self.stages
             .iter()
@@ -1000,22 +1037,14 @@ impl FilterChain {
     /// path so they do not pay an extra queueing frame for no throughput gain.
     pub fn mvutensils_cpu_pipeline_beneficial(&self, index: usize) -> bool {
         let regular_onnx = |stage: Option<&Stage>| {
-            matches!(
-                stage,
-                Some(Stage::Onnx {
-                    is_interp: false,
-                    ..
-                })
-            )
+            matches!(stage, Some(Stage::Onnx { is_interp: false, .. }))
         };
         regular_onnx(index.checked_sub(1).and_then(|i| self.stages.get(i)))
             || regular_onnx(self.stages.get(index + 1))
     }
 
     pub fn store_mvutensils_cpu_boundary_copy(&mut self, w: i32, h: i32, rgba: &[u8]) {
-        let need = (w.max(0) as usize)
-            .saturating_mul(h.max(0) as usize)
-            .saturating_mul(4);
+        let need = (w.max(0) as usize).saturating_mul(h.max(0) as usize).saturating_mul(4);
         if rgba.len() != need {
             self.mvutensils_cpu_boundary_size = None;
             return;
@@ -1061,16 +1090,21 @@ impl FilterChain {
     /// session teardown. OpenGL must release its imported memory object before
     /// the owning DirectML allocation is dropped.
     pub fn prepare_gpu_transition(&mut self, gc: &mut GlContext) {
+        self.prepare_gpu_transition_except_interp(gc,None);
+    }
+    pub fn prepare_gpu_transition_except_interp(&mut self,gc:&mut GlContext,retained:Option<usize>) {
         gc.finish();
         for stage in &mut self.stages {
             if let Stage::Dlssnr { stage } = stage {
                 stage.reset();
             }
             if let Stage::Onnx { stage, .. } = stage {
+                if retained==Some(Arc::as_ptr(stage)as usize){continue;}
                 let mut stage = stage.lock().unwrap_or_else(|poisoned| {
                     log::error!("onnx-stage-lock-poisoned: action=recover-for-gpu-retirement");
                     poisoned.into_inner()
                 });
+                stage.retire_neoarc_gl();
                 stage.retire_tensorrt_gpu_bridge(gc);
                 stage.retire_tensorrt_temporal_gpu_bridge(gc);
                 stage.retire_dml_temporal_gpu_bridge(gc);
@@ -1131,9 +1165,7 @@ impl FilterChain {
                     if stage
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .provider
-                        .is_native_pack()
-                        == false =>
+                        .provider.is_native_pack() == false =>
                 {
                     Some((
                         index,
@@ -1189,12 +1221,14 @@ impl FilterChain {
         }
     }
 
-    pub fn reset_backend_runtime_state(&mut self) {
+    pub fn reset_backend_runtime_state(&mut self) {self.reset_backend_runtime_state_except_interp(None);}
+    pub fn reset_backend_runtime_state_except_interp(&mut self,retained:Option<usize>) {
         for stage in &mut self.stages {
             if let Stage::Dlssnr { stage } = stage {
                 stage.reset();
             }
             if let Stage::Onnx { stage, .. } = stage {
+                if retained==Some(Arc::as_ptr(stage)as usize){continue;}
                 stage.lock().unwrap().reset_backend_runtime_state();
             }
         }
@@ -1205,6 +1239,13 @@ impl FilterChain {
     /// per-stage metric label used by the ordinary in-chain GLSL path so post
     /// shaders participate in GPU timer statistics as well.
     pub fn post_shaders_with_metric_labels(&self) -> Vec<(String, Rc<UserShader>)> {
+        // Avoid acquiring ONNX provider locks merely to discover that there
+        // are no post shaders while the interpolation worker is inferring.
+        if !self.stages.iter().any(|stage| {
+            matches!(stage, Stage::Glsl { shader, .. } if shader.is_post)
+        }) {
+            return Vec::new();
+        }
         let metric_names = self
             .stages
             .iter()
@@ -1233,17 +1274,7 @@ impl FilterChain {
                 is_interp: true,
                 ..
             } => Some(InterpHandle::Onnx {
-                name: {
-                    let provider = match stage.lock().unwrap().provider {
-                        OnnxProvider::TensorRT => "TensorRT",
-                        OnnxProvider::DirectML => "DirectML",
-                        OnnxProvider::MigraphX => "MIGraphX",
-                        OnnxProvider::Cuda => "CUDA",
-                        OnnxProvider::NeoAMD => "NeoAMD",
-                        OnnxProvider::NeoRTX => "NeoRTX",
-                    };
-                    format!("{name} [{provider}]")
-                },
+                name: st.metrics_name(),
                 stage: stage.clone(),
             }),
             Stage::Flow {
@@ -1255,6 +1286,23 @@ impl FilterChain {
             }),
             _ => None,
         })
+    }
+
+    /// v994: true while the interpolation stage is a NeoArc session whose GL
+    /// bridge is not built yet. Never blocks (a busy stage reports false).
+    pub fn neoarc_interp_bridge_pending(&self) -> bool {
+        self.stages.iter().any(|st| match st {
+            Stage::Onnx { stage, is_interp: true, .. } => stage
+                .try_lock()
+                .map(|stage| stage.neoarc_interp_bridge_pending())
+                .unwrap_or(false),
+            _ => false,
+        })
+    }
+
+    pub fn interp_metric_name(&self) -> Option<String> {
+        self.stages.iter().find(|stage| stage.is_interp())
+            .map(Stage::metrics_name)
     }
 
     pub fn has_interp(&self) -> bool {
@@ -1557,6 +1605,22 @@ impl FilterChain {
         Ok(true)
     }
 
+    /// Only an identical, already-validated interpolation stage and exact
+    /// enabled input prefix can retain its compiled GL bridge across post edits.
+    pub fn retained_neoarc_interp_for_edit(&self,old_specs:&[StageSpec],next:&Self,next_specs:&[StageSpec])->Option<usize> {
+        let index=self.interp_index()?;
+        if next.interp_index()!=Some(index){return None;}
+        let old:Vec<_>=old_specs.iter().filter(|s|s.enabled).collect();
+        let new:Vec<_>=next_specs.iter().filter(|s|s.enabled).collect();
+        if old.len()!=self.stages.len()||new.len()!=next.stages.len()
+            ||old.get(..=index)!=new.get(..=index){return None;}
+        match(&self.stages[index],&next.stages[index]) {
+            (Stage::Onnx{stage:a,..},Stage::Onnx{stage:b,..})if Arc::ptr_eq(a,b)=>{
+                a.lock().ok()?.can_retain_neoarc_interp().then_some(Arc::as_ptr(a)as usize)
+            },_=>None
+        }
+    }
+
     pub fn interpolation_plan(&self) -> Option<(Vec<String>, String, Vec<String>)> {
         let index = self.interp_index()?;
         let pre = self.stages[..index]
@@ -1645,11 +1709,12 @@ impl FilterChain {
                 stage,
                 is_interp: false,
                 ..
-            }) => stage
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .provider
-                .is_native_pack(),
+            }) => {
+                stage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .provider.is_native_pack()
+            }
             _ => false,
         };
         if !first_is_neoamd {
@@ -1707,13 +1772,7 @@ impl FilterChain {
                 let has_mvutensils = self.mvutensils_stage().is_some();
                 let pre = if has_mvutensils {
                     self.process_range_with_frame_tick(
-                        gc,
-                        input,
-                        out_size,
-                        0,
-                        interp_index,
-                        None,
-                        false,
+                        gc, input, out_size, 0, interp_index, None, false,
                     )?
                 } else {
                     self.process_range(gc, input, out_size, 0, interp_index, None)?
@@ -1725,7 +1784,14 @@ impl FilterChain {
                         let frame_count = stage.interp_frames();
                         let frames =
                             std::iter::repeat_n(rgb.as_slice(), frame_count).collect::<Vec<_>>();
-                        let result = stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?;
+                        let result = if stage.supports_neoarc_interp_stream() && stage.supports_interp_gpu() {
+                            // Live GL bindings need real history and run their own canonical validation.
+                            // Exercise the downstream chain now without compiling the host-only RGB route.
+                            log::info!("neoarc-switch-warmup: defer interpolation to first live GL pair");
+                            (pre.w(), pre.h(), rgb.clone())
+                        } else {
+                            stage.process_interp(pre.w(), pre.h(), &frames, 0.5)?
+                        };
                         // NeoRTX live interpolation uses RGBA shared output and
                         // separate pair preparation/phase graphs. The RGB CPU
                         // probe above does not warm either of these resources.
@@ -1733,28 +1799,11 @@ impl FilterChain {
                             && stage.supports_neoamd_interp_shared_rgba8()
                         {
                             let rgba = gc.download_rgba8(pre);
-                            let live_frames = std::iter::repeat_n(rgba.as_slice(), frame_count)
-                                .collect::<Vec<_>>();
+                            let live_frames = std::iter::repeat_n(rgba.as_slice(), frame_count).collect::<Vec<_>>();
                             for pass in 1..=3 {
-                                if let Some(shared) = stage
-                                    .prepare_neoamd_interp_stream_shared_rgba8(
-                                        pre.w(),
-                                        pre.h(),
-                                        &live_frames,
-                                    )?
-                                {
-                                    stage.run_neoamd_interp_stream_phase_shared_rgba8(
-                                        pre.w(),
-                                        pre.h(),
-                                        frame_count,
-                                        0.5,
-                                        shared,
-                                    )?;
-                                    log::debug!(
-                                        "neortx-interp-live-prime: pass={pass} size={}x{} route=shared-rgba8",
-                                        pre.w(),
-                                        pre.h()
-                                    );
+                                if let Some(shared) = stage.prepare_neoamd_interp_stream_shared_rgba8(pre.w(), pre.h(), &live_frames)? {
+                                    stage.run_neoamd_interp_stream_phase_shared_rgba8(pre.w(), pre.h(), frame_count, 0.5, shared)?;
+                                    log::debug!("neortx-interp-live-prime: pass={pass} size={}x{} route=shared-rgba8",pre.w(),pre.h());
                                 }
                             }
                         }
@@ -2013,6 +2062,155 @@ impl FilterChain {
         }
     }
 
+    /// Arc presentation boundary for a leading ordinary DirectML image model.
+    /// This keeps the final RGBA8 on the selected GPU for a Vulkan presenter.
+    /// The ordinary GL chain remains the caller's fallback on None or error.
+    pub fn process_first_onnx_to_shared_rgba8(
+        &mut self,
+        width: i32,
+        height: i32,
+        rgba: &[u8],
+        out_size: (i32, i32),
+        requested_luid: u64,
+    ) -> Result<Option<(vulkan_multipass::MultiPassSharedRgbaResult, String, f64)>> {
+        if self.dml_vulkan_image_handoff_disabled || width <= 0 || height <= 0 {
+            return Ok(None);
+        }
+        if !matches!(self.stages.first(), Some(Stage::Onnx { is_interp: false, .. })) {
+            return Ok(None);
+        }
+        let mut shaders = Vec::new();
+        for stage in &self.stages[1..] {
+            let Stage::Glsl { shader, .. } = stage else {
+                return Ok(None);
+            };
+            if shader.is_post
+                || shader.display_hz
+                || shader.name() == "NeoDeint.glsl"
+                || !vulkan_multipass::production_shader_admitted(shader)
+            {
+                return Ok(None);
+            }
+            shaders.push(Rc::clone(shader));
+        }
+        let Stage::Onnx { name, stage, .. } = &self.stages[0] else {
+            return Ok(None);
+        };
+        let mut stage = stage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stage.provider != OnnxProvider::DirectML {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let processed = (|| -> Result<Option<vulkan_multipass::MultiPassSharedRgbaResult>> {
+            if shaders.len() < 2 {
+                let identity = dml_vulkan_identity_shader();
+                let shader = shaders.first().unwrap_or(&identity);
+                stage.process_rgba8_to_shared_rgba(width, height, rgba, shader, Some(out_size))
+            } else {
+                let shared = stage.process_rgba8_dml_shared_output(width, height, rgba)?;
+                match shared {
+                    Some((shared, _)) => {
+                        let refs = shaders.iter().map(|shader| shader.as_ref()).collect::<Vec<_>>();
+                        vulkan_multipass::process_d3d12_nchw_sequence_to_shared_rgba(
+                            u64::from_le_bytes(shared.luid),
+                            &refs,
+                            shared.size.0.max(1) as u32,
+                            shared.size.1.max(1) as u32,
+                            out_size.0.max(1) as u32,
+                            out_size.1.max(1) as u32,
+                            shared.key,
+                            shared.handle.0 as isize,
+                            shared.byte_len,
+                            shared.padded.0.max(1) as u32,
+                            shared.padded.1.max(1) as u32,
+                            shared.fp16,
+                        )
+                    }
+                    None => Ok(None),
+                }
+            }
+        })();
+        let output = match processed {
+            Ok(Some(output)) if output.luid == requested_luid => output,
+            Ok(None) => return Ok(None),
+            Ok(Some(output)) => {
+                log::warn!(
+                    "dml-vulkan-shared-presentation: adapter mismatch output={:016x} requested={requested_luid:016x}",
+                    output.luid
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                self.dml_vulkan_image_handoff_disabled = true;
+                log::warn!(
+                    "dml-vulkan-shared-presentation: fallback to GL chain after error: {error:#}"
+                );
+                return Ok(None);
+            }
+        };
+        Ok(Some((
+            output,
+            format!("{name} [DirectML]"),
+            started.elapsed().as_secs_f64() * 1000.0,
+        )))
+    }
+
+    /// Diagnostic reference for the multi-shader shared-RGBA output. It
+    /// repeats the deterministic input on the same ONNX session, then uses
+    /// the established Vulkan sequence-to-GL path for pixel comparison.
+    pub fn probe_first_onnx_sequence_gl_reference(
+        &mut self,
+        gc: &mut GlContext,
+        width: i32,
+        height: i32,
+        rgba: &[u8],
+        out_size: (i32, i32),
+        requested_luid: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.stages.len() < 3 {
+            return Ok(None);
+        }
+        let shaders = self.stages[1..]
+            .iter()
+            .filter_map(|stage| match stage {
+                Stage::Glsl { shader, .. } => Some(shader.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if shaders.len() != self.stages.len() - 1 {
+            return Ok(None);
+        }
+        let Some(Stage::Onnx { stage, is_interp: false, .. }) = self.stages.first() else {
+            return Ok(None);
+        };
+        let shared = stage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .process_rgba8_dml_shared_output(width, height, rgba)?;
+        let Some((shared, _)) = shared else {
+            return Ok(None);
+        };
+        if u64::from_le_bytes(shared.luid) != requested_luid {
+            return Ok(None);
+        }
+        let output = vulkan_multipass::process_d3d12_nchw_sequence_to_gl(
+            requested_luid,
+            &shaders,
+            shared.size.0.max(1) as u32,
+            shared.size.1.max(1) as u32,
+            out_size.0.max(1) as u32,
+            out_size.1.max(1) as u32,
+            shared.key,
+            shared.handle.0 as isize,
+            shared.byte_len,
+            shared.padded.0.max(1) as u32,
+            shared.padded.1.max(1) as u32,
+            shared.fp16,
+            gc,
+        )?;
+        Ok(output.map(|output| gc.download_rgba8(output.output)))
+    }
+
     /// v792/v056: run two or more consecutive NeoAMD image/temporal ONNX
     /// stages as one Backend-Pack-resident NCHW FP16 chain. Intermediate model
     /// outputs never become RGBA/OpenGL textures, removing the expensive
@@ -2135,6 +2333,7 @@ impl FilterChain {
         // Keep the owned CPU hand-off outside the mutable borrow of self.stages.
         // v840 stored it while `stage` was still borrowed from self, which made
         // the Windows release build fail with E0499.
+        let mut host_output_bytes = 0usize;
         let mut pending_mvutensils_boundary: Option<(i32, i32, Vec<u8>)> = None;
         let (tex, metrics_name) = {
             let Some(Stage::Onnx {
@@ -2147,19 +2346,11 @@ impl FilterChain {
                 return Ok(None);
             };
             let mut stage = stage.lock().unwrap();
-            let metrics_name = match stage.provider {
-                OnnxProvider::TensorRT => format!("{name} [TensorRT]"),
-                OnnxProvider::DirectML => format!("{name} [DirectML]"),
-                OnnxProvider::MigraphX => format!("{name} [MIGraphX]"),
-                OnnxProvider::Cuda => format!("{name} [CUDA]"),
-                OnnxProvider::NeoAMD => format!("{name} [NeoAMD]"),
-                OnnxProvider::NeoRTX => format!("{name} [NeoRTX]"),
-            };
+            stage.reset_image_profile();
             // Let the ordinary GPU chain own over-limit DirectML temporal input so
             // its Spline36 1080p safety cap is applied before this first stage.
             // Returning None only bypasses this specialized raw-RGBA fast path.
-            if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some()
-            {
+            if stage.is_directml_temporal_filter() && directml_temporal_limited_size(w, h).is_some() {
                 return Ok(None);
             }
             stage.prepare_tensorrt_input_shape(w, h);
@@ -2169,6 +2360,7 @@ impl FilterChain {
             // changes only TensorRT engine precision at session-build time.
             let tex = if next_is_mvutensils {
                 let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                host_output_bytes += out.len();
                 let texture = gc.upload_rgba8(ow, oh, &out);
                 pending_mvutensils_boundary = Some((ow, oh, out));
                 texture
@@ -2188,14 +2380,15 @@ impl FilterChain {
                         texture
                     } else {
                         let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                host_output_bytes += out.len();
                         gc.upload_rgba8(ow, oh, &out)
                     }
-                } else if let Some((_ow, _oh, texture)) =
-                    stage.process_rgba8_gpu_output(gc, w, h, rgba)
+                } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba)
                 {
                     texture
                 } else {
                     let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                host_output_bytes += out.len();
                     gc.upload_rgba8(ow, oh, &out)
                 }
             } else if stage.should_try_tensorrt_gpu_texture(w, h) {
@@ -2204,18 +2397,22 @@ impl FilterChain {
                     texture
                 } else {
                     let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                host_output_bytes += out.len();
                     gc.upload_rgba8(ow, oh, &out)
                 }
-            } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba)
-            {
+            } else if let Some((_ow, _oh, texture)) = stage.process_rgba8_gpu_output(gc, w, h, rgba) {
                 texture
             } else {
                 let (ow, oh, out) = stage.process_rgba8_native_output(w, h, rgba)?;
+                host_output_bytes += out.len();
                 gc.upload_rgba8(ow, oh, &out)
             };
             if stage.complete_tensorrt_input_shape(w, h) {
                 super::onnx_stage::mark_tensorrt_model_completed(&stage.name);
             }
+            stage.log_image_pipeline((w, h), rgba.len(), (tex.w(), tex.h()),
+                host_output_bytes, t0.elapsed().as_secs_f64() * 1000.0);
+            let metrics_name = format!("{name} [{}]", stage.metrics_provider_label());
             (tex, metrics_name)
         };
         if let Some((ow, oh, out)) = pending_mvutensils_boundary {
@@ -2368,6 +2565,19 @@ impl FilterChain {
         }
 
         Some((output, batch.end))
+    }
+
+    /// Safe suffix for preparing the normal renderer before its output clock.
+    /// Deferred OUTPUT/SCALED hooks retain their original after-resize order.
+    pub fn can_prepare_interp_gpu_post(&self,start:usize)->bool{
+        start<=self.stages.len()&&!(vulkan_multipass::production_requested()&&crate::render::vulkan_gpu::production_selected_luid().is_some())&&self.stages.iter().skip(start).all(|s|match s{Stage::Glsl{shader,..}=>!shader.display_hz,Stage::Slangp{..}=>true,_=>false})
+    }
+    /// Hidden diagnostic equivalent of normal chain, resize and OUTPUT hooks.
+    pub fn diagnostic_interp_gpu_suffix(&mut self,gc:&mut GlContext,input:GpuTex,out_size:(i32,i32))->Result<GpuTex>{
+        anyhow::ensure!(self.can_prepare_interp_gpu_post(0),"diagnostic post range not eligible");
+        let main=self.process_from(gc,input,out_size,0,None)?;let mut output=super::scaler::resample(gc,main,out_size.0,out_size.1,super::scaler::Kernel::Spline36)?;
+        for(_,shader)in self.post_shaders_with_metric_labels(){output=super::glsl_engine::GlslEngine::run_post_with_main(gc,&shader,main,output)?;}
+        Ok(output)
     }
 
     pub fn process_from(
@@ -2681,6 +2891,15 @@ impl FilterChain {
         advance_frame: bool,
     ) -> Result<GpuTex> {
         let mut cur = input;
+        // An empty suffix is common when RIFE is the last selected filter.
+        // Building labels for the whole chain here locks the RIFE session and
+        // serializes presentation with the worker's next inference.
+        if start_index >= end_index.min(self.stages.len()) {
+            if advance_frame {
+                crate::render::glsl_engine::advance_frame();
+            }
+            return Ok(input);
+        }
         // Use stable per-chain labels. Metrics previously used only the file
         // name as the key, so identical stages overwrote one another even
         // though every stage was actually executed.
@@ -3433,7 +3652,11 @@ impl FilterChain {
                         cur = crate::render::scaler::align_offset(gc, cur)
                             .context("failed to align pending mpv shader OFFSET before ONNX")?;
                     }
+                    let stage_started = std::time::Instant::now();
+                    let mut host_input_bytes = 0usize;
+                    let mut host_output_bytes = 0usize;
                     let mut stage = stage.lock().unwrap();
+                    stage.reset_image_profile();
                     if stage.is_directml_temporal_filter() {
                         if let Some((limited_w, limited_h)) =
                             directml_temporal_limited_size(cur.w(), cur.h())
@@ -3473,12 +3696,16 @@ impl FilterChain {
                         cur = texture;
                     } else {
                         let rgb = gc.download_rgb8(cur);
+                        host_input_bytes = rgb.len();
                         let (ow, oh, out) = stage.process(cur.w(), cur.h(), &rgb)?;
+                        host_output_bytes = out.len();
                         cur = gc.upload_rgb8(ow, oh, &out);
                     }
                     if stage.complete_tensorrt_input_shape(input_size.0, input_size.1) {
                         super::onnx_stage::mark_tensorrt_model_completed(&stage.name);
                     }
+                    stage.log_image_pipeline(input_size, host_input_bytes, (cur.w(), cur.h()),
+                        host_output_bytes, stage_started.elapsed().as_secs_f64() * 1000.0);
                 }
             }
             if let (Some(t0), Some(p)) = (t0, probe.as_deref_mut()) {

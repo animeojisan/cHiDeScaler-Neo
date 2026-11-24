@@ -295,6 +295,13 @@ impl OverlayWindow {
     /// pumping; feeding those unrelated costs back into the x5 phase clock was
     /// the source of the ~100 fps plateau on otherwise under-utilised GPUs.
     pub fn present_with_swap_timing(&self, gc: &mut GlContext, tex: GpuTex) -> Result<Duration> {
+        self.prepare_back_buffer(gc, tex)?;
+        self.swap_prepared_back_buffer()
+    }
+
+    /// Render once before the display deadline; no swap or message pumping.
+    pub fn prepare_back_buffer(&self, gc: &mut GlContext, tex: GpuTex) -> Result<()> {
+        content_diag_present(gc, tex);
         let prog = gc
             .program(PRESENT_FRAG)
             .map_err(|e| anyhow::anyhow!("present shader: {e}"))?;
@@ -353,6 +360,10 @@ impl OverlayWindow {
                 glow::NEAREST as i32,
             );
         }
+        Ok(())
+    }
+
+    pub fn swap_prepared_back_buffer(&self) -> Result<Duration> {
         let swap_started = Instant::now();
         self.win.swap_buffers();
         let swap_elapsed = swap_started.elapsed();
@@ -379,5 +390,153 @@ impl OverlayWindow {
             );
         }
         buf
+    }
+}
+
+/// v939 diagnostic only (no behaviour change): is the PRESENTED picture changing?
+/// At most once per second the texture about to be presented is reduced to 64x36 and
+/// read back (one small ReadPixels), hashed, and compared with the previous sample.
+/// When the hash stays identical for >= 1 s while presents keep running, the output is
+/// a frozen picture even though the presentation clock is alive (user report 2026-11-17:
+/// XS at 1080p showed the same image for ~10 s right after start). Logs:
+///   content-diag-present-static: static_ms presents   (warn, when a frozen run passes 1 s, then every 5 s)
+///   content-diag-present-static-end: static_ms        (info, when the picture changes again)
+/// `CHIDESCALER_CONTENT_DIAG=off` disables it.
+fn content_diag_present(gc: &mut GlContext, tex: GpuTex) {
+    use std::sync::Mutex;
+    struct St {
+        last_sample: Instant,
+        hash: u64,
+        same_since: Option<Instant>,
+        presents: u64,
+        presents_at_change: u64,
+        warned_ms: u128,
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ST: Mutex<Option<St>> = Mutex::new(None);
+    if !*ENABLED.get_or_init(|| std::env::var("CHIDESCALER_CONTENT_DIAG").ok().as_deref() != Some("off")) {
+        return;
+    }
+    if tex.w() < 64 || tex.h() < 36 {
+        return;
+    }
+    let Ok(mut guard) = ST.lock() else { return };
+    let now = Instant::now();
+    let st = guard.get_or_insert_with(|| St {
+        last_sample: now - Duration::from_secs(2),
+        hash: 0,
+        same_since: None,
+        presents: 0,
+        presents_at_change: 0,
+        warned_ms: 0,
+    });
+    st.presents += 1;
+    // a gap of > 3 s without presents = a new session: start over
+    if now.duration_since(st.last_sample) > Duration::from_secs(3) {
+        st.same_since = None;
+        st.hash = 0;
+        st.warned_ms = 0;
+        st.presents_at_change = st.presents;
+    }
+    if now.duration_since(st.last_sample) < Duration::from_millis(1000) {
+        return;
+    }
+    st.last_sample = now;
+    let Ok(small) = crate::render::scaler::resample(gc, tex, 64, 36, crate::render::scaler::Kernel::Bilinear) else {
+        return;
+    };
+    let px = gc.download_rgba8(small);
+    gc.recycle(small);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in px {
+        h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    if h == st.hash {
+        let since = *st.same_since.get_or_insert(now);
+        let ms = now.duration_since(since).as_millis() + 1000;
+        if ms >= 1000 && (st.warned_ms == 0 || ms >= st.warned_ms + 5000) {
+            st.warned_ms = ms;
+            log::warn!(
+                "content-diag-present-static: static_ms~{} presents_since_change={} size={}x{} (presentation alive, picture unchanged)",
+                ms,
+                st.presents - st.presents_at_change,
+                tex.w(),
+                tex.h()
+            );
+        }
+    } else {
+        if let Some(since) = st.same_since.take() {
+            log::info!(
+                "content-diag-present-static-end: static_ms~{} presents={}",
+                now.duration_since(since).as_millis() + 1000,
+                st.presents - st.presents_at_change
+            );
+        }
+        st.hash = h;
+        st.warned_ms = 0;
+        st.presents_at_change = st.presents;
+    }
+}
+
+#[cfg(test)]
+mod prepared_present_tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn chain_transition_gpu_snapshot_survives_source_retirement() {
+        let overlay = OverlayWindow::new(64, 64).unwrap();
+        let gl = Rc::new(unsafe { glow::Context::from_loader_function(|n| overlay.win.loader(n)) });
+        let mut gc = GlContext::new(gl);
+        for (w, h) in [(960, 540), (1280, 720), (1920, 1080)] {
+            let pixels: Vec<u8> = (0..w*h).flat_map(|i| [(i%251) as u8, ((i*3)%251) as u8, ((i*7)%251) as u8, (i%256) as u8]).collect();
+            let src = gc.upload_rgba8(w, h, &pixels);
+            let mut cpu_ms = Vec::new();
+            let mut gpu_ms = Vec::new();
+            for round in 0..12 {
+                let start = std::time::Instant::now();
+                let cpu = gc.download_rgba8(src);
+                let old = gc.upload_rgba8(w, h, &cpu);
+                gc.finish();
+                if round > 1 { cpu_ms.push(start.elapsed().as_secs_f64()*1000.0); }
+                assert_eq!(pixels, gc.download_rgba8(old));
+                gc.recycle(old);
+                let start = std::time::Instant::now();
+                let owned = gc.snapshot_transition_rgba8(src).unwrap();
+                if round > 1 { gpu_ms.push(start.elapsed().as_secs_f64()*1000.0); }
+                assert_eq!(pixels, gc.download_rgba8(owned));
+                gc.recycle(owned);
+                gc.trim_transient_pool(0);
+            }
+            let owned = gc.snapshot_transition_rgba8(src).unwrap();
+            gc.recycle(src);
+            gc.trim_transient_pool(0);
+            assert_eq!(pixels, gc.download_rgba8(owned));
+            gc.release_frame(&[owned]);
+            assert_eq!(pixels, gc.download_rgba8(owned));
+            cpu_ms.sort_by(f64::total_cmp); gpu_ms.sort_by(f64::total_cmp);
+            println!("transition-snapshot-bench: size={}x{} cpu_median_ms={:.3} gpu_median_ms={:.3} pixels=exact", w, h, cpu_ms[5], gpu_ms[5]);
+            gc.recycle(owned); gc.trim_transient_pool(0);
+            assert_eq!(gc.live_texture_count(), 0);
+        }
+    }
+
+    #[test]
+    fn prepared_back_buffer_matches_regular_draw_without_changing_texture() {
+        let overlay=OverlayWindow::new(128,96).unwrap();
+        let gl=Rc::new(unsafe{glow::Context::from_loader_function(|n|overlay.win.loader(n))});
+        let mut gc=GlContext::new(gl);
+        for (w,h) in [(128,96),(96,96),(64,32)] {
+            let pixels:Vec<u8>=(0..w*h).flat_map(|i|[(i%251)as u8,((i*3)%251)as u8,((i*7)%251)as u8,255]).collect();
+            let tex=gc.upload_rgba8(w,h,&pixels);
+            overlay.present(&mut gc,tex).unwrap();
+            overlay.prepare_back_buffer(&mut gc,tex).unwrap();gc.finish();
+            let expected=overlay.read_front_pixels(&gc);
+            overlay.swap_prepared_back_buffer().unwrap();
+            overlay.prepare_back_buffer(&mut gc,tex).unwrap();gc.finish();
+            assert_eq!(expected,overlay.read_front_pixels(&gc));
+            assert_eq!(pixels,gc.download_rgba8(tex));
+            assert!(expected.chunks_exact(4).any(|p|p[0]>0));
+        }
     }
 }

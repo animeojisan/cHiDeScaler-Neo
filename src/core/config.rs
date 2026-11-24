@@ -3,6 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Internal command code; persisted settings keep a backward-compatible integer.
+pub const INTERP_25_CODE:u32=25;
+pub fn normalize_interp_code(code:u32)->u32{if code==INTERP_25_CODE{code}else{code.clamp(2,15)}}
+pub fn interp_capacity(code:u32)->u32{if code==INTERP_25_CODE{3}else{code.clamp(2,15)}}
+pub fn interp_ratio(code:u32)->f64{if code==INTERP_25_CODE{2.5}else{code.clamp(2,15)as f64}}
+pub fn interp_label(code:u32)->String{if code==INTERP_25_CODE{"x2.5".into()}else{format!("x{}",code.clamp(2,15))}}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StageSpec {
     pub kind: StageKind,
@@ -208,6 +215,7 @@ pub enum OnnxBackendPreference {
     TensorRT,
     NeoAMD,
     NeoRTX,
+    NeoArc,
 }
 
 /// Legacy HDR-to-SDR profile values retained only for settings-file compatibility.
@@ -373,6 +381,11 @@ pub struct Settings {
     /// perceptual duplicate. Presentation cadence is preserved.
     #[serde(default)]
     pub duplicate_frame_reduction: bool,
+    /// v941 interpolation boost: NeoRTX computes the RIFE motion once per pair
+    /// (t = 0.5) and derives every intermediate phase from it. No extra model
+    /// files; NeoRTX only (other backends ignore it). Default OFF.
+    #[serde(default)]
+    pub interp_boost: bool,
     /// Detect severe sustained GLSL overload and allow Neo to stop capture
     /// after the existing warning grace. The responsiveness guard itself stays
     /// active even when this is OFF; only forced automatic Stop is disabled.
@@ -415,6 +428,8 @@ pub struct Settings {
     /// frame interpolation output multiplier (2 = double fps)
     #[serde(default = "default_interp_factor")]
     pub interp_factor: u32,
+    #[serde(default)]
+    pub interp_fractional_25: bool,
     /// relaunch elevated at startup (needed to control elevated windows)
     #[serde(default)]
     pub run_as_admin: bool,
@@ -518,6 +533,11 @@ fn default_hotkey() -> String {
     "Ctrl+Alt+Z".into()
 }
 
+impl Settings{
+    pub fn interp_factor_code(&self)->u32{if self.interp_fractional_25{INTERP_25_CODE}else{self.interp_factor.clamp(2,15)}}
+    pub fn set_interp_factor_code(&mut self,code:u32){self.interp_fractional_25=code==INTERP_25_CODE;self.interp_factor=interp_capacity(code);}
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -534,6 +554,7 @@ impl Default for Settings {
             vsync: false,
             smooth_pacing: true,
             duplicate_frame_reduction: false,
+            interp_boost: false,
             load_detection: true,
             neo_accel: false,
             gui_topmost: false,
@@ -547,6 +568,7 @@ impl Default for Settings {
             cursor_autohide_secs: 3.0,
             cursor_speed_fix: true,
             interp_factor: 2,
+            interp_fractional_25: false,
             run_as_admin: false,
             win_pos: None,
             win_size: None,
@@ -639,6 +661,19 @@ mod tests {
         assert!(Settings::default().smooth_pacing);
         let parsed: Settings = serde_json::from_str("{}").unwrap();
         assert!(parsed.smooth_pacing);
+    }
+
+    #[test]
+    fn legacy_multiplier_limit_is_ignored_and_x15_round_trips() {
+        for enabled in [true, false] {
+            let json = format!(r#"{{"interp_factor":15,"interp_factor_limit":{enabled}}}"#);
+            let settings: Settings = serde_json::from_str(&json).unwrap();
+            assert_eq!(settings.interp_factor, 15);
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert!(saved.get("interp_factor_limit").is_none());
+            let restored: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.interp_factor, 15);
+        }
     }
 
     #[test]
@@ -753,4 +788,9 @@ mod tests {
         assert_eq!(parsed.fps_cap, 144);
         assert!(parsed.stats_on);
     }
+}
+
+#[cfg(test)]mod fractional_rate_tests{
+ use super::*;
+ #[test]fn x25_settings_keep_safe_integer_fallback_and_roundtrip(){let mut settings=Settings::default();assert_eq!(settings.interp_factor_code(),2);settings.set_interp_factor_code(INTERP_25_CODE);assert_eq!(settings.interp_factor,3);assert_eq!(interp_label(settings.interp_factor_code()),"x2.5");let json=serde_json::to_string(&settings).unwrap();let restored:Settings=serde_json::from_str(&json).unwrap();assert_eq!(restored.interp_factor_code(),INTERP_25_CODE);settings.set_interp_factor_code(3);assert!(!settings.interp_fractional_25);assert_eq!(settings.interp_factor_code(),3);}
 }

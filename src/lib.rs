@@ -4,6 +4,7 @@ pub mod input;
 pub mod logging;
 pub mod capture {
     pub mod wgc;
+    pub mod wgc_gpu;
 }
 pub mod core {
     pub mod config;
@@ -23,7 +24,10 @@ pub mod platform {
     pub mod win32;
 }
 pub mod render {
+    pub(crate) mod interp_timing;
     pub mod chain;
+    pub mod capture_gpu;
+    pub(crate) mod dml_gl_bridge;
     pub mod cuda_interop;
     pub mod dlssnr_backend;
     pub mod dlssnr_stage;
@@ -35,6 +39,7 @@ pub mod render {
     pub mod mpv;
     pub mod mvutensils_neo;
     pub mod neoamd_backend;
+    pub mod neoarc_backend;
     pub mod onnx_accel;
     pub mod onnx_backend;
     pub mod onnx_stage;

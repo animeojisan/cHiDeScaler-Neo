@@ -84,6 +84,21 @@ fn neoamd_option_visible(availability: &NeoAmdAvailability) -> bool {
     availability.available
 }
 
+fn neoarc_pack_available(
+    app_dir: &std::path::Path,
+    adapters: &[GpuAdapter],
+    selected_luid: Option<u64>,
+) -> bool {
+    if !app_dir.join("backends/neoarc/runtime/openvino_c.dll").is_file() {
+        return false;
+    }
+    let arcs = adapters.iter().filter(|gpu| gpu.vendor_id == 0x8086 && gpu.name.contains("Arc"));
+    match selected_luid {
+        Some(luid) => arcs.into_iter().any(|gpu| gpu.luid == luid),
+        None => arcs.count() == 1,
+    }
+}
+
 /// Resolve NeoAMD against the same physical adapter that Neo will use for
 /// ONNX. With Auto selected, the render GPU becomes the compute GPU once it
 /// is known. A secondary AMD adapter must not make NeoAMD appear usable while
@@ -131,7 +146,7 @@ fn tensorrt_crop_switch_allowed(current: CaptureCrop, saved: CaptureCrop) -> boo
     !current.enabled || capture_crop_geometry_matches(current, saved)
 }
 
-const BUILD_ID: &str = "20261011-v867-public-0996";
+const BUILD_ID: &str = "public-v0.99.7-v1002";
 const FULL_DEFAULT_SIZE: [f32; 2] = [900.0, 840.0];
 const FULL_MIN_SIZE: [f32; 2] = [880.0, 700.0];
 const BASIC_DEFAULT_SIZE: [f32; 2] = [720.0, 390.0];
@@ -182,6 +197,40 @@ struct GuiCaptionDragRedrawGate<'a> {
     // caption drag allow a sparse root update only for fresh stats/state, while
     // keeping the bulk of the v416 drag-time WGPU load suppression.
     last_root_drag_redraw: Option<Instant>,
+    // v994: while capture runs, pointer hover over the big egui window made
+    // WGPU submit a GUI frame per mouse event (125-1000 Hz) on the same GPU as
+    // the interpolation/present path, costing 3-5 fps at x10 and periodic
+    // phase-recover skips.  Coalesce root redraws to a bounded rate while
+    // running; input events themselves are still delivered immediately.
+    last_root_redraw: Option<Instant>,
+}
+
+static GUI_CAPTURE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn gui_running_redraw_interval() -> Option<Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("CHIDESCALER_GUI_RUNNING_REDRAW_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(33)
+            .min(250)
+    });
+    // v997: while idle (no capture) hover repaints are also coalesced, to
+    // about 60/s. A 240 Hz pointer stream made the GUI use 6-15% of the Arc's
+    // 3D engine and kept DWM re-evaluating overlay planes next to a playing
+    // PiP window (faint flicker). CHIDESCALER_GUI_IDLE_REDRAW_MS=0 disables.
+    static IDLE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let idle_ms = *IDLE_MS.get_or_init(|| {
+        std::env::var("CHIDESCALER_GUI_IDLE_REDRAW_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(16)
+            .min(250)
+    });
+    let ms = if GUI_CAPTURE_RUNNING.load(std::sync::atomic::Ordering::Relaxed) { ms } else { idle_ms };
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 impl<'a> GuiCaptionDragRedrawGate<'a> {
@@ -192,7 +241,15 @@ impl<'a> GuiCaptionDragRedrawGate<'a> {
             root_window_id: None,
             root_window_identified: false,
             last_root_drag_redraw: None,
+            last_root_redraw: None,
         }
+    }
+
+    fn root_running_redraw_due_at(&self) -> Option<Instant> {
+        let interval = gui_running_redraw_interval()?;
+        let last = self.last_root_redraw?;
+        let due = last + interval;
+        (Instant::now() < due).then_some(due)
     }
 
     fn root_drag_redraw_due(&self, now: Instant) -> bool {
@@ -225,8 +282,21 @@ impl<'a> GuiCaptionDragRedrawGate<'a> {
         }
 
         self.last_root_drag_redraw = None;
-        let pending = self.deferred_redraws.drain().collect::<Vec<_>>();
+        let root_held = self
+            .root_window_id
+            .is_some_and(|root| self.deferred_redraws.contains(&root))
+            && self.root_running_redraw_due_at().is_some();
+        let pending = self
+            .deferred_redraws
+            .iter()
+            .copied()
+            .filter(|id| !(root_held && Some(*id) == self.root_window_id))
+            .collect::<Vec<_>>();
         for window_id in pending {
+            self.deferred_redraws.remove(&window_id);
+            if Some(window_id) == self.root_window_id {
+                self.last_root_redraw = Some(Instant::now());
+            }
             self.inner
                 .window_event(event_loop, window_id, WindowEvent::RedrawRequested);
         }
@@ -262,6 +332,13 @@ impl ApplicationHandler<eframe::UserEvent> for GuiCaptionDragRedrawGate<'_> {
                 self.deferred_redraws.insert(window_id);
                 return;
             }
+        } else if is_root_window && matches!(&event, WindowEvent::RedrawRequested) {
+            if self.root_running_redraw_due_at().is_some() {
+                self.deferred_redraws.insert(window_id);
+                return;
+            }
+            self.deferred_redraws.remove(&window_id);
+            self.last_root_redraw = Some(Instant::now());
         }
 
         let destroyed = matches!(&event, WindowEvent::Destroyed);
@@ -292,6 +369,23 @@ impl ApplicationHandler<eframe::UserEvent> for GuiCaptionDragRedrawGate<'_> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_deferred_redraws(event_loop);
         self.inner.about_to_wait(event_loop);
+        // A coalesced root redraw must still happen once its slot opens even
+        // if no further input arrives.
+        if self
+            .root_window_id
+            .is_some_and(|root| self.deferred_redraws.contains(&root))
+        {
+            let due = self
+                .root_running_redraw_due_at()
+                .unwrap_or_else(Instant::now)
+                .max(Instant::now() + Duration::from_millis(1));
+            let wake = match event_loop.control_flow() {
+                winit::event_loop::ControlFlow::WaitUntil(t) => t.min(due),
+                winit::event_loop::ControlFlow::Poll => return,
+                winit::event_loop::ControlFlow::Wait => due,
+            };
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake));
+        }
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
@@ -844,6 +938,7 @@ fn cleanup_removed_browser_launcher_artifacts(app_dir: &std::path::Path) {
 }
 
 fn main() -> eframe::Result {
+    chidescaler_neo::platform::win32::initialize_physical_dpi_thread();
     if std::env::args().any(|arg| arg == "--dlssnr-worker") {
         if let Err(error) = chidescaler_neo::render::dlssnr_stage::run_worker() {
             eprintln!("DLSSNR worker: {error}");
@@ -870,6 +965,7 @@ fn main() -> eframe::Result {
     }
 
     logging::init();
+    let _log_flush_on_exit=logging::FlushOnExit;
     install_emergency_cleanup();
     log::info!("cHiDeScaler-Neo build {BUILD_ID}");
     // Prepare the optional portable backend location before the UI checks packs.
@@ -1003,9 +1099,32 @@ fn main() -> eframe::Result {
     options.renderer = eframe::Renderer::Wgpu;
     options.wgpu_options =
         eframe::WgpuConfiguration::default().with_surface_config(eframe::SurfaceConfig {
-            present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
+            present_mode: gui_present_mode(),
             desired_maximum_frame_latency: Some(1),
         });
+    // v996: choose the GUI adapter/backend explicitly. wgpu's default picks the
+    // first high-performance adapter in backend order, i.e. Vulkan; on Intel
+    // Arc the Vulkan windowed swapchain shows a faint flicker whenever the GUI
+    // repaints (pointer hover) even with no capture running. Intel discrete
+    // GPUs present the GUI through D3D12 (DXGI flip model) instead; NVIDIA/AMD
+    // keep the previous choice. CHIDESCALER_GUI_WGPU_BACKEND=auto|vulkan|dx12|gl.
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup {
+        create.native_adapter_selector = Some(std::sync::Arc::new(select_gui_wgpu_adapter));
+    }
+    // v999: on Intel-only systems the GUI is drawn with OpenGL (eframe glow).
+    // Every wgpu swapchain tried on Intel Arc misbehaved next to the 240 Hz
+    // video overlay: Vulkan flickered, D3D12 (flip model) showed black and
+    // colourful blocks while the GPU was saturated (not visible in screen
+    // captures, i.e. after DWM composition: overlay-plane scan-out). The video
+    // overlay itself is OpenGL and never showed this. No vsync, same redraw
+    // policy as before. CHIDESCALER_GUI_RENDERER=auto|wgpu|glow.
+    if gui_use_glow_renderer() {
+        options.renderer = eframe::Renderer::Glow;
+        options.glow_options.vsync = false;
+        log::info!("gui-renderer: glow reason=intel-only-overlay-plane-artifacts");
+    } else {
+        log::info!("gui-renderer: wgpu");
+    }
     // Own eframe's already-supported winit event loop only to gate WGPU
     // RedrawRequested while a native caption drag is active. The OS window
     // continues moving at full native rate; only fresh GUI GPU submissions are
@@ -1022,6 +1141,128 @@ fn main() -> eframe::Result {
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+/// v997: GUI present mode. AutoNoVsync resolves to Immediate, i.e. a
+/// tearing-allowed flip; next to a playing PiP video window on Intel Arc this
+/// made DWM switch overlay planes (faint flicker). On Intel-only systems (the
+/// GUI then uses D3D12, which always offers Mailbox) present with Mailbox:
+/// still never waits for vblank and draws no extra frames, but is composed
+/// normally. NVIDIA/AMD keep AutoNoVsync.
+/// CHIDESCALER_GUI_PRESENT_MODE=auto|mailbox|immediate|fifo|autonovsync.
+fn gui_present_mode() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu::PresentMode;
+    let requested = std::env::var("CHIDESCALER_GUI_PRESENT_MODE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".into());
+    let mode = match requested.as_str() {
+        "mailbox" => PresentMode::Mailbox,
+        "immediate" => PresentMode::Immediate,
+        "fifo" => PresentMode::Fifo,
+        "autonovsync" => PresentMode::AutoNoVsync,
+        _ => {
+            let adapters = gpu::enumerate_adapters_quiet();
+            let intel_only = adapters.iter().any(|a| a.vendor_id == 0x8086)
+                && !adapters.iter().any(|a| matches!(a.vendor_id, 0x10de | 0x1002 | 0x1022));
+            let gui_backend_dx12 = !matches!(
+                std::env::var("CHIDESCALER_GUI_WGPU_BACKEND").ok().as_deref().map(str::trim),
+                Some("vulkan" | "gl" | "opengl")
+            );
+            // Measured: Mailbox caused periodic 232-234 fps dips at x10 while
+            // the D3D12 backend alone (v996) already removed the flicker, so
+            // Mailbox stays opt-in (=mailbox).
+            let _ = (intel_only, gui_backend_dx12);
+            PresentMode::AutoNoVsync
+        }
+    };
+    log::info!("gui-present-mode: requested={requested} mode={mode:?}");
+    mode
+}
+
+fn gui_use_glow_renderer() -> bool {
+    match std::env::var("CHIDESCALER_GUI_RENDERER").ok().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("glow") | Some("gl") | Some("opengl") => true,
+        Some("wgpu") => false,
+        _ => {
+            let adapters = gpu::enumerate_adapters_quiet();
+            adapters.iter().any(|a| a.vendor_id == 0x8086)
+                && !adapters.iter().any(|a| matches!(a.vendor_id, 0x10de | 0x1002 | 0x1022))
+        }
+    }
+}
+
+/// v996: GUI adapter choice (see the call site). Ranks surface-compatible
+/// adapters like wgpu's HighPerformance default (discrete first, then
+/// integrated), then the backend: D3D12 for Intel, wgpu's order otherwise.
+fn select_gui_wgpu_adapter(
+    adapters: &[eframe::wgpu::Adapter],
+    surface: Option<&eframe::wgpu::Surface<'_>>,
+) -> Result<eframe::wgpu::Adapter, String> {
+    use eframe::wgpu::{Backend, DeviceType};
+    let policy = std::env::var("CHIDESCALER_GUI_WGPU_BACKEND")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".into());
+    let forced = match policy.as_str() {
+        "vulkan" => Some(Backend::Vulkan),
+        "dx12" | "d3d12" => Some(Backend::Dx12),
+        "gl" | "opengl" => Some(Backend::Gl),
+        _ => None,
+    };
+    let candidates: Vec<(usize, eframe::wgpu::AdapterInfo)> = adapters
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| surface.is_none_or(|s| a.is_surface_supported(s)))
+        .map(|(i, a)| (i, a.get_info()))
+        .collect();
+    let type_rank = |t: DeviceType| match t {
+        DeviceType::DiscreteGpu => 0,
+        DeviceType::IntegratedGpu => 1,
+        DeviceType::VirtualGpu => 2,
+        DeviceType::Other => 3,
+        DeviceType::Cpu => 4,
+    };
+    let backend_rank = |info: &eframe::wgpu::AdapterInfo, order: usize| -> usize {
+        if let Some(b) = forced {
+            return if info.backend == b { 0 } else { 1 + order };
+        }
+        if info.vendor == 0x8086 {
+            match info.backend {
+                Backend::Dx12 => 0,
+                Backend::Vulkan => 1,
+                _ => 2 + order,
+            }
+        } else {
+            order
+        }
+    };
+    let chosen = candidates
+        .iter()
+        .min_by_key(|(order, info)| (type_rank(info.device_type), backend_rank(info, *order)))
+        .map(|(index, _)| *index)
+        .ok_or_else(|| "no wgpu adapter supports the GUI surface".to_string())?;
+    let info = adapters[chosen].get_info();
+    let previous_default = candidates
+        .iter()
+        .min_by_key(|(order, info)| (type_rank(info.device_type), *order))
+        .map(|(_, info)| format!("{}:{:?}", info.name, info.backend))
+        .unwrap_or_default();
+    log::info!(
+        "gui-wgpu-adapter: name='{}' backend={:?} vendor={:#06x} type={:?} policy={} previous_default={} candidates=[{}]",
+        info.name,
+        info.backend,
+        info.vendor,
+        info.device_type,
+        policy,
+        previous_default,
+        candidates
+            .iter()
+            .map(|(_, c)| format!("{}:{:?}:{:?}", c.name, c.backend, c.device_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(adapters[chosen].clone())
 }
 
 fn load_icon() -> Option<egui::IconData> {
@@ -1613,6 +1854,20 @@ fn paint_ink_centered_checkbox_label(
         .galley(text_pos, galley, color);
 }
 
+/// v941: interpolation boost is a process environment switch read by NeoRTX
+/// (Win32 GetEnvironmentVariableA) when a RIFE session is created.
+fn apply_interp_boost_env(on: bool) {
+    unsafe {
+        std::env::set_var("NEORTX_RIFE_PHASE_SHARE", if on { "1" } else { "0" });
+        std::env::set_var("NEORTX_RIFE_HALF_ACCUM", if on { "1" } else { "0" });
+        // v977: NeoAMD Backend Pack v128 reads its own switch (GetEnvironmentVariableA)
+        // when a RIFE session is created. Older packs ignore it.
+        std::env::set_var("NEOAMD_RIFE_PHASE_SHARE", if on { "1" } else { "0" });
+    }
+    chidescaler_neo::render::onnx_stage::set_directml_rife_boost(on);
+    log::info!("interp-boost: {}", if on { "on" } else { "off" });
+}
+
 fn ink_centered_checkbox(
     ui: &mut egui::Ui,
     checked: &mut bool,
@@ -2178,6 +2433,44 @@ fn capture_resolution_content_size(client_size: (i32, i32), crop: CaptureCrop) -
     }
     let applied = crop.applied_to(client_size.0 as u32, client_size.1 as u32);
     (applied.content_w as i32, applied.content_h as i32)
+}
+
+/// v993 QA: one scripted switch step.
+#[derive(Clone, Debug)]
+enum QaSwitch {
+    Preset(String),
+    Resolution(Option<CaptureResolution>),
+}
+/// v993 QA: `NEO_QA_SWITCH_SEQUENCE="preset:NAME|res:960x540|res:auto|..."`,
+/// `NEO_QA_SWITCH_INTERVAL_MS` (default 8000). Test-only; unset in normal use.
+fn qa_switch_plan() -> Option<(Vec<QaSwitch>, Duration)> {
+    static PLAN: std::sync::OnceLock<Option<(Vec<QaSwitch>, Duration)>> = std::sync::OnceLock::new();
+    PLAN.get_or_init(|| {
+        let text = std::env::var("NEO_QA_SWITCH_SEQUENCE").ok()?;
+        let steps: Vec<QaSwitch> = text
+            .split('|')
+            .filter_map(|item| {
+                if let Some(name) = item.strip_prefix("preset:") {
+                    Some(QaSwitch::Preset(name.to_string()))
+                } else if let Some(value) = item.strip_prefix("res:") {
+                    if value.eq_ignore_ascii_case("auto") {
+                        Some(QaSwitch::Resolution(None))
+                    } else {
+                        let (w, h) = value.split_once('x')?;
+                        Some(QaSwitch::Resolution(Some(CaptureResolution { w: w.parse().ok()?, h: h.parse().ok()? })))
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let interval = std::env::var("NEO_QA_SWITCH_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8000);
+        (!steps.is_empty()).then(|| (steps, Duration::from_millis(interval)))
+    })
+    .clone()
 }
 
 fn capture_resolution_label(v: Option<CaptureResolution>, lang: UiLanguage) -> String {
@@ -3028,6 +3321,8 @@ struct App {
     main_control_press_until: Option<Instant>,
     capture_idle_since: Instant,
     qa_auto_start: bool,
+    qa_switch_next: Option<Instant>,
+    qa_switch_index: usize,
     qa_panel_preview: bool,
     resource_monitor: ResourceMonitor,
     basic_stats_layout_applied: Option<bool>,
@@ -3050,6 +3345,7 @@ struct App {
     tensorrt_availability: TensorRtAvailability,
     neoamd_availability: NeoAmdAvailability,
     neortx_availability: NeoAmdAvailability,
+    neoarc_available: bool,
     onnx_backend_selected: OnnxBackendPreference,
     onnx_backend_pending: Option<OnnxBackendPreference>,
     onnx_backend_revision_seen: u64,
@@ -3112,6 +3408,7 @@ impl App {
         }
         let gui_test_mode = std::env::var("NEO_GUI_SCREENSHOT_MODE").unwrap_or_default();
         let mut settings = load_settings(&dir);
+        apply_interp_boost_env(settings.interp_boost);
         let gpu_adapters = gpu::enumerate_adapters();
         if let Some(saved_luid) = settings.gpu_adapter_luid
             && gpu::adapter_for_luid(&gpu_adapters, Some(saved_luid)).is_none()
@@ -3322,6 +3619,8 @@ impl App {
             detect_neortx_for_selection(&dir, &gpu_adapters, settings.gpu_adapter_luid, None);
         let neoamd_availability =
             detect_neoamd_for_selection(&dir, &gpu_adapters, settings.gpu_adapter_luid, None);
+        let neoarc_available =
+            neoarc_pack_available(&dir, &gpu_adapters, settings.gpu_adapter_luid);
         if neoamd_availability.installed {
             if neoamd_availability.available {
                 log::info!(
@@ -3360,6 +3659,7 @@ impl App {
             OnnxBackendPreference::NeoAMD if neoamd_availability.available => {
                 OnnxBackendPreference::NeoAMD
             }
+            OnnxBackendPreference::NeoArc if neoarc_available => OnnxBackendPreference::NeoArc,
             OnnxBackendPreference::TensorRT
                 if tensorrt_availability.available && tensorrt_crop_start_allowed =>
             {
@@ -3389,6 +3689,8 @@ impl App {
                             .as_deref()
                             .unwrap_or("NeoAMD Backend Pack unavailable")
                     );
+                } else if requested == OnnxBackendPreference::NeoArc {
+                    log::warn!("onnx-backend-startup-fallback: requested=NeoArc active=DirectML reason=pack-or-Arc-unavailable");
                 } else if requested == OnnxBackendPreference::TensorRT {
                     log::warn!(
                         "onnx-backend-startup-fallback: requested=TensorRT active=DirectML reason='{}'",
@@ -3414,6 +3716,36 @@ impl App {
         engine
             .metrics
             .set_enabled(settings.stats_on || logging::diagnostics_enabled());
+        // v1001: while the main GUI is minimized/hidden it runs no frames, so the
+        // operation panel's FPS figure froze at the value of the moment it was
+        // hidden. Refresh only that figure twice a second in that state; with a
+        // visible GUI the ordinary per-frame path keeps ownership.
+        {
+            let metrics = engine.metrics.clone();
+            let _ = std::thread::Builder::new()
+                .name("panel-fps-refresh".into())
+                .spawn(move || {
+                    let mut samples = 0u64;
+                    loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let gui = win32::main_gui_hwnd();
+                    let gui_hidden = gui == 0 || win32::is_minimized(gui) || !win32::is_window_visible(gui)
+                        || win32::is_cloaked(gui);
+                    if gui_hidden && GUI_CAPTURE_RUNNING.load(std::sync::atomic::Ordering::Relaxed) {
+                        if samples < 4 || samples % 10 == 0 {
+                            let panel = win32::panel_gdi_host_hwnd();
+                            let anchor = win32::find_own_window("NeoCompositorKeepalivePanel");
+                            log::info!("panel-minimize-screen: tick={samples} panel={panel:#x} visible={} rect={:?} anchor={anchor:?} matched_total_mean_delta={:?}",
+                                win32::is_window_visible(panel), win32::window_rect(panel), win32::panel_screen_visibility_probe(panel));
+                        }
+                        samples = samples.wrapping_add(1);
+                        win32::refresh_panel_gdi_fps(metrics.snapshot().present_fps);
+                    } else {
+                        samples = 0;
+                    }
+                    }
+                });
+        }
         let hotkeys = HotkeyThread::start(
             Self::hotkey_bindings(&settings.hotkey_toggle),
             engine.stop_handle(),
@@ -3565,6 +3897,8 @@ impl App {
             main_control_press_until: None,
             capture_idle_since: Instant::now(),
             qa_auto_start,
+            qa_switch_next: None,
+            qa_switch_index: 0,
             qa_panel_preview,
             resource_monitor: ResourceMonitor::new(),
             basic_stats_layout_applied: None,
@@ -3579,6 +3913,7 @@ impl App {
             tensorrt_availability,
             neoamd_availability,
             neortx_availability,
+            neoarc_available,
             onnx_backend_selected,
             onnx_backend_pending: None,
             onnx_backend_revision_seen: 0,
@@ -4122,6 +4457,7 @@ impl App {
             );
 
             let mut backend = self.onnx_backend_selected;
+            let new_neoarc = neoarc_pack_available(&self.app_dir, &self.gpu_adapters, requested);
             if backend == OnnxBackendPreference::TensorRT && !new_tensorrt.available {
                 log::warn!(
                     "gpu-selection-tensorrt-fallback: requested_luid={} name='{}' reason='{}' active=DirectML",
@@ -4169,6 +4505,13 @@ impl App {
                 self.onnx_backend_selected = backend;
                 self.onnx_backend_pending = None;
             }
+            if backend == OnnxBackendPreference::NeoArc && !new_neoarc {
+                backend = OnnxBackendPreference::DirectML;
+                self.settings.onnx_backend = backend;
+                self.onnx_backend_selected = backend;
+                self.onnx_backend_pending = None;
+            }
+            self.neoarc_available = new_neoarc;
             self.neoamd_availability = new_neoamd;
             self.settings.gpu_adapter_luid = requested;
             self.settings.gpu_force_vulkan = force_vulkan_glsl;
@@ -4200,6 +4543,36 @@ impl App {
         }
     }
 
+    /// v941: "ブースト" toggle placed right of the interpolation factor.
+    fn interp_boost_control(&mut self, ui: &mut egui::Ui, lang: UiLanguage) {
+        let backend = self.onnx_backend_selected;
+        let supported = matches!(
+            backend,
+            OnnxBackendPreference::NeoRTX
+                | OnnxBackendPreference::DirectML
+                | OnnxBackendPreference::NeoArc
+                | OnnxBackendPreference::NeoAMD
+        );
+        let mut on = self.settings.interp_boost;
+        let response = ink_centered_checkbox_enabled(ui, supported, &mut on, tr(lang, "ブースト", "Boost"))
+            .on_hover_text(tr(
+                lang,
+                "対応するRIFE系モデルが高速化されます。\nx2.5以上で効果があります。画質はわずかに変わります。",
+                "Speeds up supported RIFE models.\nEffective at x2.5 and above. Output can differ slightly.",
+            ));
+        if response.changed() && on != self.settings.interp_boost {
+            self.settings.interp_boost = on;
+            apply_interp_boost_env(on);
+            save_settings(&self.app_dir, &self.settings);
+            // v977: NeoAMD, like NeoRTX, reads the switch at session creation.
+            if matches!(backend, OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoAMD) {
+                self.request_onnx_backend_switch(backend);
+            } else {
+                log::info!("directml-rife-boost-requested: enabled={on} apply=next-prepared-pair");
+            }
+        }
+    }
+
     fn request_onnx_backend_switch(&mut self, backend: OnnxBackendPreference) {
         if backend == OnnxBackendPreference::TensorRT && !self.tensorrt_availability.available {
             return;
@@ -4208,6 +4581,9 @@ impl App {
             return;
         }
         if backend == OnnxBackendPreference::NeoAMD && !self.neoamd_availability.available {
+            return;
+        }
+        if backend == OnnxBackendPreference::NeoArc && !self.neoarc_available {
             return;
         }
         if backend == OnnxBackendPreference::TensorRT
@@ -4710,6 +5086,9 @@ impl App {
         }
         if neoamd_option_visible(&self.neortx_availability) {
             cadence_labels.push("NeoRTX");
+        }
+        if self.neoarc_available {
+            cadence_labels.push("NeoARC");
         }
         if tensorrt_option_visible(&self.tensorrt_availability) {
             cadence_labels.push(tr(lang, "TensorRT（準備中）", "TensorRT (preparing)"));
@@ -5518,6 +5897,27 @@ impl App {
             self.qa_auto_start = false;
             log::info!("QA auto-start: target={:#x}", self.target_hwnd);
             self.start();
+            self.qa_switch_next = qa_switch_plan().map(|(_, interval)| Instant::now() + interval);
+        }
+        // v993 QA: scripted preset / capture-resolution switches for measuring
+        // switch latency on the real app (NEO_QA_SWITCH_SEQUENCE, test only).
+        if let (Some(next), Some((plan, interval))) = (self.qa_switch_next, qa_switch_plan()) {
+            if Instant::now() >= next && self.running() && !plan.is_empty() {
+                let step = plan[self.qa_switch_index % plan.len()].clone();
+                self.qa_switch_index += 1;
+                self.qa_switch_next = (self.qa_switch_index < plan.len()).then(|| Instant::now() + interval);
+                match step {
+                    QaSwitch::Preset(name) => {
+                        log::info!("QA switch: kind=preset value='{}' index={}", name, self.qa_switch_index);
+                        self.select_preset(&name);
+                    }
+                    QaSwitch::Resolution(resolution) => {
+                        log::info!("QA switch: kind=resolution value={:?} index={}", resolution.map(|r| (r.w, r.h)), self.qa_switch_index);
+                        self.settings.capture_resolution = resolution;
+                        let _ = self.apply_capture_resolution_to_target();
+                    }
+                }
+            }
         }
         let status = self.engine.status.lock().unwrap().clone();
         if status.capture_resolution_fullscreen_notice_seq
@@ -5578,6 +5978,20 @@ impl App {
                     self.settings.gui_topmost
                 );
             }
+        }
+        // Taskbar restores bypass the panel/tray reveal handler. After a
+        // background Stop, DWM can retain our app cloak across SW_RESTORE.
+        if !running && !self.tray_hidden && self.pending_ui_mode.is_none()
+            && !self.gui_topmost_off_pending && !self.background_hotkey_wake_active()
+            && !win32::background_gui_wake_active() && !win32::background_gui_wake_in_flight()
+            && !win32::main_gui_explicit_exiting() && win32::main_gui_background_intent() == 0
+            && self.gui_hwnd != 0 && win32::is_window_visible(self.gui_hwnd)
+            && !win32::is_minimized(self.gui_hwnd)
+            && win32::window_cloak_flags(self.gui_hwnd) & 1 != 0
+        {
+            let ok = win32::set_window_cloaked(self.gui_hwnd, false);
+            log::info!("idle-gui-cloak-recovery: hwnd={:#x} request_ok={} flags_after={}",
+                self.gui_hwnd, ok, win32::window_cloak_flags(self.gui_hwnd));
         }
         let mut ne = Vec::new();
         // Stable reference policy:
@@ -5827,7 +6241,7 @@ impl App {
             speed_fix: self.settings.cursor_speed_fix,
         });
         self.engine
-            .send(Cmd::SetInterpFactor(self.settings.interp_factor));
+            .send(Cmd::SetInterpFactor(self.settings.interp_factor_code()));
         self.engine
             .send(Cmd::SetDownscaler(self.settings.downscaler.clone()));
         self.engine.send(Cmd::SetVsync(self.settings.vsync));
@@ -6253,7 +6667,7 @@ impl App {
             ),
         };
         let timed_out = now >= wake.deadline;
-        if !ready && !timed_out {
+        if win32::background_gui_wake_in_flight() || (!ready && !timed_out) {
             self.background_hotkey_wake = Some(wake);
             ctx.request_repaint_after(Duration::from_millis(16));
             return;
@@ -7775,8 +8189,8 @@ impl App {
             && (win32::is_window_visible(self.panel_hwnd) || self.panel_gdi_reveal_pending);
         let active = status.running
             && !status.stopping
-            && !gui_background
-            && (!self.settings.gui_topmost || self.gui_topmost_off_pending)
+            && (!gui_background || win32::is_window_valid(self.compositor_anchor_hwnd))
+            && (panel_ui_requested || !self.settings.gui_topmost || self.gui_topmost_off_pending)
             && overlay_valid
             && panel_valid
             && self.panel_placed_for_run;
@@ -7881,6 +8295,8 @@ impl App {
         if self.compositor_anchor_hwnd == 0 {
             if let Some(hwnd) = win32::find_own_window(TITLE) {
                 self.compositor_anchor_hwnd = hwnd;
+                // Keep the backing surface independent of root minimization.
+                win32::set_owned_popup_owner(hwnd, 0);
                 self.compositor_anchor_state_sent = None;
                 win32::install_compositor_keepalive_input_passthrough(hwnd);
                 log::info!(
@@ -10466,22 +10882,24 @@ impl eframe::App for App {
                         ui.label(tr(lang, "フレーム補間:", "Frame interpolation:"));
                         egui::ComboBox::from_id_salt("basic_interp_factor")
                             .width(62.0)
-                            .selected_text(format!("x{}", self.settings.interp_factor))
+                            .selected_text(chidescaler_neo::core::config::interp_label(self.settings.interp_factor_code()))
                             .show_ui(ui, |ui| {
-                                for factor in [2u32, 3, 4, 5] {
+                                for factor in [2,25,3,4,5,6,7,8,9,10,11,12,13,14,15] {
                                     if ui
-                                        .selectable_value(
-                                            &mut self.settings.interp_factor,
-                                            factor,
-                                            format!("x{factor}"),
+                                        .selectable_label(
+                                            self.settings.interp_factor_code()==factor,
+                                            chidescaler_neo::core::config::interp_label(factor),
                                         )
-                                        .changed()
+                                        .clicked() && self.settings.interp_factor_code()!=factor
                                     {
+                                        self.settings.set_interp_factor_code(factor);
                                         settings_changed = true;
                                         self.engine.send(Cmd::SetInterpFactor(factor));
                                     }
                                 }
                             });
+                        self.interp_boost_control(ui, lang);
+
                         ui.separator();
                         if ink_centered_checkbox(
                             ui,
@@ -10976,6 +11394,24 @@ impl eframe::App for App {
                     }
                 }
 
+                if self.neoarc_available {
+                    let switching = self.onnx_backend_pending.is_some()
+                        || status.onnx_backend_switching;
+                    let mut enabled = self.onnx_backend_selected == OnnxBackendPreference::NeoArc;
+                    let response = ink_centered_checkbox_enabled(
+                        ui, !switching, &mut enabled, "NeoARC",
+                    ).on_hover_text(tr(lang,
+                        "Intel Arc用のGPU推論です。未対応モデルや失敗時はDirectMLへ戻ります。",
+                        "Intel Arc GPU inference. Unsupported models and failures use DirectML."));
+                    if response.changed() || response.clicked() {
+                        self.request_onnx_backend_switch(if enabled {
+                            OnnxBackendPreference::NeoArc
+                        } else {
+                            OnnxBackendPreference::DirectML
+                        });
+                    }
+                }
+
                 if tensorrt_option_visible(&self.tensorrt_availability) {
                     let backend_switching =
                         self.onnx_backend_pending.is_some() || status.onnx_backend_switching;
@@ -11280,24 +11716,26 @@ impl eframe::App for App {
                 ui.label(tr(lang, "フレーム補間:", "Frame interpolation:"));
                 egui::ComboBox::from_id_salt("interp_factor")
                     .width(64.0)
-                    .selected_text(format!("x{}", self.settings.interp_factor))
+                    .selected_text(chidescaler_neo::core::config::interp_label(self.settings.interp_factor_code()))
                     .show_ui(ui, |ui| {
-                        for f in [2u32, 3, 4, 5] {
+                        for f in [2,25,3,4,5,6,7,8,9,10,11,12,13,14,15] {
                             if ui
                                 .selectable_label(
-                                    self.settings.interp_factor == f,
-                                    format!("x{f}"),
+                                    self.settings.interp_factor_code() == f,
+                                    chidescaler_neo::core::config::interp_label(f),
                                 )
-                                .clicked()
+                                .clicked() && self.settings.interp_factor_code()!=f
                             {
-                                self.settings.interp_factor = f;
+                                self.settings.set_interp_factor_code(f);
                                 settings_changed = true;
                                 self.engine.send(Cmd::SetInterpFactor(f));
                             }
                         }
                     })
                     .response
-                    .on_hover_text(i18n::text(lang, "interpolation.factor_help"));
+                    .on_hover_text(format!("{}\nx2.5: 24 fps -> 60 fps (NeoRIFE / RIFE / DRBA)",i18n::text(lang, "interpolation.factor_help")));
+                self.interp_boost_control(ui, lang);
+
             });
             if input_opts_changed {
                 self.engine.send(Cmd::SetInputOpts {
@@ -12667,6 +13105,7 @@ impl eframe::App for App {
         // keyboard input still wakes egui immediately. On a genuinely slow PC,
         // only the periodic GUI fallback is reduced; filter/WGC/Present cadence
         // never receives a sleep/glFinish/yield for GUI responsiveness.
+        GUI_CAPTURE_RUNNING.store(running, std::sync::atomic::Ordering::Relaxed);
         let gui_dt = ctx.input(|i| i.stable_dt);
         ctx.request_repaint_after(Duration::from_millis(gui_fallback_repaint_ms(
             running, gui_dt,
@@ -12907,7 +13346,10 @@ mod app_tests {
     #[test]
     fn gui_surfaces_use_autonovsync_and_sparse_caption_drag_redraws() {
         let source = include_str!("main.rs");
-        assert!(source.contains("present_mode: eframe::wgpu::PresentMode::AutoNoVsync"));
+        // v997: Intel-only systems use Mailbox (never vsync); others AutoNoVsync.
+        assert!(source.contains("present_mode: gui_present_mode()"));
+        assert!(source.contains("PresentMode::AutoNoVsync"));
+        assert!(!source.contains("_ => PresentMode::Fifo"));
         let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert!(runtime.contains("fn root_drag_redraw_due"));
         assert!(runtime.contains("Duration::from_millis(200)"));
@@ -14415,7 +14857,7 @@ mod app_tests {
     }
 
     #[test]
-    fn compositor_keepalive_is_separate_from_native_panel_and_off_only() {
+    fn compositor_keepalive_covers_visible_panel_with_gui_topmost() {
         let source = include_str!("main.rs");
         let anchor = source
             .split("fn compositor_keepalive_anchor")
@@ -14424,7 +14866,7 @@ mod app_tests {
             .split("fn request_filtered_screenshot")
             .next()
             .expect("compositor anchor boundary");
-        assert!(anchor.contains("(!self.settings.gui_topmost || self.gui_topmost_off_pending)"));
+        assert!(anchor.contains("(panel_ui_requested || !self.settings.gui_topmost || self.gui_topmost_off_pending)"));
         assert!(anchor.contains("show_viewport_immediate("));
         assert!(!anchor.contains("with_mouse_passthrough(true)"));
         assert!(anchor.contains("place_below(status.overlay_hwnd, anchor)"));
@@ -14520,3 +14962,4 @@ fn detect_neortx_for_selection(
     }
     detect_neortx_backend(app_dir, None)
 }
+

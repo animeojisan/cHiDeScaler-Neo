@@ -13,6 +13,21 @@ use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use windows::Win32::{
+    Foundation::CloseHandle,
+    Graphics::{
+        Direct3D::D3D_FEATURE_LEVEL_11_0,
+        Direct3D12::{
+            D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12CreateDevice, ID3D12Device, ID3D12Resource,
+        },
+        Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC},
+        Dxgi::{CreateDXGIFactory1, IDXGIFactory1},
+    },
+};
+use windows::core::PCWSTR;
 
 /// Stable routing contract for the future production GLSL backend. `Auto` is
 /// represented by `None` and must never initialize Vulkan. An explicit GPU
@@ -61,7 +76,362 @@ pub struct VulkanGpuProbeResult {
     pub device_id: u32,
     pub api_version: u32,
     pub queue_family_index: u32,
+    /// Populated by probe_selected_luid. The other diagnostic constructors
+    /// leave these false because they do not enable surface extensions.
+    /// This is the prerequisite for bypassing OpenGL at display.
+    pub win32_present_supported: bool,
+    pub swapchain_supported: bool,
     pub queue_flags: vk::QueueFlags,
+    pub d3d12_buffer_importable: bool,
+}
+
+fn d3d12_buffer_importable(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let has_extension = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .ok()
+        .is_some_and(|extensions| {
+            extensions.iter().any(|extension| unsafe {
+                CStr::from_ptr(extension.extension_name.as_ptr())
+                    == ash::khr::external_memory_win32::NAME
+            })
+        });
+    if !has_extension {
+        return false;
+    }
+    let info = vk::PhysicalDeviceExternalBufferInfo::default()
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::D3D12_RESOURCE);
+    let mut properties = vk::ExternalBufferProperties::default();
+    unsafe {
+        instance.get_physical_device_external_buffer_properties(
+            physical_device,
+            &info,
+            &mut properties,
+        )
+    };
+    properties
+        .external_memory_properties
+        .external_memory_features
+        .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+}
+
+/// Diagnostic only: import an app-owned D3D12 NT shared buffer on the exact
+/// DXGI/Vulkan LUID, then immediately release it. No frame data is touched.
+pub fn probe_d3d12_buffer_import(requested_luid: u64) -> Result<()> {
+    probe_d3d12_buffer_import_impl(requested_luid, None, false).map(|_| ())
+}
+
+/// Import a live DirectML output handle in a diagnostic Vulkan device.
+/// The caller retains ownership of the NT handle and D3D12 resource.
+pub fn probe_existing_d3d12_buffer_import(
+    requested_luid: u64,
+    handle: isize,
+    byte_len: usize,
+) -> Result<()> {
+    probe_d3d12_buffer_import_impl(requested_luid, Some((handle, byte_len)), false).map(|_| ())
+}
+
+/// Diagnostic readback of a completed GPU RGBA buffer. Production presentation
+/// never calls this; it exists to verify actual pixels in the shared resource.
+pub fn read_existing_d3d12_buffer(
+    requested_luid: u64,
+    handle: isize,
+    byte_len: usize,
+) -> Result<Vec<u8>> {
+    probe_d3d12_buffer_import_impl(requested_luid, Some((handle, byte_len)), true)?
+        .ok_or_else(|| anyhow!("shared buffer diagnostic readback missing"))
+}
+
+fn probe_d3d12_buffer_import_impl(
+    requested_luid: u64,
+    existing: Option<(isize, usize)>,
+    read_content: bool,
+) -> Result<Option<Vec<u8>>> {
+    let entry = unsafe { Entry::load() }.context("Vulkan loader unavailable")?;
+    let app_name = CString::new("NeoArc D3D12 import probe")?;
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .api_version(vk::API_VERSION_1_1);
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app_info),
+            None,
+        )
+    }
+    .context("vkCreateInstance")?;
+    let result = (|| -> Result<Option<Vec<u8>>> {
+        let physical = unsafe { instance.enumerate_physical_devices()? }
+            .into_iter()
+            .find(|&device| {
+                let mut id = vk::PhysicalDeviceIDProperties::default();
+                let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+                unsafe { instance.get_physical_device_properties2(device, &mut props) };
+                id.device_luid_valid == vk::TRUE
+                    && u64::from_le_bytes(id.device_luid) == requested_luid
+            })
+            .ok_or_else(|| anyhow!("Vulkan LUID does not match selected DXGI GPU"))?;
+        anyhow::ensure!(
+            d3d12_buffer_importable(&instance, physical),
+            "D3D12_RESOURCE import unsupported"
+        );
+        let queue_family = unsafe { instance.get_physical_device_queue_family_properties(physical) }
+            .iter()
+            .position(|q| q.queue_count > 0 && q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .ok_or_else(|| anyhow!("no Vulkan compute queue"))? as u32;
+        let priorities = [1.0f32];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family)
+            .queue_priorities(&priorities)];
+        let extensions = [ash::khr::external_memory_win32::NAME.as_ptr()];
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&extensions);
+        let device = unsafe { instance.create_device(physical, &device_info, None) }
+            .context("vkCreateDevice with external memory")?;
+        let imported = (|| -> Result<Option<Vec<u8>>> {
+            let owned = if existing.is_none() {
+                let factory = unsafe { CreateDXGIFactory1::<IDXGIFactory1>()? };
+                let adapter = (0u32..)
+                    .find_map(|index| {
+                        let adapter = unsafe { factory.EnumAdapters1(index) }.ok()?;
+                        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+                        let luid = ((desc.AdapterLuid.HighPart as u32 as u64) << 32)
+                            | desc.AdapterLuid.LowPart as u64;
+                        (luid == requested_luid).then_some(adapter)
+                    })
+                    .ok_or_else(|| anyhow!("DXGI LUID not found"))?;
+                let mut d3d_device: Option<ID3D12Device> = None;
+                unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut d3d_device)? };
+                let d3d_device = d3d_device.ok_or_else(|| anyhow!("D3D12 device unavailable"))?;
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 65536,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let mut resource: Option<ID3D12Resource> = None;
+                unsafe {
+                    d3d_device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_SHARED,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut resource,
+                    )?
+                };
+                let resource = resource.ok_or_else(|| anyhow!("D3D12 resource unavailable"))?;
+                let handle = unsafe {
+                    d3d_device.CreateSharedHandle(&resource, None, 0x1000_0000, PCWSTR::null())?
+                };
+                Some((resource, handle))
+            } else {
+                None
+            };
+            let (handle, byte_len) =
+                existing.unwrap_or_else(|| (owned.as_ref().unwrap().1.0 as isize, 65536));
+            let result = (|| -> Result<Option<Vec<u8>>> {
+                let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D12_RESOURCE;
+                let mut external_create =
+                    vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+                let info = vk::BufferCreateInfo::default()
+                    .size(byte_len as u64)
+                    .usage(
+                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .push_next(&mut external_create);
+                let buffer =
+                    unsafe { device.create_buffer(&info, None) }.context("vkCreateBuffer")?;
+                let result = (|| -> Result<vk::DeviceMemory> {
+                    let requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
+                    let external = ash::khr::external_memory_win32::Device::new(&instance, &device);
+                    let mut props = vk::MemoryWin32HandlePropertiesKHR::default();
+                    unsafe {
+                        external.get_memory_win32_handle_properties(
+                            handle_type,
+                            handle,
+                            &mut props,
+                        )?
+                    };
+                    let compatible = requirements.memory_type_bits & props.memory_type_bits;
+                    let memory_type = (0..32)
+                        .find(|i| compatible & (1 << i) != 0)
+                        .ok_or_else(|| anyhow!("no compatible Vulkan memory type"))?;
+                    let mut import = vk::ImportMemoryWin32HandleInfoKHR::default()
+                        .handle_type(handle_type)
+                        .handle(handle);
+                    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+                    let alloc = vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type)
+                        .push_next(&mut import)
+                        .push_next(&mut dedicated);
+                    let memory = unsafe { device.allocate_memory(&alloc, None) }
+                        .context("vkAllocateMemory from D3D12 NT handle")?;
+                    if let Err(error) = unsafe { device.bind_buffer_memory(buffer, memory, 0) } {
+                        unsafe { device.free_memory(memory, None) };
+                        return Err(anyhow!("vkBindBufferMemory: {error:?}"));
+                    }
+                    Ok(memory)
+                })();
+                let final_result = match result {
+                    Ok(memory) => {
+                        let content = if read_content {
+                            read_imported_buffer(
+                                &instance,
+                                &device,
+                                physical,
+                                queue_family,
+                                buffer,
+                                byte_len,
+                            )
+                            .map(Some)
+                        } else {
+                            Ok(None)
+                        };
+                        unsafe {
+                            device.destroy_buffer(buffer, None);
+                            device.free_memory(memory, None)
+                        };
+                        content
+                    }
+                    Err(error) => {
+                        unsafe { device.destroy_buffer(buffer, None) };
+                        Err(error)
+                    }
+                };
+                final_result
+            })();
+            if let Some((_, owned_handle)) = owned {
+                unsafe {
+                    let _ = CloseHandle(owned_handle);
+                }
+            }
+            result
+        })();
+        unsafe { device.destroy_device(None) };
+        imported
+    })();
+    unsafe { instance.destroy_instance(None) };
+    result
+}
+
+fn read_imported_buffer(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical: vk::PhysicalDevice,
+    queue_family: u32,
+    source: vk::Buffer,
+    byte_len: usize,
+) -> Result<Vec<u8>> {
+    let target = unsafe {
+        device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(byte_len as u64)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+    }?;
+    let result = (|| -> Result<Vec<u8>> {
+        let requirements = unsafe { device.get_buffer_memory_requirements(target) };
+        let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let memory_type = (0..properties.memory_type_count)
+            .find(|index| {
+                requirements.memory_type_bits & (1 << index) != 0
+                    && properties.memory_types[*index as usize]
+                        .property_flags
+                        .contains(flags)
+            })
+            .ok_or_else(|| anyhow!("no coherent host memory for diagnostic readback"))?;
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
+        }?;
+        let copied = (|| -> Result<Vec<u8>> {
+            unsafe { device.bind_buffer_memory(target, memory, 0) }?;
+            let pool = unsafe {
+                device.create_command_pool(
+                    &vk::CommandPoolCreateInfo::default().queue_family_index(queue_family),
+                    None,
+                )
+            }?;
+            let result = (|| -> Result<Vec<u8>> {
+                let command = unsafe {
+                    device.allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1),
+                    )
+                }?[0];
+                unsafe {
+                    device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
+                    device.cmd_copy_buffer(
+                        command,
+                        source,
+                        target,
+                        &[vk::BufferCopy::default().size(byte_len as u64)],
+                    );
+                    let barrier = [vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)
+                        .buffer(target)
+                        .size(byte_len as u64)];
+                    device.cmd_pipeline_barrier(
+                        command,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &barrier,
+                        &[],
+                    );
+                    device.end_command_buffer(command)?;
+                    let commands = [command];
+                    let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
+                    let queue = device.get_device_queue(queue_family, 0);
+                    device.queue_submit(queue, &submits, vk::Fence::null())?;
+                    device.queue_wait_idle(queue)?;
+                    let mapped = device.map_memory(
+                        memory,
+                        0,
+                        byte_len as u64,
+                        vk::MemoryMapFlags::empty(),
+                    )?;
+                    let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), byte_len).to_vec();
+                    device.unmap_memory(memory);
+                    Ok(bytes)
+                }
+            })();
+            unsafe { device.destroy_command_pool(pool, None) };
+            result
+        })();
+        unsafe {
+            device.destroy_buffer(target, None);
+            device.free_memory(memory, None)
+        };
+        copied
+    })();
+    result
 }
 
 impl VulkanGpuProbeResult {
@@ -115,7 +485,23 @@ pub fn probe_selected_luid(requested_luid: u64) -> Result<VulkanGpuProbeResult> 
         .engine_version(1)
         // VkPhysicalDeviceIDProperties/deviceLUID is core in Vulkan 1.1.
         .api_version(vk::API_VERSION_1_1);
-    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    let instance_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .context("vkEnumerateInstanceExtensionProperties failed")?;
+    let has_instance_extension = |name: &CStr| {
+        instance_extensions
+            .iter()
+            .any(|extension| unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) == name })
+    };
+    let surface_supported = has_instance_extension(ash::khr::surface::NAME);
+    let win32_surface_supported = has_instance_extension(ash::khr::win32_surface::NAME);
+    let mut enabled_extensions = Vec::new();
+    if surface_supported && win32_surface_supported {
+        enabled_extensions.push(ash::khr::surface::NAME.as_ptr());
+        enabled_extensions.push(ash::khr::win32_surface::NAME.as_ptr());
+    }
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_extension_names(&enabled_extensions);
     let instance =
         unsafe { entry.create_instance(&create_info, None) }.context("vkCreateInstance failed")?;
 
@@ -164,6 +550,25 @@ pub fn probe_selected_luid(requested_luid: u64) -> Result<VulkanGpuProbeResult> 
                 .map(|(index, _)| index as u32)
                 .ok_or_else(|| anyhow!("matched GPU has no graphics/compute queue"))?;
             let queue_flags = queue_families[queue_family_index as usize].queue_flags;
+            let win32_present_supported = if surface_supported && win32_surface_supported {
+                let win32_surface = ash::khr::win32_surface::Instance::new(&entry, &instance);
+                unsafe {
+                    win32_surface.get_physical_device_win32_presentation_support(
+                        physical_device,
+                        queue_family_index,
+                    )
+                }
+            } else {
+                false
+            };
+            let swapchain_supported =
+                unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                    .context("vkEnumerateDeviceExtensionProperties failed")?
+                    .iter()
+                    .any(|extension| unsafe {
+                        CStr::from_ptr(extension.extension_name.as_ptr())
+                            == ash::khr::swapchain::NAME
+                    });
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family_index)
@@ -186,7 +591,10 @@ pub fn probe_selected_luid(requested_luid: u64) -> Result<VulkanGpuProbeResult> 
                 device_id: properties.device_id,
                 api_version: properties.api_version,
                 queue_family_index,
+                win32_present_supported,
+                swapchain_supported,
                 queue_flags,
+                d3d12_buffer_importable: d3d12_buffer_importable(&instance, physical_device),
             });
         }
 
@@ -744,6 +1152,9 @@ pub fn probe_glsl_compute_selected_luid(requested_luid: u64) -> Result<VulkanGls
                 api_version: properties.api_version,
                 queue_family_index,
                 queue_flags,
+                win32_present_supported: false,
+                swapchain_supported: false,
+                d3d12_buffer_importable: d3d12_buffer_importable(&instance, physical_device),
             },
             spirv_words: spirv.len(),
             verified_values: verified,
@@ -1679,6 +2090,9 @@ fn run_glsl_image_input_selected_luid(
                 api_version: properties.api_version,
                 queue_family_index,
                 queue_flags,
+                win32_present_supported: false,
+                swapchain_supported: false,
+                d3d12_buffer_importable: d3d12_buffer_importable(&instance, physical_device),
             },
             spirv_words: spirv.len(),
             verified_pixels,

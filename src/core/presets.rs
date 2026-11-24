@@ -464,7 +464,7 @@ pub fn load_settings(app_dir: &std::path::Path) -> Settings {
             UiLanguage::DeDe => UiLanguageMode::DeDe,
         };
     }
-    settings.interp_factor = settings.interp_factor.clamp(2, 5);
+    settings.interp_factor = settings.interp_factor.clamp(2, 15);
     settings
 }
 
@@ -626,6 +626,18 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn settings_load_keeps_x15_despite_retired_limit_and_clamps_invalid_values() {
+        let root = temp_filter_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        for (requested, expected) in [(15, 15), (16, 15), (1, 2)] {
+            let json = format!(r#"{{"interp_factor":{requested},"interp_factor_limit":true}}"#);
+            std::fs::write(root.join("settings.json"), json).unwrap();
+            assert_eq!(load_settings(&root).interp_factor, expected);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -7626,6 +7626,7 @@ impl InputSystem {
         let handle = std::thread::Builder::new()
             .name("mouse-hook".into())
             .spawn(move || unsafe {
+                crate::platform::win32::initialize_physical_dpi_thread();
                 struct HookDone(Option<std::sync::mpsc::Sender<()>>);
                 impl Drop for HookDone {
                     fn drop(&mut self) {

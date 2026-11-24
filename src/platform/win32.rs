@@ -46,6 +46,22 @@ struct PanelGdiMirrorSnapshot {
 struct PanelGdiMirrorState {
     hwnd: isize,
     snapshot: PanelGdiMirrorSnapshot,
+    /// v1000: last repaint caused only by the FPS figure.
+    last_fps_paint: Option<std::time::Instant>,
+}
+
+/// v1000: the panel is a TOPMOST window above the 120-240 Hz video overlay;
+/// every GDI repaint makes DWM recompose that area, and repaint timing
+/// correlated with interpolation slot misses (162 of 266 on the B570). The FPS
+/// figure alone therefore refreshes at most every 500 ms (other visual changes
+/// such as hover/stop/screenshot feedback still repaint immediately).
+/// CHIDESCALER_PANEL_FPS_REFRESH_MS=0 restores per-change repaints.
+fn panel_fps_refresh_interval() -> std::time::Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("CHIDESCALER_PANEL_FPS_REFRESH_MS").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(500).min(5000)
+    }))
 }
 
 static PANEL_GDI_MIRROR: OnceLock<Mutex<PanelGdiMirrorState>> = OnceLock::new();
@@ -178,7 +194,9 @@ pub fn install_compositor_keepalive_input_passthrough(hwnd: isize) {
                 "compositor-keepalive-input-route: hwnd={hwnd:#x} mode=wndproc-hit-transparent styles=unchanged"
             );
         } else {
-            log::warn!("compositor-keepalive-input-route: hwnd={hwnd:#x} install=failed");
+            log::warn!(
+                "compositor-keepalive-input-route: hwnd={hwnd:#x} install=failed"
+            );
         }
     }
 }
@@ -223,6 +241,18 @@ unsafe extern "system" fn main_gui_caption_wndproc(
     {
         MAIN_GUI_BACKGROUND_INTENT.store(0, Ordering::Release);
     }
+    if msg == WM_SIZE && wparam.0 == SIZE_MINIMIZED as usize {
+        let panel = panel_gdi_host_hwnd();
+        log::info!("panel-minimize: gui={:#x} panel={panel:#x} rect={:?}", hwnd.0 as isize, window_rect(panel));
+        if panel != 0 && is_window_visible(panel) {
+            // Repaint after the shell has processed the minimize transition.
+            // Include the mirror child, which owns the actual control pixels.
+            unsafe {
+                let _ = RedrawWindow(Some(HWND(panel as *mut _)), None, None,
+                    RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
+        }
+    }
     let old = MAIN_GUI_OLD_WNDPROC.load(Ordering::Acquire);
     if old != 0 {
         let old_proc: WNDPROC = unsafe { std::mem::transmute(old) };
@@ -259,6 +289,10 @@ pub fn main_gui_hwnd() -> isize {
 
 pub fn main_gui_background_intent() -> u8 {
     MAIN_GUI_BACKGROUND_INTENT.load(Ordering::Acquire)
+}
+
+pub fn background_gui_wake_active() -> bool {
+    MAIN_GUI_BACKGROUND_WAKE_ACTIVE.load(Ordering::Acquire)
 }
 
 pub fn finish_background_gui_wake() {
@@ -2112,7 +2146,7 @@ pub fn update_panel_gdi_mirror(
         return;
     }
 
-    let snapshot = PanelGdiMirrorSnapshot {
+    let mut snapshot = PanelGdiMirrorSnapshot {
         parent: parent_hwnd,
         width: width.max(1),
         height: height.max(1),
@@ -2158,6 +2192,17 @@ pub fn update_panel_gdi_mirror(
         }
 
         let old = state.snapshot.clone();
+        let only_fps_changed = !created
+            && old.fps_tenths != snapshot.fps_tenths
+            && PanelGdiMirrorSnapshot { fps_tenths: old.fps_tenths, ..snapshot.clone() } == old;
+        if only_fps_changed {
+            let now = std::time::Instant::now();
+            if state.last_fps_paint.is_some_and(|last| now.duration_since(last) < panel_fps_refresh_interval()) {
+                snapshot.fps_tenths = old.fps_tenths;
+            } else {
+                state.last_fps_paint = Some(now);
+            }
+        }
         let geometry_changed =
             created || old.width != snapshot.width || old.height != snapshot.height;
         let visibility_changed = created || old.visible != snapshot.visible;
@@ -2306,6 +2351,43 @@ pub fn update_panel_gdi_mirror(
 ///
 /// Ordinary FPS/hover updates continue to use `update_panel_gdi_mirror` and its
 /// small dirty-region BitBlt path.
+/// v1001: refresh only the FPS figure of the visible panel. The figure is
+/// normally pushed from the GUI's own frame (`update_panel_gdi_mirror`), but a
+/// minimized/hidden GUI runs no frames, so the panel kept showing the value of
+/// the moment it was hidden. A small background timer calls this while the
+/// GUI is not visible. Safe from any thread: the snapshot is mutex-protected
+/// and the region publish uses the child's own DC (USER32 allows that across
+/// threads); geometry/visibility are never touched here.
+pub fn refresh_panel_gdi_fps(present_fps: f64) {
+    let (child_hwnd, snapshot, dirty_rect) = {
+        let Ok(mut state) = panel_gdi_mirror_state().lock() else {
+            return;
+        };
+        if state.hwnd == 0 || !is_window_valid(state.hwnd) || !state.snapshot.visible || state.snapshot.chip {
+            return;
+        }
+        let fps_tenths = (present_fps * 10.0).round() as i32;
+        if fps_tenths == state.snapshot.fps_tenths {
+            return;
+        }
+        let old = state.snapshot.clone();
+        let mut snapshot = old.clone();
+        snapshot.fps_tenths = fps_tenths;
+        let dirty_rect = panel_gdi_visual_dirty_rect(&old, &snapshot);
+        state.snapshot = snapshot.clone();
+        state.last_fps_paint = Some(std::time::Instant::now());
+        (state.hwnd, snapshot, dirty_rect)
+    };
+    let child = HWND(child_hwnd as *mut _);
+    let full_rect = RECT { left: 0, top: 0, right: snapshot.width.max(1), bottom: snapshot.height.max(1) };
+    let published = unsafe { publish_panel_gdi_region(child, &snapshot, dirty_rect.unwrap_or(full_rect)) };
+    if !published {
+        unsafe {
+            let _ = RedrawWindow(Some(child), None, None, RDW_INVALIDATE);
+        }
+    }
+}
+
 pub fn republish_panel_gdi_mirror_full(parent_hwnd: isize) -> bool {
     if parent_hwnd == 0 || !is_window_valid(parent_hwnd) || !is_own_window(parent_hwnd) {
         return false;
@@ -4280,7 +4362,7 @@ pub fn panel_screen_visibility_probe(panel_hwnd: isize) -> Option<(usize, usize,
     if panel_hwnd == 0 || !is_window_valid(panel_hwnd) || !is_window_visible(panel_hwnd) {
         return None;
     }
-    let (child_hwnd, snapshot) = {
+    let snapshot = {
         let state = panel_gdi_mirror_state().lock().ok()?;
         if state.hwnd == 0
             || !is_window_valid(state.hwnd)
@@ -4289,23 +4371,31 @@ pub fn panel_screen_visibility_probe(panel_hwnd: isize) -> Option<(usize, usize,
         {
             return None;
         }
-        (state.hwnd, state.snapshot.clone())
+        state.snapshot.clone()
     };
     let (sx, sy, sw, sh) = window_rect(panel_hwnd)?;
     let w = snapshot.width.min(sw).max(1);
     let h = snapshot.height.min(sh).max(1);
     unsafe {
         let screen_dc = GetDC(None);
-        let child_dc = GetDC(Some(HWND(child_hwnd as *mut _)));
-        if screen_dc.is_invalid() || child_dc.is_invalid() {
-            if !screen_dc.is_invalid() {
-                let _ = ReleaseDC(None, screen_dc);
-            }
-            if !child_dc.is_invalid() {
-                let _ = ReleaseDC(Some(HWND(child_hwnd as *mut _)), child_dc);
-            }
+        if screen_dc.is_invalid() {
             return None;
         }
+        let mem = raw_create_compatible_dc(screen_dc.0);
+        let bitmap = raw_create_compatible_bitmap(screen_dc.0, snapshot.width.max(1), snapshot.height.max(1));
+        let old = if !mem.is_null() && !bitmap.is_null() {
+            raw_select_object(mem, bitmap)
+        } else {
+            core::ptr::null_mut()
+        };
+        if old.is_null() {
+            if !bitmap.is_null() { raw_delete_object(bitmap); }
+            if !mem.is_null() { raw_delete_dc(mem); }
+            let _ = ReleaseDC(None, screen_dc);
+            return None;
+        }
+        let reference = windows::Win32::Graphics::Gdi::HDC(mem);
+        paint_panel_gdi_mirror(reference, &snapshot);
 
         // Spread samples over the complete 297x33 bar. Comparing against the
         // mirror's own pixels makes the probe valid for localized text, hover,
@@ -4319,7 +4409,7 @@ pub fn panel_screen_visibility_probe(panel_hwnd: isize) -> Option<(usize, usize,
             for &y0 in &ys {
                 let x = x0.clamp(0, w - 1);
                 let y = y0.clamp(0, h - 1);
-                let expected = GetPixel(child_dc, x, y).0;
+                let expected = GetPixel(reference, x, y).0;
                 let actual = GetPixel(screen_dc, sx + x, sy + y).0;
                 if expected == 0xffff_ffff || actual == 0xffff_ffff {
                     continue;
@@ -4334,7 +4424,9 @@ pub fn panel_screen_visibility_probe(panel_hwnd: isize) -> Option<(usize, usize,
                 delta_sum += delta as u64;
             }
         }
-        let _ = ReleaseDC(Some(HWND(child_hwnd as *mut _)), child_dc);
+        raw_select_object(mem, old);
+        raw_delete_object(bitmap);
+        raw_delete_dc(mem);
         let _ = ReleaseDC(None, screen_dc);
         if sampled == 0 {
             None
@@ -5489,6 +5581,10 @@ pub fn set_window_cloaked(hwnd: isize, cloaked: bool) -> bool {
 
 /// DWM-cloaked windows (suspended UWP etc.) are invisible to the user.
 pub fn is_cloaked(hwnd: isize) -> bool {
+    window_cloak_flags(hwnd) != 0
+}
+
+pub fn window_cloak_flags(hwnd: isize) -> u32 {
     unsafe {
         let mut cloaked: u32 = 0;
         let _ = DwmGetWindowAttribute(
@@ -5497,7 +5593,7 @@ pub fn is_cloaked(hwnd: isize) -> bool {
             &mut cloaked as *mut _ as *mut _,
             4,
         );
-        cloaked != 0
+        cloaked
     }
 }
 
@@ -5638,5 +5734,21 @@ mod tests {
         assert!(rect_covers_monitor((2559, -1, 2562, 1442), monitor, 2));
         assert!(!rect_covers_monitor((2560, 0, 2560, 1400), monitor, 2));
         assert!(!rect_covers_monitor((2600, 30, 2400, 1300), monitor, 2));
+    }
+}
+
+/// Pin coordinate-owning threads to physical pixels even when a compatibility
+/// setting supplied an unaware process default. Call before creating HWNDs.
+pub fn initialize_physical_dpi_thread() {
+    use windows::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    unsafe {
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        if previous.0.is_null() {
+            log::warn!("physical-dpi-thread: unable to select PerMonitorV2: {}", windows::core::Error::from_thread());
+        } else {
+            log::info!("physical-dpi-thread: thread={:?} context=PerMonitorV2 coordinates=physical", std::thread::current().name());
+        }
     }
 }

@@ -7,7 +7,7 @@
 use crate::capture::wgc::{FrameBuf, WgcSource};
 use crate::core::config::{
     AspectCorrectionMode, CaptureCrop, HdrSdrMode, OnnxBackendPreference, ScaleMode, StageKind,
-    StageSpec, sanitize_aspect_correction_scale,
+    StageSpec, sanitize_aspect_correction_scale, interp_capacity, interp_ratio, normalize_interp_code, INTERP_25_CODE,
 };
 use crate::core::metrics::Metrics;
 use crate::overlay::window::OverlayWindow;
@@ -50,7 +50,22 @@ fn metrics_kind_label(kind: StageKind) -> &'static str {
 }
 
 const NEOFLOW_QUEUE_MAX: usize = 1;
+// v952: RIFE/ONNX interpolation keeps every captured picture in order (A-B,
+// B-C, C-D...). Depth 3 dropped the oldest frame whenever 1080p processing ran
+// slightly behind the source, so pairs skipped pictures. Latency may grow
+// instead; see also the gap reset where history is extended.
+// v960: back to the v874-era depth 3 for real-time latency. Depth 16 let a
+// single hiccup leave a permanent backlog (observed 650ms / 39 frames). Frame
+// order is still protected: dropping a queued picture triggers the v952
+// queue-gap reset, so no pair ever bridges a gap (shown as an honest hitch).
+// CHIDESCALER_INTERP_QUEUE_MAX=16 restores the v952 behavior.
 const ONNX_INTERP_QUEUE_MAX: usize = 3;
+fn onnx_interp_queue_max() -> usize {
+    std::env::var("CHIDESCALER_INTERP_QUEUE_MAX").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=16).contains(v))
+        .unwrap_or(ONNX_INTERP_QUEUE_MAX)
+}
 // DirectML DRBA is a delayed four-real-frame model. At 1080p x5 the provider
 // can run only a few milliseconds slower than a 24p source period; dropping the
 // oldest frame at depth 3 then turns B->C into a multi-frame temporal jump. Use
@@ -913,6 +928,7 @@ impl EngineHandle {
         let thread = std::thread::Builder::new()
             .name("render-engine".into())
             .spawn(move || {
+                win32::initialize_physical_dpi_thread();
                 let _done = EngineThreadDone(done_tx);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     engine_main(
@@ -1531,6 +1547,66 @@ fn vulkan_capture_tile_rgba8(frame: &FrameBuf) -> Option<(Vec<u8>, i32, i32)> {
     Some((tile, x as i32, y as i32))
 }
 
+/// v939 diagnostic only (no behaviour change): is the CAPTURED source picture changing?
+/// Every delivered capture frame gets the existing 64x36 luma signature (cheap, host data),
+/// hashed and compared with the previous one. Identical pictures for >= 1 s while frames keep
+/// arriving = the source (e.g. mpv) is showing a frozen image; compare with
+/// content-diag-present-static from the overlay to tell a source stall from a Neo stall.
+/// Logs content-diag-capture-static (warn, after 1 s and every 5 s) and
+/// content-diag-capture-static-end (info). `CHIDESCALER_CONTENT_DIAG=off` disables it.
+fn content_diag_capture(frame: &FrameBuf) {
+    use std::sync::Mutex;
+    struct St {
+        hash: u64,
+        last: Instant,
+        same_since: Option<Instant>,
+        frames_same: u64,
+        warned_ms: u128,
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ST: Mutex<Option<St>> = Mutex::new(None);
+    if !*ENABLED.get_or_init(|| std::env::var("CHIDESCALER_CONTENT_DIAG").ok().as_deref() != Some("off")) {
+        return;
+    }
+    let Some(sig) = frame_signature(frame) else { return };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ ((frame.w as u64) << 32 | frame.h as u64);
+    for b in &sig.luma {
+        h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    let Ok(mut guard) = ST.lock() else { return };
+    let now = Instant::now();
+    let st = guard.get_or_insert_with(|| St { hash: 0, last: now, same_since: None, frames_same: 0, warned_ms: 0 });
+    if now.duration_since(st.last) > Duration::from_secs(3) {
+        st.same_since = None;
+        st.frames_same = 0;
+        st.warned_ms = 0;
+        st.hash = 0;
+    }
+    st.last = now;
+    if h == st.hash {
+        st.frames_same += 1;
+        let since = *st.same_since.get_or_insert(now);
+        let ms = now.duration_since(since).as_millis();
+        if ms >= 1000 && (st.warned_ms == 0 || ms >= st.warned_ms + 5000) {
+            st.warned_ms = ms;
+            log::warn!(
+                "content-diag-capture-static: static_ms={} identical_frames={} size={}x{} (frames arriving, source picture unchanged)",
+                ms, st.frames_same, frame.w, frame.h
+            );
+        }
+    } else {
+        if let Some(since) = st.same_since.take() {
+            let ms = now.duration_since(since).as_millis();
+            if ms >= 1000 {
+                log::info!("content-diag-capture-static-end: static_ms={} identical_frames={}", ms, st.frames_same);
+            }
+        }
+        st.hash = h;
+        st.frames_same = 0;
+        st.warned_ms = 0;
+    }
+}
+
 /// Conservative perceptual signature for duplicate animation frames. Four
 /// samples per 64x36 cell suppress codec grain, while the strict maximum
 /// delta guard prevents a small moving object or subtitle from being missed.
@@ -1645,6 +1721,13 @@ fn update_neodeint_scene_latch(history: &mut u8, hold: &mut u8, combed: bool) ->
 
 fn signatures_match(a: &FrameSignature, b: &FrameSignature) -> bool {
     signatures_luma_close(a, b) && !signature_has_coherent_motion(a, b)
+}
+
+// A picture arriving at the native 24p interval is a real source slot even
+// when the perceptual signature happens to resemble its neighbour. Only a
+// faster compositor delivery (30 Hz or above) may be omitted as a repeat.
+fn compositor_repeat_interval(previous: Option<i64>, current: Option<i64>) -> bool {
+    matches!((previous, current), (Some(a), Some(b)) if b > a && b - a < 370_000)
 }
 
 fn signatures_luma_close(a: &FrameSignature, b: &FrameSignature) -> bool {
@@ -2090,6 +2173,12 @@ struct Session {
     // anchor to submission time, not completion time, because a healthy DWM
     // path may block inside SwapBuffers for several milliseconds.
     last_present_started: Instant,
+    dml_early_tail_logged: bool,
+    neoarc_early_tail_logged: bool,
+    queue_gap_bridged: u64,
+    last_present_refresh: Option<u64>,
+    last_present_counted: Option<Instant>,
+    present_hidden_total: u64,
     frame: FrameBuf,
     /// A live chain replacement must process the cached source even when a
     /// static PIP does not emit another WGC frame.
@@ -2223,6 +2312,7 @@ struct Session {
     /// Smooth mode extracts the cadence of changing picture content from
     /// compositor-driven WGC updates (e.g. Chrome 24p video delivered at 30Hz).
     smooth_content_signature: Option<FrameSignature>,
+    smooth_content_last_delivery_time: Option<i64>,
     smooth_content_duplicates: u64,
     smooth_content_seq: u64,
     smooth_content_unique_since_duplicate: u8,
@@ -2232,9 +2322,14 @@ struct Session {
     smooth_content_candidate_gaps: std::collections::VecDeque<u64>,
     smooth_content_24p_detected: bool,
     cadence: CadenceEstimator,
+    /// Cadence sequence stays independent of the contiguous content IDs used
+    /// by interpolation when the capture queue has dropped source frames.
+    cadence_input_seq: u64,
+    cadence_last_capture_seq: Option<u64>,
     smooth_pacer: SmoothPacer,
     /// Exact source-cadence presentation slot for a non-interpolated frame.
     paced_present_deadline: Option<Instant>,
+    intel_early_present_prepare:u8,
     flow_output_cadence: FlowOutputCadence,
     present_cadence: PresentCadence,
     cap_diag: CapDiag,
@@ -2273,6 +2368,7 @@ struct Session {
     /// through SwapBuffers before the next unique RIFE/DRBA invocation starts.
     gpu_interp_permit_after_post_submit: Option<(u64, u64)>,
     gpu_interp_pair_id: u64,
+    gpu_interp_last_retired_diag: Option<(u64, u64, Instant)>,
     gpu_interp_active_logged: bool,
     /// DRBA real-time admission controller. The GUI multiplier is never
     /// rewritten: x5 always keeps the x5 phase grid (0.2/0.4/0.6/0.8). If the
@@ -2281,10 +2377,21 @@ struct Session {
     /// therefore falls naturally (for example ~94fps instead of a fake 120fps)
     /// while source frames and temporal order remain authoritative.
     drba_midpoint_ema_ms: f64,
+    rife_mid_recent: std::collections::VecDeque<f64>,
+    refresh_limited_logged_code: u32,
+    capture_upload_ema_ms: f64,
+    capture_take_deferred: u64,
+    interp_period_hold: InterpPeriodHold,
     drba_perf_samples: u32,
     drba_compute_credit_ms: f64,
     drba_phase_rotation: usize,
     drba_dropped_midpoints: u64,
+    /// v938: the same admission controller for DirectML RIFE-family models
+    /// (NeoRIFE / FraZerion split etc.). Only engages when the measured cost of
+    /// all requested mids exceeds the source interval; otherwise every phase is
+    /// submitted exactly as before. Without it a 1080p x5 overload starved the
+    /// capture queue, corrupted the cadence estimate and made playback look frozen.
+    rife_admission_active: bool,
     /// Cursor mapping stays released while a newly-selected interpolation
     /// provider performs its first real inference. This avoids treating a
     /// legitimate cold TensorRT build as a render-heartbeat failure.
@@ -2301,6 +2408,14 @@ struct Session {
     /// Smooth-mode output clock. Unlike WGC arrival time, this advances by an
     /// exact source-period/factor step (20.833 ms for 24p x2).
     interp_present_deadline: Option<Instant>,
+    /// v979: (carried deadline, ideal time) left by the cooperative-slot
+    /// drain. The ideal is used only while interp_present_deadline still
+    /// equals the carried deadline, so any reset elsewhere discards it.
+    interp_catchup_carry: Option<(Instant, Instant)>,
+    /// v981: retired interpolation input buffers (8MB at 1080p RGBA) reused
+    /// for the next frame copy / pre-chain readback, so the render thread no
+    /// longer faults in fresh zeroed pages for every source frame.
+    frame_pool: Vec<Arc<Vec<u8>>>,
     /// A cold DirectML post-stage can be 2-3 ms slower until its command
     /// path and GPU clocks have been exercised. At 48fps that crosses the
     /// 20.83ms slot and leaves the capture queue permanently behind.
@@ -2353,8 +2468,13 @@ struct Session {
     last_chain_submit_ms: f64,
     last_resample_submit_ms: f64,
     last_post_submit_ms: f64,
+    last_interp_post_ready_ms: f64,
+    interp_timing:Option<crate::render::interp_timing::AsyncInterpTiming>,
     last_pacer_wait_ms: f64,
     last_present_call_ms: f64,
+    /// v992: fence after the previous present (GL frame-latency limit).
+    gl_prev_present_fence: Option<glow::Fence>,
+    gl_latency_wait_ms: f64,
     /// Time spent inside the most recent SwapBuffers/present call. A blocking
     /// present gives us a trustworthy DWM/vblank phase sample; a non-blocking
     /// present leaves the manual deadline as the authority.
@@ -2370,6 +2490,8 @@ struct Session {
     metric_seq: u64,
     last_metrics_log: Instant,
     phase_diag_samples: u8,
+    // v994: first reveal held while the NeoArc GL bridge builds (bounded).
+    neoarc_reveal_hold_started: Option<Instant>,
     glsl_guard: GlslResponsivenessGuard,
     /// GLSL-containing chains that were already proven
     /// overloaded during this capture session. This survives chain edits so
@@ -2408,6 +2530,7 @@ struct GlslResponsivenessGuard {
     admission_phase: u8,
     last_log: Instant,
     skipped_since_log: u32,
+    gui_hold_since:Option<Instant>,
 }
 
 impl Default for GlslResponsivenessGuard {
@@ -2420,6 +2543,7 @@ impl Default for GlslResponsivenessGuard {
             admission_phase: 0,
             last_log: Instant::now() - Duration::from_secs(5),
             skipped_since_log: 0,
+            gui_hold_since:None,
         }
     }
 }
@@ -2453,6 +2577,7 @@ impl GlslResponsivenessGuard {
         self.healthy_since = None;
         self.admission_phase = 0;
         self.skipped_since_log = 0;
+        self.gui_hold_since=None;
     }
 
     fn observe_processed(
@@ -2542,6 +2667,14 @@ impl GlslResponsivenessGuard {
         } else {
             self.healthy_since = None;
         }
+    }
+
+    fn pause_for_gui(&mut self,requested:bool,now:Instant)->bool{
+        if !requested{self.gui_hold_since=None;return false;}
+        let since=self.gui_hold_since.get_or_insert(now);
+        if now.saturating_duration_since(*since)>=Duration::from_millis(100){
+            *since=now;false
+        }else{true}
     }
 
     fn should_skip_frame(&mut self) -> bool {
@@ -3161,7 +3294,7 @@ impl CadenceEstimator {
         // Browser/content-aware cadence keeps its existing multimodal model.
         if !self.content_aware {
             if let Some(period) = dominant_video_period_with_missed_pictures(&samples) {
-                return Some(period);
+                return Some(refine_24_25_period(period, &samples));
             }
         }
         samples.sort_unstable();
@@ -3324,6 +3457,93 @@ fn dominant_video_period_with_missed_pictures(samples: &[i64]) -> Option<f64> {
     best.map(|(_, _, _, period)| period)
 }
 
+/// v1000: interpolation clock hold. A changed source period is adopted only
+/// after it has persisted (24 pairs, ~1 s at 24p; 6 pairs for a large >15%
+/// change such as 24 -> 30/60). A new interpolation generation (history reset,
+/// geometry/model change) adopts the estimate immediately. Every adopted change
+/// rebases the output clock, so short estimator flips must not reach it.
+/// CHIDESCALER_INTERP_PERIOD_HOLD=off disables.
+#[derive(Default, Clone, Copy)]
+struct InterpPeriodHold {
+    current: f64,
+    candidate: f64,
+    count: u32,
+    generation: u64,
+}
+
+fn hold_interp_source_period(hold: &mut InterpPeriodHold, raw: f64, generation: u64) -> f64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CHIDESCALER_INTERP_PERIOD_HOLD").ok().as_deref() != Some("off")) {
+        return raw;
+    }
+    if !raw.is_finite() || raw <= 0.0 {
+        return raw;
+    }
+    if hold.current <= 0.0 || hold.generation != generation {
+        *hold = InterpPeriodHold { current: raw, candidate: raw, count: 0, generation };
+        return raw;
+    }
+    let rel = |a: f64, b: f64| ((a - b) / b).abs();
+    if rel(raw, hold.current) <= 0.005 {
+        hold.count = 0;
+        hold.candidate = hold.current;
+        return hold.current;
+    }
+    if rel(raw, hold.candidate) <= 0.005 {
+        hold.count = hold.count.saturating_add(1);
+    } else {
+        hold.candidate = raw;
+        hold.count = 1;
+    }
+    let needed = if rel(raw, hold.current) > 0.15 { 6 } else { 24 };
+    if hold.count >= needed {
+        log::info!(
+            "interp-period-hold: adopted old_ms={:.3} new_ms={:.3} after={} pairs",
+            hold.current * 1000.0, raw * 1000.0, hold.count
+        );
+        hold.current = raw;
+        hold.count = 0;
+    }
+    hold.current
+}
+
+/// v1000: 25p delivered by a 240 Hz compositor arrives as 41.7/37.5 ms
+/// (10/9 refreshes). Per-sample matching scores 24p and 25p almost equally, so
+/// the lock flipped between 8.000 and 8.342 ms output slots every few frames at
+/// x5; each flip rebased the output clock and skipped slots (visible hitches
+/// about every 5 s). Between the 23.976/24 and 25 candidates the mean of the
+/// direct intervals (40.0 vs 41.7 ms, a 4% gap) decides instead.
+/// CHIDESCALER_CADENCE_2425_MEAN=off restores the per-sample choice.
+fn refine_24_25_period(period: f64, samples: &[i64]) -> f64 {
+    const P25: f64 = 1.0 / 25.0;
+    const P24: f64 = 1.0 / 24.0;
+    const P23: f64 = 1001.0 / 24000.0;
+    let is_family = [P25, P24, P23].iter().any(|p| (period - p).abs() < 1e-6);
+    if !is_family || std::env::var("CHIDESCALER_CADENCE_2425_MEAN").ok().as_deref() == Some("off") {
+        return period;
+    }
+    // Direct intervals only (33-48 ms); missed-picture multiples are excluded.
+    let direct: Vec<f64> = samples
+        .iter()
+        .map(|v| *v as f64 / 10_000_000.0)
+        .filter(|v| (0.033..=0.048).contains(v))
+        .collect();
+    if direct.len() < 8 {
+        return period;
+    }
+    let mean = direct.iter().sum::<f64>() / direct.len() as f64;
+    let midpoint = (P25 + P24) * 0.5; // 40.83 ms
+    if mean < midpoint {
+        P25
+    } else if (period - P25).abs() < 1e-6 {
+        // The per-sample choice said 25p but the mean says 24p-class: keep
+        // the exact 24p period (23.976 vs 24 is not resolvable this way).
+        P24
+    } else {
+        period
+    }
+}
+
 fn normalized_frame_span_s(
     prev_time_100ns: Option<i64>,
     cur_time_100ns: Option<i64>,
@@ -3392,14 +3612,14 @@ fn refresh_limited_output_ratio(
     refresh_hz: Option<f64>,
 ) -> f64 {
     let (Some(period), Some(refresh)) = (source_period_s, refresh_hz) else {
-        return requested as f64;
+        return if requested==INTERP_25_CODE{2.5}else{requested as f64};
     };
     if !period.is_finite()
         || !refresh.is_finite()
         || !(1.0 / 240.0..=0.2).contains(&period)
         || !(20.0..=1000.0).contains(&refresh)
     {
-        return requested as f64;
+        return if requested==INTERP_25_CODE{2.5}else{requested as f64};
     }
     // The GUI multiplier is a processing contract, not a request to fill the
     // monitor. x2 must remain exactly two outputs per source interval (24p ->
@@ -3409,7 +3629,7 @@ fn refresh_limited_output_ratio(
     // 60Hz monitor. ONNX interpolation no longer uses this helper: x2-x5 are
     // strict processing multipliers regardless of display refresh.
     let display_ratio = refresh * period;
-    display_ratio.clamp(1.0, requested as f64)
+    display_ratio.clamp(1.0, if requested==INTERP_25_CODE{2.5}else{requested as f64})
 }
 
 /// ONNX interpolation multiplier is a processing contract.  x2/x3/x4/x5
@@ -3417,16 +3637,68 @@ fn refresh_limited_output_ratio(
 /// of monitor refresh or a transient source-period estimate.  Presentation may
 /// naturally drop/hold frames when the selected multiplier exceeds the display
 /// refresh, but inference cadence must not silently change the user's setting.
-fn onnx_output_ratio(
-    requested: u32,
-    _source_period_s: Option<f64>,
-    _refresh_hz: Option<f64>,
-) -> f64 {
-    requested.clamp(2, 5) as f64
+fn onnx_output_ratio(requested:u32,source_period_s:Option<f64>,refresh_hz:Option<f64>)->f64{
+    let ratio=interp_ratio(requested);
+    if requested==INTERP_25_CODE{
+        if let(Some(period),Some(refresh))=(source_period_s,refresh_hz){
+            let matched=period*refresh;
+            // 23.976/24 sources and 59.94/60 displays may differ slightly.
+            // Only the explicit fractional mode follows a nearby display clock.
+            if period.is_finite()&&refresh.is_finite()&&(20.0..=1000.0).contains(&refresh)&&(matched/2.5-1.0).abs()<=0.02{return matched;}
+        }
+    }
+    ratio
+}
+
+/// v997: largest integer multiplier the display can actually show for this
+/// source. Only applies when source_period * refresh is within 3% of an
+/// integer N >= 2 (24p/23.976p on 120/144/240/360 Hz, 30p on 240 Hz, ...);
+/// then a requested multiplier above N becomes N. Non-integer ratios (25p on
+/// 240 Hz) and x2.5 are unchanged. Default off; CHIDESCALER_INTERP_REFRESH_CAP=on enables.
+fn refresh_limited_interp_code(code: u32, source_period_s: f64, refresh_hz: Option<f64>) -> u32 {
+    if code == INTERP_25_CODE {
+        return code;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Opt-in only (=on): the user prefers rendering above the display rate
+    // (perceived smoothness), so the default keeps the selected multiplier.
+    if !*ON.get_or_init(|| std::env::var("CHIDESCALER_INTERP_REFRESH_CAP").ok().as_deref() == Some("on")) {
+        return code;
+    }
+    refresh_limited_interp_code_core(code, source_period_s, refresh_hz)
+}
+
+fn refresh_limited_interp_code_core(code: u32, source_period_s: f64, refresh_hz: Option<f64>) -> u32 {
+    if code == INTERP_25_CODE {
+        return code;
+    }
+    let Some(refresh) = refresh_hz.filter(|r| r.is_finite() && (20.0..=1000.0).contains(r)) else { return code };
+    if !source_period_s.is_finite() || source_period_s <= 0.0 {
+        return code;
+    }
+    let ratio = source_period_s * refresh;
+    let n = ratio.round();
+    if n < 2.0 || ((ratio - n) / n).abs() > 0.03 {
+        return code;
+    }
+    let n = n as u32;
+    if code > n { n.clamp(2, 15) } else { code }
 }
 
 #[derive(Default)]
 struct FlowOutputCadence {
+    /// v988: NeoArc integer interpolation. A pair's first mid is due the moment
+    /// its source frame arrives, so every pair started 1-2 slots late and the
+    /// phase-preserving skip dropped a slot per pair while the grid crept later
+    /// (x10 at 240 Hz: ~215 fps, rising latency, queue-gap resets). With this
+    /// set, a small lateness (<= LATE_REBASE_SLOTS) moves the grid to `now`
+    /// once instead; later pairs then have the trunk time built in.
+    late_rebase:bool,
+    late_rebase_count:u64,
+    fractional_onnx:bool,
+    fractional_submit_deadline:Option<Instant>,
+    fractional_exact_correction:f64,
+    fractional_started:bool,
     next_phase: Option<f64>,
     phase_step: f64,
     next_present: Option<Instant>,
@@ -3437,12 +3709,147 @@ struct FlowOutputCadence {
     /// phase already proven to work instead of anchoring to an arbitrary loop
     /// iteration.
     last_present_started: Option<Instant>,
+    /// v956: number of vblank phase corrections applied (diagnostics).
+    vblank_align_count: u64,
 }
 
 /// Multi-slot interpolation releases the next provider timestep after the
 /// current output's GL work has been submitted. Integer x3/x4/x5 share the
 /// same cooperative scheduling rule; x3's direct-output detach is synchronized
 /// before this release so provider work does not race the copy.
+/// v956: absolute DWM refresh index containing "now" (for honest FPS).
+fn dwm_refresh_index() -> Option<(u64, f64)> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
+    use windows::Win32::System::Performance::QueryPerformanceCounter;
+    unsafe {
+        let mut info = DWM_TIMING_INFO {
+            cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+            ..Default::default()
+        };
+        DwmGetCompositionTimingInfo(HWND::default(), &mut info).ok()?;
+        let mut now_qpc = 0i64;
+        QueryPerformanceCounter(&mut now_qpc).ok()?;
+        if info.qpcRefreshPeriod == 0 || info.qpcVBlank == 0 {
+            return None;
+        }
+        let since = now_qpc as i128 - info.qpcVBlank as i128;
+        let whole = since.div_euclid(info.qpcRefreshPeriod as i128);
+        let mut freq = 0i64;
+        windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq).ok()?;
+        if freq <= 0 { return None; }
+        let refresh_s = info.qpcRefreshPeriod as f64 / freq as f64;
+        Some(((info.cRefresh as i128 + whole).max(0) as u64, refresh_s))
+    }
+}
+
+/// v956: vblank phase alignment for output rate == refresh rate (default on).
+fn vblank_align_enabled() -> bool {
+    std::env::var("CHIDESCALER_INTERP_VBLANK_ALIGN").ok().as_deref() != Some("off")
+}
+
+/// v956: where inside a refresh interval presents should land (0..1).
+fn vblank_target_fraction() -> f64 {
+    std::env::var("CHIDESCALER_INTERP_VBLANK_PHASE").ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.05 && *v <= 0.95)
+        .unwrap_or(0.45)
+}
+
+/// v956/v958: signed correction (seconds) that moves the repeating present
+/// phase set of this cadence away from the compositor latch.
+fn vblank_phase_error_s(deadline: Instant, period_s: f64) -> Option<f64> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
+    use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    unsafe {
+        let mut info = DWM_TIMING_INFO {
+            cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+            ..Default::default()
+        };
+        DwmGetCompositionTimingInfo(HWND::default(), &mut info).ok()?;
+        let mut freq = 0i64;
+        QueryPerformanceFrequency(&mut freq).ok()?;
+        let mut now_qpc = 0i64;
+        QueryPerformanceCounter(&mut now_qpc).ok()?;
+        let now = Instant::now();
+        if freq <= 0 || info.qpcRefreshPeriod == 0 || info.qpcVBlank == 0 {
+            return None;
+        }
+        let refresh_s = info.qpcRefreshPeriod as f64 / freq as f64;
+        if !(refresh_s > 0.002 && refresh_s < 0.05) {
+            return None;
+        }
+        // v958: any output cadence whose pattern repeats against the refresh
+        // within 8 outputs (n*P == m*R): x5 = 120fps (n=1), x4 = 96fps (n=4),
+        // x3 = 72fps (n=3), x2 = 48fps (n=2) on 120 Hz, 60fps on 120 Hz, etc.
+        // Each such cadence presents at a FIXED set of phases inside a refresh.
+        // Which set is chosen at session start is random; if one phase sits on
+        // the compositor latch, sub-ms jitter flips that frame between two
+        // refreshes (one frame never shown, another shown twice) while FPS and
+        // present intervals still look perfect. Move the whole set so every
+        // phase is as far from the latch as possible.
+        let ratio = period_s / refresh_s;
+        let mut repeat = 0usize;
+        for n in 1..=8usize {
+            let m = (ratio * n as f64).round();
+            if m >= 1.0 && ((ratio * n as f64) - m).abs() * refresh_s <= 0.000_25 {
+                repeat = n;
+                break;
+            }
+        }
+        if repeat == 0 {
+            return None;
+        }
+        let ahead_s = if deadline >= now {
+            deadline.duration_since(now).as_secs_f64()
+        } else {
+            -now.duration_since(deadline).as_secs_f64()
+        };
+        let deadline_qpc = now_qpc as f64 + ahead_s * freq as f64;
+        let since_vblank_s = (deadline_qpc - info.qpcVBlank as f64) / freq as f64;
+        let phase = since_vblank_s.rem_euclid(refresh_s);
+        // Latch phase: v956 aimed single-phase presents at 0.45 of the refresh,
+        // i.e. half a refresh away from 0.95 (just before vblank).
+        let latch = (vblank_target_fraction() + 0.5).rem_euclid(1.0) * refresh_s;
+        let clearance = |shift: f64| -> f64 {
+            (0..repeat)
+                .map(|j| {
+                    let p = (phase + shift + j as f64 * period_s).rem_euclid(refresh_s);
+                    let d = (p - latch).abs();
+                    d.min(refresh_s - d)
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let samples = 96;
+        let mut best_shift: f64 = 0.0;
+        let mut best_clear = clearance(0.0);
+        for k in 0..samples {
+            let shift = (k as f64 / samples as f64 - 0.5) * refresh_s;
+            let c = clearance(shift);
+            // Prefer the smallest move among (nearly) equally safe positions.
+            if c > best_clear + 0.000_05 || ((c - best_clear).abs() <= 0.000_05 && shift.abs() < best_shift.abs()) {
+                best_clear = c;
+                best_shift = shift;
+            }
+        }
+        // Caller moves the deadline EARLIER by a positive error.
+        let err = -best_shift;
+        Some(err)
+    }
+}
+
+fn intel_interp_outputs_are_independent(outputs:&[PreparedInterpGpuOutput])->bool{
+ if outputs.is_empty(){return false;}
+ // These descriptors are created only by the validated B570 WGL or NeoArc
+ // bridge. Old DML external-memory, CUDA, AMD and RTX paths remain unchanged.
+ let wgl=outputs.iter().all(|s|s.key&(1u64<<63)!=0&&s.texture.is_none());
+ let arc=outputs.iter().all(|s|s.texture.is_some());
+ if wgl{return outputs.iter().enumerate().all(|(i,a)|outputs[..i].iter().all(|b|a.key!=b.key));}
+ if arc{return outputs.iter().enumerate().all(|(i,a)|outputs[..i].iter().all(|b|a.texture.unwrap().tex!=b.texture.unwrap().tex));}
+ false
+}
+
 fn gpu_interp_slot_policy(factor: u32, timestep_count: usize) -> (bool, bool) {
     // v803 DirectML DRBA baseline: restore the exact v782 cooperative provider
     // ownership contract. x3 needs both midpoints; x4/x5 need at least three.
@@ -3471,7 +3878,50 @@ fn gpu_interp_slot_policy_for_path(
 }
 
 impl FlowOutputCadence {
+    fn onnx_fractional_phases(&mut self,ratio:f64)->Vec<f32>{
+        self.fractional_onnx=true;
+        let ratio=if ratio.is_finite(){ratio.clamp(2.45,2.55)}else{2.5};let step=1./ratio;
+        if self.next_phase.is_none()||self.phase_step<=0.||((step-self.phase_step)/self.phase_step).abs()>0.02{
+            self.next_phase=Some(1.-(ratio.ceil()-1.)*step);self.next_present=None;self.fractional_started=false;
+        }
+        if (step-0.4).abs()<1e-12{
+            if (self.phase_step-step).abs()>1e-12{
+                let phase=self.next_phase.unwrap();let canonical=[0.,0.2,0.4].into_iter().min_by(|a,b|((a-phase).abs()).total_cmp(&(b-phase).abs())).unwrap();
+                self.fractional_exact_correction=canonical-phase;
+                log::info!("fractional-grid-exact-lock: old_phase={:.9} phase={:.9} correction_source_frames={:.9} gradual={} output_clock_preserved=true",phase,canonical,canonical-phase,(canonical-phase).abs()>0.01);
+            }
+            let remaining=self.fractional_exact_correction;
+            if remaining.abs()>1e-12{
+                // Large startup offsets converge with <=0.002 source-frame
+                // adjustments per pair. Only the final <=0.01 is snapped.
+                let correction=if remaining.abs()<=0.01{remaining}else{remaining.clamp(-0.002,0.002)};
+                let phase=(self.next_phase.unwrap()+correction).max(0.);self.fractional_exact_correction-=correction;
+                self.next_phase=Some(if self.fractional_exact_correction.abs()<1e-12{
+                    self.fractional_exact_correction=0.;[0.,0.2,0.4].into_iter().min_by(|a,b|((a-phase).abs()).total_cmp(&(b-phase).abs())).unwrap()
+                }else{phase});
+            }
+        }else{self.fractional_exact_correction=0.;}
+        self.phase_step=step;
+        let mut phase=self.next_phase.unwrap();let mut phases=Vec::with_capacity(3);
+        while phase<=1.+1e-9{phases.push(phase.min(1.)as f32);phase+=step;}
+        // No artificial lower bound: 23.976 -> 60 occasionally needs a
+        // valid phase very close to zero to maintain the display time grid.
+        self.next_phase=Some(phase-1.);phases
+    }
+    fn fractional_start(&mut self,now:Instant,source_period:f64,first_phase:f32)->Option<Instant>{
+        if !self.fractional_onnx||self.fractional_started{return None;}
+        self.fractional_started=true;
+        // A fixed causal lookahead prevents the 3-output/2-output boundary
+        // from alternately starving a ready display slot. Added once per start.
+        let guard=if source_period.is_finite(){(source_period*first_phase as f64).clamp(0.,0.05)}else{0.};
+        let deadline=now+Duration::from_secs_f64(guard);self.next_present=Some(deadline);
+        // A preceding integer clock must not rebase away this causal guard
+        // when reserve_present_deadline sees the new fractional period.
+        self.present_period_s=source_period*self.phase_step;self.last_present_started=None;self.fractional_submit_deadline=None;
+        Some(deadline)
+    }
     fn phases(&mut self, output_ratio: f64) -> Vec<f32> {
+        self.fractional_onnx=false;self.fractional_started=false;
         let ratio = output_ratio.max(1.0);
         let step = 1.0 / ratio;
         if self.next_phase.is_none()
@@ -3564,7 +4014,20 @@ impl FlowOutputCadence {
         // available. Present that first real model output immediately; only
         // subsequent outputs wait for their 1/factor slots.
         let mut deadline = self.next_present.unwrap_or(now);
-        if now > deadline + period {
+        const LATE_REBASE_SLOTS: f64 = 3.0;
+        if self.late_rebase && !self.fractional_onnx && now > deadline + period
+            && now.duration_since(deadline).as_secs_f64() <= period_s * LATE_REBASE_SLOTS {
+            // v988: shift the grid (keeps every generated slot) instead of skipping.
+            let late_s = now.duration_since(deadline).as_secs_f64();
+            deadline = now;
+            self.late_rebase_count = self.late_rebase_count.wrapping_add(1);
+            if self.late_rebase_count <= 3 || self.late_rebase_count % 600 == 0 {
+                log::info!(
+                    "interp-cadence-late-rebase: count={} late_ms={:.3} period_ms={:.3} action=shift-grid-keep-slots",
+                    self.late_rebase_count, late_s * 1000.0, period_s * 1000.0
+                );
+            }
+        } else if now > deadline + period {
             let late_s = now.duration_since(deadline).as_secs_f64();
             let elapsed_slots = (late_s / period_s).floor().max(1.0);
             deadline = deadline + period.mul_f64(elapsed_slots);
@@ -3576,8 +4039,34 @@ impl FlowOutputCadence {
             );
         }
 
+        // v956: when one output slot equals one display refresh (x5 at 24fps
+        // on 120 Hz), timer jitter around the DWM latch point makes two presents
+        // share one refresh (one frame never shown, another shown twice). Drift
+        // the integer output grid gently (<=0.5 ms per slot) so presents land in
+        // the middle of a refresh interval. Other ratios (x4 = 96fps) are
+        // untouched; no VSync, no frame skipping, order unchanged.
+        if !self.fractional_onnx && vblank_align_enabled() {
+            if let Some(err) = vblank_phase_error_s(deadline, period_s) {
+                let step = err.clamp(-0.0005, 0.0005);
+                let shift = Duration::from_secs_f64(step.abs());
+                deadline = if step > 0.0 { deadline.checked_sub(shift).unwrap_or(deadline) } else { deadline + shift };
+                self.vblank_align_count = self.vblank_align_count.wrapping_add(1);
+                if self.vblank_align_count <= 2 || self.vblank_align_count % 1200 == 0 {
+                    log::info!(
+                        "interp-vblank-align: count={} phase_err_ms={:.3} step_ms={:.3} period_ms={:.3} target_fraction={:.2} vsync=off",
+                        self.vblank_align_count, err * 1000.0, step * 1000.0, period_s * 1000.0, vblank_target_fraction()
+                    );
+                }
+            }
+        }
         self.next_present = Some(deadline + period);
         self.present_period_s = period_s;
+        if self.fractional_onnx{if let Some(previous)=self.last_present_started{
+            // Recover a transient fractional miss over several small steps,
+            // rather than following a late frame with an 8-11ms catch-up burst.
+            // The underlying output grid and every generated image are retained.
+            let floor=previous+period.mul_f64(0.90);if floor>deadline{return floor;}
+        }}
         deadline
     }
 
@@ -3592,11 +4081,13 @@ impl FlowOutputCadence {
         smooth: bool,
         lead_s: f64,
     ) {
-        if !smooth || vsync_on || !period_s.is_finite() || period_s <= 0.0 {
+        self.fractional_submit_deadline=None;
+        if (!smooth&&!self.fractional_onnx) || vsync_on || !period_s.is_finite() || period_s <= 0.0 {
             return;
         }
         let now = Instant::now();
         let deadline = self.reserve_present_deadline(now, period_s);
+        if self.fractional_onnx{self.fractional_submit_deadline=Some(deadline);}
         let lead = Duration::from_secs_f64(lead_s.clamp(0.0, period_s * 0.90));
         let prepare_at = deadline.checked_sub(lead).unwrap_or(deadline);
         wait_until_with_pump(overlay, prepare_at);
@@ -3684,11 +4175,13 @@ impl FlowOutputCadence {
 /// selected multiplier is never reduced by startup/source cadence estimation.
 fn onnx_interpolation_phases(
     factor: u32,
-    _output_ratio: f64,
+    output_ratio: f64,
     _x3_60hz_mode: bool,
     cadence: &mut FlowOutputCadence,
 ) -> Vec<f32> {
-    let factor = factor.clamp(2, 5);
+    if factor==INTERP_25_CODE{return cadence.onnx_fractional_phases(output_ratio);}
+    let factor = factor.clamp(2, 15);
+    cadence.fractional_onnx=false;cadence.fractional_started=false;
 
     // v761 multiplier contract: x2/x3/x4/x5 means exactly 1/2/3/4 synthetic
     // midpoints followed by the real endpoint. Provider switches and startup
@@ -3702,6 +4195,14 @@ fn onnx_interpolation_phases(
     (1..=factor)
         .map(|index| index as f32 / factor as f32)
         .collect()
+}
+
+fn wait_fractional_start(cadence:&mut FlowOutputCadence,overlay:&mut OverlayWindow,source_period:f64,phase:f32)->Option<Instant>{
+    let deadline=cadence.fractional_start(Instant::now(),source_period,phase)?;wait_until_with_pump(overlay,deadline);Some(deadline)
+}
+
+fn log_fractional_grid(code:u32,seq:u64,source_period:Option<f64>,refresh:Option<f64>,ratio:f64,phases:&[f32]){
+    if code==INTERP_25_CODE&&(seq<10||seq%60==0){log::info!("fractional-interp-grid: selected=x2.5 seq={} source_period_ms={:.6} refresh_hz={:.6} output_ratio={:.9} output_period_ms={:.6} phases={:?} endpoint={} backend_capacity=3 clock=continuous",seq,source_period.unwrap_or(0.)*1000.,refresh.unwrap_or(0.),ratio,source_period.unwrap_or(0.)/ratio*1000.,phases,phases.last().is_some_and(|t|*t>=1.-1e-5));}
 }
 
 /// Choose the synthetic DRBA slots that can actually be computed in real time
@@ -3831,6 +4332,72 @@ fn observe_drba_midpoint_cost(
         };
         *midpoint_ema_ms = *midpoint_ema_ms * (1.0 - alpha) + sample * alpha;
     }
+    *perf_samples = perf_samples.saturating_add(1);
+}
+
+/// v938: DirectML RIFE overload admission switch.
+/// v948: off by default at the user's request (it shed midpoints after a boost
+/// toggle and mixed boosted/unboosted pairs). `CHIDESCALER_RIFE_ADMISSION=on`
+/// re-enables it.
+fn rife_overload_admission_enabled() -> bool {
+    // v950: restored to the v938-v942 default (on); `=off` disables it.
+    std::env::var("CHIDESCALER_RIFE_ADMISSION").ok().as_deref() != Some("off")
+}
+
+/// v938: learn the per-mid cost of a RIFE pair. Session build / first-run spikes
+/// (several hundred ms) are not throughput and must not make the controller drop
+/// every mid for seconds, so samples above 4 source intervals are ignored.
+fn observe_rife_midpoint_cost(
+    midpoint_ema_ms: &mut f64,
+    perf_samples: &mut u32,
+    pair_run_ms: f64,
+    midpoint_count: usize,
+    source_period_s: f64,
+) {
+    let limit_ms = if source_period_s.is_finite() && source_period_s > 0.0 {
+        source_period_s * 1000.0 * 4.0
+    } else {
+        200.0
+    };
+    if pair_run_ms > limit_ms {
+        return;
+    }
+    observe_drba_midpoint_cost(midpoint_ema_ms, perf_samples, pair_run_ms, midpoint_count);
+}
+
+/// v995: RIFE admission estimate = median of the last five per-mid costs.
+/// A single pair delayed by another GPU client (browser decode, DWM) made the
+/// fast-attack EMA shed midpoints for several pairs although the typical pair
+/// used well under half of the source interval. Sustained overload still
+/// shows up after three pairs (~125 ms at 24p). CHIDESCALER_RIFE_ADMISSION_EMA=on
+/// restores the plain EMA.
+fn observe_rife_midpoint_cost_robust(
+    midpoint_ema_ms: &mut f64,
+    perf_samples: &mut u32,
+    recent: &mut std::collections::VecDeque<f64>,
+    pair_run_ms: f64,
+    midpoint_count: usize,
+    source_period_s: f64,
+) {
+    if std::env::var("CHIDESCALER_RIFE_ADMISSION_EMA").ok().as_deref() == Some("on") {
+        observe_rife_midpoint_cost(midpoint_ema_ms, perf_samples, pair_run_ms, midpoint_count, source_period_s);
+        return;
+    }
+    let limit_ms = if source_period_s.is_finite() && source_period_s > 0.0 {
+        source_period_s * 1000.0 * 4.0
+    } else {
+        200.0
+    };
+    if midpoint_count == 0 || !pair_run_ms.is_finite() || pair_run_ms <= 0.0 || pair_run_ms > limit_ms {
+        return;
+    }
+    recent.push_back(pair_run_ms / midpoint_count as f64);
+    while recent.len() > 5 {
+        recent.pop_front();
+    }
+    let mut sorted: Vec<f64> = recent.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    *midpoint_ema_ms = sorted[sorted.len() / 2];
     *perf_samples = perf_samples.saturating_add(1);
 }
 
@@ -4147,6 +4714,9 @@ fn source_identity_matches(s: &Session) -> bool {
     win32::window_matches_pid(s.hwnd, s.source_pid)
 }
 
+static CAPTURE_GEOMETRY_PRESENT_FREEZE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn source_hide_window_visual(s: &Session) -> Option<bool> {
     source_identity_matches(s)
         .then(|| win32::hide_window_visual(s.hwnd))
@@ -4172,6 +4742,62 @@ fn source_keep_window_reachable(s: &Session) -> Option<(i32, i32)> {
 fn source_place_below(s: &Session, above: isize) {
     if source_identity_matches(s) {
         win32::place_below(s.hwnd, above);
+    }
+}
+
+/// v981: interpolation input buffer reuse (see Session::frame_pool).
+/// Retired frames are kept as Arc and reused only once every other owner
+/// (the worker's job, the pending pair) has released them.
+const FRAME_POOL_MAX: usize = 4;
+
+fn frame_pool_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = !matches!(
+            std::env::var("CHIDESCALER_FRAME_POOL").ok().as_deref(),
+            Some("off") | Some("0")
+        );
+        log::info!("frame-pool-policy: enabled={enabled} max={FRAME_POOL_MAX}");
+        enabled
+    })
+}
+
+/// A retired buffer of exactly `len` bytes, or an empty Vec. A size change
+/// (geometry switch) drops the stale buffers.
+fn take_frame_buffer(pool: &mut Vec<Arc<Vec<u8>>>, len: usize) -> Vec<u8> {
+    if !frame_pool_enabled() {
+        return Vec::new();
+    }
+    // A geometry change makes every retired buffer useless.
+    pool.retain(|buf| buf.len() == len);
+    match pool.iter().position(|buf| Arc::strong_count(buf) == 1) {
+        Some(index) => Arc::try_unwrap(pool.remove(index)).unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Keep a retired frame for reuse. It is only handed out again by
+/// take_frame_buffer once nobody else holds it; the oldest entry is
+/// dropped beyond FRAME_POOL_MAX, exactly as before v981.
+fn recycle_frame_buffer(pool: &mut Vec<Arc<Vec<u8>>>, data: Arc<Vec<u8>>) {
+    if !frame_pool_enabled() || data.is_empty() {
+        return;
+    }
+    pool.push(data);
+    while pool.len() > FRAME_POOL_MAX {
+        pool.remove(0);
+    }
+}
+
+/// Copy `src` into a pooled buffer (same bytes as `src.to_vec()`).
+fn pooled_copy(pool: &mut Vec<Arc<Vec<u8>>>, src: &[u8]) -> Vec<u8> {
+    let buf = take_frame_buffer(pool, src.len());
+    if buf.len() == src.len() {
+        let mut buf = buf;
+        buf.copy_from_slice(src);
+        buf
+    } else {
+        src.to_vec()
     }
 }
 
@@ -4331,6 +4957,8 @@ struct InterpWorker {
     res_rx: Receiver<InterpResult>,
     /// identity of the OnnxStage this worker drives (rebuild on chain swap)
     stage_ptr: usize,
+    // Worker readiness is independent of the previous presentation timeline.
+    neoarc_ready: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: Receiver<()>,
 }
@@ -4354,7 +4982,9 @@ struct InterpJob {
     /// native dynamic multi-phase batch while keeping CPU-visible owned outputs.
     force_sequential: bool,
     prefer_dml_vulkan_shared: bool,
+    interp_capacity: usize,
     neoamd_stream_slots: bool,
+    neoarc_stream_slots: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -4393,20 +5023,182 @@ impl InterpWorker {
         let (permit_tx, permit_rx) = channel::<InterpPermit>();
         let (res_tx, res_rx) = channel::<InterpResult>();
         let (done_tx, done_rx) = channel::<()>();
+        let neoarc_ready = Arc::new(AtomicBool::new(false));
+        let worker_neoarc_ready = neoarc_ready.clone();
         let thread = std::thread::Builder::new()
             .name("interp-worker".into())
             .spawn(move || {
                 let _done = InterpWorkerDone(done_tx);
                 let mut dml_shared_bank = 0usize;
+                // v978: NeoAMD shared-output ring. With N output slots the
+                // worker may run up to N generated midpoints ahead of display
+                // (also across pair boundaries), instead of waiting for every
+                // present. Slot i%N is rewritten only after the presenter has
+                // permitted result i-N, i.e. after GL retired its read fence.
+                // CHIDESCALER_NEOAMD_INTERP_RING=off|1 restores v977.
+                let ring_want: usize = match std::env::var("CHIDESCALER_NEOAMD_INTERP_RING") {
+                    Ok(v) if matches!(v.trim(), "off" | "0" | "1") => 1,
+                    Ok(v) => v.trim().parse::<usize>().unwrap_or(6).clamp(1, 8),
+                    Err(_) => 6,
+                };
+                let mut ring_sent = 0u64;
+                let mut ring_permits = 0u64;
+                let mut ring_next = 0usize;
+                let mut ring_geometry: Option<(i32, i32)> = None;
                 while let Ok(job) = job_rx.recv() {
                     let frames: Vec<&[u8]> =
                         job.frames.iter().map(|frame| frame.as_slice()).collect();
+                    if job.rgba && job.neoarc_stream_slots && job.frames.len() == 2 && job.ts.len() >= 3
+                        && std::env::var("CHIDESCALER_NEOARC_ASYNC").ok().as_deref() == Some("1") {
+                        let mut st = stage.lock().unwrap();
+                        let prepared = st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts);
+                        drop(st);
+                        match prepared {
+                            Ok(outputs) if outputs.len() == job.ts.len() => {
+                                worker_neoarc_ready.store(true,Ordering::Release);
+                                for (idx, (w, h, data)) in outputs.into_iter().enumerate() {
+                                    if res_tx.send(InterpResult { pair_id: job.pair_id, idx,
+                                        r: Ok(InterpPayload::Cpu(w, h, data)), profile: None }).is_err() {
+                                        return;
+                                    }
+                                    if idx + 1 < job.ts.len() {
+                                        loop {
+                                            match permit_rx.recv() {
+                                                Ok(permit) if permit.pair_id == job.pair_id => break,
+                                                Ok(_) => continue,
+                                                Err(_) => return,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = res_tx.send(InterpResult { pair_id: job.pair_id, idx: 0,
+                                    r: Err(anyhow::anyhow!("NeoArc async phase count mismatch")),
+                                    profile: None });
+                            }
+                            Err(error) => {
+                                let _ = res_tx.send(InterpResult { pair_id: job.pair_id, idx: 0,
+                                    r: Err(error), profile: None });
+                            }
+                        }
+                        continue;
+                    }
+                    if job.rgba && job.neoarc_stream_slots {
+                        stage.lock().unwrap().set_neoarc_pair_reuse(true);
+                        for (idx, t) in job.ts.iter().copied().enumerate() {
+                            let mut st = stage.lock().unwrap();
+                            let r = st.process_interp_rgba8(job.w, job.h, &frames, t)
+                                .map(|(w, h, data)| InterpPayload::Cpu(w, h, data));
+                            let profile = st.last_interp_profile()
+                                .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
+                            drop(st);
+                            let failed = r.is_err();
+                            if !failed { worker_neoarc_ready.store(true, Ordering::Release); }
+                            if res_tx.send(InterpResult { pair_id: job.pair_id, idx, r, profile }).is_err() {
+                                return;
+                            }
+                            if failed { break; }
+                            if idx + 1 < job.ts.len() {
+                                loop {
+                                    match permit_rx.recv() {
+                                        Ok(permit) if permit.pair_id == job.pair_id => break,
+                                        Ok(_) => continue,
+                                        Err(_) => return,
+                                    }
+                                }
+                            }
+                        }
+                        stage.lock().unwrap().set_neoarc_pair_reuse(false);
+                        continue;
+                    }
                     if job.rgba && job.neoamd_stream_slots {
+                        // A geometry change reallocates every shared slot in the
+                        // Backend Pack, so let the presenter retire all ring
+                        // outputs still in flight before preparing.
+                        if ring_sent > ring_permits && ring_geometry != Some((job.w, job.h)) {
+                            while ring_sent > ring_permits {
+                                if permit_rx.recv().is_err() {
+                                    return;
+                                }
+                                ring_permits += 1;
+                            }
+                        }
                         let shared_prepared = {
                             let mut st = stage.lock().unwrap();
                             st.prepare_neoamd_interp_stream_shared_rgba8(job.w, job.h, &frames)
                         };
+                        let ring_outputs = match &shared_prepared {
+                            Ok(Some(shared)) if ring_want > 1 => stage
+                                .lock()
+                                .unwrap()
+                                .neoamd_interp_ring_outputs(job.w, job.h, *shared, ring_want),
+                            _ => Vec::new(),
+                        };
+                        if ring_outputs.len() < 2 && ring_sent > ring_permits {
+                            // Leaving ring mode: drain before the serialized contract.
+                            while ring_sent > ring_permits {
+                                if permit_rx.recv().is_err() {
+                                    return;
+                                }
+                                ring_permits += 1;
+                            }
+                        }
                         match shared_prepared {
+                            Ok(Some(_)) if ring_outputs.len() >= 2 => {
+                                ring_geometry = Some((job.w, job.h));
+                                let slots = ring_outputs.len() as u64;
+                                if job.pair_id < 3 {
+                                    log::info!(
+                                        "neoamd-interp-stream-job: pair={} outputs={} mode=shared-rgba8-ring slots={} keys={:?}",
+                                        job.pair_id,
+                                        job.ts.len(),
+                                        slots,
+                                        ring_outputs.iter().map(|o| o.resource_key).collect::<Vec<_>>()
+                                    );
+                                }
+                                for (idx, t) in job.ts.iter().copied().enumerate() {
+                                    while ring_sent - ring_permits >= slots {
+                                        // Permits arrive in present order, one per
+                                        // presented shared midpoint of any pair.
+                                        if permit_rx.recv().is_err() {
+                                            return;
+                                        }
+                                        ring_permits += 1;
+                                    }
+                                    let output = ring_outputs[ring_next % ring_outputs.len()];
+                                    ring_next = ring_next.wrapping_add(1);
+                                    let mut st = stage.lock().unwrap();
+                                    let r = st
+                                        .run_neoamd_interp_stream_phase_shared_rgba8(
+                                            job.w,
+                                            job.h,
+                                            frames.len(),
+                                            t,
+                                            output,
+                                        )
+                                        .map(InterpPayload::NeoAmdShared);
+                                    let profile = st
+                                        .last_interp_profile()
+                                        .map(|p| (p.pack_ms, p.run_ms, p.out_ms));
+                                    drop(st);
+                                    let failed = r.is_err();
+                                    if res_tx
+                                        .send(InterpResult { pair_id: job.pair_id, idx, r, profile })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    ring_sent += 1;
+                                    if failed {
+                                        break;
+                                    }
+                                }
+                                // No wait after the final midpoint: the next pair's
+                                // first (heaviest) phase may start while this pair
+                                // is still being presented.
+                                continue;
+                            }
                             Ok(Some(shared)) => {
                                 if job.pair_id < 3 {
                                     log::info!(
@@ -4533,7 +5325,7 @@ impl InterpWorker {
                                         .map(|(w, h, data)| InterpPayload::Cpu(w, h, data))
                                 })
                                 .collect()
-                        } else if job.prefer_dml_vulkan_shared {
+                        } else if job.prefer_dml_vulkan_shared && !st.wants_dml_host_boost(job.interp_capacity) {
                             match st.process_interp_many_rgba8_dml_shared(
                                 job.w,
                                 job.h,
@@ -4573,7 +5365,7 @@ impl InterpWorker {
                                         st.disable_dml_cpu_interp_shared(&format!(
                                             "DirectML shared output export failed: {error:#}"
                                         ));
-                                        st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                        st.process_interp_rgba8_pair(job.w, job.h, &frames, &job.ts, job.interp_capacity)
                                             .map(|results| {
                                                 results
                                                     .into_iter()
@@ -4585,7 +5377,7 @@ impl InterpWorker {
                                     }
                                 },
                                 Ok(None) => st
-                                    .process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                    .process_interp_rgba8_pair(job.w, job.h, &frames, &job.ts, job.interp_capacity)
                                     .map(|results| {
                                         results
                                             .into_iter()
@@ -4596,7 +5388,7 @@ impl InterpWorker {
                                     log::warn!(
                                         "dml-vulkan-resident-handoff: worker setup failed: {error:#}; fallback=cpu-visible-interpolation"
                                     );
-                                    st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                                    st.process_interp_rgba8_pair(job.w, job.h, &frames, &job.ts, job.interp_capacity)
                                         .map(|results| {
                                             results
                                                 .into_iter()
@@ -4606,7 +5398,7 @@ impl InterpWorker {
                                 }
                             }
                         } else {
-                            st.process_interp_many_rgba8(job.w, job.h, &frames, &job.ts)
+                            st.process_interp_rgba8_pair(job.w, job.h, &frames, &job.ts, job.interp_capacity)
                                 .map(|results| {
                                     results
                                         .into_iter()
@@ -4662,6 +5454,7 @@ impl InterpWorker {
             permit_tx: Some(permit_tx),
             res_rx,
             stage_ptr,
+            neoarc_ready,
             thread: Some(thread),
             done_rx,
         }
@@ -4762,7 +5555,76 @@ struct ReadyGpuInterpOutput {
 /// provider pair in flight.  This is the key separation between inference and
 /// presentation: the render thread may admit/capture the next real source pair
 /// while these already-computed frames are paced to the display.
+const FRACTIONAL_TAIL_IMAGES: [&str; 2] = ["__neoarc_fractional_tail_0", "__neoarc_fractional_tail_1"];
+fn fractional_tail_key(pair_id: u64) -> &'static str { FRACTIONAL_TAIL_IMAGES[(pair_id % 2) as usize] }
+// v995: a parked MID (the last midpoint of a pair) owns separate storage so it
+// can wait in the present queue together with the same pair's parked endpoint.
+const FRACTIONAL_TAIL_MID_IMAGES: [[&str; 8]; 2] = [
+    ["__neoarc_fractional_tail_mid_0_0", "__neoarc_fractional_tail_mid_0_1", "__neoarc_fractional_tail_mid_0_2", "__neoarc_fractional_tail_mid_0_3", "__neoarc_fractional_tail_mid_0_4", "__neoarc_fractional_tail_mid_0_5", "__neoarc_fractional_tail_mid_0_6", "__neoarc_fractional_tail_mid_0_7"],
+    ["__neoarc_fractional_tail_mid_1_0", "__neoarc_fractional_tail_mid_1_1", "__neoarc_fractional_tail_mid_1_2", "__neoarc_fractional_tail_mid_1_3", "__neoarc_fractional_tail_mid_1_4", "__neoarc_fractional_tail_mid_1_5", "__neoarc_fractional_tail_mid_1_6", "__neoarc_fractional_tail_mid_1_7"],
+];
+fn tail_key(pair_id: u64, is_real: bool, slot_index: usize) -> &'static str {
+    if is_real { fractional_tail_key(pair_id) } else { FRACTIONAL_TAIL_MID_IMAGES[(pair_id % 2) as usize][slot_index % 8] }
+}
+/// v995: NeoArc integer factors also park the last midpoint (then the endpoint)
+/// so the pair retires one output slot earlier and the next pair's motion pass
+/// starts sooner. CHIDESCALER_NEOARC_LAST_MID_TAIL=off restores v994.
+fn neoarc_last_mid_tail_enabled() -> bool { neoarc_tail_mids_override() != Some(0) }
+/// Explicit CHIDESCALER_NEOARC_TAIL_MIDS=N (0..=8); LAST_MID_TAIL=off means 0.
+fn neoarc_tail_mids_override() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var("CHIDESCALER_NEOARC_LAST_MID_TAIL").ok().as_deref() == Some("off") { return Some(0); }
+        std::env::var("CHIDESCALER_NEOARC_TAIL_MIDS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map(|n| n.min(8))
+    })
+}
+/// How many trailing mids of a NeoArc integer pair may be parked. Storage keys
+/// are slot_index % 8 (at most 8 consecutive). Default 4 up to x10, 8 above
+/// (x15 slots are 2.8 ms; a 1080p motion pass needs ~6 of them).
+/// Measured (B570, x10 1080p): off 198.9, 1 216.7, 3 234, 4 239.5 fps.
+fn neoarc_tail_mids_for(factor: u32) -> usize {
+    neoarc_tail_mids_override().unwrap_or(if factor > 10 { 8 } else { 4 })
+}/// v959: which integer factors use the DirectML early real-endpoint tail.
+/// Default x5 only; CHIDESCALER_DML_EARLY_TAIL=all enables x3-x5, =off disables.
+fn dml_early_tail_factor_ok(factor: u32) -> bool {
+    // v962: every factor by default (x2, x2.5, x3 ... x12 and up). Standard
+    // NeoRIFE x3 at 1080p ran infer 27ms + endpoint wait 13ms + gap 3ms =
+    // ~55ms per 41.7ms pair (50-60fps) because the next pair waited for the
+    // endpoint present. "x5" restores v959 (x5 only), "x3x5" the 3..=5 range.
+    match std::env::var("CHIDESCALER_DML_EARLY_TAIL").ok().as_deref() {
+        Some("off") => false,
+        Some("x5") => factor == 5,
+        Some("x3x5") | Some("all") => (3..=5).contains(&factor),
+        _ => factor == crate::core::config::INTERP_25_CODE || (2..=15).contains(&factor),
+    }
+}
+
+/// v992: GL frame-latency limit (one queued present). CHIDESCALER_GL_FRAME_LATENCY=1 enables (experiment).
+fn gl_frame_latency_limit()->bool{
+    static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ON.get_or_init(||std::env::var("CHIDESCALER_GL_FRAME_LATENCY").ok().as_deref()==Some("1"))
+}
+/// v991 diagnostics: per-pair event timeline (NEO_PAIR_TRACE=1). Off by default.
+fn capture_defer_take_enabled()->bool{
+    static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ON.get_or_init(||std::env::var("CHIDESCALER_CAPTURE_DEFER_TAKE").ok().as_deref()==Some("on"))
+}
+fn phase_trace_enabled()->bool{
+    static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ON.get_or_init(||std::env::var("NEO_PHASE_TRACE").ok().as_deref()==Some("1"))
+}
+fn pair_trace()->bool{
+    static ON:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ON.get_or_init(||std::env::var("NEO_PAIR_TRACE").ok().as_deref()==Some("1"))
+}
+fn fractional_tail_prepare_at(deadline:Instant,period:f64)->Instant {
+    deadline.checked_sub(Duration::from_secs_f64((period*0.1).clamp(0.0,0.002))).unwrap_or(deadline)
+}
+
 struct DrbaQueuedPresent {
+    fractional_tail: bool,
+    chain_already_processed: bool,
+    fixed_deadline: Option<Instant>,
     generation: u64,
     pair_id: u64,
     slot_index: usize,
@@ -4939,8 +5801,7 @@ fn beam_async_onnx_stage(
         crate::render::onnx_stage::OnnxProvider::TensorRT => Some("TensorRT"),
         crate::render::onnx_stage::OnnxProvider::MigraphX
         | crate::render::onnx_stage::OnnxProvider::Cuda
-        | crate::render::onnx_stage::OnnxProvider::NeoAMD
-        | crate::render::onnx_stage::OnnxProvider::NeoRTX => None,
+        | crate::render::onnx_stage::OnnxProvider::NeoAMD | crate::render::onnx_stage::OnnxProvider::NeoRTX => None,
     })?;
     Some((stage, metric_name, provider_name))
 }
@@ -5247,6 +6108,7 @@ struct PendingInterp {
     /// then permit-gated so every generated midpoint is presented exactly once
     /// before the next phase is allowed to overwrite/reuse its work buffers.
     neoamd_stream_slots: bool,
+    neoarc_stream_slots: bool,
 }
 
 fn interp_pair_is_contiguous(
@@ -5337,6 +6199,7 @@ fn apply_chain_update(
     metrics: &Metrics,
     status: &Arc<Mutex<Status>>,
 ) {
+    let transition_started = Instant::now();
     // Beam-only async prefix owns the old ONNX stage; retire it before replacing the chain.
     if let Some(values) = crate::core::dlssnr::options_only_change(&s.chain_specs, specs) {
         if s.chain.set_dlssnr_options(values) {
@@ -5347,7 +6210,7 @@ fn apply_chain_update(
             // true until one frame has first been submitted to start the new worker.
             // Force that submission from the cached source frame instead of waiting
             // for a mouse/UI repaint in the captured application.
-            s.chain_reprocess_pending = !s.frame.data.is_empty();
+            s.chain_reprocess_pending = s.frame.has_pixels();
             if s.chain_reprocess_pending {
                 // The cached output belongs to the previous NR configuration.
                 // Make the semantic refresh win over every duplicate/cadence reuse
@@ -5509,11 +6372,16 @@ fn apply_chain_update(
         && s.chain_specs != specs
         && s.chain.has_directml_temporal_filter();
 
+    let construct_started = Instant::now();
     let (mut chain, errs) = FilterChain::from_specs(factory, specs);
+    let construct_ms = construct_started.elapsed().as_secs_f64() * 1000.0;
     // A warm TensorRT Session may be reused from StageFactory. Per-capture
     // temporal/packing state must never cross the session boundary even though
     // the expensive ORT/TensorRT execution session remains resident.
-    chain.reset_backend_runtime_state();
+    let retained_neoarc_interp=if !explicit_interp_hard_handoff&&errs.is_empty(){
+        s.chain.retained_neoarc_interp_for_edit(&s.chain_specs,&chain,specs)
+    }else{None};
+    chain.reset_backend_runtime_state_except_interp(retained_neoarc_interp);
     let requested = specs.iter().filter(|spec| spec.enabled).count();
     if requested > 0 && chain.stages.is_empty() {
         log::error!(
@@ -5614,20 +6482,34 @@ fn apply_chain_update(
     // made the retained image sample the replacement allocation with the old
     // dimensions (the brief giant crop seen when switching ONNX on static
     // PIP). Preserve it as an ordinary owned GL texture before teardown.
+    let snapshot_started = Instant::now();
+    let mut snapshot_gpu = false;
     let transition_snapshot = if explicit_interp_hard_handoff {
         None
     } else {
         s.last_tex.map(|texture| {
-            (
-                texture,
-                texture.w(),
-                texture.h(),
-                gc.download_rgba8(texture),
-            )
+            match gc.snapshot_transition_rgba8(texture) {
+                Ok(owned) => {
+                    snapshot_gpu = true;
+                    (texture, Some(owned), None)
+                }
+                Err(error) => {
+                    log::warn!("chain-transition-snapshot-fallback: reason={error} path=cpu-readback");
+                    (texture, None, Some((texture.w(), texture.h(), gc.download_rgba8(texture))))
+                }
+            }
         })
     };
+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+    let retire_started = Instant::now();
     if !explicit_interp_hard_handoff {
-        s.chain.prepare_gpu_transition(gc);
+        s.chain.prepare_gpu_transition_except_interp(gc,retained_neoarc_interp);
+        if retained_neoarc_interp.is_some() {
+            if let Some(crate::render::chain::InterpHandle::Onnx{stage,..})=chain.interp_stage(){
+                stage.lock().unwrap_or_else(|e|e.into_inner()).reset_interp_gpu_for_factor_change(gc);
+            }
+            log::info!("neoarc-chain-transition: compiled_bridge=retained input_prefix=identical workers=retired old_phases=cleared");
+        }
     }
     if rebuild_existing_directml_temporal && chain.has_directml_temporal_filter() {
         // Candidate validation happens before the running bridge is touched.
@@ -5666,10 +6548,11 @@ fn apply_chain_update(
     }
     gc.clear_gpu_timers();
     gc.clear_temporal_shader_storage();
-    if let Some((old, width, height, rgba)) = transition_snapshot {
+    if let Some((old, owned, cpu)) = transition_snapshot {
         gc.recycle(old);
-        s.last_tex = Some(gc.upload_rgba8(width, height, &rgba));
+        s.last_tex = owned.or_else(|| cpu.map(|(w, h, rgba)| gc.upload_rgba8(w, h, &rgba)));
     }
+    let retire_ms = retire_started.elapsed().as_secs_f64() * 1000.0;
     let previous_glsl_key = glsl_chain_key(&s.chain);
     let next_glsl_key = glsl_chain_key(&chain);
     let filter_chain_changed = previous_glsl_key != next_glsl_key;
@@ -5786,7 +6669,7 @@ fn apply_chain_update(
         );
     }
     let usage = s.chain.onnx_backend_usage();
-    s.chain_reprocess_pending = !s.frame.data.is_empty();
+    s.chain_reprocess_pending = s.frame.has_pixels();
     // A filter-chain edit changes the meaning of the cached output even when
     // the source pixels are byte-identical. Never allow duplicate/cadence
     // reuse from the previous chain to win over the forced reprocess.
@@ -5803,6 +6686,7 @@ fn apply_chain_update(
     s.source.set_queue_enabled(s.chain.has_interp());
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
+    metrics.set_interpolation_stage(s.chain.interp_metric_name());
     // v833: v829 already samples stage timing every processed frame while the
     // bounded settle window is active.  We can therefore discard exactly one
     // transition frame (provider/Graph/bridge re-arm work) without leaving the
@@ -5840,6 +6724,10 @@ fn apply_chain_update(
             "Interpolation chain plan: pre={pre:?} interp={interp:?} post={post:?} effective_order=pre->interp->post verified=true"
         );
     }
+    log::info!(
+        "chain-transition-timing: construct_ms={construct_ms:.3} snapshot_ms={snapshot_ms:.3} retire_ms={retire_ms:.3} total_ms={:.3} snapshot_gpu={} explicit_handoff={} first_frame_included=false",
+        transition_started.elapsed().as_secs_f64() * 1000.0, snapshot_gpu, explicit_interp_hard_handoff
+    );
 }
 
 fn reset_gpu_interp_for_backend_switch(
@@ -5874,6 +6762,7 @@ fn reset_gpu_interp_for_backend_switch(
     s.drba_diag_present_seq = 0;
     s.drba_diag_last_semantic_ts_100ns = None;
     s.drba_midpoint_ema_ms = 0.0;
+    s.rife_mid_recent.clear();
     s.drba_perf_samples = 0;
     s.drba_compute_credit_ms = 0.0;
     s.drba_phase_rotation = 0;
@@ -5909,11 +6798,14 @@ fn reset_gpu_interp_for_geometry_transition(s: &mut Session, gc: &mut GlContext,
     s.drba_diag_present_seq = 0;
     s.drba_diag_last_semantic_ts_100ns = None;
     s.drba_midpoint_ema_ms = 0.0;
+    s.rife_mid_recent.clear();
     s.drba_perf_samples = 0;
     s.drba_compute_credit_ms = 0.0;
     s.drba_phase_rotation = 0;
     s.drba_dropped_midpoints = 0;
     s.flow_output_cadence.reset();
+    s.paced_present_deadline = None;
+    s.intel_early_present_prepare = 0;
     s.interp_present_deadline = None;
     s.chain.prepare_gpu_transition(gc);
     log::info!(
@@ -6099,7 +6991,11 @@ fn switch_onnx_backend(
     }
 
     let preserve = s.last_tex.into_iter().collect::<Vec<_>>();
-    let warmup_result = if s.frame.data.is_empty() || s.frame.w <= 0 || s.frame.h <= 0 {
+    if let Err(error)=s.frame.ensure_host(){
+        let mut state=status.lock().unwrap();state.onnx_backend_switching=false;
+        state.onnx_backend_error=Some(format!("capture recovery: {error:#}"));return false;
+    }
+    let warmup_result = if !s.frame.has_pixels() || s.frame.w <= 0 || s.frame.h <= 0 {
         log::info!("onnx-backend-warmup: skipped=no-current-frame backend={backend:?}");
         Ok(candidate_chain.onnx_backend_usage())
     } else {
@@ -6130,9 +7026,7 @@ fn switch_onnx_backend(
         if result.is_ok()
             && matches!(
                 backend,
-                OnnxBackendPreference::NeoAMD
-                    | OnnxBackendPreference::NeoRTX
-                    | OnnxBackendPreference::DirectML
+                OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoArc | OnnxBackendPreference::DirectML
             )
             && !candidate_chain.has_interp()
         {
@@ -6162,10 +7056,7 @@ fn switch_onnx_backend(
         // retire only generic warmup bridge resources, then prime the exact
         // live ingress.  This executes only at a provider switch.
         if result.is_ok()
-            && matches!(
-                backend,
-                OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
-            )
+            && matches!(backend, OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX)
             && !candidate_chain.has_interp()
         {
             let retired = candidate_chain.rearm_neoamd_live_ingress_after_generic_warmup(gc);
@@ -6309,37 +7200,25 @@ fn switch_onnx_backend(
     }
     // Prime the actual interpolation route after the old worker and its
     // bridges have been drained. Keep the warmed candidate resources alive.
-    if backend == OnnxBackendPreference::NeoRTX
-        && candidate_chain.has_interp()
-        && !s.frame.hdr
-        && !s.frame.data.is_empty()
+    if backend == OnnxBackendPreference::NeoRTX && candidate_chain.has_interp()
+        && !s.frame.hdr && s.frame.has_pixels()
     {
-        let preserve = s.last_tex.into_iter().collect::<Vec<_>>();
-        let out_size = s
-            .last_tex
-            .map(|t| (t.w(), t.h()))
-            .unwrap_or((s.frame.w, s.frame.h));
-        if let Err(error) = candidate_chain.warmup_candidate(
-            gc,
-            s.frame.w,
-            s.frame.h,
-            &s.frame.data,
-            out_size,
-            &preserve,
-        ) {
+        let preserve=s.last_tex.into_iter().collect::<Vec<_>>();
+        let out_size=s.last_tex.map(|t|(t.w(),t.h())).unwrap_or((s.frame.w,s.frame.h));
+        if let Err(error)=s.frame.ensure_host(){
+        let mut state=status.lock().unwrap();state.onnx_backend_switching=false;
+        state.onnx_backend_error=Some(format!("capture recovery: {error:#}"));return false;
+    }
+        if let Err(error)=candidate_chain.warmup_candidate(gc,s.frame.w,s.frame.h,&s.frame.data,out_size,&preserve) {
             candidate_chain.prepare_gpu_transition(gc);
-            let mut state = status.lock().unwrap();
-            state.onnx_backend_switching = false;
-            state.onnx_backend_error = Some(format!("{error:#}"));
-            state.onnx_backend_revision = state.onnx_backend_revision.saturating_add(1);
-            log::error!(
-                "onnx-backend-switch-rollback: post-drain NeoRTX interpolation prime failed: {error:#}"
-            );
+            let mut state=status.lock().unwrap();
+            state.onnx_backend_switching=false;
+            state.onnx_backend_error=Some(format!("{error:#}"));
+            state.onnx_backend_revision=state.onnx_backend_revision.saturating_add(1);
+            log::error!("onnx-backend-switch-rollback: post-drain NeoRTX interpolation prime failed: {error:#}");
             return false;
         }
-        log::info!(
-            "neortx-interp-switch-boundary: old-worker=drained old-bridge=retired live-route=primed"
-        );
+        log::info!("neortx-interp-switch-boundary: old-worker=drained old-bridge=retired live-route=primed");
     }
     s.chain = candidate_chain;
     s.chain_specs = specs.to_vec();
@@ -6355,9 +7234,7 @@ fn switch_onnx_backend(
     // fully dropped, without changing the steady-state kernels.
     if matches!(
         backend,
-        OnnxBackendPreference::NeoAMD
-            | OnnxBackendPreference::NeoRTX
-            | OnnxBackendPreference::DirectML
+        OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoArc | OnnxBackendPreference::DirectML
     ) && !s.chain.has_interp()
     {
         // Preserve the last visible image as ordinary CPU RGBA while the target
@@ -6434,14 +7311,14 @@ fn switch_onnx_backend(
         (previous, backend),
         (
             OnnxBackendPreference::DirectML,
-            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX
+            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoArc
         ) | (
-            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX,
+            OnnxBackendPreference::NeoAMD | OnnxBackendPreference::NeoRTX | OnnxBackendPreference::NeoArc,
             OnnxBackendPreference::DirectML
         )
     ) && restart_wgc_epoch_for_backend_switch(s);
 
-    s.chain_reprocess_pending = !wgc_epoch_restarted && !s.frame.data.is_empty();
+    s.chain_reprocess_pending = !wgc_epoch_restarted && s.frame.has_pixels();
     s.smooth_content_signature = None;
     s.smooth_content_duplicates = 0;
     s.smooth_content_seq = 0;
@@ -6483,11 +7360,12 @@ fn switch_onnx_backend(
     s.drba_diag_last_semantic_ts_100ns = None;
     log::info!(
         "backend-switch-runtime-rearm: backend={backend:?} factor=x{} phases={} queue=flushed cadence=reset timing=reset pair_id=0",
-        interp_factor.clamp(2, 5),
-        interp_factor.clamp(2, 5).saturating_sub(1)
+        interp_capacity(interp_factor),
+        interp_capacity(interp_factor).saturating_sub(1)
     );
     metrics.reset();
     metrics.set_stage_order(s.chain.metric_stage_order());
+    metrics.set_interpolation_stage(s.chain.interp_metric_name());
     // v835: do not average provider/session/Graph/autotune setup into the
     // user-facing ONNX row. Hold the row empty during the transition; the
     // first completed frame after Present becomes the live value directly.
@@ -6655,11 +7533,227 @@ fn should_detach_directml_drba_midpoint(
 }
 
 /// Release every frame waiting in the v802 one-pair DirectML DRBA presentation FIFO.
+/// Park only the final output of a fractional pair. The next provider pair
+/// may start, while the display FIFO still owns the earlier source-time slot.
+fn queue_neoarc_fractional_tail(gc: &mut GlContext, s: &mut Session, metrics: &Metrics,
+    status: &Arc<Mutex<Status>>, pending: &PendingGpuInterp,
+    source: GpuTex, is_real: bool, vsync_on: bool, mid_index: usize) -> bool {
+    // v986: integer factors on NeoArc park the REAL endpoint the same way (the
+    // v959/v962 DirectML early tail). With the endpoint waiting on its reserved
+    // slot, the next pair's trunk + first head run during that wait instead of
+    // after it; at x10/240 Hz every pair's first mid was otherwise ~4.5 ms late
+    // and one clock slot was skipped per pair (~220 instead of 240 fps).
+    // v995: the last MID of an integer pair (followed by its endpoint) may be
+    // parked too; it uses the same eligibility as the endpoint tail.
+    let last_mid_tail = !is_real && pending.present_real;
+    if last_mid_tail && (!neoarc_last_mid_tail_enabled() || s.flow_output_cadence.fractional_onnx) { return false; }
+    let neoarc_integer_tail = (is_real || last_mid_tail) && !s.flow_output_cadence.fractional_onnx && s.smooth_pacing
+        && (2..=15).contains(&pending.factor)
+        && std::env::var("CHIDESCALER_NEOARC_EARLY_TAIL").ok().as_deref() != Some("off");
+    // A later mid or the endpoint may join a queue that holds only this
+    // pair's parked (earlier) mids.
+    let queue_admits = s.drba_present_queue.is_empty()
+        || ((is_real || last_mid_tail) && s.drba_present_queue.iter().all(|queued| queued.fractional_tail && !queued.is_real
+            && queued.pair_id == pending.pair_id && queued.generation == pending.generation));
+    let eligible_arc = !pending.is_drba && !vsync_on && (s.flow_output_cadence.fractional_onnx || neoarc_integer_tail)
+        && pending.post_chain_start == 1 && pending.metric_name.contains("[NeoARC]")
+        && !s.chain.has_display_hz() && s.chain.can_prepare_interp_gpu_post(pending.post_chain_start)
+        && queue_admits
+        && std::env::var("CHIDESCALER_NEOARC_FRACTIONAL_TAIL").ok().as_deref() != Some("off");
+    if last_mid_tail && !eligible_arc { return false; }
+    if eligible_arc && neoarc_integer_tail && !s.neoarc_early_tail_logged {
+        s.neoarc_early_tail_logged = true;
+        log::info!("neoarc-early-tail: active factor=x{} pair={} policy=park-real-endpoint-then-start-next-pair order=A-B,B,B-C", pending.factor, pending.pair_id);
+    }
+    // v959: DirectML RIFE at x5. The real endpoint needs no inference, so park
+    // it on its reserved slot and retire the pair; the next pair's trunk/first
+    // head then runs while the endpoint waits (about two slots of budget
+    // instead of one). Without this every pair's first midpoint arrived ~6 ms
+    // late at 8.33 ms slots and was followed by an on-grid present 1.5 ms
+    // later (16.5/1.5 ms judder at a perfect 120 fps). Order is unchanged:
+    // A-B mids, B, then B-C mids. x4 and other paths keep their old schedule.
+    // v962: x2.5 (fractional) mirrors the NeoArc tail: the last item of the
+    // pair (real endpoint, or the final mid when the endpoint is not shown) is
+    // copied to a persistent texture and parked on its reserved deadline.
+    let fractional = s.flow_output_cadence.fractional_onnx;
+    let eligible_dml = !eligible_arc && (is_real || fractional) && dml_early_tail_factor_ok(pending.factor)
+        && !pending.is_drba && !pending.directml_drba && !vsync_on && s.smooth_pacing
+        && (!fractional || std::env::var("CHIDESCALER_DML_EARLY_TAIL_FRACTIONAL").ok().as_deref() != Some("off"))
+        && pending.post_chain_start == 1 && pending.metric_name.contains("[DirectML]")
+        && !s.chain.has_display_hz() && s.chain.can_prepare_interp_gpu_post(pending.post_chain_start)
+        && s.drba_present_queue.is_empty();
+    if !eligible_arc && !eligible_dml { return false; }
+    if eligible_dml && !s.dml_early_tail_logged {
+        s.dml_early_tail_logged = true;
+        log::info!("dml-early-tail: active factor=x{} pair={} policy=park-real-endpoint-then-start-next-pair order=A-B,B,B-C", pending.factor, pending.pair_id);
+    }
+    let index = if is_real { pending.timesteps.len() } else { mid_index.min(pending.timesteps.len().saturating_sub(1)) };
+    let key = tail_key(pending.pair_id, is_real, index);
+    if gc.persistent_texture_by_key(key).is_some_and(|image| s.last_tex.is_some_and(|last|last.tex==image.tex)) {
+        return false;
+    }
+    // v997: a parked item keeps the original phase grid when the overload
+    // controller omitted a phase before it (same rule as the normal mid path).
+    if !s.flow_output_cadence.fractional_onnx && s.smooth_pacing && !vsync_on {
+        let previous_slot = if is_real {
+            pending.timesteps.last().map(|t| drba_phase_slot(*t, pending.factor)).unwrap_or(0)
+        } else if index == 0 { 0 } else { drba_phase_slot(pending.timesteps[index - 1], pending.factor) };
+        let current_slot = if is_real { pending.factor as usize } else { drba_phase_slot(pending.timesteps[index], pending.factor) };
+        let skipped = current_slot.saturating_sub(previous_slot).max(1) - 1;
+        if skipped > 0 {
+            s.flow_output_cadence.skip_present_slots(Instant::now(), pending.output_period, skipped);
+        }
+    }
+    let deadline = s.flow_output_cadence.reserve_present_deadline(Instant::now(), pending.output_period);
+    s.flow_output_cadence.fractional_submit_deadline = None;
+    // Deferred OUTPUT hooks can bind frame-local SAVE images or depend on
+    // sampler policy. Preserve v929 evaluation order for those configurations.
+    let retained_output_inputs = s.chain.post_shaders_with_metric_labels().is_empty();
+    // v998: only the first parked item runs the post chain at queue time. Later
+    // items are post-processed one at a time right after the previous parked
+    // item is shown (see `prepare_next_parked_tail_post`). Running 4-5 Anime4K
+    // passes back to back here occupied the GPU exactly while the next pair's
+    // motion pass had to run. Measured worse (191 vs 238 fps at x10 720p with
+    // Anime4K), so it is opt-in only: CHIDESCALER_NEOARC_TAIL_POST_STAGED=on.
+    let post_possible = pending.post_chain_start < s.chain.stage_count() && retained_output_inputs
+        && std::env::var("CHIDESCALER_NEOARC_TAIL_POST_PREPARE").ok().as_deref()!=Some("off");
+    let prepare_post = post_possible && (s.drba_present_queue.is_empty() || !tail_post_staged_enabled());
+    let post_started = Instant::now();
+    let prepared = if prepare_post {
+        let mut probe=|name:&str,kind:StageKind,ms:f64|metrics.probe(name,metrics_kind_label(kind),ms);
+        match s.chain.process_from_with_frame_tick(gc,source,pending.out_size,pending.post_chain_start,
+            if metrics.detailed_enabled() && pending.frame.seq%30==0 {Some(&mut probe)}else{None},true) {
+            Ok(image)=>image,
+            Err(error)=>{
+                let message=format!("NeoArc fractional tail post: {error:#}");
+                log::error!("neoarc-fractional-tail-post-failed: {message} action=hold-last-filtered-frame");
+                let mut state=status.lock().unwrap();
+                if !state.chain_errors.contains(&message){state.chain_errors.push(message);}
+                return true;
+            }
+        }
+    } else {source};
+    let prep_ms=if prepare_post {post_started.elapsed().as_secs_f64()*1000.0}else{0.0};
+    let parked=if prepare_post && prepared.tex!=source.tex {
+        gc.park_transient_texture(key,prepared).or_else(|_|gc.copy_to_persistent_rgba(key,prepared))
+    }else{gc.copy_to_persistent_rgba(key,prepared)};
+    let texture=match parked {
+        Ok(image)=>image,
+        Err(error)=>{
+            let message=format!("NeoArc fractional tail storage: {error}");
+            log::error!("neoarc-fractional-tail-storage-failed: {message} action=hold-last-filtered-frame");
+            let mut state=status.lock().unwrap();
+            if !state.chain_errors.contains(&message){state.chain_errors.push(message);}
+            return true;
+        }
+    };
+    // The next input-pack fence now also closes the regular post suffix before
+    // new inference starts. Rendering the final scale/OUTPUT remains at display time.
+    unsafe {gc.gl.flush();}
+    let timing = if is_real { FrameTiming::from_frame(&pending.frame, Instant::now()) }
+        else { FrameTiming::from_interpolated(&pending.frame, pending.start_source_time_100ns,
+            pending.timesteps[index], Instant::now()) };
+    s.drba_present_queue.push_back(DrbaQueuedPresent {
+        fractional_tail: true, chain_already_processed: prepare_post,
+        fixed_deadline: Some(deadline), generation: pending.generation,
+        pair_id: pending.pair_id, slot_index: index,
+        slot_count: pending.timesteps.len()+usize::from(pending.present_real), factor: pending.factor,
+        tex: texture, out_size: pending.out_size, chain_start: pending.post_chain_start,
+        preprocessed_chain_ms: prep_ms, timing, frame_seq: pending.frame.seq, is_real,
+        output_period: pending.output_period, output_ratio: if s.flow_output_cadence.fractional_onnx { 2.5 } else { pending.factor.clamp(2, 15) as f64 },
+    });
+    if pending.pair_id < 3 || pending.pair_id % 120 <= 1 || pair_trace() {
+        log::info!("neoarc-fractional-tail-queued: pair={} generation={} kind={} wait_ms={:.3} storage=gpu-persistent post_prepared={} post_submit_ms={:.3} next_pair=admitted frame_skip=false",
+            pending.pair_id, pending.generation, if is_real {"real"} else {"mid"},
+            deadline.saturating_duration_since(Instant::now()).as_secs_f64()*1000.0, prepare_post, prep_ms);
+    }
+    true
+}
+
+fn tail_post_staged_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CHIDESCALER_NEOARC_TAIL_POST_STAGED").ok().as_deref() == Some("on"))
+}
+
+/// v998: run the post chain for the next parked item (one slot ahead of its
+/// deadline), right after the previous parked item was presented. Any failure
+/// leaves it unprepared; the present path then processes it as before.
+fn prepare_next_parked_tail_post(gc: &mut GlContext, s: &mut Session, metrics: &Metrics) {
+    if !tail_post_staged_enabled() {
+        return;
+    }
+    let Some(next) = s.drba_present_queue.front() else { return };
+    if !next.fractional_tail || next.chain_already_processed || next.preprocessed_chain_ms > 0.0
+        || next.generation != s.interp_generation || next.chain_start >= s.chain.stage_count()
+        || !s.chain.post_shaders_with_metric_labels().is_empty()
+    {
+        return;
+    }
+    let (key, out_size, chain_start, seq) = (tail_key(next.pair_id, next.is_real, next.slot_index), next.out_size, next.chain_start, next.frame_seq);
+    let Some(raw) = gc.persistent_texture_by_key(key) else { return };
+    let started = Instant::now();
+    let mut probe = |name: &str, kind: StageKind, ms: f64| metrics.probe(name, metrics_kind_label(kind), ms);
+    let prepared = match s.chain.process_from_with_frame_tick(gc, raw, out_size, chain_start,
+        if metrics.detailed_enabled() && seq % 30 == 0 { Some(&mut probe) } else { None }, true)
+    {
+        Ok(image) => image,
+        Err(error) => {
+            log::warn!("neoarc-tail-post-staged-failed: reason={error:#} action=post-at-present");
+            return;
+        }
+    };
+    if prepared.tex != raw.tex {
+        if gc.park_transient_texture(key, prepared).or_else(|_| gc.copy_to_persistent_rgba(key, prepared)).is_err() {
+            return;
+        }
+    }
+    unsafe { gc.gl.flush(); }
+    if let Some(front) = s.drba_present_queue.front_mut() {
+        front.chain_already_processed = true;
+        front.preprocessed_chain_ms = started.elapsed().as_secs_f64() * 1000.0;
+    }
+}
+
+/// v975: a REAL frame presented immediately by the GPU interpolation route
+/// (a pair whose mids were all shed under overload, or a history restart) is
+/// newer than any parked fractional/early tail of the previous pair. Showing
+/// that tail afterwards made the picture step back (C, then B, then D). Retire
+/// tails the immediate frame supersedes, so an overloaded run skips B like an
+/// ordinary dropped frame and chronology stays forward-only.
+fn retire_tails_superseded_by(gc: &mut GlContext, s: &mut Session, seq: u64, reason: &str) {
+    if !s.drba_present_queue.iter().any(|queued| queued.fractional_tail && queued.frame_seq <= seq) {
+        return;
+    }
+    static LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut kept = std::collections::VecDeque::with_capacity(s.drba_present_queue.len());
+    while let Some(queued) = s.drba_present_queue.pop_front() {
+        if queued.fractional_tail && queued.frame_seq <= seq {
+            let n = LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 || n % 240 == 0 {
+                log::info!(
+                    "interp-tail-superseded: pair={} generation={} tail_seq={} kind={} newer_seq={} reason={} action=retire-before-immediate-present count={}",
+                    queued.pair_id, queued.generation, queued.frame_seq,
+                    if queued.is_real { "real" } else { "mid" }, seq, reason, n + 1
+                );
+            }
+            gc.remove_persistent_texture(tail_key(queued.pair_id, queued.is_real, queued.slot_index));
+        } else {
+            kept.push_back(queued);
+        }
+    }
+    s.drba_present_queue = kept;
+    if s.drba_present_queue.is_empty() {
+        s.drba_present_deadline = None;
+    }
+}
+
 /// The FIFO owns detached GL textures; provider/history textures are never
 /// stored here, so recycling these handles cannot invalidate a live DRBA job.
 fn recycle_drba_present_queue(gc: &mut GlContext, s: &mut Session) {
     while let Some(queued) = s.drba_present_queue.pop_front() {
-        gc.recycle(queued.tex);
+        if queued.fractional_tail {
+            gc.remove_persistent_texture(tail_key(queued.pair_id, queued.is_real, queued.slot_index));
+        } else { gc.recycle(queued.tex); }
     }
     s.drba_present_deadline = None;
 }
@@ -6674,6 +7768,7 @@ fn drba_present_keep_textures(s: &Session) -> Vec<GpuTex> {
     keep.extend(s.gpu_interp_hist.iter().map(|frame| frame.tex));
     if let Some(pending) = s.gpu_interp_pending.as_ref() {
         keep.push(pending.real_tex);
+        keep.extend(pending.output_slots.iter().filter_map(|slot| slot.texture));
         keep.extend(pending.history_keep.iter().copied());
         keep.extend(
             pending
@@ -6685,6 +7780,7 @@ fn drba_present_keep_textures(s: &Session) -> Vec<GpuTex> {
     }
     if let Some(pack) = s.gpu_interp_pack_pending.as_ref() {
         keep.push(pack.pending.real_tex);
+        keep.extend(pack.pending.output_slots.iter().filter_map(|slot| slot.texture));
         keep.extend(pack.pending.history_keep.iter().copied());
         keep.extend(
             pack.pending
@@ -6721,6 +7817,9 @@ fn queue_directml_drba_midpoint_for_present(
     })?;
     let now = Instant::now();
     s.drba_present_queue.push_back(DrbaQueuedPresent {
+        fractional_tail: false,
+        chain_already_processed: false,
+        fixed_deadline: None,
         generation: pending.generation,
         pair_id: pending.pair_id,
         slot_index: index,
@@ -6739,7 +7838,7 @@ fn queue_directml_drba_midpoint_for_present(
         frame_seq: pending.frame.seq,
         is_real: false,
         output_period: pending.output_period,
-        output_ratio: pending.factor.clamp(2, 5) as f64,
+        output_ratio: pending.factor.clamp(2, 15) as f64,
     });
     Ok(())
 }
@@ -6762,6 +7861,9 @@ fn finalize_directml_drba_pair_for_present(
             })?;
         let now = Instant::now();
         s.drba_present_queue.push_back(DrbaQueuedPresent {
+        fractional_tail: false,
+        chain_already_processed: false,
+        fixed_deadline: None,
             generation: pending.generation,
             pair_id: pending.pair_id,
             slot_index: pending.timesteps.len(),
@@ -6775,7 +7877,7 @@ fn finalize_directml_drba_pair_for_present(
             frame_seq: pending.frame.seq,
             is_real: true,
             output_period: pending.output_period,
-            output_ratio: pending.factor.clamp(2, 5) as f64,
+            output_ratio: pending.factor.clamp(2, 15) as f64,
         });
         added = 1;
     }
@@ -6791,7 +7893,7 @@ fn finalize_directml_drba_pair_for_present(
 }
 
 fn directml_drba_pipeline_busy(s: &Session) -> bool {
-    !s.drba_present_queue.is_empty()
+    s.drba_present_queue.iter().any(|queued| !queued.fractional_tail)
         || s.gpu_interp_pending
             .as_ref()
             .is_some_and(|pending| pending.directml_drba)
@@ -6843,7 +7945,8 @@ fn service_directml_drba_present_queue(
                 stale.slot_index + 1,
                 stale.slot_count
             );
-            gc.recycle(stale.tex);
+            if stale.fractional_tail { gc.remove_persistent_texture(tail_key(stale.pair_id, stale.is_real, stale.slot_index)); }
+            else { gc.recycle(stale.tex); }
         }
     }
     let Some(front) = s.drba_present_queue.front() else {
@@ -6858,16 +7961,24 @@ fn service_directml_drba_present_queue(
     let output_period = front.output_period.clamp(1.0 / 240.0, 0.2);
     let period = Duration::from_secs_f64(output_period);
     let now = Instant::now();
-    if let Some(deadline) = s.drba_present_deadline {
-        if now < deadline {
-            return false;
-        }
+    if let Some(deadline) = front.fixed_deadline.or(s.drba_present_deadline) {
+        let prepare_at=if front.fractional_tail {fractional_tail_prepare_at(deadline,output_period)}else{deadline};
+        if now < prepare_at { return false; }
     }
 
-    let queued = s
+    let mut queued = s
         .drba_present_queue
         .pop_front()
         .expect("DRBA presentation queue front");
+    if queued.fractional_tail {
+        let Some(owned) = gc.persistent_texture_by_key(tail_key(queued.pair_id, queued.is_real, queued.slot_index)) else {
+            log::warn!("neoarc-fractional-tail-cancel: pair={} reason=storage-retired", queued.pair_id);
+            return false;
+        };
+        queued.tex = owned;
+        s.paced_present_deadline = queued.fixed_deadline;
+        s.intel_early_present_prepare = 4;
+    }
     let keep = drba_present_keep_textures(s);
     let captures = if queued.is_real {
         let delivered = s.source.delivered();
@@ -6878,7 +7989,7 @@ fn service_directml_drba_present_queue(
         0
     };
     let t0 = Instant::now();
-    if queued.preprocessed_chain_ms > 0.0 {
+    if queued.chain_already_processed || queued.preprocessed_chain_ms > 0.0 {
         process_and_present_from_impl(
             gc,
             overlay,
@@ -6919,6 +8030,22 @@ fn service_directml_drba_present_queue(
 
     // Always schedule from the actual present. If this output was late, do not
     // attempt to catch up by emitting several frames back-to-back.
+    if queued.fractional_tail {
+        s.drba_present_deadline = None;
+        if s.smooth_pacing {
+            s.flow_output_cadence.observe_blocking_present(s.last_present_started, s.last_present,
+                output_period, s.last_present_block_ms / 1000.0);
+        }
+        if queued.pair_id < 3 || queued.pair_id % 120 <= 1 || pair_trace() {
+            log::info!("neoarc-fractional-tail-present: pair={} generation={} seq={} kind={} next_pair_inflight={} late_ms={:.3} post_compute_ms={:.3} present_call_ms={:.3} order=previous-tail-before-next-mid cpu_pixel_bytes=0",
+                queued.pair_id, queued.generation, queued.frame_seq, if queued.is_real {"real"} else {"mid"},
+                s.gpu_interp_pending.is_some() || s.gpu_interp_pack_pending.is_some(),
+                queued.fixed_deadline.map(|d|s.last_present_started.saturating_duration_since(d).as_secs_f64()*1000.0).unwrap_or(0.0),
+                s.last_compute_ms, s.last_present_call_ms);
+        }
+        prepare_next_parked_tail_post(gc, s, metrics);
+        return true;
+    }
     s.drba_present_deadline = Some(s.last_present_started + period);
     if !s.gpu_interp_active_logged {
         log::info!(
@@ -6963,6 +8090,13 @@ fn drain_gpu_interp_stream(
     vsync_on: bool,
     downscaler: crate::render::scaler::Kernel,
 ) -> bool {
+    // The previous real endpoint owns the next output deadline. The new pair
+    // may infer, but no newer midpoint can overtake that endpoint.
+    if s.drba_present_queue.front().is_some_and(|queued| queued.fractional_tail
+        && s.gpu_interp_pending.as_ref().is_none_or(|pending|
+            pending.generation != queued.generation || pending.pair_id != queued.pair_id)) {
+        return false;
+    }
     let mut completed = s.gpu_interp_result_stash.drain(..).collect::<Vec<_>>();
     if completed.is_empty() {
         if let Some(worker) = s.gpu_interp_worker.as_ref() {
@@ -7384,15 +8518,35 @@ fn drain_gpu_interp_stream(
             let local_snapshot = ready.local_snapshot;
             let mid_chain_start = ready.chain_start;
             let preprocessed_chain_ms = ready.preprocessed_chain_ms;
-            // DirectML DRBA multi-slot scheduling uses one persistent output resource per
-            // timestep. When DRBA is the final chain stage, the completed slot
-            // is already detached from the provider's *next* output resource.
+            let tail_from = if pending.present_real {
+                pending.timesteps.len().saturating_sub(neoarc_tail_mids_for(pending.factor).max(1))
+            } else {
+                pending.timesteps.len().saturating_sub(1)
+            };
+            if index >= tail_from
+                && preprocessed_chain_ms == 0.0 && mid_chain_start == pending.post_chain_start
+                && queue_neoarc_fractional_tail(gc, s, metrics, status, &pending, mid, false, vsync_on, index) {
+                pending.next_output_index += 1;
+                // v995: a parked mid that is not the last one releases the
+                // next slot itself (its normal present path would have).
+                if pending.cooperative_slots && index + 1 < pending.timesteps.len() {
+                    if let Some(worker) = s.gpu_interp_worker.as_ref() {
+                        worker.permit_next_slot(pending.generation, pending.pair_id);
+                    }
+                }
+                s.gpu_interp_pending = Some(pending);
+                return true;
+            }
+            // Validated B570 WGL and NeoArc use distinct persistent output slots.
+            // The ready image is already detached and GL-fenced. With no
+            // post stage, the next slot can start before display pacing.
             // Release the next provider invocation before waiting for this
             // slot's display phase so inference overlaps presentation pacing.
             // v788 released only after the GL post submit, but the pacing wait
             // occurs before that submit; at 1080p this serialized ~32 ms of
             // inference with ~42 ms of display pacing and starved the WGC queue.
-            let provider_released_before_pacing = pending.directml_drba
+            let provider_released_before_pacing = (pending.directml_drba || intel_interp_outputs_are_independent(&pending.output_slots))
+                && std::env::var("CHIDESCALER_INTEL_INTERP_EARLY_PERMIT").ok().as_deref()!=Some("off")
                 && pending.cooperative_slots
                 && pending.permit_next_after_post_submit
                 && index + 1 < pending.timesteps.len()
@@ -7402,7 +8556,7 @@ fn drain_gpu_interp_stream(
                     worker.permit_next_slot(pending.generation, pending.pair_id);
                     if pending.pair_id < 3 || pending.pair_id % 120 == 0 {
                         log::debug!(
-                            "dml-drba-provider-overlap: pair={} generation={} slot={}/{} point=output-ready-before-present-wait",
+                            "interp-provider-overlap: pair={} generation={} slot={}/{} point=detached-output-ready-before-present-wait",
                             pending.pair_id,
                             pending.generation,
                             index + 1,
@@ -7411,6 +8565,7 @@ fn drain_gpu_interp_stream(
                     }
                 }
             }
+            wait_fractional_start(&mut s.flow_output_cadence,overlay,pending.source_period,pending.timesteps[index]);
             let lead_s = gpu_interp_present_lead_s(
                 s.last_compute_ms,
                 s.last_present_block_ms,
@@ -7471,13 +8626,21 @@ fn drain_gpu_interp_stream(
                         skipped_slots,
                     );
                 }
-                s.flow_output_cadence.wait_for_present_with_lead(
-                    overlay,
-                    pending.output_period,
-                    vsync_on,
-                    s.smooth_pacing,
-                    lead_s,
-                );
+                if intel_interp_outputs_are_independent(&pending.output_slots)
+                    &&s.chain.can_prepare_interp_gpu_post(pending.post_chain_start)
+                    &&std::env::var("CHIDESCALER_INTEL_INTERP_EARLY_POST").ok().as_deref()!=Some("off")
+                    &&!vsync_on&&(s.smooth_pacing||s.flow_output_cadence.fractional_onnx){
+                    let reserve_now=Instant::now();
+                    let deadline=s.flow_output_cadence.reserve_present_deadline(reserve_now,pending.output_period);
+                    if pair_trace(){
+                        let slack=if deadline>=reserve_now{deadline.duration_since(reserve_now).as_secs_f64()}else{-reserve_now.duration_since(deadline).as_secs_f64()};
+                        log::info!("pair-trace: ev=mid-reserve pair={} idx={} slack_ms={:.3} since_submit_ms={:.3}",pending.pair_id,index,slack*1000.0,reserve_now.saturating_duration_since(pending.submitted_at).as_secs_f64()*1000.0);
+                    }
+                    s.flow_output_cadence.fractional_submit_deadline=None;s.paced_present_deadline=Some(deadline);s.intel_early_present_prepare=if (pending.post_chain_start<s.chain.stage_count()||!s.chain.post_shaders_with_metric_labels().is_empty())&&std::env::var("CHIDESCALER_INTEL_INTERP_POST_READY").ok().as_deref()==Some("on"){2}else if pending.factor==3&&pending.post_chain_start<s.chain.stage_count()&&pending.output_slots.iter().all(|slot|slot.key>>63!=0)&&std::env::var("CHIDESCALER_DML_INTERP_POST_PRIORITY").ok().as_deref()!=Some("off"){2}else if pending.post_chain_start<s.chain.stage_count()||!s.chain.post_shaders_with_metric_labels().is_empty(){3}else{1};
+                    if pending.pair_id<3||pending.pair_id%120==0{log::info!("interp-early-post: pair={} generation={} slot={}/{} stages={} scope=full-GL-Slang-including-OUTPUT-before-submit-wait post_priority={} frame_tick=once host_image_bytes=0",pending.pair_id,pending.generation,index+1,pending.timesteps.len(),s.chain.stage_count().saturating_sub(pending.post_chain_start),s.intel_early_present_prepare);}
+                }else{
+                    s.flow_output_cadence.wait_for_present_with_lead(overlay,pending.output_period,vsync_on,s.smooth_pacing,lead_s);
+                }
             }
 
             if should_detach_directml_drba_midpoint(overlay, s, &pending, mid) {
@@ -7699,7 +8862,7 @@ fn drain_gpu_interp_stream(
                 s.gpu_interp_active_logged = true;
             }
             pending.next_output_index += 1;
-            if pending.directml_drba || pending.directml_drba_v782 {
+            if presented_after > presented_before {
                 pending.presented_mid_count = pending.presented_mid_count.saturating_add(1);
             }
             // Multi-slot jobs normally release from process_and_present_from
@@ -7758,6 +8921,25 @@ fn drain_gpu_interp_stream(
     // source pair uses this measurement only to decide which original phase
     // slots can really be computed; it never rewrites the selected x2..x5
     // multiplier and never fabricates target FPS.
+    if !pending.is_drba && s.rife_admission_active {
+        // v947: with the DirectML RIFE boost most of a pair's cost is the
+        // shared motion pass, so dividing by the admitted count made a pair with
+        // fewer midpoints look more expensive per midpoint and the controller
+        // kept shedding. Spread the cost over every requested midpoint instead.
+        let midpoints = if crate::render::onnx_stage::last_prepared_pair_uses_rife_split() {
+            pending.timesteps.len().max(pending.factor.saturating_sub(1) as usize)
+        } else {
+            pending.timesteps.len()
+        };
+        observe_rife_midpoint_cost_robust(
+            &mut s.drba_midpoint_ema_ms,
+            &mut s.drba_perf_samples,
+            &mut s.rife_mid_recent,
+            pending.run_ms_total,
+            midpoints,
+            pending.source_period,
+        );
+    }
     if pending.is_drba {
         observe_drba_midpoint_cost(
             &mut s.drba_midpoint_ema_ms,
@@ -7810,13 +8992,25 @@ fn drain_gpu_interp_stream(
             s.last_present_block_ms,
             raw_lead_ms
         );
+        if pending.metric_name.contains("NeoARC") {
+            log::info!("neoarc-gpu-transfer-audit: pair={} capture_storage={} interpolation_input=GL interpolation_output=GL host_mid_bytes=0 post_stages={} presented_mids={} requested_mids={} scope=steady-pair verify_post_stage_fallback_logs=true",
+                pending.pair_id,if pending.frame.gpu.is_some(){"D3D11"}else{"host"},
+                s.chain.stage_count().saturating_sub(pending.post_chain_start),pending.presented_mid_count,pending.timesteps.len());
+        }
+        if pending.output_slots.iter().any(|slot|slot.key>>63!=0){
+            log::info!("directml-gpu-transfer-audit: pair={} capture_storage={} interpolation_input=D3D11-WGL-D3D12 interpolation_output=D3D12-D3D11-WGL host_input_bytes=0 host_mid_bytes=0 post_stages={} presented_mids={} requested_mids={} real_endpoint={} scope=steady-pair verify_post_stage_fallback_logs=true",pending.pair_id,if pending.frame.gpu.is_some(){"D3D11"}else{"host"},s.chain.stage_count().saturating_sub(pending.post_chain_start),pending.presented_mid_count,pending.timesteps.len(),pending.present_real);
+        }
+
     }
 
     if metrics.detailed_enabled() {
         metrics.probe(&pending.metric_name, "onnx", pending.run_ms_total);
     }
 
-    if pending.present_real {
+    let endpoint_started_diag = Instant::now();
+    let queued_endpoint = pending.present_real && queue_neoarc_fractional_tail(gc, s, metrics, status, &pending,
+        pending.real_tex, true, vsync_on, 0);
+    if pending.present_real && !queued_endpoint {
         let lead_s = gpu_interp_present_lead_s(
             s.last_compute_ms,
             s.last_present_block_ms,
@@ -7855,13 +9049,13 @@ fn drain_gpu_interp_stream(
                     );
                 }
             }
-            s.flow_output_cadence.wait_for_present_with_lead(
-                overlay,
-                pending.output_period,
-                vsync_on,
-                s.smooth_pacing,
-                lead_s,
-            );
+            if intel_interp_outputs_are_independent(&pending.output_slots)
+                &&s.chain.can_prepare_interp_gpu_post(pending.post_chain_start)
+                &&std::env::var("CHIDESCALER_INTEL_INTERP_EARLY_POST").ok().as_deref()!=Some("off")
+                &&!vsync_on&&(s.smooth_pacing||s.flow_output_cadence.fractional_onnx){
+                let deadline=s.flow_output_cadence.reserve_present_deadline(Instant::now(),pending.output_period);
+                s.flow_output_cadence.fractional_submit_deadline=None;s.paced_present_deadline=Some(deadline);s.intel_early_present_prepare=if (pending.post_chain_start<s.chain.stage_count()||!s.chain.post_shaders_with_metric_labels().is_empty())&&std::env::var("CHIDESCALER_INTEL_INTERP_POST_READY").ok().as_deref()==Some("on"){2}else if pending.factor==3&&pending.post_chain_start<s.chain.stage_count()&&pending.output_slots.iter().all(|slot|slot.key>>63!=0)&&std::env::var("CHIDESCALER_DML_INTERP_POST_PRIORITY").ok().as_deref()!=Some("off"){2}else if pending.post_chain_start<s.chain.stage_count()||!s.chain.post_shaders_with_metric_labels().is_empty(){3}else{1};
+            }else{s.flow_output_cadence.wait_for_present_with_lead(overlay,pending.output_period,vsync_on,s.smooth_pacing,lead_s);}
         }
         let now = Instant::now();
         let delivered = s.source.delivered();
@@ -7931,6 +9125,19 @@ fn drain_gpu_interp_stream(
             );
     }
 
+    let retired_diag = Instant::now();
+    s.gpu_interp_last_retired_diag = Some((pending.generation, pending.pair_id, retired_diag));
+    if !queued_endpoint && !s.drba_present_queue.iter().any(|q|q.generation==pending.generation&&q.pair_id==pending.pair_id)
+        && crate::logging::diagnostics_enabled() && (pending.pair_id < 3 || pending.pair_id % 120 <= 1) {
+        log::info!("interp-gpu-pair-retired: pair={} generation={} backend={} generated={} presented_mids={} real_endpoint={} source_budget_ms={:.3} infer_ms={:.3} endpoint_phase_ms={:.3} total_pair_ms={:.3} endpoint_compute_ms={:.3} endpoint_pacer_wait_ms={:.3} endpoint_present_call_ms={:.3} scope=worker-submit-through-final-endpoint-present capture_prefix_excluded=true physical_scanout_measured=false",
+            pending.pair_id, pending.generation, pending.metric_name, pending.timesteps.len(), pending.presented_mid_count,
+            pending.present_real, pending.source_period*1000.0, pending.run_ms_total,
+            if pending.present_real { retired_diag.duration_since(endpoint_started_diag).as_secs_f64()*1000.0 } else { 0.0 },
+            retired_diag.saturating_duration_since(pending.submitted_at).as_secs_f64()*1000.0,
+            if pending.present_real { s.last_compute_ms } else { 0.0 },
+            if pending.present_real { s.last_pacer_wait_ms } else { 0.0 },
+            if pending.present_real { s.last_present_call_ms } else { 0.0 });
+    }
     if crate::logging::diagnostics_enabled() {
         let residency = crate::render::onnx_stage::interp_residency_snapshot();
         if residency.gpu_output_frames > 0
@@ -7967,7 +9174,7 @@ fn apply_interp_factor_now(
     current: &mut u32,
     requested: u32,
 ) {
-    let next = requested.clamp(2, 5);
+    let next = normalize_interp_code(requested);
     let previous = *current;
     *current = next;
     if let Some(s) = s {
@@ -8016,7 +9223,7 @@ fn apply_interp_factor_now(
                     log::error!("onnx-stage-lock-poisoned: action=recover-for-factor-transition");
                     poisoned.into_inner()
                 });
-                stage.retire_interp_gpu_bridges(gc);
+                stage.reset_interp_gpu_for_factor_change(gc);
                 stage.reset_interp_pack_cache();
             }
             s.gpu_interp_pair_id = 0;
@@ -8024,6 +9231,7 @@ fn apply_interp_factor_now(
             s.drba_diag_present_seq = 0;
             s.drba_diag_last_semantic_ts_100ns = None;
             s.drba_midpoint_ema_ms = 0.0;
+            s.rife_mid_recent.clear();
             s.drba_perf_samples = 0;
             s.drba_compute_credit_ms = 0.0;
             s.drba_phase_rotation = 0;
@@ -8038,9 +9246,9 @@ fn apply_interp_factor_now(
             s.smooth_pacer.reset();
             s.paced_present_deadline = None;
             log::info!(
-                "interp-gpu-factor-transition-reset: previous=x{} next=x{} worker=stopped bridge=retired pair_id=0 timing=reset",
-                previous,
-                next
+                "interp-gpu-factor-transition-reset: previous={} next={} worker=stopped bridge=retired pair_id=0 timing=reset",
+                crate::core::config::interp_label(previous),
+                crate::core::config::interp_label(next)
             );
             // Drop any source frames already queued under the old output
             // period. This keeps x2/x3/x4/x5 changes from spending several
@@ -8050,9 +9258,9 @@ fn apply_interp_factor_now(
             s.source.set_queue_enabled(s.chain.has_interp());
             s.cadence.reset();
             log::info!(
-                "interp-factor-source-rearm: factor=x{} phases={} queue=flushed cadence=reset",
-                next,
-                next.saturating_sub(1)
+                "interp-factor-source-rearm: factor={} capacity={} queue=flushed cadence=reset",
+                crate::core::config::interp_label(next),
+                interp_capacity(next)
             );
         }
 
@@ -8072,10 +9280,11 @@ fn apply_interp_factor_now(
         s.gpu_interp_active_logged = false;
     }
     log::info!(
-        "frame-interpolation factor applied: requested=x{} effective=x{} previous=x{} history=reset",
-        requested,
-        next,
-        previous
+        "frame-interpolation factor applied: requested={} effective={} previous={} ratio={} history=reset",
+        crate::core::config::interp_label(requested),
+        crate::core::config::interp_label(next),
+        crate::core::config::interp_label(previous),
+        interp_ratio(next)
     );
 }
 
@@ -8438,7 +9647,7 @@ fn apply_live_aspect_update(
     s.source_client_drag_raw_origin = None;
     s.source_client_drag_overlay_origin = None;
     s.aspect_transition_pending = true;
-    s.chain_reprocess_pending = !s.frame.data.is_empty();
+    s.chain_reprocess_pending = s.frame.has_pixels();
 
     // A presentation semantic change must win over duplicate-frame reuse. No
     // provider/filter state is discarded; these are only lightweight content
@@ -8771,7 +9980,8 @@ fn engine_main(
                         input.set_transition_suspended(false);
                         input.release();
                         stop_session(&mut session, &mut overlay, &mut gc, &status);
-                        let kept = factory.retain_optional_backend_sessions_for_capture_restart();
+                        let kept =
+                            factory.retain_optional_backend_sessions_for_capture_restart();
                         log::info!(
                             "onnx-session-stop-cache: action=retain-last-chain-then-lru kept={} limit={} bridge_resources=retired source=wake-for-stop",
                             kept,
@@ -9072,12 +10282,13 @@ fn engine_main(
                                 s.src_was_topmost || s.source_monitor_fullscreen,
                             ));
                             g.onnx_neoamd_stages = usage.neoamd;
-                            g.onnx_neortx_stages = usage.neortx;
+        g.onnx_neortx_stages = usage.neortx;
                             g.onnx_tensorrt_stages = usage.tensorrt;
                             g.onnx_cuda_stages = usage.cuda;
                             g.onnx_directml_fallbacks = usage.directml_fallback;
                             metrics.reset();
                             metrics.set_stage_order(s.chain.metric_stage_order());
+                            metrics.set_interpolation_stage(s.chain.interp_metric_name());
                             // v833: discard the single capture-start transition
                             // frame, then seed from the next frame.  Because v829
                             // takes per-frame timing while settle is active this is
@@ -9656,7 +10867,7 @@ fn engine_main(
                     input_speed_fix = speed_fix;
                 }
                 Cmd::SetInterpFactor(f) => {
-                    let next = f.clamp(2, 5);
+                    let next = normalize_interp_code(f);
                     let in_flight = session.as_ref().is_some_and(|s| {
                         s.gpu_interp_pack_pending.is_some()
                             || s.gpu_interp_pending.is_some()
@@ -9671,8 +10882,8 @@ fn engine_main(
                     // and the overlay remain alive.
                     if in_flight {
                         log::info!(
-                            "frame-interpolation factor force-transition: requested=x{} reason=pair-in-flight action=discard-old-pair",
-                            next
+                            "frame-interpolation factor force-transition: requested={} reason=pair-in-flight action=discard-old-pair",
+                            crate::core::config::interp_label(next)
                         );
                     }
                     deferred_interp_factor = None;
@@ -9791,8 +11002,7 @@ fn engine_main(
                         let mut state = status
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let deadline_cancelled =
-                            state.glsl_overload_auto_stop_deadline.take().is_some();
+                        let deadline_cancelled = state.glsl_overload_auto_stop_deadline.take().is_some();
                         let notice_cleared = state.glsl_overload_notice_latched;
                         state.glsl_overload_notice_latched = false;
                         if deadline_cancelled || notice_cleared {
@@ -10061,7 +11271,7 @@ fn engine_main(
         }
 
         let stale_capture_size = s.frame.capture_size();
-        let stale_reference = if !s.frame.data.is_empty() {
+        let stale_reference = if s.frame.has_pixels() {
             session_source_input_reference_rect(s, stale_capture_size)
         } else {
             None
@@ -10782,7 +11992,10 @@ fn engine_main(
                 }
                 last_source_visible_windows = source_windows;
                 last_helper_compositor_diag = Instant::now();
-            } else if last_helper_compositor_diag.elapsed() >= Duration::from_secs(2) {
+            } else if last_helper_compositor_diag.elapsed() >= Duration::from_secs(15) {
+                // v1000: was every 2 s; each snapshot walks the whole USER32
+                // z-list with cross-process queries and correlated with slot
+                // misses while "save log" is on. Event-driven snapshots stay.
                 last_helper_compositor_diag = Instant::now();
                 if helper_compositor_diag_inflight
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -11037,6 +12250,23 @@ fn engine_main(
                 s.source_input_geometry_missing_logged = true;
             }
         }
+        if phase_trace_enabled() {
+            let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+            let now = Instant::now();
+            let total = ms(phase_tick_started, now);
+            if total > 1.0 {
+                log::info!(
+                    "phase-trace: total_ms={:.2} cursor_ms={:.2} mid_ms={:.2} geometry_tail_ms={:.2} panel_ms={:.2} pre_input_ms={:.2} input_ms={:.2}",
+                    total,
+                    ms(phase_tick_started, phase_cursor_finished),
+                    ms(phase_cursor_finished, phase_geometry_finished),
+                    0.0,
+                    ms(phase_geometry_finished, phase_panel_finished),
+                    ms(phase_panel_finished, phase_input_started),
+                    ms(phase_input_started, phase_input_finished),
+                );
+            }
+        }
 
         // GUI responsiveness must never split, flush, finish or sleep
         // the normal GPU filter path. Low-spec relief is GUI-thread-only.
@@ -11086,6 +12316,11 @@ fn engine_main(
                         s.gpu_interp_worker =
                             Some(GpuInterpWorker::spawn(pack.pending.stage.clone()));
                     }
+                    // v985b: NeoArc endpoints GL buffers -> CL memory on this GL
+                    // owner thread (fence above has signalled; worker is idle).
+                    if let Ok(mut stage) = pack.pending.stage.lock() {
+                        stage.stage_neoarc_interp_inputs();
+                    }
                     let cooperative_slots = pack.job.cooperative_slots;
                     match s
                         .gpu_interp_worker
@@ -11096,6 +12331,21 @@ fn engine_main(
                         Ok(()) => {
                             let mut pending = pack.pending;
                             pending.submitted_at = Instant::now();
+                            if pair_trace() {
+                                log::info!("pair-trace: ev=job-submitted pair={} since_retire_ms={:.3} fence_wait_ms={:.3}", pending.pair_id,
+                                    s.gpu_interp_last_retired_diag.map(|(_,_,t)|t.elapsed().as_secs_f64()*1000.0).unwrap_or(-1.0),
+                                    elapsed.as_secs_f64()*1000.0);
+                            }
+                            if crate::logging::diagnostics_enabled() {
+                                if let Some((generation, previous_pair, retired)) = s.gpu_interp_last_retired_diag {
+                                    if generation == pending.generation && previous_pair.checked_add(1) == Some(pending.pair_id)
+                                        && (previous_pair < 3 || previous_pair % 120 <= 1) {
+                                        log::info!("interp-gpu-next-pair-gap: previous_pair={} pair={} generation={} gap_ms={:.3} scope=previous-retire-to-next-worker-submit includes_capture_prefix_pack=true gpu_idle_not_proven=true",
+                                            previous_pair, pending.pair_id, generation,
+                                            pending.submitted_at.saturating_duration_since(retired).as_secs_f64()*1000.0);
+                                    }
+                                }
+                            }
                             if pending.pair_id < 3 {
                                 log::info!(
                                     "interp-gpu-job-submitted: pair={} generation={} outputs={} scheduling={}",
@@ -11175,6 +12425,35 @@ fn engine_main(
             }
         }
 
+        // v932: capture-resolution present freeze. The GUI publishes the resize
+        // intent before it resizes the source HWND and only afterwards sends
+        // SetCaptureGeometry, which arms the transition shield. In that window
+        // (typically 150-400 ms) an in-flight interpolation pair could still be
+        // presented although it mixed the old-size and the new-size picture:
+        // the new 1280x720 frame landed top-left in the old 1920x1080 canvas and
+        // was shown as a ghost "small window" over the magnified image until the
+        // first exact frame replaced it. Present nothing new while the intent is
+        // pending; the last complete frame stays on screen as the shield. The
+        // intent is cleared by SetCaptureGeometry (or by the GUI on rejection),
+        // so this never outlives the transaction.
+        if status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture_resolution_resize_intent
+            .is_some()
+        {
+            if !CAPTURE_GEOMETRY_PRESENT_FREEZE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::info!(
+                    "capture-geometry-present-freeze: action=hold-last-complete-frame reason=resize-intent-before-transaction"
+                );
+            }
+            overlay.win.pump_messages();
+            continue;
+        }
+        if CAPTURE_GEOMETRY_PRESENT_FREEZE_LOGGED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("capture-geometry-present-freeze: action=released");
+        }
+
         // Stream each genuinely interpolated timestep as soon as that unique
         // output slot is ready. This overlaps later RIFE inference with the
         // presentation/post-chain work of earlier slots instead of serialising
@@ -11219,7 +12498,7 @@ fn engine_main(
                     s.chain.prepare_gpu_transition(&mut gc);
                     s.chain.reset_backend_runtime_state();
                     gc.clear_external_buffer();
-                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.chain_reprocess_pending = s.frame.has_pixels();
                     s.smooth_pacer.reset();
                     s.paced_present_deadline = None;
                     s.provider_transition_recovery_attempts = 1;
@@ -11236,7 +12515,7 @@ fn engine_main(
                         "first-present watchdog",
                     );
                     gc.clear_external_buffer();
-                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.chain_reprocess_pending = s.frame.has_pixels();
                     s.smooth_pacer.reset();
                     s.paced_present_deadline = None;
                     s.provider_transition_recovery_attempts = 2;
@@ -11291,10 +12570,33 @@ fn engine_main(
                 }
             }
             overlay.win.pump_messages();
-            std::thread::yield_now();
+            if s.gpu_interp_pending.is_some() {
+                if let Some(deadline) = s.drba_present_queue.front()
+                    .filter(|queued| queued.fractional_tail).and_then(|queued| queued.fixed_deadline) {
+                    wait_until_with_pump(&mut overlay, fractional_tail_prepare_at(deadline,
+                        s.drba_present_queue.front().map(|q|q.output_period).unwrap_or(1.0/60.0)));
+                } else { std::thread::yield_now(); }
+            } else { std::thread::yield_now(); }
             continue;
         }
 
+        // GPU pixel delivery supports NeoArc and verified B570 DirectML SISR/interpolation. CPU-only
+        // optional preprocessing keeps the established capture route explicitly.
+        let gpu_capture_requested=(factory.onnx_preference()==OnnxBackendPreference::NeoArc
+            ||(factory.onnx_preference()==OnnxBackendPreference::DirectML&&s.chain.supports_dml_wgl_capture()))
+            && !s.capture_hdr && !s.duplicate_frame_reduction
+            && !s.chain.has_neodeint()
+            // Vulkan is enabled by default, but GPU=Auto has no selected
+            // Vulkan adapter and never enters that host-input route. The
+            // global opt-in alone must not disable NeoArc GPU capture.
+            && !(crate::render::vulkan_multipass::production_requested()
+                && crate::render::vulkan_gpu::production_selected_luid().is_some())
+            && match s.chain.interp_stage(){
+                Some(crate::render::chain::InterpHandle::Onnx{stage,..})=>stage.lock().unwrap().supports_interp_gpu(),
+                Some(crate::render::chain::InterpHandle::Flow{..})=>false,None=>true,
+            }
+            && std::env::var("CHIDESCALER_NEOARC_CAPTURE_GPU").ok().as_deref()!=Some("off");
+        s.source.set_gpu_delivery(gpu_capture_requested);
         let flow_active = matches!(
             s.chain.interp_stage(),
             Some(crate::render::chain::InterpHandle::Flow { .. })
@@ -11450,6 +12752,11 @@ fn engine_main(
         } else {
             Duration::from_millis(20)
         };
+        let capture_wait = s.drba_present_queue.front()
+            .filter(|queued| queued.fractional_tail).and_then(|queued| queued.fixed_deadline)
+            .map(|deadline|capture_wait.min(fractional_tail_prepare_at(deadline,
+                s.drba_present_queue.front().map(|q|q.output_period).unwrap_or(1.0/60.0)).saturating_duration_since(Instant::now())))
+            .unwrap_or(capture_wait);
         let mut got_new = s.source.wait_new(capture_wait);
         let lookahead_ready = !temporal_lookahead
             || s.source.queued_len() >= 2
@@ -11460,14 +12767,37 @@ fn engine_main(
             // Do not spin while last_seq intentionally remains behind.
             std::thread::sleep(Duration::from_millis(1));
         }
-        let mut took_frame = if queued_capture && lookahead_ready {
+        // v998: wglDXLockObjectsNV in the GPU capture copy drains the GL queue
+        // (~3.3 ms behind 720p x10 + Anime4K post shaders). Taking a frame just
+        // before a parked tail is due made that tail late (a skipped slot).
+        // When the next tail is closer than the measured copy cost, present it
+        // first; the frame stays queued for the next iteration (one slot at
+        // most). Cheap copies (no heavy post chain) never defer.
+        // CHIDESCALER_CAPTURE_DEFER_TAKE=off disables.
+        let defer_take = queued_capture && lookahead_ready
+            && s.capture_upload_ema_ms > 1.0
+            && capture_defer_take_enabled()
+            && s.drba_present_queue.front()
+                .filter(|queued| queued.fractional_tail)
+                .and_then(|queued| queued.fixed_deadline.map(|d| fractional_tail_prepare_at(d, queued.output_period)))
+                .is_some_and(|prepare_at| prepare_at.saturating_duration_since(Instant::now())
+                    < Duration::from_secs_f64((s.capture_upload_ema_ms + 0.7) / 1000.0));
+        if defer_take {
+            s.capture_take_deferred = s.capture_take_deferred.wrapping_add(1);
+            if s.capture_take_deferred <= 3 || s.capture_take_deferred % 1200 == 0 {
+                log::info!("capture-take-deferred: count={} copy_ema_ms={:.2} reason=parked-tail-due-first", s.capture_take_deferred, s.capture_upload_ema_ms);
+            }
+        }
+        let mut took_frame = if defer_take {
+            false
+        } else if queued_capture && lookahead_ready {
             let max_queue = if flow_active {
                 NEOFLOW_QUEUE_MAX
             } else if interp_active {
                 if s.directml_drba_capture_queue {
                     DIRECTML_DRBA_QUEUE_MAX
                 } else {
-                    ONNX_INTERP_QUEUE_MAX
+                    onnx_interp_queue_max()
                 }
             } else if load_reduction_lookahead {
                 LOAD_REDUCTION_QUEUE_MAX
@@ -11482,6 +12812,11 @@ fn engine_main(
         } else {
             s.source.take_latest(&mut s.frame)
         };
+        if !took_frame && s.drba_present_queue.front().is_some_and(|queued|queued.fractional_tail) {
+            overlay.win.pump_messages();
+            continue;
+        }
+        if took_frame && !gpu_capture_requested {s.frame.ensure_host()?;}
         if took_frame && s.capture_canvas_suspended_for_fullscreen {
             let monitor_size = (s.monitor_rect.2, s.monitor_rect.3);
             let capture_size = s.frame.capture_size();
@@ -11655,7 +12990,7 @@ fn engine_main(
         // the old chain's last_tex and defer the visible effect until a later
         // mouse/hover repaint from the source window.
         let mut chain_reprocess_forced = false;
-        if !took_frame && s.chain_reprocess_pending && !s.frame.data.is_empty() {
+        if !took_frame && s.chain_reprocess_pending && s.frame.has_pixels() {
             got_new = true;
             took_frame = true;
             chain_reprocess_forced = true;
@@ -11792,7 +13127,7 @@ fn engine_main(
                             log::warn!("{line}");
                             vulkan_gpu::record_probe_result(&line);
                         }
-                    } else if !s.frame.data.is_empty() {
+                    } else if s.frame.has_pixels() {
                         s.vulkan_capture_probe_started = true;
                         let line = format!(
                             "vulkan-capture-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
@@ -11880,7 +13215,7 @@ fn engine_main(
                             log::warn!("{line}");
                             vulkan_gpu::record_probe_result(&line);
                         }
-                    } else if !s.frame.data.is_empty() {
+                    } else if s.frame.has_pixels() {
                         s.vulkan_frame_probe_started = true;
                         let line = format!(
                             "vulkan-frame-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
@@ -11981,7 +13316,7 @@ fn engine_main(
                             log::warn!("{line}");
                             vulkan_gpu::record_probe_result(&line);
                         }
-                    } else if !s.frame.data.is_empty() {
+                    } else if s.frame.has_pixels() {
                         s.vulkan_user_glsl_probe_started = true;
                         let line = format!(
                             "vulkan-user-glsl-probe: result=skipped requested_luid={luid:016x} source={}x{} seq={} hdr={} bytes={} reason=frame-not-rgba8-or-too-small fallback=OpenGL-unchanged",
@@ -12179,7 +13514,7 @@ fn engine_main(
             && !s.chain.has_onnx()
             && s.capture_resolution_wait_started
                 .is_some_and(|started| started.elapsed() >= Duration::from_millis(1200))
-            && !s.frame.data.is_empty()
+            && s.frame.has_pixels()
         {
             // Re-filter the exact source pixels captured before Chromium's
             // client resize. Do not mutate frame.w/h and do not resample its
@@ -12429,7 +13764,7 @@ fn engine_main(
                     {
                         let mut state = status.lock().unwrap();
                         state.onnx_neoamd_stages = usage.neoamd;
-                        state.onnx_neortx_stages = usage.neortx;
+        state.onnx_neortx_stages = usage.neortx;
                         state.onnx_tensorrt_stages = usage.tensorrt;
                         state.onnx_cuda_stages = usage.cuda;
                         state.onnx_directml_fallbacks = usage.directml_fallback;
@@ -12450,6 +13785,17 @@ fn engine_main(
                 }
             }
         }
+        let capture_delivery_seq = s.frame.seq;
+        if interp_active && got_new && took_frame && (capture_delivery_seq % 30 <= 3 || capture_delivery_seq <= 3) {
+            log::info!(
+                "interp-capture-dequeue: seq={} source_time={:?} queued={} cap_skip={} interp_active={}",
+                capture_delivery_seq, s.frame.source_time_100ns,
+                s.source.queued_len(), cap_skip, interp_active,
+            );
+        }
+        if got_new && took_frame {
+            content_diag_capture(&s.frame);
+        }
         let mut smooth_content_duplicate = false;
         let browser_fullscreen_cadence = AUTO_CONTENT_CADENCE_ENABLED
             && ((win32::is_browser_window(s.hwnd) && win32::is_monitor_fullscreen(s.hwnd))
@@ -12457,6 +13803,7 @@ fn engine_main(
         if browser_fullscreen_cadence != s.browser_fullscreen_cadence {
             s.browser_fullscreen_cadence = browser_fullscreen_cadence;
             s.smooth_content_signature = None;
+            s.smooth_content_last_delivery_time = None;
             s.smooth_content_last_candidate_seq = None;
             s.smooth_content_last_candidate_time = None;
             s.smooth_content_pattern_hits = 0;
@@ -12480,6 +13827,11 @@ fn engine_main(
             && let Some(signature) = frame_signature(&s.frame)
         {
             let input_seq = s.frame.seq;
+            let repeat_interval = compositor_repeat_interval(
+                s.smooth_content_last_delivery_time,
+                s.frame.source_time_100ns,
+            );
+            s.smooth_content_last_delivery_time = s.frame.source_time_100ns;
             let signature_matches = if s.duplicate_frame_reduction {
                 let forward_motion = lookahead_signature
                     .as_ref()
@@ -12598,8 +13950,9 @@ fn engine_main(
             // Load reduction may remove every matching picture. With it off,
             // omission begins only after a repeated ~5-frame 3:2 pattern has
             // proved that this is 24p contained in a 30Hz surface.
-            smooth_content_duplicate =
-                signature_matches && (s.duplicate_frame_reduction || s.smooth_content_24p_detected);
+            smooth_content_duplicate = signature_matches
+                && repeat_interval
+                && (s.duplicate_frame_reduction || s.smooth_content_24p_detected);
             // Compare against the immediately preceding WGC delivery even
             // when that delivery is omitted from presentation.
             s.smooth_content_signature = Some(signature);
@@ -12632,7 +13985,10 @@ fn engine_main(
                 let keepalive_due =
                     s.strict_static_last_present.elapsed() >= IDLE_KEEPALIVE_INTERVAL;
                 let should_present = !strict_static_hold || keepalive_due;
-                if should_present && let Some(tex) = s.last_tex {
+                // During interpolation the pending pair owns the visible
+                // timeline. Replaying the last texture here can show a later
+                // real endpoint before that pair's midpoint, then jump back.
+                if should_present && !interp_active && let Some(tex) = s.last_tex {
                     if overlay.present(&mut gc, tex).is_ok() {
                         s.last_present = now;
                         s.strict_static_last_present = now;
@@ -12689,6 +14045,7 @@ fn engine_main(
         } else if got_new && took_frame && !cap_skip && (resize_committed || !s.smooth_pacing) {
             s.strict_static_streak = 0;
             s.smooth_content_signature = None;
+            s.smooth_content_last_delivery_time = None;
             s.smooth_content_seq = 0;
             s.smooth_content_unique_since_duplicate = 4;
             s.smooth_content_last_candidate_seq = None;
@@ -12741,7 +14098,7 @@ fn engine_main(
         }
         // A static capture needs one refresh when the isolated NR initialization
         // completes. No worker/atomic access occurs for ordinary chains.
-        let dlssnr_refresh = s.chain.dlssnr_needs_refresh() && !s.frame.data.is_empty();
+        let dlssnr_refresh = s.chain.dlssnr_needs_refresh() && s.frame.has_pixels();
         if got_new && took_frame && !cap_skip && !duplicate_skip && !smooth_content_duplicate {
             // The only frames that reach the chain have passed both gates in this
             // exact order: FPS cap -> duplicate reduction -> GLSL/ONNX/interpolation.
@@ -12756,8 +14113,44 @@ fn engine_main(
                 // not divide their timestamp span by skipped WGC deliveries.
                 s.cadence.observe_content(s.frame.source_time_100ns);
             } else {
-                s.cadence
-                    .observe_frame(s.frame.source_time_100ns, s.frame.seq);
+                if interp_active && s.duplicate_frame_reduction {
+                    let capture_steps = s
+                        .cadence_last_capture_seq
+                        .replace(capture_delivery_seq)
+                        .map(|previous| capture_delivery_seq.saturating_sub(previous).max(1))
+                        .unwrap_or(1);
+                    // Content IDs are deliberately contiguous for temporal
+                    // filters. Under GPU load, WGC can drop every other 24p
+                    // picture; using those IDs for cadence falsely locks 12p.
+                    // Use the WGC delivery gap only while frames are actually
+                    // being dropped and no compositor duplicates were omitted.
+                    let recovered_period = s
+                        .cadence
+                        .prev_t
+                        .zip(s.frame.source_time_100ns)
+                        .and_then(|(previous, current)| {
+                            (current > previous).then_some(
+                                (current - previous) as f64
+                                    / 10_000_000.0
+                                    / capture_steps as f64,
+                            )
+                        });
+                    let steps = if s.source.queued_dropped() > 0
+                        && s.smooth_content_unique_since_duplicate >= 8
+                        && capture_steps <= 3
+                        && recovered_period.is_some_and(|period| (0.025..=0.1).contains(&period))
+                    {
+                        capture_steps
+                    } else {
+                        1
+                    };
+                    s.cadence_input_seq = s.cadence_input_seq.saturating_add(steps);
+                    s.cadence
+                        .observe_frame(s.frame.source_time_100ns, s.cadence_input_seq);
+                } else {
+                    s.cadence
+                        .observe_frame(s.frame.source_time_100ns, s.frame.seq);
+                }
             }
             metrics.set_source_fps(s.cadence.period_s().map(|period| 1.0 / period));
         }
@@ -12911,7 +14304,7 @@ fn engine_main(
                 } else {
                     upload_session_frame_timed(&mut gc, s)
                 };
-                let requested_factor = interp_factor.max(2);
+                let requested_factor = normalize_interp_code(interp_factor);
                 let pair_period_s = normalized_frame_span_s(
                     s.prev_tex_source_time_100ns,
                     s.frame.source_time_100ns,
@@ -13163,6 +14556,7 @@ fn engine_main(
                     directml_drba,
                     neoamd_cpu_visible,
                     neoamd_stream_supported,
+                    neoarc_stream_supported,
                 ) = {
                     let ist = ist.lock().unwrap();
                     (
@@ -13182,6 +14576,7 @@ fn engine_main(
                             && matches!(&ist.interp, crate::render::onnx_stage::InterpKind::Drba),
                         ist.provider == crate::render::onnx_stage::OnnxProvider::NeoAMD,
                         ist.supports_neoamd_interp_stream(),
+                        ist.supports_neoarc_interp_stream() || ist.supports_arc_dml_cpu_stream(),
                     )
                 };
                 s.directml_drba_capture_queue = directml_drba;
@@ -13326,7 +14721,44 @@ fn engine_main(
                         overlay.win.pump_messages();
                         continue;
                     }
-                    let continuity_broken = continuity == GpuInterpContinuity::Broken;
+                    // v952: if the capture queue had to discard pictures since the
+                    // previous accepted frame, the history endpoint and this frame are
+                    // not adjacent. Never interpolate across that gap; restart history
+                    // (same handling as a scene/seek discontinuity).
+                    // v994: a single discarded picture (the queue absorbing a tiny
+                    // producer/consumer rate difference, every ~5 s at 24p) is
+                    // bridged instead: the time-based continuity check above still
+                    // accepts the two-period interval, and interpolating it costs
+                    // nothing, while a history restart froze output ~100 ms (x5:
+                    // 12 slots) each time. Two or more discards still restart.
+                    // CHIDESCALER_INTERP_QUEUE_GAP=reset restores v952 for all.
+                    let queue_gap = {
+                        thread_local! {
+                            static LAST_DROPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+                        }
+                        let dropped = s.source.queued_dropped();
+                        let previous = LAST_DROPPED.with(|c| c.replace(dropped));
+                        let gap = previous != u64::MAX && dropped > previous && !s.gpu_interp_hist.is_empty();
+                        let bridge = gap && dropped - previous == 1
+                            && continuity == GpuInterpContinuity::Continuous
+                            && std::env::var("CHIDESCALER_INTERP_QUEUE_GAP").ok().as_deref() != Some("reset");
+                        if bridge {
+                            s.queue_gap_bridged = s.queue_gap_bridged.saturating_add(1);
+                            if s.queue_gap_bridged <= 3 || s.queue_gap_bridged % 60 == 0 {
+                                log::info!("interp-gpu-queue-gap-bridged: seq={} queue_dropped={} total={} action=keep-history-interpolate-two-period-interval",
+                                    s.frame.seq, dropped, s.queue_gap_bridged);
+                            }
+                        }
+                        gap && !bridge
+                    };
+                    if queue_gap {
+                        log::warn!(
+                            "interp-gpu-queue-gap-reset: seq={} queue_dropped={} action=restart-history-no-cross-gap-pair",
+                            s.frame.seq,
+                            s.source.queued_dropped()
+                        );
+                    }
+                    let continuity_broken = continuity == GpuInterpContinuity::Broken || queue_gap;
                     if dimensions_changed || continuity_broken {
                         let previous_for_diag = s.gpu_interp_hist.back().cloned();
                         while let Some(old) = s.gpu_interp_hist.pop_front() {
@@ -13381,6 +14813,7 @@ fn engine_main(
                     // surviving adjacent history frames are still interpolated.
                     // Genuine seek/resize/provider discontinuities continue to use
                     // the common continuity reset above.
+                    capture_order_diag(&s.frame);
                     s.gpu_interp_hist.push_back(GpuInterpFrame {
                         tex: cur_tex,
                         seq: s.frame.seq,
@@ -13397,7 +14830,7 @@ fn engine_main(
                     // from that multiplier's original phase grid, never by
                     // rewriting x5 into x4/x3. Actual Present FPS therefore
                     // reflects real throughput.
-                    let factor = interp_factor.clamp(2, 5);
+                    let factor = interp_capacity(interp_factor);
                     let mut history = Vec::with_capacity(need);
                     history.extend(s.gpu_interp_hist.iter().map(|frame| frame.tex));
                     // DRBA is a delayed four-frame model. Its interpolation
@@ -13416,14 +14849,42 @@ fn engine_main(
                         .period_s()
                         .or_else(|| (s.arrival_interval > 0.0).then_some(s.arrival_interval))
                         .unwrap_or(1.0 / 30.0);
+                    // v1000: hold the interpolation clock against estimator flips.
+                    // Only a locked estimate is held; the arrival-interval fallback
+                    // used before the estimator converges passes through as before.
+                    let source_period = if delayed { source_period } else if s.cadence.period_s().is_none() {
+                        s.interp_period_hold = InterpPeriodHold::default();
+                        source_period
+                    } else {
+                        hold_interp_source_period(&mut s.interp_period_hold, source_period, s.interp_generation)
+                    };
+                    // v997: never compute mids the display cannot show. With a
+                    // source/refresh ratio that is (nearly) an integer N, a larger
+                    // multiplier is presented as xN (24p on 240 Hz: x15 -> x10;
+                    // on a 360 Hz display x15 stays x15). Capacity (output surfaces)
+                    // keeps the selected multiplier, so nothing is rebuilt.
+                    let phase_code = if delayed { interp_factor } else {
+                        refresh_limited_interp_code(interp_factor, source_period, s.monitor_refresh_hz)
+                    };
+                    if phase_code != s.refresh_limited_logged_code {
+                        s.refresh_limited_logged_code = phase_code;
+                        if phase_code != interp_factor {
+                            log::info!(
+                                "interp-refresh-cap: requested=x{} effective=x{} source_period_ms={:.3} refresh_hz={:.2} reason=display-cannot-show-more",
+                                interp_factor, phase_code, source_period * 1000.0, s.monitor_refresh_hz.unwrap_or(0.0)
+                            );
+                        }
+                    }
+                    let phase_factor = interp_capacity(phase_code);
                     let output_ratio =
-                        onnx_output_ratio(factor, Some(source_period), s.monitor_refresh_hz);
+                        onnx_output_ratio(phase_code, Some(source_period), s.monitor_refresh_hz);
                     let phases = onnx_interpolation_phases(
-                        factor,
+                        phase_code,
                         output_ratio,
                         false,
                         &mut s.flow_output_cadence,
                     );
+                    log_fractional_grid(phase_code,s.frame.seq,Some(source_period),s.monitor_refresh_hz,output_ratio,&phases);
                     let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
                     let requested_timesteps = phases
                         .into_iter()
@@ -13437,8 +14898,42 @@ fn engine_main(
                     // normal presentation-frame loss is allowed downstream; the
                     // interpolation contract itself remains intact. NeoAMD keeps
                     // its already-proven adaptive admission path unchanged.
+                    s.rife_admission_active = dml_rife && !delayed && rife_overload_admission_enabled();
                     let timesteps = if directml_drba {
                         requested_timesteps.clone()
+                    } else if s.rife_admission_active && history_ready && s.drba_perf_samples > 0 {
+                        // v938: shed individual mids (rotating, evenly spaced on the
+                        // original x2..x5 grid) only when all of them cannot be computed
+                        // within one source interval. Under budget this returns every
+                        // requested phase, i.e. v937 behaviour.
+                        let admitted = drba_admit_timesteps(
+                            &requested_timesteps,
+                            source_period,
+                            s.drba_midpoint_ema_ms,
+                            s.drba_perf_samples,
+                            &mut s.drba_compute_credit_ms,
+                            &mut s.drba_phase_rotation,
+                        );
+                        if admitted.len() < requested_timesteps.len() {
+                            let dropped = requested_timesteps.len() - admitted.len();
+                            s.drba_dropped_midpoints =
+                                s.drba_dropped_midpoints.saturating_add(dropped as u64);
+                            if s.drba_dropped_midpoints <= 8
+                                || s.drba_dropped_midpoints % 240 < dropped as u64
+                            {
+                                log::warn!(
+                                    "rife-overload-drop: requested=x{} requested_mids={} admitted_mids={} phases={:?} ema_mid_ms={:.2} source_budget_ms={:.2} dropped_total={} route=directml-rife",
+                                    factor,
+                                    requested_timesteps.len(),
+                                    admitted.len(),
+                                    admitted,
+                                    s.drba_midpoint_ema_ms,
+                                    source_period * 1000.0,
+                                    s.drba_dropped_midpoints
+                                );
+                            }
+                        }
+                        admitted
                     } else if delayed && history_ready {
                         let ema = s.drba_midpoint_ema_ms;
                         let samples = s.drba_perf_samples;
@@ -13541,6 +15036,8 @@ fn engine_main(
                                 gc.release_frame(&keep);
                             }
                         } else {
+                            let seq = s.frame.seq;
+                            retire_tails_superseded_by(&mut gc, s, seq, "history-not-ready");
                             let now = Instant::now();
                             process_and_present_from(
                                 &mut gc,
@@ -13583,6 +15080,7 @@ fn engine_main(
                         endpoint_frame.seq = endpoint.seq;
                         endpoint_frame.received_at = endpoint.received_at;
                         endpoint_frame.source_time_100ns = endpoint.source_time_100ns;
+                        retire_tails_superseded_by(&mut gc, s, endpoint.seq, "all-mids-shed");
                         let now = Instant::now();
                         process_and_present_from(
                             &mut gc,
@@ -13782,13 +15280,15 @@ fn engine_main(
                         // into a visible cell/dot pattern every other frame.
                         // Conversion remains GPU-resident and adds no CPU copy.
                         let preserve_float_after_dml = false;
-                        let prepared = stage.prepare_interp_gpu_textures_with_factor(
+                        let sequences: Vec<_> = s.gpu_interp_hist.iter().map(|frame| frame.seq).collect();
+                        let prepared = stage.prepare_interp_gpu_history(
                             &mut gc,
                             &history,
                             &timesteps,
                             s.interp_generation,
                             factor as usize,
                             post_glsl,
+                            &sequences,
                         )?;
                         let slots = if prepared.is_some() {
                             stage.prepared_interp_gpu_outputs(
@@ -13816,7 +15316,7 @@ fn engine_main(
                     // ownership. Each next phase is permitted only after the prior
                     // phase's GL post work has been submitted.
                     let (cooperative_slots, permit_next_after_post_submit) =
-                        gpu_interp_slot_policy_for_path(false, factor, timesteps.len());
+                        gpu_interp_slot_policy_for_path(false, phase_factor, timesteps.len());
                     if directml_drba && (pair_id < 3 || pair_id % 120 == 0) {
                         log::info!(
                             "dml-drba-v782-provider: pair={} factor=x{} mids={} cooperative_slots={} permit_after_post_submit={}",
@@ -13827,10 +15327,18 @@ fn engine_main(
                             permit_next_after_post_submit
                         );
                     }
+                    // v988: NeoArc integer pairs absorb a small start lateness by
+                    // shifting the output grid instead of skipping a slot.
+                    // v989: opt-in only. In v988 (default on) the grid kept shifting
+                    // whenever overload admission changed the per-pair output
+                    // period; latency grew, capture overflowed and fps fell
+                    // (~190 vs ~215 at x10). CHIDESCALER_NEOARC_LATE_REBASE=on.
+                    s.flow_output_cadence.late_rebase = interp_name.contains("[NeoARC]")
+                        && std::env::var("CHIDESCALER_NEOARC_LATE_REBASE").ok().as_deref() == Some("on");
                     let pending = PendingGpuInterp {
                         generation: s.interp_generation,
                         pair_id,
-                        factor,
+                        factor: phase_factor,
                         is_drba: delayed,
                         directml_drba: false, // v803: bypass v783-v802 DirectML-DRBA special presentation lanes
                         directml_drba_v782: directml_drba,
@@ -13874,12 +15382,33 @@ fn engine_main(
                                 count: pending.timesteps.len(),
                                 cooperative_slots: pending.cooperative_slots,
                             };
+                            // v990: NeoArc's pair handoff is a tiny GPU copy. Wait for
+                            // it here (<= 2 ms) so the job reaches the worker before
+                            // the parked endpoint's present and its SwapBuffers block
+                            // (1.5-5 ms on Arc). The trunk then overlaps that wait;
+                            // v987 submitted 3-11 ms after the previous pair retired
+                            // and every first mid of a pair was late.
+                            // v991: opt-in only. On the real app v990 (default on)
+                            // lengthened the retire->submit gap to 9-20 ms and caused
+                            // periodic hitches even at x5. CHIDESCALER_NEOARC_FAST_HANDOFF=on.
+                            let neoarc_fast_handoff = pending.metric_name.contains("[NeoARC]")
+                                && std::env::var("CHIDESCALER_NEOARC_FAST_HANDOFF").ok().as_deref() == Some("on");
+                            if pair_trace() {
+                                log::info!("pair-trace: ev=prepare-issued pair={} since_retire_ms={:.3}", pair_id,
+                                    s.gpu_interp_last_retired_diag.map(|(_,_,t)|t.elapsed().as_secs_f64()*1000.0).unwrap_or(-1.0));
+                            }
                             s.gpu_interp_pack_pending = Some(PendingGpuPack {
                                 fence,
                                 started: Instant::now(),
                                 job,
                                 pending,
                             });
+                            if neoarc_fast_handoff {
+                                match gc.wait_commands_fence(fence, Duration::from_millis(2)) {
+                                    Ok(_) => {}
+                                    Err(error) => log::warn!("neoarc-fast-handoff: fence wait failed reason={error} action=normal-poll"),
+                                }
+                            }
                             overlay.win.pump_messages();
                             continue;
                         }
@@ -13902,6 +15431,7 @@ fn engine_main(
                         interp_name
                     );
                 }
+                s.frame.ensure_host()?;
                 let conv_t0 = Instant::now();
                 let (mut interp_w, mut interp_h, mut cur_data) = if s.frame.hdr {
                     (s.frame.w, s.frame.h, Vec::new())
@@ -13911,6 +15441,12 @@ fn engine_main(
                     let mut pre_probe = |name: &str, kind: StageKind, ms: f64| {
                         m.probe(name, metrics_kind_label(kind), ms);
                     };
+                    // v980 diagnostic: once per ~second split the pre-chain
+                    // readback into submit / GPU completion / transfer. The
+                    // explicit finish only runs on sampled frames, where the
+                    // following synchronous download would wait anyway.
+                    let pre_sample = s.frame.seq % 24 == 0;
+                    let pre_submit_t0 = Instant::now();
                     match s.chain.process_range(
                         &mut gc,
                         input,
@@ -13920,11 +15456,42 @@ fn engine_main(
                         if stats { Some(&mut pre_probe) } else { None },
                     ) {
                         Ok(texture) => {
+                            let submit_ms = pre_submit_t0.elapsed().as_secs_f64() * 1000.0;
+                            let gpu_t0 = Instant::now();
+                            if pre_sample {
+                                gc.finish();
+                            }
+                            let gpu_wait_ms = gpu_t0.elapsed().as_secs_f64() * 1000.0;
+                            let download_t0 = Instant::now();
+                            let mut pooled = false;
+                            let mut pbo = false;
                             let data = if rgba_direct {
-                                gc.download_rgba8(texture)
+                                let len = (texture.w().max(0) as usize)
+                                    * (texture.h().max(0) as usize)
+                                    * 4;
+                                let mut buf = take_frame_buffer(&mut s.frame_pool, len);
+                                pooled = buf.len() == len;
+                                pbo = gc.download_rgba8_into_fast(texture, &mut buf);
+                                buf
                             } else {
                                 gc.download_rgb8(texture)
                             };
+                            if pre_sample {
+                                log::info!(
+                                    "pre-chain-timing: seq={} size={}x{} stages={} pooled={} pbo={} submit_ms={:.2} gpu_wait_ms={:.2} download_ms={:.2} total_ms={:.2} bytes={}",
+                                    s.frame.seq,
+                                    texture.w(),
+                                    texture.h(),
+                                    interp_index,
+                                    pooled,
+                                    pbo,
+                                    submit_ms,
+                                    gpu_wait_ms,
+                                    download_t0.elapsed().as_secs_f64() * 1000.0,
+                                    pre_submit_t0.elapsed().as_secs_f64() * 1000.0,
+                                    data.len()
+                                );
+                            }
                             let route_key =
                                 (s.frame.w, s.frame.h, texture.w(), texture.h(), interp_index);
                             if s.pre_chain_route_log_key != Some(route_key) {
@@ -13961,7 +15528,7 @@ fn engine_main(
                         }
                     }
                 } else if rgba_direct {
-                    (s.frame.w, s.frame.h, s.frame.data.clone())
+                    (s.frame.w, s.frame.h, pooled_copy(&mut s.frame_pool, &s.frame.data))
                 } else {
                     (s.frame.w, s.frame.h, rgba_to_rgb(&s.frame.data))
                 };
@@ -14024,7 +15591,7 @@ fn engine_main(
                     s.interp_worker = None;
                     s.interp_pending = None;
                 }
-                let factor = interp_factor.max(2);
+                let factor = interp_capacity(interp_factor);
                 // ---- PIPELINED path: RIFE and 4-frame delayed DRBA ----
                 // Inference for pair (N-1, N) runs on the worker while THIS
                 // tick presents the previous pair's mids + real frame, hiding
@@ -14226,18 +15793,30 @@ fn engine_main(
                         })
                     };
                     let (submitted, next_pending) = if let Some((frames, real)) = job_inputs {
+                        if neoarc_stream_supported && (s.frame.seq % 30 <= 3 || s.frame.seq <= 3) {
+                            let previous_seq = s.hist.back().map(|frame| frame.seq);
+                            log::info!(
+                                "neoarc-source-order: start_seq={:?} end_seq={} endpoint_seq={} source_time_start={:?} source_time_end={:?}",
+                                previous_seq,
+                                s.frame.seq,
+                                real.seq,
+                                s.hist.back().and_then(|frame| frame.source_time_100ns),
+                                s.frame.source_time_100ns,
+                            );
+                        }
                         let source_period_s =
                             s.cadence.period_s().or(pair_dt).or_else(|| {
                                 (s.arrival_interval > 0.0).then_some(s.arrival_interval)
                             });
                         let output_ratio =
-                            onnx_output_ratio(factor, source_period_s, s.monitor_refresh_hz);
+                            onnx_output_ratio(interp_factor, source_period_s, s.monitor_refresh_hz);
                         let phases = onnx_interpolation_phases(
-                            factor,
+                            interp_factor,
                             output_ratio,
                             false,
                             &mut s.flow_output_cadence,
                         );
+                        log_fractional_grid(interp_factor,s.frame.seq,source_period_s,s.monitor_refresh_hz,output_ratio,&phases);
                         let present_real = phases.last().is_some_and(|phase| *phase >= 1.0 - 1e-5);
                         let requested_ts: Vec<f32> = phases
                             .into_iter()
@@ -14303,14 +15882,17 @@ fn engine_main(
                             // D3D12/OpenGL output bridge remains disabled. process_interp_many_rgba8()
                             // therefore returns owned CPU-visible RGB8 frames in phase order.
                             force_sequential: false,
+                            interp_capacity: factor as usize,
                             prefer_dml_vulkan_shared: !directml_drba
                                 && !neoamd_stream_supported
+                                && !neoarc_stream_supported
                                 && rgba_direct
                                 && s.chain.can_process_range_from_dml_shared(
                                     post_chain_start,
                                     s.chain.stage_count(),
                                 ),
                             neoamd_stream_slots: neoamd_stream_supported,
+                            neoarc_stream_slots: neoarc_stream_supported,
                         };
                         // v797: restore exactly one performance feature on top of the
                         // v796 correctness baseline: queue the next DirectML DRBA pair before
@@ -14349,7 +15931,8 @@ fn engine_main(
                                 pair_dt,
                                 chain_start_index: post_chain_start,
                                 neoamd_cpu_visible,
-                                neoamd_stream_slots: neoamd_stream_supported,
+                                neoamd_stream_slots: neoamd_stream_supported || neoarc_stream_supported,
+                                neoarc_stream_slots: neoarc_stream_supported,
                             }),
                         )
                     } else {
@@ -14500,7 +16083,9 @@ fn engine_main(
                         &s.frame, interp_w, interp_h, cur_frame,
                     ));
                     while s.hist.len() > need.saturating_sub(1).max(1) {
-                        s.hist.pop_front();
+                        if let Some(old) = s.hist.pop_front() {
+                            recycle_frame_buffer(&mut s.frame_pool, old.data);
+                        }
                     }
                     overlay.win.pump_messages();
                     s.interp_tail = Some(Instant::now());
@@ -14513,6 +16098,10 @@ fn engine_main(
                     && s.last_process_ms / 1000.0 > s.arrival_interval * 0.9;
                 let can_interpolate = s.hist.len() + 1 >= need && !behind;
                 let will_present_delayed = delayed && s.hist.len() >= 3;
+                let legacy_ratio=onnx_output_ratio(interp_factor,s.cadence.period_s(),s.monitor_refresh_hz);
+                let legacy_phases=if can_interpolate{onnx_interpolation_phases(interp_factor,legacy_ratio,false,&mut s.flow_output_cadence)}else{vec![1.0]};
+                let legacy_present_real=legacy_phases.last().is_some_and(|t|*t>=1.0-1e-5);
+                let legacy_ts:Vec<f32>=legacy_phases.into_iter().filter(|t|*t<1.0-1e-5).collect();
                 if s.last_neoflow_log.elapsed() >= Duration::from_secs(1) {
                     log::info!(
                         "onnx-interp-state: name={} factor={} need={} hist={} delayed={} behind={} can_interpolate={} arrival_ms={:.2} last_process_ms={:.2}",
@@ -14538,14 +16127,14 @@ fn engine_main(
                     let mut interp_total_ms = 0.0;
                     if delayed && factor > 2 {
                         let interp_t0 = Instant::now();
-                        let ts: Vec<f32> = (1..factor).map(|k| k as f32 / factor as f32).collect();
+                        let ts=legacy_ts.clone();
                         let results = {
                             let mut frames: Vec<&[u8]> =
                                 s.hist.iter().map(|f| f.data.as_slice()).collect();
                             frames.push(&cur_frame);
                             let mut ist = ist.lock().unwrap();
                             let results =
-                                ist.process_interp_many_rgba8(s.frame.w, s.frame.h, &frames, &ts);
+                                ist.process_interp_rgba8_pair(s.frame.w, s.frame.h, &frames, &ts, factor as usize);
                             if stats {
                                 if let Some(p) = ist.last_interp_profile() {
                                     metrics.probe("Frame interpolation pack", "cpu", p.pack_ms);
@@ -14559,7 +16148,8 @@ fn engine_main(
                         match results {
                             Ok(results) => {
                                 for (index, (mw, mh, mid)) in results.into_iter().enumerate() {
-                                    let k = index + 1;
+                                    let phase=ts[index];
+                                    if interp_factor==INTERP_25_CODE{wait_fractional_start(&mut s.flow_output_cadence,&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval),phase);s.flow_output_cadence.wait_for_present(&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval)/legacy_ratio,vsync_on,true);}
                                     let mid_t0 = Instant::now();
                                     let tex = gc.upload_rgb8(mw, mh, &mid);
                                     process_and_present(
@@ -14583,9 +16173,9 @@ fn engine_main(
                                         s.arrival_interval
                                     };
                                     let target =
-                                        (pacing_period * k as f64 / factor as f64).min(0.08);
+                                        (pacing_period * phase as f64).min(0.08);
                                     let spent = t0.elapsed().as_secs_f64();
-                                    if !vsync_on && target > spent {
+                                    if interp_factor!=INTERP_25_CODE&&!vsync_on && target > spent {
                                         wait_until_with_pump(
                                             &mut overlay,
                                             Instant::now()
@@ -14607,8 +16197,7 @@ fn engine_main(
                             }
                         }
                     } else {
-                        for k in 1..factor {
-                            let t = k as f32 / factor as f32;
+                        for &t in &legacy_ts {
                             // scope the hist borrows so process_and_present can
                             // take &mut s afterwards
                             let interp_t0 = Instant::now();
@@ -14651,6 +16240,7 @@ fn engine_main(
                                             upload_t0.elapsed().as_secs_f64() * 1000.0,
                                         );
                                     }
+                                    if interp_factor==INTERP_25_CODE{wait_fractional_start(&mut s.flow_output_cadence,&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval),t);s.flow_output_cadence.wait_for_present(&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval)/legacy_ratio,vsync_on,true);}
                                     process_and_present(
                                         &mut gc,
                                         &mut overlay,
@@ -14673,9 +16263,9 @@ fn engine_main(
                                         s.arrival_interval
                                     };
                                     let target =
-                                        (pacing_period * k as f64 / factor as f64).min(0.08);
+                                        (pacing_period * t as f64).min(0.08);
                                     let spent = t0.elapsed().as_secs_f64();
-                                    if !vsync_on && target > spent {
+                                    if interp_factor!=INTERP_25_CODE&&!vsync_on && target > spent {
                                         wait_until_with_pump(
                                             &mut overlay,
                                             Instant::now()
@@ -14705,6 +16295,8 @@ fn engine_main(
                 // DRBA runs one frame behind: after the in-betweens, present
                 // the DELAYED real frame (hist[-1] = f(n+1)), not the newest
                 if delayed && s.hist.len() >= 3 {
+                    if !legacy_present_real{s.hist.push_back(HistFrame::from_frame(&s.frame,cur_frame));while s.hist.len()>3{s.hist.pop_front();}overlay.win.pump_messages();continue;}
+                    if interp_factor==INTERP_25_CODE{s.flow_output_cadence.wait_for_present(&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval)/legacy_ratio,vsync_on,true);}
                     let real_t0 = Instant::now();
                     let delayed_frame = s.hist.back().cloned().unwrap();
                     let tex = if rgba_direct {
@@ -14741,6 +16333,8 @@ fn engine_main(
                 while s.hist.len() > need.saturating_sub(1).max(1) {
                     s.hist.pop_front();
                 }
+                if !legacy_present_real{overlay.win.pump_messages();continue;}
+                if can_interpolate&&interp_factor==INTERP_25_CODE{s.flow_output_cadence.wait_for_present(&mut overlay,s.cadence.period_s().unwrap_or(s.arrival_interval)/legacy_ratio,vsync_on,true);}
             } else {
                 // interpolation stage removed from the chain: drop history
                 // and the pipeline (worker drop discards queued results)
@@ -14778,7 +16372,12 @@ fn engine_main(
             } else {
                 FrameTiming::from_frame(&s.frame, real_t0)
             };
-            if crate::logging::diagnostics_enabled() && captures > 1 && s.phase_diag_samples < 12 {
+            let phase_trace_slow = phase_trace_enabled()
+                && phase_capture_started.duration_since(phase_tick_started).as_secs_f64() > 0.0012;
+            if crate::logging::diagnostics_enabled()
+                && captures > 1
+                && (s.phase_diag_samples < 12 || phase_trace_slow)
+            {
                 log::debug!(
                     "frame-phase diag: captures={} seq={} since_present_ms={:.2} setup_ms={:.2} cursor_ms={:.2} watchdog_ms={:.2} zorder_ms={:.2} geometry_ms={:.2} panel_ms={:.2} foreground_ms={:.2} input_ms={:.2} post_input_ms={:.2} capture_wait_take_ms={:.2} pre_process_ms={:.2}",
                     captures,
@@ -14826,7 +16425,7 @@ fn engine_main(
                         * 1000.0,
                     real_t0.duration_since(phase_capture_finished).as_secs_f64() * 1000.0
                 );
-                s.phase_diag_samples += 1;
+                s.phase_diag_samples = s.phase_diag_samples.saturating_add(1);
             }
             // v652: before ordinary DirectML tries to import its output into
             // presentation OpenGL, prefer a same-selected-GPU D3D12 -> Vulkan
@@ -14834,7 +16433,7 @@ fn engine_main(
             // specifically the explicit cross-GPU case (for example AMD
             // compute with NVIDIA presentation) where the GL import must fail
             // on LUID mismatch even though DirectML and Vulkan are co-located.
-            let direct_onnx = if s.frame.hdr {
+            let direct_onnx = if s.frame.hdr || s.frame.gpu.is_some() {
                 Ok(None)
             } else {
                 match s.chain.process_first_neoamd_peer_chain_rgba8(
@@ -15132,9 +16731,7 @@ fn engine_main(
                         );
                     } else {
                         if !s.frame.hdr
-                            && s.chain
-                                .mvutensils_stage()
-                                .is_some_and(|(index, _)| index == 0)
+                            && s.chain.mvutensils_stage().is_some_and(|(index, _)| index == 0)
                         {
                             s.chain.store_mvutensils_cpu_boundary_copy(
                                 s.frame.w,
@@ -15819,6 +17416,12 @@ fn start_session(
             beam_onnx_worker,
             last_present: Instant::now(),
             last_present_started: Instant::now(),
+            dml_early_tail_logged: false,
+            neoarc_early_tail_logged: false,
+            queue_gap_bridged: 0,
+            last_present_refresh: None,
+            last_present_counted: None,
+            present_hidden_total: 0,
             frame: FrameBuf::default(),
             chain_reprocess_pending: false,
             in_size: (0, 0),
@@ -15881,6 +17484,7 @@ fn start_session(
             neodeint_comb_history: 0,
             neodeint_scene_hold: 0,
             smooth_content_signature: None,
+            smooth_content_last_delivery_time: None,
             smooth_content_duplicates: 0,
             smooth_content_seq: 0,
             smooth_content_unique_since_duplicate: 4,
@@ -15890,8 +17494,11 @@ fn start_session(
             smooth_content_candidate_gaps: std::collections::VecDeque::new(),
             smooth_content_24p_detected: false,
             cadence: CadenceEstimator::default(),
+            cadence_input_seq: 0,
+            cadence_last_capture_seq: None,
             smooth_pacer: SmoothPacer::default(),
             paced_present_deadline: None,
+            intel_early_present_prepare:0,
             flow_output_cadence: FlowOutputCadence::default(),
             present_cadence: PresentCadence::default(),
             cap_diag: CapDiag::new(),
@@ -15909,11 +17516,18 @@ fn start_session(
             gpu_interp_result_stash: std::collections::VecDeque::new(),
             gpu_interp_permit_after_post_submit: None,
             gpu_interp_pair_id: 0,
+            gpu_interp_last_retired_diag: None,
             gpu_interp_active_logged: false,
             drba_midpoint_ema_ms: 0.0,
+            rife_mid_recent: std::collections::VecDeque::new(),
+            refresh_limited_logged_code: 0,
+            capture_upload_ema_ms: 0.0,
+            capture_take_deferred: 0,
+            interp_period_hold: InterpPeriodHold::default(),
             drba_perf_samples: 0,
             drba_compute_credit_ms: 0.0,
             drba_phase_rotation: 0,
+            rife_admission_active: false,
             drba_dropped_midpoints: 0,
             provider_transition_input_suspended: false,
             provider_transition_input_suspended_since: None,
@@ -15921,6 +17535,8 @@ fn start_session(
             interp_last_tick: None,
             interp_tail: None,
             interp_present_deadline: None,
+            interp_catchup_carry: None,
+            frame_pool: Vec::new(),
             interp_post_warm: false,
             pre_chain_route_log_key: None,
             dml_rife_limit_log_key: None,
@@ -15937,8 +17553,12 @@ fn start_session(
             last_chain_submit_ms: 0.0,
             last_resample_submit_ms: 0.0,
             last_post_submit_ms: 0.0,
+            last_interp_post_ready_ms: 0.0,
+            interp_timing:None,
             last_pacer_wait_ms: 0.0,
             last_present_call_ms: 0.0,
+            gl_prev_present_fence: None,
+            gl_latency_wait_ms: 0.0,
             last_present_block_ms: 0.0,
             compositor_pressure_window_started: Instant::now(),
             compositor_pressure_samples: 0,
@@ -15948,6 +17568,7 @@ fn start_session(
             metric_seq: 0,
             last_metrics_log: Instant::now(),
             phase_diag_samples: 0,
+            neoarc_reveal_hold_started: None,
             glsl_guard: GlslResponsivenessGuard::default(),
             glsl_overload_history: std::collections::VecDeque::new(),
             glsl_overload_hint: false,
@@ -16586,7 +18207,7 @@ fn stop_session(
     g.source_live_fullscreen = false;
     g.capture_resolution_resize_intent = None;
     g.onnx_neoamd_stages = 0;
-    g.onnx_neortx_stages = 0;
+        g.onnx_neortx_stages = 0;
     g.onnx_tensorrt_stages = 0;
     g.onnx_cuda_stages = 0;
     g.onnx_directml_fallbacks = 0;
@@ -16790,8 +18411,71 @@ const DISPLAY_REGION_UPLOAD_RING_SLOTS: usize = 4;
 /// immediately can therefore block glTexSubImage2D for most of a 60 Hz frame.
 /// A storage ring removes the reuse dependency without delaying or reordering
 /// frames and leaves the Smooth/VSync pacing state machines untouched.
+/// v951 diagnostics: detect source pictures that step back in time (A B A).
+/// A 32x18 luma signature of each captured host frame is compared with the
+/// previous two; logs only, no behaviour change.
+fn capture_order_diag(frame: &crate::capture::wgc::FrameBuf) {
+    use std::cell::RefCell;
+    thread_local! {
+        static SIGS: RefCell<(std::collections::VecDeque<(u64, Vec<u8>)>, u64)> =
+            RefCell::new((std::collections::VecDeque::new(), 0));
+    }
+    let (w, h) = (frame.w.max(0) as usize, frame.h.max(0) as usize);
+    if frame.hdr || w < 32 || h < 18 || frame.data.len() != w * h * 4 {
+        return;
+    }
+    let mut sig = Vec::with_capacity(32 * 18);
+    for gy in 0..18 {
+        for gx in 0..32 {
+            let x = (gx * 2 + 1) * w / 64;
+            let y = (gy * 2 + 1) * h / 36;
+            let i = (y * w + x) * 4;
+            let d = &frame.data[i..i + 3];
+            sig.push(((d[0] as u32 * 77 + d[1] as u32 * 150 + d[2] as u32 * 29) >> 8) as u8);
+        }
+    }
+    let dist = |a: &[u8], b: &[u8]| -> f64 {
+        a.iter().zip(b).map(|(x, y)| (*x as i32 - *y as i32).abs() as f64).sum::<f64>() / a.len() as f64
+    };
+    SIGS.with(|cell| {
+        let mut st = cell.borrow_mut();
+        if st.0.len() == 2 {
+            let d1 = dist(&sig, &st.0[1].1);
+            let d2 = dist(&sig, &st.0[0].1);
+            let d12 = dist(&st.0[1].1, &st.0[0].1);
+            if d12 > 2.0 && d2 < d1 * 0.5 {
+                st.1 += 1;
+                if st.1 <= 30 || st.1 % 100 == 0 {
+                    log::warn!(
+                        "capture-order-suspect: seq={} prev_seq={} prev2_seq={} d_prev={:.2} d_prev2={:.2} d_prev_prev2={:.2} size={}x{} count={}",
+                        frame.seq, st.0[1].0, st.0[0].0, d1, d2, d12, w, h, st.1
+                    );
+                }
+            }
+        }
+        if st.0.len() == 2 {
+            st.0.pop_front();
+        }
+        st.0.push_back((frame.seq, sig));
+    });
+}
+
 fn upload_session_frame_timed(gc: &mut GlContext, s: &mut Session) -> GpuTex {
     let started = Instant::now();
+    if let Some(view)=s.frame.gpu.as_ref() {
+        match gc.capture_gpu_copy(view,s.frame.w,s.frame.h) {
+            Ok(texture)=>{
+                s.last_upload_submit_ms=started.elapsed().as_secs_f64()*1000.0;
+                s.capture_upload_ema_ms = if s.capture_upload_ema_ms <= 0.0 { s.last_upload_submit_ms }
+                    else { s.capture_upload_ema_ms * 0.8 + s.last_upload_submit_ms.min(20.0) * 0.2 };
+                if s.frame.seq<10||s.frame.seq%120==0 {log::info!("capture-gpu-handoff: seq={} input={}x{} route=D3D11-WGL-GL host_pixel_bytes=0 copy_ms={:.3}",s.frame.seq,s.frame.w,s.frame.h,s.last_upload_submit_ms);}
+                return texture;
+            }
+            Err(error)=>{s.source.disable_gpu_delivery();log::warn!("capture-gpu-handoff-fallback: reason={error:#} action=host-capture-for-session");
+                if let Err(error)=s.frame.ensure_host(){log::error!("capture-host-recovery-failed: {error:#}");}
+            }
+        }
+    }
     let use_display_region_ring = !s.display_region_upload_ring_fallback_logged
         && !s.frame.hdr
         && s.source.uses_display_region_fallback();
@@ -16852,6 +18536,10 @@ fn upload_frame_timed(gc: &mut GlContext, frame: &FrameBuf, last_ms: &mut f64) -
 /// Upload a captured frame. HDR normally became RGBA8 in the pre-chain stage;
 /// the fp16 branch is retained only as a malformed-frame safety fallback.
 fn upload_frame(gc: &mut GlContext, frame: &FrameBuf) -> GpuTex {
+    if let Some(view)=frame.gpu.as_ref() {
+        if let Ok(texture)=gc.capture_gpu_copy(view,frame.w,frame.h){return texture;}
+        if let Ok(pixels)=view.read_rgba(frame.w,frame.h){return gc.upload_rgba8(frame.w,frame.h,&pixels);}
+    }
     if frame.hdr {
         let t = gc.upload_rgba16f(frame.w, frame.h, &frame.data);
         crate::render::scaler::tonemap_hdr(gc, t).unwrap_or(t)
@@ -16925,6 +18613,15 @@ fn resize_static_rgba8_frame(frame: &mut FrameBuf, target: (i32, i32)) -> bool {
 fn fit_frame_canvas_dot_by_dot(frame: &mut FrameBuf, target: (i32, i32)) -> bool {
     let (sw, sh) = (frame.w, frame.h);
     let (dw, dh) = target;
+    if let Some(view)=frame.gpu.as_mut() {
+        if sw<=0||sh<=0||dw<=0||dh<=0||dw-sw>1||dh-sh>1{return false;}
+        let(cw,ch)=(sw.min(dw),sh.min(dh));let(sx,sy)=(((sw-cw)/2)as u32,((sh-ch)/2)as u32);
+        view.left+=sx.min(view.content_w.saturating_sub(1));view.top+=sy.min(view.content_h.saturating_sub(1));
+        view.content_w=view.content_w.saturating_sub(sx).max(1).min(cw as u32);
+        view.content_h=view.content_h.saturating_sub(sy).max(1).min(ch as u32);
+        view.black_extent=if dw>cw||dh>ch{Some((cw as u32,ch as u32))}else{None};
+        frame.w=dw;frame.h=dh;return true;
+    }
     let bytes_per_pixel = if frame.hdr { 8usize } else { 4usize };
     if sw <= 0
         || sh <= 0
@@ -17188,6 +18885,68 @@ fn frame_present_latency_ms(timing: FrameTiming, present_time: PresentTime) -> f
 /// interval, in t order) then the delayed REAL end frame. Worker errors and
 /// timeouts skip the affected mids but the real frame is always presented.
 #[allow(clippy::too_many_arguments)]
+/// v979: cooperative-slot catch-up. v780 chained every slot from the ACTUAL
+/// previous present so a late slot never caused a burst, but it also meant a
+/// late slot (pre-interpolation GLSL readback, heavy post GLSL) was never
+/// recovered: every pair stretched past the source period and the output fps
+/// sagged. Keep the v780 behaviour when on time, and when late shorten the
+/// following intervals to at most `CATCHUP_MIN_RATIO` of a step until the
+/// ideal timeline is reached again. No interval is ever shorter than that, so
+/// bursts remain impossible. Large hiccups (> 3 steps) re-anchor as before.
+const INTERP_CATCHUP_MIN_RATIO: f64 = 0.75;
+const INTERP_CATCHUP_TOLERANCE: Duration = Duration::from_micros(250);
+
+fn interp_catchup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = !matches!(
+            std::env::var("CHIDESCALER_INTERP_CATCHUP").ok().as_deref(),
+            Some("off") | Some("0")
+        );
+        log::info!("interp-catchup-policy: enabled={} min_ratio={}", enabled, INTERP_CATCHUP_MIN_RATIO);
+        enabled
+    })
+}
+
+/// Shortest interval the catch-up may use, independent of the display rate
+/// where possible. When the output rate does not exceed the display refresh
+/// (e.g. x10 on 240 Hz, x5 on 144 Hz, x2 on 60 Hz) every output owns its own
+/// refresh, so the interval is never shortened below ~one refresh period:
+/// two presents inside one refresh would turn a late frame into a dropped
+/// one. When the output exceeds the refresh (x10 on 60/120/144 Hz) the
+/// display already merges outputs and the plain ratio applies.
+fn interp_catchup_min_gap(step: Duration, refresh_hz: Option<f64>) -> Duration {
+    let base = step.mul_f64(INTERP_CATCHUP_MIN_RATIO);
+    if let Some(hz) = refresh_hz.filter(|hz| hz.is_finite() && (20.0..=1000.0).contains(hz)) {
+        let refresh = Duration::from_secs_f64(1.0 / hz);
+        if step >= refresh.mul_f64(0.98) {
+            return base.max(refresh.mul_f64(0.95)).min(step);
+        }
+    }
+    base
+}
+
+/// Next slot after a present that started at `actual` for a slot whose ideal
+/// time was `ideal`. Returns (deadline to wait for, ideal time of the next
+/// slot, time recovered versus v780).
+fn interp_catchup_next_deadline(
+    ideal: Instant,
+    actual: Instant,
+    step: Duration,
+    min_gap: Duration,
+    enabled: bool,
+) -> (Instant, Instant, Duration) {
+    let natural = actual + step;
+    if !enabled || actual <= ideal + INTERP_CATCHUP_TOLERANCE || actual > ideal + step * 3 {
+        // On time, disabled, or a large hiccup: exactly v780 (re-anchor).
+        return (natural, natural, Duration::ZERO);
+    }
+    let next_ideal = ideal + step;
+    let shortest = actual + min_gap.min(step);
+    let next = next_ideal.max(shortest);
+    (next, next_ideal, natural.saturating_duration_since(next))
+}
+
 fn drain_pending_interp_neoamd_stream(
     gc: &mut GlContext,
     overlay: &mut OverlayWindow,
@@ -17202,11 +18961,15 @@ fn drain_pending_interp_neoamd_stream(
     downscaler: crate::render::scaler::Kernel,
     pending: PendingInterp,
 ) -> bool {
+    let use_output_clock=s.smooth_pacing||s.flow_output_cadence.fractional_onnx;
+    let backend=if pending.neoarc_stream_slots{"NeoARC"}else{"NeoAMD"};
     let drain_t0 = Instant::now();
     let gap_ms = s
         .interp_last_tick
         .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
+    let neoarc_initial_pair = pending.neoarc_stream_slots
+        && s.interp_worker.as_ref().is_some_and(|w| !w.neoarc_ready.load(Ordering::Acquire));
     s.interp_last_tick = Some(tick_t0);
     let pre_ms = drain_t0.duration_since(tick_t0).as_secs_f64() * 1000.0;
     let wait_take_ms = s
@@ -17214,7 +18977,7 @@ fn drain_pending_interp_neoamd_stream(
         .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
     let n = pending.count + usize::from(pending.present_real);
-    let content_dt = if s.smooth_pacing {
+    let content_dt = if use_output_clock {
         s.cadence
             .period_s()
             .or(pending.pair_dt)
@@ -17239,23 +19002,51 @@ fn drain_pending_interp_neoamd_stream(
     // forbids the 0.3-0.5 ms catch-up bursts seen in v778/v779 and guarantees
     // that every generated x2/x3/x4/x5 midpoint owns one visible output slot.
     let mut next_deadline = s.interp_present_deadline.unwrap_or_else(Instant::now);
+    // The fractional (x2.5) display grid owns its own clock and deliberately
+    // never short-catches-up; keep it on the exact v780/v978 behaviour.
+    let catchup_enabled = use_output_clock
+        && !s.flow_output_cadence.fractional_onnx
+        && interp_catchup_enabled();
+    let catchup_min_gap = interp_catchup_min_gap(output_step, s.monitor_refresh_hz);
+    // Ideal time of the next slot, carried from the previous pair only if the
+    // carried deadline was not reset or replaced in between.
+    let mut ideal_next: Option<Instant> = match (s.interp_catchup_carry.take(), s.interp_present_deadline) {
+        (Some((carried, ideal)), Some(deadline)) if catchup_enabled && carried == deadline && ideal <= deadline => Some(ideal),
+        _ => None,
+    };
+    let mut catchup_recovered = Duration::ZERO;
+    let mut catchup_slots = 0usize;
+    let mut late_slots = 0usize;
     let mut fail: Option<String> = None;
     let mut interp_run_ms = 0.0f64;
+    let mut backend_pack_ms = 0.0f64;
+    let mut backend_output_ms = 0.0f64;
     let mut mids_ok = 0usize;
     let mut presented_mid_count = 0usize;
     let mut slot_wait_overshoot_max_ms = 0.0f64;
     let mut slot_present_work_ms = 0.0f64;
     let mut slot_present_count = 0usize;
+    let mut worker_wait_ms = 0.0f64;
+    let mut slot_pace_wait_ms = 0.0f64;
+    let mut slot_upload_ms = 0.0f64;
+    let mut slot_render_present_ms = 0.0f64;
+    let mut host_mid_frames = 0usize;
+    let mut host_mid_bytes = 0usize;
+    let mut shared_mid_frames = 0usize;
+    let mut prefetched_phases = 0usize;
+    let cpu_prefetch_enabled = std::env::var("CHIDESCALER_INTERP_CPU_PREFETCH")
+        .ok().as_deref() != Some("off");
     let recv_started = Instant::now();
     let mids_started = Instant::now();
 
     for expected_idx in 0..pending.count {
+        let worker_wait_started = Instant::now();
         let result = match s.interp_worker.as_ref() {
-            Some(worker) => match worker.res_rx.recv_timeout(Duration::from_millis(400)) {
+            Some(worker) => match worker.res_rx.recv_timeout(if neoarc_initial_pair&&expected_idx==0{Duration::from_secs(10)}else{Duration::from_millis(400)}) {
                 Ok(result) => result,
                 Err(_) => {
                     fail = Some(format!(
-                        "NeoAMD cooperative slot timeout: pair={} slot={}/{}",
+                        "{backend} cooperative slot timeout: pair={} slot={}/{}",
                         pending.pair_id,
                         expected_idx + 1,
                         pending.count
@@ -17264,19 +19055,22 @@ fn drain_pending_interp_neoamd_stream(
                 }
             },
             None => {
-                fail = Some("NeoAMD cooperative interpolation worker disappeared".into());
+                fail = Some(format!("{backend} cooperative interpolation worker disappeared"));
                 break;
             }
         };
+        worker_wait_ms += worker_wait_started.elapsed().as_secs_f64() * 1000.0;
         if result.pair_id != pending.pair_id || result.idx != expected_idx {
             fail = Some(format!(
-                "NeoAMD cooperative slot order mismatch: expected pair={} slot={} got pair={} slot={}",
+                "{backend} cooperative slot order mismatch: expected pair={} slot={} got pair={} slot={}",
                 pending.pair_id, expected_idx, result.pair_id, result.idx
             ));
             break;
         }
         if let Some((p, r, o)) = result.profile {
+            backend_pack_ms += p;
             interp_run_ms += r;
+            backend_output_ms += o;
             if stats {
                 metrics.probe("Frame interpolation pack", "cpu", p);
                 metrics.probe("Frame interpolation run", "onnx", r);
@@ -17293,7 +19087,24 @@ fn drain_pending_interp_neoamd_stream(
                 break;
             }
         };
-        if s.smooth_pacing {
+        // Each CPU payload owns its pixels. Permit exactly one next phase
+        // before the slot wait, while this immutable image stays with the
+        // presenter. GLSL-only post stages consume that owned image, not the
+        // next inference output. Shared buffers and ONNX post stages stay serialized.
+        let permit_after_upload = pending.neoarc_stream_slots
+            && matches!(&payload, InterpPayload::Cpu(..))
+            && s.chain.stages.iter().skip(pending.chain_start_index)
+                .all(|stage| matches!(stage, crate::render::chain::Stage::Glsl { .. }))
+            && expected_idx + 1 < pending.count;
+        let permit_before_wait = permit_after_upload && cpu_prefetch_enabled;
+        if permit_before_wait {
+            if let Some(worker) = s.interp_worker.as_ref() {
+                worker.permit_next_slot(pending.pair_id);
+                prefetched_phases += 1;
+            }
+        }
+        if use_output_clock {
+            let pace_wait_started = Instant::now();
             let current_phase_slot = pending
                 .mid_ts
                 .get(expected_idx)
@@ -17315,6 +19126,9 @@ fn drain_pending_interp_neoamd_stream(
                 .saturating_sub(1);
             if skipped_slots > 0 {
                 next_deadline += output_step.mul_f64(skipped_slots as f64);
+                if let Some(ideal) = ideal_next.as_mut() {
+                    *ideal += output_step.mul_f64(skipped_slots as f64);
+                }
             }
             let now = Instant::now();
             let overshoot_ms = if now < next_deadline {
@@ -17323,16 +19137,31 @@ fn drain_pending_interp_neoamd_stream(
                 now.duration_since(next_deadline).as_secs_f64() * 1000.0
             };
             slot_wait_overshoot_max_ms = slot_wait_overshoot_max_ms.max(overshoot_ms);
+            slot_pace_wait_ms += pace_wait_started.elapsed().as_secs_f64() * 1000.0;
         }
         // Anchor the next slot at the start of this present, not after the
         // upload/post/present work returns.  v780 added that work to every
         // interval, so the error accumulated with x3/x4/x5.
+        if let Some(deadline)=wait_fractional_start(&mut s.flow_output_cadence,overlay,content_dt,pending.mid_ts[expected_idx]){next_deadline=deadline;ideal_next=None;}
+        let slot_scheduled = ideal_next.unwrap_or(next_deadline).min(next_deadline);
         let slot_anchor = Instant::now();
         let t0 = slot_anchor;
         let mut neoamd_shared_read_key = None;
+        let upload_started = Instant::now();
         let tex = match payload {
-            InterpPayload::Cpu(mw, mh, mid) => gc.upload_rgb8(mw, mh, &mid),
+            InterpPayload::Cpu(mw, mh, mid) => {
+                host_mid_frames += 1;
+                host_mid_bytes += mid.len();
+                if pending.neoarc_stream_slots
+                    && std::env::var("CHIDESCALER_NEOARC_UPLOAD_RING").ok().as_deref() == Some("on") {
+                    gc.upload_rgb8_interp_ring(mw, mh, &mid)
+                        .unwrap_or_else(|_| gc.upload_rgb8(mw, mh, &mid))
+                } else {
+                    gc.upload_rgb8(mw, mh, &mid)
+                }
+            },
             InterpPayload::NeoAmdShared(mut shared) => {
+                shared_mid_frames += 1;
                 if !gc.has_external_import(shared.key) {
                     let handle = shared.take_handle();
                     if let Err(error) = gc.import_external_d3d12_buffer(
@@ -17370,8 +19199,15 @@ fn drain_pending_interp_neoamd_stream(
                 break;
             }
         };
+        slot_upload_ms += upload_started.elapsed().as_secs_f64() * 1000.0;
+        if permit_after_upload && !permit_before_wait {
+            if let Some(worker) = s.interp_worker.as_ref() {
+                worker.permit_next_slot(pending.pair_id);
+            }
+        }
         let presented_before = status.lock().unwrap().presented;
         let transition_was_suspended = s.provider_transition_input_suspended;
+        let render_present_started = Instant::now();
         process_and_present_from(
             gc,
             overlay,
@@ -17401,6 +19237,7 @@ fn drain_pending_interp_neoamd_stream(
             downscaler,
             pending.chain_start_index,
         );
+        slot_render_present_ms += render_present_started.elapsed().as_secs_f64() * 1000.0;
         let presented_after = status.lock().unwrap().presented;
         if presented_after > presented_before {
             presented_mid_count += 1;
@@ -17414,7 +19251,7 @@ fn drain_pending_interp_neoamd_stream(
             }
         } else {
             fail = Some(format!(
-                "NeoAMD generated midpoint was not committed to present: pair={} slot={}/{}",
+                "{backend} generated midpoint was not committed to present: pair={} slot={}/{}",
                 pending.pair_id,
                 expected_idx + 1,
                 pending.count
@@ -17423,8 +19260,23 @@ fn drain_pending_interp_neoamd_stream(
         }
         slot_present_work_ms += slot_anchor.elapsed().as_secs_f64() * 1000.0;
         slot_present_count += 1;
-        if s.smooth_pacing {
-            next_deadline = slot_anchor + output_step;
+        if use_output_clock {
+            let (deadline, ideal, recovered) = interp_catchup_next_deadline(
+                slot_scheduled,
+                slot_anchor,
+                output_step,
+                catchup_min_gap,
+                catchup_enabled,
+            );
+            if slot_anchor > slot_scheduled + INTERP_CATCHUP_TOLERANCE {
+                late_slots += 1;
+            }
+            if !recovered.is_zero() {
+                catchup_slots += 1;
+                catchup_recovered += recovered;
+            }
+            next_deadline = deadline;
+            ideal_next = Some(ideal);
         } else if !vsync_on {
             let phase = pending
                 .mid_ts
@@ -17443,7 +19295,8 @@ fn drain_pending_interp_neoamd_stream(
                 break;
             }
         }
-        if neoamd_shared_read_key.is_some() || expected_idx + 1 < pending.count {
+        if !permit_after_upload
+            && (neoamd_shared_read_key.is_some() || expected_idx + 1 < pending.count) {
             if let Some(worker) = s.interp_worker.as_ref() {
                 worker.permit_next_slot(pending.pair_id);
             }
@@ -17455,7 +19308,8 @@ fn drain_pending_interp_neoamd_stream(
     let real_started = Instant::now();
     let mut presented_real_count = 0usize;
     if pending.present_real {
-        if s.smooth_pacing {
+        if use_output_clock {
+            let pace_wait_started = Instant::now();
             if pending.count > 0 {
                 let last_phase_slot = pending
                     .mid_ts
@@ -17469,6 +19323,9 @@ fn drain_pending_interp_neoamd_stream(
                     .saturating_sub(1) as usize;
                 if skipped_before_real > 0 {
                     next_deadline += output_step.mul_f64(skipped_before_real as f64);
+                    if let Some(ideal) = ideal_next.as_mut() {
+                        *ideal += output_step.mul_f64(skipped_before_real as f64);
+                    }
                 }
             }
             let now = Instant::now();
@@ -17478,18 +19335,23 @@ fn drain_pending_interp_neoamd_stream(
                 now.duration_since(next_deadline).as_secs_f64() * 1000.0
             };
             slot_wait_overshoot_max_ms = slot_wait_overshoot_max_ms.max(overshoot_ms);
+            slot_pace_wait_ms += pace_wait_started.elapsed().as_secs_f64() * 1000.0;
         }
+        let real_scheduled = ideal_next.unwrap_or(next_deadline).min(next_deadline);
         let slot_anchor = Instant::now();
         let t0 = slot_anchor;
+        let upload_started = Instant::now();
         let tex = if pending.rgba {
             gc.upload_rgba8(pending.real.w, pending.real.h, &pending.real.data)
         } else {
             gc.upload_rgb8(pending.real.w, pending.real.h, &pending.real.data)
         };
+        slot_upload_ms += upload_started.elapsed().as_secs_f64() * 1000.0;
         let delivered = s.source.delivered();
         let captures = delivered.saturating_sub(s.metric_seq) as u32;
         s.metric_seq = delivered;
         let presented_before = status.lock().unwrap().presented;
+        let render_present_started = Instant::now();
         process_and_present_from(
             gc,
             overlay,
@@ -17506,21 +19368,42 @@ fn drain_pending_interp_neoamd_stream(
             downscaler,
             pending.chain_start_index,
         );
+        slot_render_present_ms += render_present_started.elapsed().as_secs_f64() * 1000.0;
         if status.lock().unwrap().presented > presented_before {
             presented_real_count = 1;
         } else if fail.is_none() {
             fail = Some(format!(
-                "NeoAMD REAL endpoint was not committed to present: pair={}",
+                "{backend} REAL endpoint was not committed to present: pair={}",
                 pending.pair_id
             ));
         }
         slot_present_work_ms += slot_anchor.elapsed().as_secs_f64() * 1000.0;
         slot_present_count += 1;
-        if s.smooth_pacing {
-            next_deadline = slot_anchor + output_step;
+        if use_output_clock {
+            let (deadline, ideal, recovered) = interp_catchup_next_deadline(
+                real_scheduled,
+                slot_anchor,
+                output_step,
+                catchup_min_gap,
+                catchup_enabled,
+            );
+            if slot_anchor > real_scheduled + INTERP_CATCHUP_TOLERANCE {
+                late_slots += 1;
+            }
+            if !recovered.is_zero() {
+                catchup_slots += 1;
+                catchup_recovered += recovered;
+            }
+            next_deadline = deadline;
+            ideal_next = Some(ideal);
         }
     }
-    s.interp_present_deadline = s.smooth_pacing.then_some(next_deadline);
+    s.interp_present_deadline = use_output_clock.then_some(next_deadline);
+    s.interp_catchup_carry = if catchup_enabled && fail.is_none() {
+        ideal_next.filter(|ideal| *ideal < next_deadline).map(|ideal| (next_deadline, ideal))
+    } else {
+        None
+    };
 
     if pending.is_drba && fail.is_none() && interp_run_ms > 0.0 {
         observe_drba_midpoint_cost(
@@ -17534,6 +19417,9 @@ fn drain_pending_interp_neoamd_stream(
         metrics.probe(&pending.interp_name, "onnx", interp_run_ms);
     }
     if let Some(msg) = &fail {
+        log::warn!("interp-cooperative-failure: backend={} pair={} input={}x{} count={} reason={}",
+            if pending.neoarc_stream_slots {"NeoARC"} else {"NeoAMD"},
+            pending.pair_id, pending.real.w, pending.real.h, pending.count, msg);
         let message = format!("補間: {msg}");
         let mut state = status.lock().unwrap();
         if !state.chain_errors.contains(&message) {
@@ -17556,13 +19442,13 @@ fn drain_pending_interp_neoamd_stream(
             .stage_count()
             .saturating_sub(pending.chain_start_index);
         log::info!(
-            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} pacing=neoamd-cooperative-slots cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} mids_ms={:.1} real_ms={:.1} slot_present_ms_avg={:.3} slot_wait_overshoot_ms_max={:.3} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} generated_mid_count={} presented_mid_count={} presented_total_count={} expected_total_count={} present_order_ok={} dropped_mid_count={} repeated_present_count=0",
+            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} pacing=neoamd-cooperative-slots cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} backend_pack_ms={:.2} backend_run_ms={:.2} backend_output_ms={:.2} mids_ms={:.1} real_ms={:.1} slot_present_ms_avg={:.3} slot_wait_overshoot_ms_max={:.3} worker_wait_ms={:.2} slot_pace_wait_ms={:.2} slot_upload_ms={:.2} slot_render_present_ms={:.2} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} generated_mid_count={} presented_mid_count={} presented_total_count={} expected_total_count={} present_order_ok={} dropped_mid_count={} repeated_present_count=0",
             pending.real.w,
             pending.real.h,
             mids_ok,
             pending.count,
             fail.as_deref(),
-            s.smooth_pacing,
+            use_output_clock,
             s.cadence.period_s().unwrap_or(0.0) * 1000.0,
             s.arrival_interval * 1000.0,
             pending.pair_dt.unwrap_or(0.0) * 1000.0,
@@ -17571,6 +19457,9 @@ fn drain_pending_interp_neoamd_stream(
             wait_take_ms,
             pre_ms,
             recv_ms,
+            backend_pack_ms,
+            interp_run_ms,
+            backend_output_ms,
             mids_ms,
             real_started.elapsed().as_secs_f64() * 1000.0,
             if slot_present_count > 0 {
@@ -17579,6 +19468,10 @@ fn drain_pending_interp_neoamd_stream(
                 0.0
             },
             slot_wait_overshoot_max_ms,
+            worker_wait_ms,
+            slot_pace_wait_ms,
+            slot_upload_ms,
+            slot_render_present_ms,
             pre_stage_count,
             post_stage_count,
             if pre_stage_count > 0 { source_fps } else { 0.0 },
@@ -17593,6 +19486,28 @@ fn drain_pending_interp_neoamd_stream(
             pending
                 .requested_mid_count
                 .saturating_sub(presented_mid_count),
+        );
+        if catchup_enabled {
+            log::info!(
+                "interp-catchup: pair={} min_gap_ms={:.2} refresh_hz={:.2} late_slots={} catchup_slots={} recovered_ms={:.2} carried_late_ms={:.2}",
+                pending.pair_id,
+                catchup_min_gap.as_secs_f64() * 1000.0,
+                s.monitor_refresh_hz.unwrap_or(0.0),
+                late_slots,
+                catchup_slots,
+                catchup_recovered.as_secs_f64() * 1000.0,
+                Instant::now()
+                    .saturating_duration_since(next_deadline)
+                    .as_secs_f64()
+                    * 1000.0
+            );
+        }
+        log::info!(
+            "pixel-transfer-audit: scope=cooperative-pair pair={} model='{}' capture_storage=host host_mid_frames={} host_mid_bytes={} shared_mid_frames={} host_real_bytes={} upload_submit_ms={:.3} render_present_ms={:.3} prefetched_phases={} gpu_resident_end_to_end=false timing=cpu-wall overlap_with_inference=true",
+            pending.pair_id, pending.interp_name, host_mid_frames, host_mid_bytes,
+            shared_mid_frames,
+            if pending.present_real { pending.real.data.len() } else { 0 },
+            slot_upload_ms, slot_render_present_ms, prefetched_phases,
         );
         s.last_neoflow_log = Instant::now();
     }
@@ -17612,9 +19527,11 @@ fn drain_pending_interp(
     tick_t0: Instant,
     downscaler: crate::render::scaler::Kernel,
 ) -> bool {
+    let use_output_clock=s.smooth_pacing||s.flow_output_cadence.fractional_onnx;
     let Some(pending) = s.interp_pending.take() else {
         return true;
     };
+    let pair_presented_before = status.lock().unwrap().presented;
     if pending.neoamd_stream_slots {
         return drain_pending_interp_neoamd_stream(
             gc, overlay, input, s, metrics, status, out_size, stats, vsync_on, tick_t0, downscaler,
@@ -17626,6 +19543,10 @@ fn drain_pending_interp(
         .interp_last_tick
         .map(|t| tick_t0.duration_since(t).as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
+    // A new resolution compiles its DirectML shape on the worker's first run.
+    // Give that one pair time to finish; ordinary frames retain the short
+    // watchdog so a hung provider cannot stall playback indefinitely.
+    let first_pair_after_reset = s.interp_last_tick.is_none();
     s.interp_last_tick = Some(tick_t0);
     let pre_ms = drain_t0.duration_since(tick_t0).as_secs_f64() * 1000.0;
     let wait_take_ms = s
@@ -17635,9 +19556,18 @@ fn drain_pending_interp(
     let mut got: Vec<Option<InterpPayload>> = (0..pending.count).map(|_| None).collect();
     let mut fail: Option<String> = None;
     let mut interp_run_ms = 0.0f64;
+    let mut interp_pack_ms = 0.0f64;
+    let mut interp_output_ms = 0.0f64;
     if let Some(worker) = s.interp_worker.as_ref() {
         for _ in 0..pending.count {
-            match worker.res_rx.recv_timeout(Duration::from_millis(400)) {
+            let timeout = if pending.neoarc_stream_slots && !worker.neoarc_ready.load(Ordering::Acquire) {
+                Duration::from_secs(10)
+            } else if first_pair_after_reset {
+                Duration::from_millis(1500)
+            } else {
+                Duration::from_millis(400)
+            };
+            match worker.res_rx.recv_timeout(timeout) {
                 Ok(res) => {
                     if res.pair_id != pending.pair_id
                         || res.idx >= pending.count
@@ -17653,7 +19583,9 @@ fn drain_pending_interp(
                         break;
                     }
                     if let Some((p, r, o)) = res.profile {
+                        interp_pack_ms = interp_pack_ms.max(p);
                         interp_run_ms = interp_run_ms.max(r);
+                        interp_output_ms = interp_output_ms.max(o);
                         if stats {
                             metrics.probe("Frame interpolation pack", "cpu", p);
                             metrics.probe("Frame interpolation run", "onnx", r);
@@ -17693,7 +19625,7 @@ fn drain_pending_interp(
     let n = pending.count + usize::from(pending.present_real);
     let mids_ok = got.iter().filter(|g| g.is_some()).count();
     let recv_ms = drain_t0.elapsed().as_secs_f64() * 1000.0;
-    let content_dt = if s.smooth_pacing {
+    let content_dt = if use_output_clock {
         s.cadence
             .period_s()
             .or(pending.pair_dt)
@@ -17719,14 +19651,19 @@ fn drain_pending_interp(
     // once to `now` instead of trying to catch up with back-to-back presents.
     // When work is on time, planned slots remain exact (20.83/13.89/10.42/8.33
     // ms) without adding rendering time to every interval.
+    if let Some(&phase)=pending.mid_ts.first(){wait_fractional_start(&mut s.flow_output_cadence,overlay,content_dt,phase);}
     let pair_clock_now = Instant::now();
     let exact_multiplier_period = output_period_s * n.max(1) as f64;
-    let neoamd_continuous_slot_pacing = s.smooth_pacing
+    let neoamd_continuous_slot_pacing = use_output_clock
         && pending.neoamd_cpu_visible
         && pending.present_real
         && (exact_multiplier_period - content_dt).abs() <= (output_period_s * 0.15).max(0.000_25);
+    let cpu_visible_rife_reanchor = use_output_clock
+        && !pending.is_drba
+        && (pending.interp_name.contains("DirectML")
+            || pending.interp_name.contains("NeoARC"));
     let mut deadline_miss_count = 0u32;
-    let mut pair_next_deadline = if s.smooth_pacing {
+    let mut pair_next_deadline = if use_output_clock {
         s.interp_present_deadline.unwrap_or(pair_clock_now)
     } else {
         pair_clock_now
@@ -17749,7 +19686,7 @@ fn drain_pending_interp(
             if !vsync_on && now < deadline {
                 wait_until_with_pump(overlay, deadline);
             }
-        } else if s.smooth_pacing && !dml_native_cadence {
+        } else if use_output_clock && !dml_native_cadence {
             let current_phase_slot = pending
                 .mid_ts
                 .get(index)
@@ -17773,7 +19710,7 @@ fn drain_pending_interp(
                 pair_next_deadline += output_step.mul_f64(skipped_slots as f64);
             }
             let now = Instant::now();
-            if neoamd_continuous_slot_pacing
+            if (neoamd_continuous_slot_pacing || cpu_visible_rife_reanchor)
                 && now > pair_next_deadline
                 && now.duration_since(pair_next_deadline) > late_reanchor
             {
@@ -18097,7 +20034,7 @@ fn drain_pending_interp(
                 );
             }
         }
-        if !dml_drba_ordered_grid && !s.smooth_pacing && !vsync_on {
+        if !dml_drba_ordered_grid && !use_output_clock && !vsync_on {
             // Low-latency mode retains arrival-relative pacing.
             let target = (content_dt * (index + 1) as f64 / n as f64).min(0.025);
             let deadline = tick_t0 + Duration::from_secs_f64(target);
@@ -18124,13 +20061,13 @@ fn drain_pending_interp(
             }
         } else if dml_native_cadence {
             // retained for non-DRBA compatibility; currently false
-        } else if s.smooth_pacing {
+        } else if use_output_clock {
             let skipped_before_real = real_slot_delta.saturating_sub(1);
             if skipped_before_real > 0 {
                 pair_next_deadline += output_step.mul_f64(skipped_before_real as f64);
             }
             let now = Instant::now();
-            if neoamd_continuous_slot_pacing
+            if (neoamd_continuous_slot_pacing || cpu_visible_rife_reanchor)
                 && now > pair_next_deadline
                 && now.duration_since(pair_next_deadline) > late_reanchor
             {
@@ -18168,9 +20105,11 @@ fn drain_pending_interp(
             pending.chain_start_index,
         );
     }
-    s.interp_present_deadline = (s.smooth_pacing && !dml_native_cadence && !dml_drba_ordered_grid)
+    s.interp_present_deadline = (use_output_clock && !dml_native_cadence && !dml_drba_ordered_grid)
         .then_some(pair_next_deadline);
     if s.last_neoflow_log.elapsed() >= Duration::from_secs(1) {
+        let pair_presented_actual = status.lock().unwrap().presented
+            .saturating_sub(pair_presented_before);
         let source_fps = 1.0 / content_dt.max(1.0 / 240.0);
         let requested_output_fps = 1.0 / output_step.as_secs_f64().max(1.0 / 1000.0);
         let actual_presented_mids = if dml_drba_ordered_grid {
@@ -18186,13 +20125,15 @@ fn drain_pending_interp(
             .stage_count()
             .saturating_sub(pending.chain_start_index);
         log::info!(
-            "interp-pipeline: rife_input={}x{} mids={}/{} fail={:?} smooth={} pacing={} cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} mids_ms={:.1} real_ms={:.1} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} deadline_miss_count={} dropped_mid_count={} late_present_drop_count={} repeated_present_count=0",
+            "interp-pipeline: rife_input={}x{} mids={}/{} actual_presented={}/{} fail={:?} smooth={} pacing={} cadence_ms={:.2} arrival_ms={:.1} pair_dt_ms={:.1} present_period_ms={:.2} gap_ms={:.1} wait_take_ms={:.1} pre_ms={:.1} recv_ms={:.1} backend_pack_ms={:.2} backend_run_ms={:.2} backend_output_ms={:.2} mids_ms={:.1} real_ms={:.1} pre_stage_count={} post_stage_count={} pre_invocations_per_s={:.2} interp_invocations_per_s={:.2} requested_output_fps={:.2} actual_pair_output_fps={:.2} deadline_miss_count={} dropped_mid_count={} late_present_drop_count={} repeated_present_count=0",
             pending.real.w,
             pending.real.h,
             mids_ok,
             pending.count,
+            pair_presented_actual,
+            n,
             fail.as_deref(),
-            s.smooth_pacing,
+            use_output_clock,
             if dml_drba_ordered_grid {
                 "directml-drba-provider-paced"
             } else if neoamd_continuous_slot_pacing {
@@ -18208,6 +20149,9 @@ fn drain_pending_interp(
             wait_take_ms,
             pre_ms,
             recv_ms,
+            interp_pack_ms,
+            interp_run_ms,
+            interp_output_ms,
             mids_ms,
             real_t0.elapsed().as_secs_f64() * 1000.0,
             pre_stage_count,
@@ -18222,7 +20166,7 @@ fn drain_pending_interp(
         );
         s.last_neoflow_log = Instant::now();
     }
-    true
+    fail.is_none()
 }
 
 fn reset_display_hz_cache(s: &mut Session, gc: &mut GlContext, reason: &str) {
@@ -18363,7 +20307,27 @@ fn keep_display_hz_base(s: &Session, keep: &mut Vec<GpuTex>) {
     {
         keep.push(base);
     }
+    // v957: every release_frame() in the present paths goes through here.
+    // Never pool a texture that interpolation still owns: callers pass a keep
+    // snapshot taken at pair submission, so a capture uploaded while that pair
+    // was presenting (already in the live history / next pair) was pooled.
+    // The next DirectML output conversion could then overwrite that REAL frame
+    // with a synthetic one, which fed back into following pairs (two scenes
+    // mixed for ~1.5 s until a history reset). Keeping more is always safe.
+    if interp_live_keep_enabled() {
+        for tex in drba_present_keep_textures(s) {
+            if !keep.iter().any(|item| item.tex == tex.tex) {
+                keep.push(tex);
+            }
+        }
+    }
 }
+
+/// v957: keep live interpolation textures out of the pool (default on).
+fn interp_live_keep_enabled() -> bool {
+    std::env::var("CHIDESCALER_INTERP_LIVE_KEEP").ok().as_deref() != Some("off")
+}
+
 
 fn process_and_present(
     gc: &mut GlContext,
@@ -18473,6 +20437,12 @@ fn process_and_present_from_impl(
     preprocessed_chain_ms: f64,
     chain_frame_tick: bool,
 ) {
+    let intel_early_prepare=std::mem::take(&mut s.intel_early_present_prepare);
+    if let Some(timing)=s.interp_timing.as_mut(){timing.poll();}
+    let gpu_timing_sample=if intel_early_prepare>=2&&crate::logging::diagnostics_enabled()
+        &&std::env::var("CHIDESCALER_INTERP_GPU_TIMING").ok().as_deref()==Some("on"){
+        s.interp_timing.get_or_insert_with(||crate::render::interp_timing::AsyncInterpTiming::new(gc.gl.clone())).begin(s.frame.seq,chain_start_index)
+    }else{None};
     // `process_from()` clears chain_reprocess_pending after a successful chain
     // run. Remember whether this present came from an explicit filter edit so
     // we can synchronously commit that one frame to DWM below.
@@ -18496,10 +20466,12 @@ fn process_and_present_from_impl(
         && s.deferred_capture_resolution.is_none()
         && s.pending_resize_size.is_none();
 
-    let interactive_pause = guard_can_hold
+    let gui_hold_requested = guard_can_hold
         && s.glsl_guard.mode != GlslGuardMode::Off
         && !s.glsl_resolution_recheck_active
         && crate::input::main_gui_has_native_cursor_ownership();
+    let interactive_pause=s.glsl_guard.pause_for_gui(gui_hold_requested,Instant::now());
+    let gui_progress_admitted=gui_hold_requested&&!interactive_pause;
     let auto_stop_hold = s.load_detection
         && guard_can_hold
         && !s.glsl_resolution_recheck_active
@@ -18556,7 +20528,7 @@ fn process_and_present_from_impl(
         return;
     }
 
-    if guard_can_hold && s.glsl_guard.should_skip_frame() {
+    if guard_can_hold && !gui_progress_admitted && s.glsl_guard.should_skip_frame() {
         release_gpu_interp_permit_after_post_submit(s);
         let gpu = latest_gui_gpu_percent();
         s.glsl_guard.note_skipped(gpu);
@@ -18628,14 +20600,11 @@ fn process_and_present_from_impl(
                             })
                             .and_then(|(layout, _)| {
                                 crate::render::mvutensils_neo::PortableBackendLibrary::load(&layout)
-                                    .and_then(|library| {
-                                        library.create_session(&layout, &runtime_options)
-                                    })
+                                    .and_then(|library| library.create_session(&layout, &runtime_options))
                             });
                         match created {
                             Ok(runtime) => {
-                                let variant =
-                                    runtime.variant().unwrap_or_else(|| "unknown".to_string());
+                                let variant = runtime.variant().unwrap_or_else(|| "unknown".to_string());
                                 log::info!(
                                     "MVUtensils-Neo runtime active: stage={} radius={} internal_precision={}bit analysis_precision={}bit cpu_pipeline={} highres_fast={} variant={}",
                                     stage_index,
@@ -18663,8 +20632,7 @@ fn process_and_present_from_impl(
                         // reports the true cost and makes cross-API stalls
                         // obvious instead of hiding them outside stage stats.
                         let stage_started = Instant::now();
-                        let cached_cpu =
-                            s.chain.mvutensils_cpu_boundary(width as i32, height as i32);
+                        let cached_cpu = s.chain.mvutensils_cpu_boundary(width as i32, height as i32);
                         let downloaded;
                         let rgba: &[u8] = if let Some(bytes) = cached_cpu {
                             bytes
@@ -18703,11 +20671,7 @@ fn process_and_present_from_impl(
                                     profile.mvtools_ms,
                                     profile.convert_out_ms,
                                     profile.total_ms,
-                                    if used_cached_cpu {
-                                        "cpu-direct"
-                                    } else {
-                                        "gl-readback"
-                                    },
+                                    if used_cached_cpu { "cpu-direct" } else { "gl-readback" },
                                     runtime_options.degrain.async_pipeline
                                 );
                             }
@@ -18729,9 +20693,7 @@ fn process_and_present_from_impl(
                                     let stage_ms = if runtime_options.degrain.async_pipeline {
                                         backend_profile
                                             .map(|profile| profile.total_ms + upload_ms)
-                                            .unwrap_or_else(|| {
-                                                stage_started.elapsed().as_secs_f64() * 1000.0
-                                            })
+                                            .unwrap_or_else(|| stage_started.elapsed().as_secs_f64() * 1000.0)
                                     } else {
                                         stage_started.elapsed().as_secs_f64() * 1000.0
                                     };
@@ -18860,7 +20822,8 @@ fn process_and_present_from_impl(
     match result {
         Ok(chain_tex) => {
             s.chain_reprocess_pending = false;
-            if stats && !chain_already_processed && s.chain.has_interp() && chain_start_index > 0 {
+            if stats && !chain_already_processed && s.chain.has_interp() && chain_start_index > 0
+                && (s.frame.seq<4||s.frame.seq%120==0) {
                 let post_stages = s
                     .chain
                     .stages
@@ -18990,7 +20953,6 @@ fn process_and_present_from_impl(
             // here, not after import (which lets RIFE preempt the GLSL chain)
             // and not after SwapBuffers (which needlessly serializes DML with
             // compositor wait). All interpolation/output buffers are per-slot.
-            release_gpu_interp_permit_after_post_submit(s);
             let geometry_transition_pending =
                 s.aspect_transition_pending || s.crop_transition_pending;
             let overlay_commit_needed = if geometry_transition_pending {
@@ -19024,6 +20986,26 @@ fn process_and_present_from_impl(
                     s.in_size.1
                 );
             }
+            // The last draw to the actual WGL back buffer must also finish
+            // before handing GPU time to the next inference. Swap alone remains
+            // at the original deadline. Preserve all ordinary/DisplayHz paths.
+            let prepared_back_buffer = if intel_early_prepare>=2 && (chain_frame_tick || intel_early_prepare==4) && !s.chain.has_display_hz() {
+                match overlay.prepare_back_buffer(gc,final_tex) {
+                    Ok(())=>true,
+                    Err(error)=>{log::warn!("interp-early-back-buffer: fallback error={error:#}");false}
+                }
+            }else{false};
+            if let Some(id)=gpu_timing_sample{if let Some(timing)=s.interp_timing.as_mut(){timing.end(id,prepared_back_buffer);}}
+            let post_ready_started=Instant::now();
+            if intel_early_prepare==2{gc.finish();}else if intel_early_prepare>0{unsafe{gc.gl.flush();}}
+            s.last_interp_post_ready_ms=if intel_early_prepare==2{post_ready_started.elapsed().as_secs_f64()*1000.}else{0.};
+            if intel_early_prepare==2&&(s.frame.seq<4||s.frame.seq%120==0){
+                log::debug!("interp-post-gpu-ready: seq={} suffix_start={} ready_wait_ms={:.3} next_provider_permit=after-ready final_deadline_preserved=true",s.frame.seq,chain_start_index,s.last_interp_post_ready_ms);
+            }
+            if prepared_back_buffer&&(s.frame.seq<4||s.frame.seq%120==0){
+                log::debug!("interp-back-buffer-early-submit: seq={} mode={} final_draw=before-deadline next_permit=after-final-draw gpu_ready_confirmed={}",s.frame.seq,intel_early_prepare,intel_early_prepare==2);
+            }
+            release_gpu_interp_permit_after_post_submit(s);
             let compute_elapsed = t0.elapsed();
             s.last_compute_ms = compute_elapsed.as_secs_f64() * 1000.0;
 
@@ -19042,6 +21024,12 @@ fn process_and_present_from_impl(
                     (s.display_hz_next_present > now).then_some(s.display_hz_next_present);
             }
 
+            // Fractional ONNX owns this clock. Preparation may begin early,
+            // but variable post work must never turn the lead into an early
+            // submit. Honor its exact deadline at the final presentation edge.
+            if let Some(deadline)=s.flow_output_cadence.fractional_submit_deadline.take(){
+                if s.flow_output_cadence.fractional_onnx&&!s.chain.has_display_hz(){s.paced_present_deadline=Some(deadline);}
+            }
             let pacer_wait_started = Instant::now();
             if let Some(deadline) = s.paced_present_deadline.take() {
                 wait_until_with_pump(overlay, deadline);
@@ -19052,10 +21040,51 @@ fn process_and_present_from_impl(
                 );
             }
             s.last_pacer_wait_ms = pacer_wait_started.elapsed().as_secs_f64() * 1000.0;
+            if let Some(id)=gpu_timing_sample{if let Some(timing)=s.interp_timing.as_mut(){timing.observe_swap(id);}}
             let present_call_started = Instant::now();
             s.last_present_started = present_call_started;
-            let present_result = overlay.present_with_swap_timing(gc, final_tex);
+            // v956: honest FPS. Two presents inside one display refresh can
+            // never both be seen; count the earlier one as a dropped frame.
+            // v960: DWM's cRefresh can lag real time in some sessions
+            // (observed: index +3 across 41ms at 120 Hz), which made evenly
+            // spaced 72/90fps presents look like collisions and dragged the
+            // shown FPS down to ~50/60 until the next restart. Two presents
+            // further apart than one refresh can never share a refresh, so
+            // require that physically necessary condition as well.
+            let since_last_present = s.last_present_counted.map(|t| present_call_started.duration_since(t).as_secs_f64());
+            s.last_present_counted = Some(present_call_started);
+            if let Some((refresh_index, refresh_s)) = dwm_refresh_index() {
+                let close_enough = since_last_present.map_or(false, |dt| dt < refresh_s * 0.9);
+                if s.last_present_refresh == Some(refresh_index) && close_enough {
+                    metrics.present_hidden();
+                    s.present_hidden_total = s.present_hidden_total.saturating_add(1);
+                    if s.present_hidden_total <= 3 || s.present_hidden_total % 600 == 0 {
+                        log::info!("present-refresh-collision: total={} refresh_index={} action=count-as-dropped", s.present_hidden_total, refresh_index);
+                    }
+                }
+                s.last_present_refresh = Some(refresh_index);
+            }
+            if s.flow_output_cadence.fractional_onnx{s.flow_output_cadence.last_present_started=Some(present_call_started);}
+            let present_result = if prepared_back_buffer { overlay.swap_prepared_back_buffer() } else { overlay.present_with_swap_timing(gc, final_tex) };
             s.last_present_call_ms = present_call_started.elapsed().as_secs_f64() * 1000.0;
+            // v992: keep at most one presented frame queued on the GL context.
+            // Every GL->OpenCL handoff (NeoArc interpolation input) drains the
+            // GL queue; at 240 Hz two queued presents made each handoff wait
+            // 5-10 ms. Waiting here for the previous present's fence bounds it.
+            if gl_frame_latency_limit() {
+                let latency_started = Instant::now();
+                unsafe {
+                    use glow::HasContext;
+                    if let Ok(fence) = gc.gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0) {
+                        gc.gl.flush();
+                        if let Some(previous) = s.gl_prev_present_fence.replace(fence) {
+                            let _ = gc.gl.client_wait_sync(previous, 0, 12_000_000);
+                            gc.gl.delete_sync(previous);
+                        }
+                    }
+                }
+                s.gl_latency_wait_ms = latency_started.elapsed().as_secs_f64() * 1000.0;
+            }
             let present_time = PresentTime::now();
             s.last_present_block_ms = present_result
                 .as_ref()
@@ -19136,7 +21165,7 @@ fn process_and_present_from_impl(
             }
             if let Err(e) = present_result {
                 if s.provider_transition_input_suspended {
-                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.chain_reprocess_pending = s.frame.has_pixels();
                     log::warn!(
                         "provider-transition-present-failed: error={:#} retry_cached={}",
                         e,
@@ -19162,7 +21191,7 @@ fn process_and_present_from_impl(
                     // Keep the transition armed and force another cached-frame
                     // render. This also covers Auto mode, where content aspect
                     // changes without changing the fullscreen overlay rectangle.
-                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.chain_reprocess_pending = s.frame.has_pixels();
                     log::warn!(
                         "aspect-live-transition-present-failed: overlay_rollback={} restored={}x{} pending=true retry_cached={}",
                         transition_overlay_repositioned,
@@ -19172,7 +21201,7 @@ fn process_and_present_from_impl(
                     );
                 }
                 if s.crop_transition_pending {
-                    s.chain_reprocess_pending = !s.frame.data.is_empty();
+                    s.chain_reprocess_pending = s.frame.has_pixels();
                     log::warn!(
                         "crop-live-transition-present-failed: pending=true retry_cached={}",
                         s.chain_reprocess_pending
@@ -19346,6 +21375,33 @@ fn process_and_present_from_impl(
                                     applied.1
                                 );
                             }
+                        }
+                    }
+                    // v994: keep the live source visible (overlay hidden) while
+                    // the NeoArc interpolation bridge compiles/validates on the
+                    // next pair, instead of revealing a first frame that then
+                    // freezes for seconds. Bounded. v994b: opt-in only
+                    // (CHIDESCALER_NEOARC_REVEAL_HOLD=on) at the user's request.
+                    if reveal_ready
+                        && s.hide_source_pending
+                        && std::env::var("CHIDESCALER_NEOARC_REVEAL_HOLD").ok().as_deref() == Some("on")
+                        && s.chain.neoarc_interp_bridge_pending()
+                    {
+                        let started = *s.neoarc_reveal_hold_started.get_or_insert_with(|| {
+                            log::info!("neoarc-reveal-hold: reason=interp-bridge-build source=visible overlay=hidden");
+                            Instant::now()
+                        });
+                        if started.elapsed() < Duration::from_secs(20) {
+                            reveal_ready = false;
+                        } else {
+                            log::warn!("neoarc-reveal-hold: result=timeout action=reveal");
+                        }
+                    } else if reveal_ready {
+                        if let Some(started) = s.neoarc_reveal_hold_started.take() {
+                            log::info!(
+                                "neoarc-reveal-hold: result=released held_ms={:.1}",
+                                started.elapsed().as_secs_f64() * 1000.0
+                            );
                         }
                     }
                     if reveal_ready && s.hide_source_pending && !s.source_monitor_fullscreen {
@@ -19708,10 +21764,11 @@ fn log_metrics_if_due(
     let (present_ms, present_jitter_ms, present_min_ms, present_max_ms) =
         s.present_cadence.summary();
     log::debug!(
-        "stats-snapshot: source_locked_fps={:.3} capture_dequeue_fps={:.1} present_fps={:.1} total_ms={:.2} delay_frames={} in={}x{} out={}x{} last_process_ms={:.2} compute_ms={:.2} path_ms(upload={:.2},chain={:.2},resample={:.2},post={:.2},pacer_wait={:.2},present_call={:.2},swap={:.2}) smooth={} cadence_ms={:.3} present_interval_ms={:.2} jitter_ms={:.2} present_min_ms={:.2} present_max_ms={:.2} queue_depth={} queue_dropped={}",
+        "stats-snapshot: source_locked_fps={:.3} capture_dequeue_fps={:.1} present_fps={:.1} hidden_fps={:.1} total_ms={:.2} delay_frames={} in={}x{} out={}x{} last_process_ms={:.2} compute_ms={:.2} path_ms(upload={:.2},chain={:.2},resample={:.2},post={:.2},pacer_wait={:.2},present_call={:.2},swap={:.2}) smooth={} cadence_ms={:.3} present_interval_ms={:.2} jitter_ms={:.2} present_min_ms={:.2} present_max_ms={:.2} queue_depth={} queue_dropped={}",
         snap.source_fps,
         snap.capture_fps,
         snap.present_fps,
+        snap.present_hidden_fps,
         snap.total_ms,
         snap.lag_frames,
         snap.in_size.0,
@@ -19749,10 +21806,132 @@ fn log_metrics_if_due(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_24p_capture_is_not_mistaken_for_compositor_repeats() {
+        use super::compositor_repeat_interval;
+        assert!(compositor_repeat_interval(Some(1_000_000), Some(1_333_333)));
+        assert!(!compositor_repeat_interval(Some(1_000_000), Some(1_416_667)));
+        assert!(!compositor_repeat_interval(Some(1_000_000), Some(1_000_000)));
+        assert!(!compositor_repeat_interval(None, Some(1_333_333)));
+    }
     use super::*;
     use crate::capture::wgc::FrameBuf;
     use half::f16;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn frame_pool_reuses_only_unshared_buffers_of_the_same_size() {
+        let mut pool: Vec<Arc<Vec<u8>>> = Vec::new();
+        let a = Arc::new(vec![7u8; 16]);
+        let held = a.clone(); // still owned by a worker job
+        recycle_frame_buffer(&mut pool, a);
+        // Shared: never handed out.
+        assert!(take_frame_buffer(&mut pool, 16).is_empty());
+        drop(held);
+        // Released: reused, and pooled_copy yields exactly the source bytes.
+        let src: Vec<u8> = (0..16).collect();
+        assert_eq!(pooled_copy(&mut pool, &src), src);
+        assert!(pool.is_empty());
+        // Size change drops stale buffers and falls back to a plain copy.
+        recycle_frame_buffer(&mut pool, Arc::new(vec![1u8; 16]));
+        let src2 = vec![9u8; 32];
+        assert_eq!(pooled_copy(&mut pool, &src2), src2);
+        assert!(pool.is_empty());
+        // Bounded.
+        for _ in 0..10 {
+            recycle_frame_buffer(&mut pool, Arc::new(vec![0u8; 8]));
+        }
+        assert_eq!(pool.len(), FRAME_POOL_MAX);
+    }
+
+    #[test]
+    fn interp_catchup_keeps_on_time_slots_unchanged() {
+        let t = Instant::now();
+        let step = Duration::from_micros(4167);
+        // On time (or within the tolerance): identical to v780 (actual + step).
+        let gap = interp_catchup_min_gap(step, None);
+        let (d, i, r) = interp_catchup_next_deadline(t, t, step, gap, true);
+        assert_eq!(d, t + step);
+        assert_eq!(i, t + step);
+        assert!(r.is_zero());
+        let a = t + Duration::from_micros(100);
+        assert_eq!(interp_catchup_next_deadline(t, a, step, gap, true).0, a + step);
+        // Disabled: always v780.
+        let late = t + Duration::from_millis(3);
+        assert_eq!(interp_catchup_next_deadline(t, late, step, gap, false).0, late + step);
+    }
+
+    #[test]
+    fn interp_catchup_is_safe_on_60_120_144_240hz_for_every_multiplier() {
+        for hz in [60.0f64, 75.0, 120.0, 144.0, 165.0, 240.0, 360.0] {
+            let refresh = Duration::from_secs_f64(1.0 / hz);
+            for factor in 2u32..=15 {
+                let step = Duration::from_secs_f64(1.0 / (24.0 * factor as f64));
+                let gap = interp_catchup_min_gap(step, Some(hz));
+                // Never longer than a step (catch-up can only shorten).
+                assert!(gap <= step, "{hz}Hz x{factor}: gap > step");
+                if step >= refresh.mul_f64(0.98) {
+                    // Output fits the display: each output keeps its own refresh.
+                    assert!(gap >= refresh.mul_f64(0.95), "{hz}Hz x{factor}: two outputs could share a refresh");
+                } else {
+                    assert_eq!(gap, step.mul_f64(INTERP_CATCHUP_MIN_RATIO), "{hz}Hz x{factor}");
+                }
+                // Simulate one 4 ms hiccup followed by on-deadline presents over
+                // three pairs: intervals never drop below the gap and the
+                // timeline converges (or keeps the v780 timing when gap==step).
+                let t0 = Instant::now();
+                let slots = (factor as usize) * 3;
+                let mut ideal = t0;
+                let mut actual = t0 + Duration::from_millis(4);
+                let mut prev: Option<Instant> = None;
+                let mut deadline = t0;
+                for _ in 0..slots {
+                    if let Some(p) = prev {
+                        assert!(actual.duration_since(p) + Duration::from_nanos(2) >= gap.min(step),
+                            "{hz}Hz x{factor}: interval below gap");
+                    }
+                    let (next, next_ideal, _) = interp_catchup_next_deadline(ideal, actual, step, gap, true);
+                    prev = Some(actual);
+                    deadline = next;
+                    ideal = next_ideal;
+                    actual = next;
+                }
+                let v780_end = t0 + Duration::from_millis(4) + step * slots as u32;
+                assert!(deadline <= v780_end + Duration::from_micros(1), "{hz}Hz x{factor}: later than v780");
+            }
+        }
+    }
+
+    #[test]
+    fn interp_catchup_recovers_gradually_without_bursts() {
+        let t0 = Instant::now();
+        let step = Duration::from_micros(4167);
+        let min_gap = step.mul_f64(INTERP_CATCHUP_MIN_RATIO);
+        // First slot 3.5 ms late (pre-GLSL readback), later slots present on their deadline.
+        let mut ideal = t0;
+        let mut actual = t0 + Duration::from_micros(3500);
+        let mut prev_actual: Option<Instant> = None;
+        let mut deadline = t0;
+        let mut total_recovered = Duration::ZERO;
+        for i in 0..10 {
+            if let Some(p) = prev_actual {
+                assert!(actual.duration_since(p) + Duration::from_nanos(1) >= min_gap, "burst at slot {i}");
+            }
+            let (next, next_ideal, recovered) =
+                interp_catchup_next_deadline(ideal, actual, step, min_gap, true);
+            total_recovered += recovered;
+            prev_actual = Some(actual);
+            deadline = next;
+            ideal = next_ideal;
+            actual = next; // present exactly on the deadline
+        }
+        // After 10 slots the deadline is back on the ideal grid (t0 + 10 steps).
+        assert!(deadline <= t0 + step * 10 + Duration::from_micros(1), "not recovered");
+        assert!(total_recovered >= Duration::from_micros(3400), "recovered {total_recovered:?}");
+        // A large hiccup re-anchors instead of compressing many intervals.
+        let huge = t0 + step * 4;
+        assert_eq!(interp_catchup_next_deadline(t0, huge, step, min_gap, true).0, huge + step);
+    }
 
     #[test]
     fn pending_live_preset_publishes_chain_and_matching_aspect_together() {
@@ -20024,6 +22203,34 @@ mod tests {
     }
 
     #[test]
+    fn onnx_x25_grid_is_continuous_and_exactly_sixty_from_24(){
+        let mut cadence=FlowOutputCadence::default();let mut timeline=Vec::new();let mut counts=Vec::new();
+        for pair in 0..120{let phases=onnx_interpolation_phases(INTERP_25_CODE,2.5,false,&mut cadence);counts.push(phases.len());for phase in phases{timeline.push(pair as f64+phase as f64);}}
+        assert_eq!(timeline.len(),300);assert_eq!(&counts[..4],&[3,2,3,2]);
+        for window in timeline.windows(2){assert!((window[1]-window[0]-0.4).abs()<1e-6);assert!(((window[1]-window[0])/24.-1./60.).abs()<1e-7);}
+        assert_eq!(onnx_interpolation_phases(3,2.5,false,&mut cadence),vec![1./3.,2./3.,1.]);
+        assert_eq!(onnx_interpolation_phases(2,2.,false,&mut cadence),vec![0.5,1.]);
+    }
+    #[test]
+    fn onnx_x25_start_guard_is_once_and_covers_causal_source_arrival(){
+        let mut cadence=FlowOutputCadence::default();let phases=cadence.onnx_fractional_phases(2.5);let now=Instant::now();let period=1./24.;let first=phases[0];let deadline=cadence.fractional_start(now,period,first).unwrap();assert!((deadline.duration_since(now).as_secs_f64()-period*first as f64).abs()<1e-8);assert!(cadence.fractional_start(now,period,first).is_none());
+        let inference=0.010;let latency=period+inference;
+        for pair in 0..120{let phases=if pair==0{phases.clone()}else{cadence.onnx_fractional_phases(2.5)};for(index,phase)in phases.iter().enumerate(){let ready=(pair+1)as f64*period+(index+1)as f64*inference;let scheduled=(pair as f64+*phase as f64)*period+latency;assert!(scheduled+1e-8>=ready);}}
+        onnx_interpolation_phases(3,3.,false,&mut cadence);assert!(cadence.fractional_start(now,period,0.333).is_none());
+    }
+
+    #[test]
+    fn onnx_x25_matches_nearby_monitor_only_in_fractional_mode(){
+        let source=1001./24000.;let ratio=onnx_output_ratio(INTERP_25_CODE,Some(source),Some(60.));assert!((source/ratio-1./60.).abs()<1e-12);
+        assert_eq!(onnx_output_ratio(3,Some(source),Some(60.)),3.);
+        assert_eq!(onnx_output_ratio(INTERP_25_CODE,Some(source),Some(120.)),2.5);
+        let mut cadence=FlowOutputCadence::default();let mut times=Vec::new();
+        for pair in 0..1000{for t in onnx_interpolation_phases(INTERP_25_CODE,ratio,false,&mut cadence){times.push((pair as f64+t as f64)*source);}}
+        assert!((times.len()as f64-1000.*ratio).abs()<=1.);
+        assert!(times.windows(2).all(|w|(w[1]-w[0]-1./60.).abs()<1e-7));
+    }
+
+    #[test]
     fn onnx_x2_always_requests_one_midpoint_even_after_fractional_cadence() {
         let mut cadence = FlowOutputCadence::default();
         assert_eq!(cadence.phases(2.5).len(), 3);
@@ -20159,6 +22366,68 @@ mod tests {
     }
 
     #[test]
+    fn v1000_interp_period_hold_ignores_short_flips() {
+        let mut hold = InterpPeriodHold::default();
+        let p25 = 1.0 / 25.0;
+        let p23 = 1001.0 / 24000.0;
+        assert_eq!(hold_interp_source_period(&mut hold, p25, 1), p25);
+        // Alternating flips never reach 24 consecutive pairs.
+        for i in 0..200 {
+            let raw = if i % 3 == 0 { p23 } else { p25 };
+            assert_eq!(hold_interp_source_period(&mut hold, raw, 1), p25);
+        }
+        // A persistent change is adopted after 24 pairs.
+        let mut last = 0.0;
+        for _ in 0..24 {
+            last = hold_interp_source_period(&mut hold, p23, 1);
+        }
+        assert_eq!(last, p23);
+        // A large change (24 -> 60) is adopted after 6 pairs; a new generation immediately.
+        let p60 = 1.0 / 60.0;
+        for _ in 0..5 { assert_eq!(hold_interp_source_period(&mut hold, p60, 1), p23); }
+        assert_eq!(hold_interp_source_period(&mut hold, p60, 1), p60);
+        assert_eq!(hold_interp_source_period(&mut hold, p25, 2), p25);
+    }
+
+    #[test]
+    fn v1000_25p_on_240hz_locks_25_and_24p_stays_24() {
+        // 25p on 240 Hz: 10,10,9,10,9 refreshes -> 41.67/41.67/37.5/41.67/37.5 ms.
+        let mut c = CadenceEstimator::default();
+        let pattern = [416_667i64, 416_667, 375_000, 416_667, 375_000];
+        let mut t = 0i64;
+        for i in 0..120u64 {
+            t += pattern[(i % 5) as usize];
+            c.observe_frame(Some(t), i + 1);
+        }
+        let p = c.period_s().unwrap();
+        assert!((p - 1.0 / 25.0).abs() < 1e-6, "25p locked as {p}");
+        // 23.976p on 240 Hz: mostly 10 refreshes with an occasional 11.
+        let mut c = CadenceEstimator::default();
+        let mut t = 0i64;
+        for i in 0..120u64 {
+            t += if i % 120 == 60 { 458_333 } else { 416_667 };
+            c.observe_frame(Some(t), i + 1);
+        }
+        let p = c.period_s().unwrap();
+        assert!(p > 0.0414 && p < 0.0420, "24p-class locked as {p}");
+    }
+
+    #[test]
+    fn v997_refresh_cap_only_limits_what_the_display_cannot_show() {
+        let p24 = 1.0 / 24.0;
+        let p23 = 1001.0 / 24000.0;
+        assert_eq!(refresh_limited_interp_code_core(15, p24, Some(240.0)), 10);
+        assert_eq!(refresh_limited_interp_code_core(15, p23, Some(240.0)), 10);
+        assert_eq!(refresh_limited_interp_code_core(15, p24, Some(360.0)), 15);
+        assert_eq!(refresh_limited_interp_code_core(10, p24, Some(240.0)), 10);
+        assert_eq!(refresh_limited_interp_code_core(8, p24, Some(240.0)), 8);
+        assert_eq!(refresh_limited_interp_code_core(10, p24, Some(144.0)), 6);
+        assert_eq!(refresh_limited_interp_code_core(10, 1.0 / 25.0, Some(240.0)), 10);
+        assert_eq!(refresh_limited_interp_code_core(INTERP_25_CODE, p24, Some(60.0)), INTERP_25_CODE);
+        assert_eq!(refresh_limited_interp_code_core(15, p24, None), 15);
+    }
+
+    #[test]
     fn interp_cadence_period_lock_rebases_from_last_submit_not_loop_time() {
         let base = Instant::now();
         let mut cadence = FlowOutputCadence::default();
@@ -20215,6 +22484,96 @@ mod tests {
             );
             assert!(next > now);
         }
+    }
+
+    #[test]
+    fn fractional_exact_lock_removes_startup_residue_without_resetting_display_clock(){
+        let mut c=FlowOutputCadence::default();let now=Instant::now();c.next_present=Some(now);c.next_phase=Some(0.39386892);c.phase_step=1./2.499;
+        assert_eq!(c.onnx_fractional_phases(2.5),vec![0.4,0.8]);assert_eq!(c.next_present,Some(now));
+        let mut total=2;let mut mids=2;for _ in 1..120{let p=c.onnx_fractional_phases(2.5);total+=p.len();mids+=p.iter().filter(|v|**v<1.-1e-5).count();}
+        assert_eq!(total,300);assert_eq!(mids,240);
+        c.next_phase=Some(0.39386892);c.phase_step=1./2.499;c.onnx_fractional_phases(2.4975);assert_ne!(c.next_phase,Some(0.2));
+    }
+
+    #[test]
+    fn fractional_x25_long_run_has_uniform_unique_timestamps_and_full_reset() {
+        let mut cadence = FlowOutputCadence::default();
+        let mut previous: Option<f64> = None;
+        let mut total = 0;
+        for pair in 0..10_000 {
+            for phase in cadence.onnx_fractional_phases(2.5) {
+                let timestamp = pair as f64 + phase as f64;
+                if let Some(last) = previous {
+                    assert!((timestamp - last - 0.4f64).abs() < 1e-6);
+                }
+                previous = Some(timestamp);
+                total += 1;
+            }
+        }
+        assert_eq!(total, 25_000);
+        cadence.fractional_submit_deadline = Some(Instant::now());
+        cadence.fractional_exact_correction = 0.05;
+        cadence.reset();
+        assert!(cadence.fractional_submit_deadline.is_none());
+        assert_eq!(cadence.fractional_exact_correction, 0.0);
+        assert!(!cadence.fractional_started);
+        assert_eq!(cadence.onnx_fractional_phases(2.5), vec![0.2, 0.6, 1.0]);
+    }
+    #[test]
+    fn fractional_large_startup_offset_converges_without_resetting_output_clock(){
+        let base=Instant::now();let mut c=FlowOutputCadence::default();c.next_present=Some(base);c.next_phase=Some(0.1);c.phase_step=1./2.49;
+        c.onnx_fractional_phases(2.5);assert!(c.fractional_exact_correction.abs()>0.01);
+        for _ in 0..52{let old=c.fractional_exact_correction;c.onnx_fractional_phases(2.5);assert!((old-c.fractional_exact_correction).abs()<=0.010000001);}
+        assert_eq!(c.fractional_exact_correction,0.);assert_eq!(c.next_present,Some(base));
+        let mut total=0;let mut mids=0;for _ in 0..120{let p=c.onnx_fractional_phases(2.5);total+=p.len();mids+=p.iter().filter(|v|**v<1.-1e-5).count();}assert_eq!((total,mids),(300,240));
+        c.fractional_exact_correction=0.05;c.onnx_fractional_phases(2.5025);assert_eq!(c.fractional_exact_correction,0.);
+    }
+
+    #[test]
+    fn fractional_start_from_integer_preserves_causal_guard(){
+        let base=Instant::now();let mut c=FlowOutputCadence::default();c.present_period_s=1./48.;c.last_present_started=Some(base-Duration::from_millis(40));let phases=c.onnx_fractional_phases(2.5);let start=c.fractional_start(base,1./24.,phases[0]).unwrap();
+        assert_eq!(c.reserve_present_deadline(base,1./60.),start);assert!((c.present_period_s-1./60.).abs()<1e-12);
+    }
+
+    #[test]
+    fn v988_neoarc_late_rebase_shifts_grid_instead_of_skipping(){
+        // The v956 vblank alignment may nudge any deadline by up to 0.5 ms.
+        let close=|a:Instant,b:Instant|{let(x,y)=if a>b{(a,b)}else{(b,a)};x.duration_since(y)<=Duration::from_micros(600)};
+        let period=1./240.;let d=Duration::from_secs_f64(period);let base=Instant::now();
+        // Small lateness (1.5 slots): the slot is presented now and the grid follows.
+        let mut c=FlowOutputCadence::default();c.late_rebase=true;c.present_period_s=period;c.next_present=Some(base);
+        let now=base+d.mul_f64(1.5);let first=c.reserve_present_deadline(now,period);
+        assert!(close(first,now));assert!(close(c.next_present.unwrap(),now+d));
+        // Large lateness (5 slots): old phase-preserving skip.
+        let mut big=FlowOutputCadence::default();big.late_rebase=true;big.present_period_s=period;big.next_present=Some(base);
+        let late=base+d.mul_f64(5.2);assert!(close(big.reserve_present_deadline(late,period),base+d.mul_f64(5.0)));
+        // Not enabled: unchanged skip behaviour (one slot later, not `now`).
+        let mut old=FlowOutputCadence::default();old.present_period_s=period;old.next_present=Some(base);
+        assert!(close(old.reserve_present_deadline(now,period),base+d));
+    }
+
+    #[test]
+    fn fractional_late_frame_recovers_without_short_catchup_or_grid_drift(){
+        let period=1./60.;let d=Duration::from_secs_f64(period);let base=Instant::now();let mut c=FlowOutputCadence::default();c.fractional_onnx=true;c.present_period_s=period;c.next_present=Some(base+d);c.last_present_started=Some(base+Duration::from_millis(5));
+        let reserved=c.reserve_present_deadline(base+Duration::from_millis(10),period);
+        assert!(reserved.duration_since(c.last_present_started.unwrap())>=d.mul_f64(0.9));assert_eq!(c.next_present,Some(base+d.mul_f64(2.)));
+        c.last_present_started=Some(reserved);let next=c.reserve_present_deadline(reserved,period);assert!(next.duration_since(reserved)>=d.mul_f64(0.9));assert_eq!(c.next_present,Some(base+d.mul_f64(3.)));
+        let mut integer=FlowOutputCadence::default();integer.present_period_s=period;integer.next_present=Some(base+d);integer.last_present_started=Some(base+Duration::from_millis(5));assert_eq!(integer.reserve_present_deadline(base+Duration::from_millis(10),period),base+d);
+    }
+
+    #[test]
+    fn intel_overlap_requires_distinct_owned_output_slots(){
+        let make=|key,texture|PreparedInterpGpuOutput{key,texture,size:(1280,720),padded:(1280,768),fp16:true,directml_drba_snapshot_candidate:false,preserve_float:false};
+        let a=make((1u64<<63)|1,None);let b=make((1u64<<63)|2,None);
+        assert!(intel_interp_outputs_are_independent(&[a,b]));
+        assert!(!intel_interp_outputs_are_independent(&[a,a]));
+        assert!(intel_interp_outputs_are_independent(&[a]));
+        assert!(!intel_interp_outputs_are_independent(&[make(1,None),make(2,None)]));
+        let texture=|id|GpuTex{tex:glow::NativeTexture(std::num::NonZeroU32::new(id).unwrap()),key:crate::render::gl::TexKey{w:1280,h:720,d:1,comps:4,dtype:crate::render::gl::Dtype::U8},allocation_id:id as u64,offset_x:0.,offset_y:0.};
+        let a=make(0,Some(texture(10)));let b=make(0,Some(texture(11)));
+        assert!(intel_interp_outputs_are_independent(&[a,b]));
+        assert!(!intel_interp_outputs_are_independent(&[a,a]));
+        assert!(!intel_interp_outputs_are_independent(&[a,make(1,None)]));
     }
 
     #[test]
@@ -20755,6 +23114,18 @@ mod tests {
                 assert!(cadence.next_phase.is_none());
                 assert_eq!(cadence.phase_step, 0.0);
             }
+        }
+    }
+
+    #[test]
+    fn experimental_x6_x15_keep_strict_unique_phases_without_changing_x2_x5() {
+        for factor in 6..=15 {
+            let mut cadence = FlowOutputCadence::default();
+            let phases = onnx_interpolation_phases(factor, factor as f64, false, &mut cadence);
+            assert_eq!(phases.len(), factor as usize);
+            assert_eq!(phases.last().copied(), Some(1.0));
+            assert!(phases.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(onnx_output_ratio(factor, Some(1.0 / 8.0), Some(120.0)), factor as f64);
         }
     }
 
@@ -21958,5 +24329,64 @@ mod tests {
             update_neodeint_scene_latch(&mut history, &mut hold, false);
         }
         assert!(update_neodeint_scene_latch(&mut history, &mut hold, false));
+    }
+}
+
+#[cfg(test)]
+mod gui_render_progress_tests {
+    use super::*;
+    #[test]
+    fn overloaded_gui_hover_cannot_starve_rendering(){
+        let mut guard=GlslResponsivenessGuard::default();let start=Instant::now();let mut admitted=0;
+        for ms in 0..1000{if !guard.pause_for_gui(true,start+Duration::from_millis(ms)){admitted+=1;}}
+        assert_eq!(admitted,9);
+        assert!(!guard.pause_for_gui(false,start+Duration::from_secs(1)));
+        assert!(guard.pause_for_gui(true,start+Duration::from_secs(1)));
+    }
+    #[test]
+    fn leaving_gui_resumes_without_waiting_for_deadline(){
+        let mut guard=GlslResponsivenessGuard::default();let now=Instant::now();
+        assert!(guard.pause_for_gui(true,now));assert!(!guard.pause_for_gui(false,now));
+        guard.reset();assert!(!guard.pause_for_gui(false,now));
+    }
+}
+
+#[cfg(test)]
+mod v938_rife_admission_tests {
+    use super::*;
+
+    fn run(pair_ms: f64, mids: usize, pairs: usize) -> Vec<usize> {
+        let requested: Vec<f32> = (1..=mids).map(|i| i as f32 / (mids + 1) as f32).collect();
+        let (mut ema, mut n, mut credit, mut rot) = (0.0, 0u32, 0.0, 0usize);
+        // build spike first: must be ignored
+        observe_rife_midpoint_cost(&mut ema, &mut n, 534.0, mids, 1.0 / 24.0);
+        assert_eq!(n, 0);
+        let mut kept = Vec::new();
+        for _ in 0..pairs {
+            let ts = if n == 0 { requested.clone() } else { drba_admit_timesteps(&requested, 1.0 / 24.0, ema, n, &mut credit, &mut rot) };
+            if !ts.is_empty() {
+                // split path cost model: trunk 12ms on the first mid + 13ms per mid
+                let cost = if pair_ms > 0.0 { pair_ms / mids as f64 * ts.len() as f64 } else { 12.0 + 13.0 * ts.len() as f64 };
+                observe_rife_midpoint_cost(&mut ema, &mut n, cost, ts.len(), 1.0 / 24.0);
+            }
+            kept.push(ts.len());
+        }
+        kept
+    }
+
+    #[test]
+    fn overload_x5_1080p_sheds_some_mids_but_keeps_most() {
+        let kept = run(0.0, 4, 48);
+        let tail = &kept[8..];
+        let avg = tail.iter().sum::<usize>() as f64 / tail.len() as f64;
+        assert!(avg >= 2.0 && avg < 4.0, "kept {kept:?}");
+        assert!(tail.iter().all(|&k| k >= 1), "kept {kept:?}");
+    }
+
+    #[test]
+    fn within_budget_keeps_every_phase() {
+        // 1080p x3 measured 30.8 ms for 2 mids; 720p x5 26 ms for 4 mids
+        assert!(run(30.8, 2, 30).iter().all(|&k| k == 2));
+        assert!(run(26.0, 4, 30).iter().all(|&k| k == 4));
     }
 }

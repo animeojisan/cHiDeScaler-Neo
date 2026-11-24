@@ -595,6 +595,12 @@ pub fn analyze_local_image_model(path: &Path) -> Result<Option<LocalModelPlan>> 
     if !neoaccel_enabled() {
         return Ok(None);
     }
+    inspect_local_image_model(path)
+}
+
+/// Structural ONNX inspection independent of the NeoAccel GUI setting.
+/// Arc DirectML may use this for conservative shape specialization.
+pub fn inspect_local_image_model(path: &Path) -> Result<Option<LocalModelPlan>> {
     let bytes = fs::read(path)?;
     let graph = proto_fields(&bytes)
         .find_map(|field| (field.number == 7).then_some(field.bytes).flatten())
@@ -701,6 +707,96 @@ pub fn analyze_local_image_model(path: &Path) -> Result<Option<LocalModelPlan>> 
         // inference while retaining RDNA 4-friendly 16-pixel dimensions.
         alignment: lcm(DEFAULT_ALIGNMENT, scale_hint),
     }))
+}
+
+/// Conservative SPANF3-like image topology for Arc DirectML shape tuning.
+/// This inspects operators, not filenames or the NeoAccel GUI flag.
+pub fn inspect_spanf3_image_model(path: &Path) -> Result<bool> {
+    let Some(counts) = image_op_counts(path)? else {
+        return Ok(false);
+    };
+    let allowed = [
+        "Conv",
+        "Relu",
+        "Mul",
+        "Unsqueeze",
+        "Gather",
+        "Concat",
+        "Add",
+        "Tanh",
+        "Mod",
+        "Reshape",
+        "Slice",
+        "Shape",
+        "Sub",
+        "Transpose",
+        "Div",
+        "Pad",
+        "DepthToSpace",
+    ];
+    Ok(counts.keys().all(|op| allowed.contains(&op.as_str()))
+        && counts.get("Conv") == Some(&23)
+        && counts.get("Relu") == Some(&10)
+        && counts.get("Tanh") == Some(&5)
+        && counts.get("DepthToSpace") == Some(&1)
+        && counts.get("Pad") == Some(&1))
+}
+
+/// RTMoSR-style restoration graph: global reductions are allowed here because
+/// shape specialization changes the ORT graph, not the spatial crop semantics.
+pub fn inspect_rtmosr_image_model(path: &Path) -> Result<bool> {
+    let Some(counts) = image_op_counts(path)? else {
+        return Ok(false);
+    };
+    let allowed = [
+        "Constant",
+        "Conv",
+        "Add",
+        "Mul",
+        "ReduceMean",
+        "Split",
+        "Softplus",
+        "Tanh",
+        "Reshape",
+        "Cast",
+        "Sub",
+        "Pow",
+        "Sqrt",
+        "Div",
+        "Concat",
+        "Unsqueeze",
+        "Transpose",
+        "Squeeze",
+        "DepthToSpace",
+        "Resize",
+    ];
+    Ok(counts.keys().all(|op| allowed.contains(&op.as_str()))
+        && counts.get("Conv") == Some(&12)
+        && counts.get("ReduceMean") == Some(&4)
+        && counts.get("Softplus") == Some(&4)
+        && counts.get("DepthToSpace") == Some(&1))
+}
+
+fn image_op_counts(path: &Path) -> Result<Option<HashMap<String, usize>>> {
+    let bytes = fs::read(path)?;
+    let graph = proto_fields(&bytes)
+        .find_map(|field| (field.number == 7).then_some(field.bytes).flatten())
+        .ok_or_else(|| anyhow!("ONNX ModelProto has no graph"))?;
+    let mut counts = HashMap::<String, usize>::new();
+    for node in proto_fields(graph).filter(|field| field.number == 1) {
+        let Some(node_bytes) = node.bytes else {
+            return Ok(None);
+        };
+        let Some(op) = proto_fields(node_bytes)
+            .find_map(|field| (field.number == 4).then_some(field.bytes).flatten())
+        else {
+            return Ok(None);
+        };
+        *counts
+            .entry(String::from_utf8_lossy(op).into_owned())
+            .or_default() += 1;
+    }
+    Ok(Some(counts))
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {

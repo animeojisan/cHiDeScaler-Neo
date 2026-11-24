@@ -31,7 +31,10 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window;
 
-const CAPTURE_QUEUE_HARD_MAX: usize = 8;
+// v952: 8 -> 16 so the ordered RIFE queue (16) is not capped here.
+// v960: kept at 16 only so CHIDESCALER_INTERP_QUEUE_MAX can opt back in;
+// the engine's default interpolation depth is 3 again (v874 latency).
+const CAPTURE_QUEUE_HARD_MAX: usize = 16;
 const MAX_NATIVE_CAPTURE_FPS: f64 = 240.0;
 
 fn native_capture_interval() -> MinimumUpdateIntervalSettings {
@@ -56,6 +59,7 @@ pub struct FrameBuf {
     /// source client plus an odd UI crop cannot leave one replicated pad row.
     pub crop_base_w: i32,
     pub crop_base_h: i32,
+    pub gpu: Option<super::wgc_gpu::View>,
     pub data: Vec<u8>, // tightly packed RGBA8, or RGBA16F bytes when hdr
     pub hdr: bool,
     pub seq: u64,
@@ -64,6 +68,12 @@ pub struct FrameBuf {
 }
 
 impl FrameBuf {
+    pub fn has_pixels(&self)->bool{self.gpu.is_some()||!self.data.is_empty()}
+    pub fn ensure_host(&mut self)->Result<()> {
+        if self.data.is_empty() {if let Some(view)=self.gpu.as_ref(){self.data=view.read_rgba(self.w,self.h)?;self.gpu=None;}}
+        Ok(())
+    }
+
     pub fn capture_size(&self) -> (i32, i32) {
         if self.capture_w > 0 && self.capture_h > 0 {
             (self.capture_w, self.capture_h)
@@ -75,6 +85,8 @@ impl FrameBuf {
 
 pub struct Shared {
     pub buf: Mutex<FrameBuf>,
+    pub gpu_delivery: AtomicBool,
+    pub gpu_failed: AtomicBool,
     pub queue: Mutex<VecDeque<FrameBuf>>,
     /// Reuse full-frame allocations returned by the render thread. This keeps
     /// the interpolation callback to one mapped-texture copy per frame.
@@ -124,6 +136,7 @@ struct Handler {
     shared: Arc<Shared>,
     scratch: Vec<u8>,
     staging: Option<ID3D11Texture2D>,
+    gpu_pool: Vec<Arc<super::wgc_gpu::Snapshot>>,
     staging_key: Option<(u32, u32, ColorFormat)>,
     crop_cache: Option<(u32, u32, bool, isize, isize, Option<ClientCrop>)>,
     last_crop_log: Option<(u32, u32, u32, u32, u32, u32)>,
@@ -133,6 +146,8 @@ struct Handler {
     diag_frames: u32,
     diag_callback_ms: f64,
     diag_callback_max_ms: f64,
+    diag_map_ms: f64,
+    diag_copy_ms: f64,
     diag_arrival_ms: f64,
     diag_arrival_max_ms: f64,
     diag_source_ms: f64,
@@ -375,15 +390,20 @@ impl Handler {
             }
         }
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let map_started = crate::logging::diagnostics_enabled().then(Instant::now);
         unsafe {
             frame
                 .device_context()
                 .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
         }
+        if let Some(started) = map_started {
+            self.diag_map_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
         let bytes_per_pixel = if format == ColorFormat::Rgba16F { 8 } else { 4 };
         let row_bytes = width as usize * bytes_per_pixel;
         let total_bytes = row_bytes * height as usize;
         destination.resize(total_bytes, 0);
+        let copy_started = map_started.map(|_| Instant::now());
         if mapped.RowPitch as usize == row_bytes {
             // The common fullscreen RGBA8 case (for example 1920 pixels) is
             // already tightly packed by D3D11. Copy it as one contiguous
@@ -406,6 +426,9 @@ impl Handler {
                     );
                 }
             }
+        }
+        if let Some(started) = copy_started {
+            self.diag_copy_ms += started.elapsed().as_secs_f64() * 1000.0;
         }
         unsafe {
             frame.device_context().Unmap(staging, 0);
@@ -463,6 +486,7 @@ impl GraphicsCaptureApiHandler for Handler {
             shared: ctx.flags,
             scratch: Vec::new(),
             staging: None,
+            gpu_pool: Vec::new(),
             staging_key: None,
             crop_cache: None,
             last_crop_log: None,
@@ -472,6 +496,8 @@ impl GraphicsCaptureApiHandler for Handler {
             diag_frames: 0,
             diag_callback_ms: 0.0,
             diag_callback_max_ms: 0.0,
+            diag_map_ms: 0.0,
+            diag_copy_ms: 0.0,
             diag_arrival_ms: 0.0,
             diag_arrival_max_ms: 0.0,
             diag_source_ms: 0.0,
@@ -733,7 +759,18 @@ impl GraphicsCaptureApiHandler for Handler {
             .unwrap()
             .pop()
             .unwrap_or_else(|| std::mem::take(&mut self.scratch));
-        let (w, h) = self.copy_frame_to_vec(frame, valid_crop, pixel_lock, &mut frame_data)?;
+        let mut gpu=None;
+        let (w,h)=if self.shared.gpu_delivery.load(Ordering::Acquire)&&!self.shared.hdr.load(Ordering::Relaxed) {
+            let(x0,y0,x1,y1)=valid_crop.map(|c|(c.x0,c.y0,c.x1,c.y1)).unwrap_or((0,0,frame.width(),frame.height()));
+            match super::wgc_gpu::Snapshot::copy(frame,(x0,y0,x1-x0,y1-y0),&mut self.gpu_pool) {
+                Ok(snapshot)=>{
+                    let(cw,ch)=(snapshot.w,snapshot.h);let(w,h)=pixel_lock.unwrap_or((cw,ch));
+                    gpu=Some(super::wgc_gpu::View{snapshot,left:0,top:0,content_w:cw.min(w),content_h:ch.min(h),black_extent:None});
+                    frame_data.clear();((w+w%2)as i32,(h+h%2)as i32)
+                }
+                Err(error)=>{log::warn!("wgc-gpu-snapshot-fallback: reason={error:#} action=staging-map");self.shared.gpu_delivery.store(false,Ordering::Release);self.copy_frame_to_vec(frame,valid_crop,pixel_lock,&mut frame_data)?}
+            }
+        }else{self.copy_frame_to_vec(frame, valid_crop, pixel_lock, &mut frame_data)?};
         let pad_key = (base_size.0, base_size.1, w as u32, h as u32);
         if (w as u32, h as u32) != base_size && self.last_pad_log != Some(pad_key) {
             log::info!(
@@ -758,6 +795,7 @@ impl GraphicsCaptureApiHandler for Handler {
                 source_time_100ns,
                 ..FrameBuf::default()
             };
+            queued.gpu=gpu;
             queued.data = frame_data;
             let mut q = self.shared.queue.lock().unwrap();
             // v795: WGC may notify the same decoded video picture more than once
@@ -784,6 +822,7 @@ impl GraphicsCaptureApiHandler for Handler {
                     let mut recycled = std::mem::replace(&mut back.data, queued.data);
                     recycled.clear();
                     self.shared.recycled_data.lock().unwrap().push(recycled);
+                    back.gpu=queued.gpu;
                     back.seq = queued.seq;
                     back.received_at = queued.received_at;
                     back.source_time_100ns = queued.source_time_100ns;
@@ -808,6 +847,7 @@ impl GraphicsCaptureApiHandler for Handler {
             }
         } else {
             let mut buf = self.shared.buf.lock().unwrap();
+            buf.gpu=gpu;
             buf.w = w;
             buf.h = h;
             buf.crop_base_w = base_size.0 as i32;
@@ -841,18 +881,24 @@ impl GraphicsCaptureApiHandler for Handler {
             if self.diag_frames >= 120 {
                 let intervals = (self.diag_frames - 1).max(1) as f64;
                 log::debug!(
-                    "wgc-callback: frames={} callback_avg_ms={:.2} callback_max_ms={:.2} arrival_avg_ms={:.2} arrival_max_ms={:.2} source_avg_ms={:.2} source_max_ms={:.2}",
+                    "wgc-callback: frames={} callback_avg_ms={:.2} callback_max_ms={:.2} d3d11_map_avg_ms={:.2} cpu_copy_avg_ms={:.2} arrival_avg_ms={:.2} arrival_max_ms={:.2} source_avg_ms={:.2} source_max_ms={:.2} pixel_route={} gpu_resident_capture={}",
                     self.diag_frames,
                     self.diag_callback_ms / self.diag_frames as f64,
                     self.diag_callback_max_ms,
+                    self.diag_map_ms / self.diag_frames as f64,
+                    self.diag_copy_ms / self.diag_frames as f64,
                     self.diag_arrival_ms / intervals,
                     self.diag_arrival_max_ms,
                     self.diag_source_ms / intervals,
-                    self.diag_source_max_ms
+                    self.diag_source_max_ms,
+                    if self.shared.gpu_delivery.load(Ordering::Acquire){"d3d11-owned-snapshot"}else{"d3d11-staging-map-to-host"},
+                    self.shared.gpu_delivery.load(Ordering::Acquire),
                 );
                 self.diag_frames = 0;
                 self.diag_callback_ms = 0.0;
                 self.diag_callback_max_ms = 0.0;
+                self.diag_map_ms = 0.0;
+                self.diag_copy_ms = 0.0;
                 self.diag_arrival_ms = 0.0;
                 self.diag_arrival_max_ms = 0.0;
                 self.diag_source_ms = 0.0;
@@ -867,6 +913,8 @@ impl GraphicsCaptureApiHandler for Handler {
             self.diag_frames = 0;
             self.diag_callback_ms = 0.0;
             self.diag_callback_max_ms = 0.0;
+            self.diag_map_ms = 0.0;
+            self.diag_copy_ms = 0.0;
             self.diag_arrival_ms = 0.0;
             self.diag_arrival_max_ms = 0.0;
             self.diag_source_ms = 0.0;
@@ -890,7 +938,7 @@ fn copy_user_cropped_frame(source: &FrameBuf, out: &mut FrameBuf, crop: CaptureC
     }
     let bytes_per_pixel = if source.hdr { 8usize } else { 4usize };
     let expected = source.w as usize * source.h as usize * bytes_per_pixel;
-    if source.data.len() != expected {
+    if source.gpu.is_none() && source.data.len() != expected {
         return false;
     }
     let crop_base_w = if source.crop_base_w > 0 {
@@ -923,6 +971,15 @@ fn copy_user_cropped_frame(source: &FrameBuf, out: &mut FrameBuf, crop: CaptureC
     out.received_at = source.received_at;
     out.source_time_100ns = source.source_time_100ns;
 
+    out.gpu=None;
+    if let Some(view)=source.gpu.as_ref() {
+        let mut view=view.clone();
+        let left=applied.left;let top=applied.top;
+        view.left+=left;view.top+=top;
+        view.content_w=applied.content_w.min(view.content_w.saturating_sub(left));
+        view.content_h=applied.content_h.min(view.content_h.saturating_sub(top));
+        out.gpu=Some(view);out.data.clear();return true;
+    }
     // Fast path keeps v576's ordinary no-crop copy exactly simple.
     if !crop.enabled && out_w == src_w && out_h == source.h as usize {
         out.data.clear();
@@ -1007,6 +1064,13 @@ fn start_monitor_region_capture_control(
 }
 
 impl WgcSource {
+    pub fn disable_gpu_delivery(&self){self.shared.gpu_failed.store(true,Ordering::Release);self.shared.gpu_delivery.store(false,Ordering::Release);}
+    pub fn set_gpu_delivery(&self,enabled:bool){
+        let failed=self.shared.gpu_failed.load(Ordering::Acquire);let active=enabled&&!failed;
+        let previous=self.shared.gpu_delivery.swap(active,Ordering::AcqRel);
+        if previous!=active{log::info!("wgc-pixel-delivery-policy: requested={} active={} session_gpu_failed={} route={}",enabled,active,failed,if active{"d3d11-owned-snapshot"}else{"d3d11-staging-map-to-host"});}
+    }
+
     /// Start capturing `hwnd`. WGC remains at the stable native/high-Hz request;
     /// `fps_cap` is applied by the engine before optional pre-processing and the filter chain.
     /// `client_only` crops away title bar/borders.
@@ -1036,6 +1100,8 @@ impl WgcSource {
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             buf: Mutex::new(FrameBuf::default()),
+            gpu_delivery: AtomicBool::new(false),
+            gpu_failed: AtomicBool::new(false),
             queue: Mutex::new(VecDeque::new()),
             recycled_data: Mutex::new(Vec::new()),
             ready: Condvar::new(),
@@ -1464,6 +1530,8 @@ impl WgcSource {
     ) -> Result<Self> {
         let shared = Arc::new(Shared {
             buf: Mutex::new(FrameBuf::default()),
+            gpu_delivery: AtomicBool::new(false),
+            gpu_failed: AtomicBool::new(false),
             queue: Mutex::new(VecDeque::new()),
             recycled_data: Mutex::new(Vec::new()),
             ready: Condvar::new(),
@@ -1632,10 +1700,11 @@ impl WgcSource {
             return false;
         }
         let buf = self.shared.buf.lock().unwrap();
-        if buf.data.is_empty() || buf.seq != cur {
+        if !buf.has_pixels() || buf.seq != cur {
             return false;
         }
         if !self.shared.crop_enabled.load(Ordering::Acquire) {
+            out.gpu=buf.gpu.clone();
             out.w = buf.w;
             out.h = buf.h;
             out.capture_w = buf.w;

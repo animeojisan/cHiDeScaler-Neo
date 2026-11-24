@@ -2,6 +2,18 @@ fn main() {
     guard_text_encoding();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rerun-if-changed=native/dml_gl_bridge.cpp");
+            let output=std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+            let helper=output.join("neo_dml_gl_bridge.dll");
+            let mut command=cc::Build::new().cpp(true).get_compiler().to_command();
+            command.arg("/nologo").arg("/std:c++17").arg("/EHsc").arg("/O2").arg("/MD").arg("/LD")
+                .arg("native/dml_gl_bridge.cpp").arg(format!("/Fo{}",output.join("dml_gl_bridge.obj").display()))
+                .arg(format!("/Fe{}",helper.display())).arg("/link")
+                .arg(format!("/IMPLIB:{}",output.join("dml_gl_bridge.lib").display()))
+                .args(["d3d11.lib","d3d12.lib","dxgi.lib","d3dcompiler.lib"]);
+            assert!(command.status().expect("compile DML texture helper").success(),"DML texture helper build failed");
+            println!("cargo:rustc-env=NEO_DML_BRIDGE_DLL={}",helper.display());
+
             // Hybrid-GPU drivers inspect these exported data symbols before
             // creating the first WGL context. Keep native WGL/GLSL while
             // requesting the discrete/high-performance adapter.
@@ -12,6 +24,17 @@ fn main() {
         }
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/cHiDeScaler-Neo.ico");
+        // Establish physical coordinates before any helper thread or HWND exists.
+        // A late winit/DXGI request cannot safely change the process default.
+        res.set_manifest(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+ <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="cHiDeScaler.Neo" type="win32"/>
+ <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3"><security><requestedPrivileges><requestedExecutionLevel level="asInvoker" uiAccess="false"/></requestedPrivileges></security></trustInfo>
+ <application xmlns="urn:schemas-microsoft-com:asm.v3"><windowsSettings>
+  <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+  <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+ </windowsSettings></application>
+</assembly>"#);
         // Populate standard VERSIONINFO fields for consistent Windows metadata.
         res.set("ProductName", "cHiDeScaler-Neo");
         res.set(
@@ -22,13 +45,13 @@ fn main() {
         res.set("LegalCopyright", "(c) 2026 cHiDeScaler-Neo project");
         res.set("OriginalFilename", "cHiDeScaler-Neo.exe");
         res.set("InternalName", "chidescaler-neo");
-        res.set("ProductVersion", "0.7.18.0");
-        res.set("FileVersion", "0.7.18.0");
+        res.set("ProductVersion", "0.99.7.0");
+        res.set("FileVersion", "0.99.7.0");
         res.set_version_info(
             winresource::VersionInfo::PRODUCTVERSION,
-            0x0000_0007_0012_0000,
+            0x0000_0063_0007_0000,
         );
-        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0007_0012_0000);
+        res.set_version_info(winresource::VersionInfo::FILEVERSION, 0x0000_0063_0007_0000);
         if let Err(e) = res.compile() {
             println!("cargo:warning=icon resource compile failed: {e}");
         }

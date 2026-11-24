@@ -38,10 +38,18 @@ pub struct TexKey {
 pub struct GpuTex {
     pub tex: glow::Texture,
     pub key: TexKey,
+    /// Storage identity, retained across pool reuse but never GL-name reuse.
+    /// Zero means externally owned/unknown and must not key an interop cache.
+    pub allocation_id:u64,
     /// mpv user-shader pixel phase waiting to be corrected by the next scale.
     /// This is metadata only; pooled storage identity remains TexKey-based.
     pub offset_x: f32,
     pub offset_y: f32,
+}
+
+fn next_texture_allocation_id()->u64{
+    static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -151,6 +159,12 @@ pub struct GlContext {
     /// still participate in the normal LINEAR/NEAREST source-filter dance.
     capture_upload_ring: Vec<GpuTex>,
     capture_upload_ring_key: Option<TexKey>,
+    interp_upload_ring: Vec<GpuTex>,
+    interp_upload_ring_key: Option<TexKey>,
+    interp_upload_ring_next: usize,
+    capture_gpu_bridge: Option<super::capture_gpu::Bridge>,
+    dml_shared_images: Vec<super::dml_gl_bridge::SharedImage>,
+    dml_interp_images: HashMap<u64,super::dml_gl_bridge::SharedImage>,
     external_neoflow_state: ExternalNeoFlowState,
     fbo: glow::Framebuffer,
     pub quad_vao: glow::VertexArray,
@@ -174,6 +188,16 @@ pub struct GlContext {
     next_command_fence: u64,
     gpu_timer_queries: VecDeque<(glow::Query, String)>,
     gpu_timer_last_sample: HashMap<String, std::time::Instant>,
+    /// v982: persistent-mapped pixel-pack buffer for the interpolation
+    /// readback. Disabled for the rest of the process on any GL error.
+    readback_pbo: Option<ReadbackPbo>,
+    readback_pbo_disabled: bool,
+}
+
+struct ReadbackPbo {
+    buffer: glow::Buffer,
+    bytes: usize,
+    ptr: *mut u8,
 }
 
 #[derive(Clone, Copy)]
@@ -250,6 +274,12 @@ impl GlContext {
                 persist: HashMap::new(),
                 capture_upload_ring: Vec::new(),
                 capture_upload_ring_key: None,
+                interp_upload_ring: Vec::new(),
+                interp_upload_ring_key: None,
+                interp_upload_ring_next: 0,
+                capture_gpu_bridge: None,
+                dml_shared_images: Vec::new(),
+                dml_interp_images: HashMap::new(),
                 external_neoflow_state: ExternalNeoFlowState::default(),
                 fbo,
                 quad_vao: vao,
@@ -264,6 +294,11 @@ impl GlContext {
                 next_command_fence: 1,
                 gpu_timer_queries: VecDeque::new(),
                 gpu_timer_last_sample: HashMap::new(),
+                readback_pbo: None,
+                readback_pbo_disabled: matches!(
+                    std::env::var("CHIDESCALER_PBO_READBACK").ok().as_deref(),
+                    Some("off") | Some("0")
+                ),
             }
         }
     }
@@ -272,6 +307,13 @@ impl GlContext {
         &mut self,
         loader: impl Fn(&str) -> *const c_void,
     ) -> Result<(), String> {
+        // Intel's Windows OpenGL driver does not implement this import entry
+        // point, even on Arc devices that expose other external-object APIs.
+        // Keep the existing CPU-visible transfer fallback and avoid probing an
+        // unsupported function on every Intel startup.
+        if self.gl_vendor.to_ascii_lowercase().contains("intel") {
+            return Err("Intel OpenGL does not support glImportMemoryWin32HandleEXT".into());
+        }
         for required in ["GL_EXT_memory_object", "GL_EXT_memory_object_win32"] {
             if !self.gl.supported_extensions().contains(required) {
                 return Err(format!("missing {required}"));
@@ -1686,7 +1728,7 @@ impl GlContext {
             let t = GpuTex {
                 tex,
                 key,
-                offset_x: 0.0,
+                allocation_id: next_texture_allocation_id(), offset_x: 0.0,
                 offset_y: 0.0,
             };
             self.tracked.push(t);
@@ -1788,7 +1830,7 @@ impl GlContext {
                     ring.push(GpuTex {
                         tex,
                         key,
-                        offset_x: 0.0,
+                        allocation_id: next_texture_allocation_id(), offset_x: 0.0,
                         offset_y: 0.0,
                     });
                 }
@@ -2044,12 +2086,36 @@ impl GlContext {
                     comps: 4,
                     dtype,
                 },
-                offset_x: 0.0,
+                allocation_id: next_texture_allocation_id(), offset_x: 0.0,
                 offset_y: 0.0,
             }
         };
         self.persist.insert(key.to_string(), texture);
         Ok(texture)
+    }
+
+    /// Move a frame-owned image into bounded persistent storage without a copy.
+    /// Provider/history-owned images must use an explicit GPU copy instead.
+    pub fn park_transient_texture(&mut self, key: &str, image: GpuTex) -> Result<GpuTex, String> {
+        let index = self.tracked.iter().position(|item|item.tex==image.tex)
+            .ok_or_else(||"image is not owned by the transient frame".to_string())?;
+        self.tracked.swap_remove(index);
+        if let Some(previous)=self.persist.insert(key.to_string(),image) {
+            if previous.tex!=image.tex {self.recycle(previous);}
+        }
+        Ok(image)
+    }
+
+    /// Detach a displayed image from provider-owned storage before a live edit.
+    /// Completion is required only at this ownership boundary, never per frame.
+    /// The result follows ordinary tracked/pool lifetime, not shader history.
+    pub fn snapshot_transition_rgba8(&mut self, src: GpuTex) -> Result<GpuTex, String> {
+        const KEY: &str = "__neo_owned_chain_transition";
+        let dst = self.copy_to_persistent_rgba8(KEY, src)?;
+        self.finish();
+        self.persist.remove(KEY);
+        self.tracked.push(dst);
+        Ok(dst)
     }
 
     /// Copy any 2D texture into a persistent RGBA8 texture without a CPU
@@ -2112,7 +2178,7 @@ impl GlContext {
                         comps: 4,
                         dtype: Dtype::U8,
                     },
-                    offset_x: 0.0,
+                    allocation_id: next_texture_allocation_id(), offset_x: 0.0,
                     offset_y: 0.0,
                 }
             };
@@ -2262,6 +2328,56 @@ void main(){
         t
     }
 
+    /// Rotate NeoArc's CPU-visible midframes over dedicated textures. The
+    /// general pool can recycle the just-presented texture on the next slot,
+    /// forcing Intel GL to wait before writing it again.
+    pub fn upload_rgb8_interp_ring(&mut self, w: i32, h: i32, data: &[u8]) -> Result<GpuTex, String> {
+        let expected = usize::try_from(w).ok()
+            .and_then(|w| usize::try_from(h).ok().and_then(|h| w.checked_mul(h)))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| "interpolation upload size overflow".to_string())?;
+        if w <= 0 || h <= 0 || data.len() != expected {
+            return Err("invalid interpolation RGB8 frame".into());
+        }
+        let key = TexKey { w, h, d: 1, comps: 3, dtype: Dtype::U8 };
+        if let Some(existing) = self.interp_upload_ring_key {
+            if existing != key { return Err("interpolation upload geometry changed".into()); }
+        } else {
+            let gl = &self.gl;
+            let mut ring: Vec<GpuTex> = Vec::with_capacity(8);
+            let (internal, format, ty) = formats(3, Dtype::U8);
+            unsafe {
+                for _ in 0..8 {
+                    let tex = match gl.create_texture() {
+                        Ok(texture) => texture,
+                        Err(error) => {
+                            for allocated in ring.drain(..) { gl.delete_texture(allocated.tex); }
+                            return Err(error.to_string());
+                        }
+                    };
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.tex_image_2d(glow::TEXTURE_2D, 0, internal, w, h, 0, format, ty,
+                        glow::PixelUnpackData::Slice(None));
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                    ring.push(GpuTex { tex, key, allocation_id: next_texture_allocation_id(), offset_x: 0.0, offset_y: 0.0 });
+                }
+            }
+            self.interp_upload_ring = ring;
+            self.interp_upload_ring_key = Some(key);
+        }
+        let texture = self.interp_upload_ring[self.interp_upload_ring_next % self.interp_upload_ring.len()];
+        self.interp_upload_ring_next += 1;
+        unsafe {
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture.tex));
+            self.gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, w, h,
+                glow::RGB, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(data)));
+        }
+        Ok(texture)
+    }
+
     /// Upload raw RGBA16F bytes (HDR capture) into a pooled F16 texture.
     pub fn upload_rgba16f(&mut self, w: i32, h: i32, data: &[u8]) -> GpuTex {
         let t = self.make_tex(w, h, 4, Dtype::F16);
@@ -2351,6 +2467,111 @@ void main(){
             );
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
+    }
+
+    /// v982: same bytes as `download_rgba8_into`, but the GPU first copies the
+    /// pixels into a persistent-mapped pack buffer (DMA), then one memcpy
+    /// moves them into `rgba`. Synchronous like the original. Any GL error
+    /// disables this route for the process and falls back to glReadPixels
+    /// into client memory. Returns true when the pack-buffer route was used.
+    pub fn download_rgba8_into_fast(&mut self, t: GpuTex, rgba: &mut Vec<u8>) -> bool {
+        if !self.readback_pbo_disabled {
+            match self.download_rgba8_pbo(t, rgba) {
+                Ok(()) => return true,
+                Err(error) => {
+                    log::warn!("pbo-readback-disabled: reason={error}; fallback=glReadPixels-client");
+                    self.readback_pbo_disabled = true;
+                    self.release_readback_pbo();
+                }
+            }
+        }
+        self.download_rgba8_into(t, rgba);
+        false
+    }
+
+    fn release_readback_pbo(&mut self) {
+        if let Some(pbo) = self.readback_pbo.take() {
+            unsafe {
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo.buffer));
+                self.gl.unmap_buffer(glow::PIXEL_PACK_BUFFER);
+                self.gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                self.gl.delete_buffer(pbo.buffer);
+            }
+        }
+    }
+
+    fn download_rgba8_pbo(&mut self, t: GpuTex, rgba: &mut Vec<u8>) -> Result<(), String> {
+        let (w, h) = (t.w().max(0) as usize, t.h().max(0) as usize);
+        let bytes = w * h * 4;
+        if bytes == 0 || bytes > i32::MAX as usize {
+            return Err(format!("unsupported size {w}x{h}"));
+        }
+        let gl = self.gl.clone();
+        unsafe {
+            while gl.get_error() != glow::NO_ERROR {}
+            if self.readback_pbo.as_ref().map(|p| p.bytes) != Some(bytes) {
+                self.release_readback_pbo();
+                let buffer = gl.create_buffer().map_err(|e| format!("create: {e}"))?;
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+                let flags = glow::MAP_READ_BIT | glow::MAP_PERSISTENT_BIT | glow::MAP_COHERENT_BIT;
+                gl.buffer_storage(glow::PIXEL_PACK_BUFFER, bytes as i32, None, flags | glow::CLIENT_STORAGE_BIT);
+                let ptr = gl.map_buffer_range(glow::PIXEL_PACK_BUFFER, 0, bytes as i32, flags);
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+                let error = gl.get_error();
+                if ptr.is_null() || error != glow::NO_ERROR {
+                    gl.delete_buffer(buffer);
+                    return Err(format!("storage/map error=0x{error:04x} null={}", ptr.is_null()));
+                }
+                self.readback_pbo = Some(ReadbackPbo { buffer, bytes, ptr });
+                log::info!("pbo-readback-ready: bytes={bytes} size={w}x{h}");
+            }
+            let (buffer, ptr) = {
+                let pbo = self.readback_pbo.as_ref().expect("readback pbo");
+                (pbo.buffer, pbo.ptr)
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(t.tex),
+                0,
+            );
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(buffer));
+            gl.read_pixels(
+                0,
+                0,
+                t.w(),
+                t.h(),
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::BufferOffset(0),
+            );
+            gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            let error = gl.get_error();
+            if error != glow::NO_ERROR {
+                return Err(format!("read_pixels error=0x{error:04x}"));
+            }
+            let fence = gl
+                .fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)
+                .map_err(|e| format!("fence: {e}"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+            loop {
+                let status = gl.client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, 5_000_000);
+                if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+                    break;
+                }
+                if status == glow::WAIT_FAILED || std::time::Instant::now() >= deadline {
+                    gl.delete_sync(fence);
+                    return Err(format!("fence wait status=0x{status:04x}"));
+                }
+            }
+            gl.delete_sync(fence);
+            rgba.resize(bytes, 0);
+            std::ptr::copy_nonoverlapping(ptr as *const u8, rgba.as_mut_ptr(), bytes);
+        }
+        Ok(())
     }
 
     /// Read the final filtered texture as tightly packed RGBA8. Used only for
@@ -2593,7 +2814,7 @@ void main(){
                     0,
                     format,
                     ty,
-                    glow::PixelUnpackData::Slice(Some(data)),
+                    glow::PixelUnpackData::Slice(if data.is_empty(){None}else{Some(data)}),
                 );
             } else {
                 gl.tex_image_2d(
@@ -2605,7 +2826,7 @@ void main(){
                     0,
                     format,
                     ty,
-                    glow::PixelUnpackData::Slice(Some(data)),
+                    glow::PixelUnpackData::Slice(if data.is_empty(){None}else{Some(data)}),
                 );
             }
             let f = if filter_linear {
@@ -2629,7 +2850,7 @@ void main(){
                     comps,
                     dtype,
                 },
-                offset_x: 0.0,
+                allocation_id: next_texture_allocation_id(), offset_x: 0.0,
                 offset_y: 0.0,
             }
         };
@@ -2660,10 +2881,14 @@ void main(){
 
     /// Return a kept texture (e.g. last frame's output) to the pool.
     pub fn recycle(&mut self, t: GpuTex) {
+        // Persistent images are owned by `persist`, never by the transient
+        // pool. In particular a displayed fractional tail can outlive a swap.
+        if self.is_persistent(t) { return; }
         if self
             .capture_upload_ring
             .iter()
             .any(|capture| capture.tex == t.tex)
+            || self.interp_upload_ring.iter().any(|interp| interp.tex == t.tex)
         {
             return;
         }
@@ -2790,6 +3015,11 @@ void main(){
                 gl.delete_texture(t.tex);
             }
             self.capture_upload_ring_key = None;
+            for t in self.interp_upload_ring.drain(..) {
+                gl.delete_texture(t.tex);
+            }
+            self.interp_upload_ring_key = None;
+            self.interp_upload_ring_next = 0;
             for t in self.tracked.drain(..) {
                 gl.delete_texture(t.tex);
             }
@@ -2942,6 +3172,30 @@ void main(){
                 self.gl.delete_sync(fence);
                 return Err("OpenGL interpolation handoff fence failed".into());
             }
+        }
+        Ok(false)
+    }
+
+    /// v990: bounded wait for a submitted command fence (flushes first). On
+    /// success the token is consumed, so a later `poll_commands_fence` returns
+    /// true immediately. A timeout leaves the token pending for normal polling.
+    pub fn wait_commands_fence(&mut self, token: u64, timeout: std::time::Duration) -> Result<bool, String> {
+        let Some(fence) = self.command_fences.get(&token).copied() else {
+            return Ok(true);
+        };
+        unsafe {
+            let status = self.gl.client_wait_sync(
+                fence,
+                glow::SYNC_FLUSH_COMMANDS_BIT,
+                i32::try_from(timeout.as_nanos()).unwrap_or(i32::MAX),
+            );
+            if status == glow::ALREADY_SIGNALED || status == glow::CONDITION_SATISFIED {
+                self.command_fences.remove(&token);
+                self.gl.delete_sync(fence);
+                return Ok(true);
+            }
+            // WAIT_FAILED: keep the token so the regular poll reports the
+            // failure through its established error path.
         }
         Ok(false)
     }
@@ -3221,4 +3475,34 @@ fn bytemuck_cast_slice(v: &[f32]) -> &[u8] {
 }
 fn bytemuck_cast_slice_mut(v: &mut [f32]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
+}
+
+impl GlContext {
+    pub fn capture_gpu_copy(&mut self,view:&crate::capture::wgc_gpu::View,w:i32,h:i32)->anyhow::Result<GpuTex> {
+        let mut bridge=match self.capture_gpu_bridge.take(){Some(b)if b.matches(view)=>b,_=>super::capture_gpu::Bridge::new(self.gl.clone(),view)?};
+        let result=bridge.copy(self,view,w,h);
+        if result.is_ok(){self.capture_gpu_bridge=Some(bridge);}
+        result
+    }
+}
+
+impl GlContext{
+    pub(crate) fn register_dml_interp_image(&mut self,key:u64,source:&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,w:i32,h:i32)->anyhow::Result<()>{let image=super::dml_gl_bridge::SharedImage::new(self.gl.clone(),source,w,h)?;self.dml_interp_images.insert(key,image);Ok(())}
+    pub(crate) fn has_dml_interp_image(&self,key:u64)->bool{self.dml_interp_images.contains_key(&key)}
+    pub(crate) fn clear_dml_interp_image(&mut self,key:u64){self.dml_interp_images.remove(&key);}
+    pub(crate) fn copy_dml_interp_image(&mut self,key:u64,w:i32,h:i32)->anyhow::Result<GpuTex>{let mut image=self.dml_interp_images.remove(&key).ok_or_else(||anyhow::anyhow!("DML interpolation image retired"))?;let result=image.copy(self,w,h);self.dml_interp_images.insert(key,image);result}
+    pub(crate) fn upload_dml_d3d11(&mut self,source:&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,input:GpuTex)->anyhow::Result<()>{
+        let mut cache=std::mem::take(&mut self.dml_shared_images);
+        let result=(||{let mut image=if let Some(i)=cache.iter().position(|v|v.matches(source)){cache.remove(i)}else{super::dml_gl_bridge::SharedImage::new(self.gl.clone(),source,input.w(),input.h())?};let result=image.upload(self,input);cache.push(image);result})();
+        while cache.len()>1&&(cache.len()>16||cache.iter().map(|v|v.bytes).sum::<usize>()>128*1024*1024){cache.remove(0);}
+        self.dml_shared_images=cache;result
+    }
+    pub(crate) fn copy_dml_d3d11(&mut self,source:&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,w:i32,h:i32)->anyhow::Result<(GpuTex,bool)>{
+        let mut cache=std::mem::take(&mut self.dml_shared_images);
+        let fresh=!cache.iter().any(|v|v.matches(source));
+        let mut image=if let Some(i)=cache.iter().position(|v|v.matches(source)){cache.remove(i)}else{super::dml_gl_bridge::SharedImage::new(self.gl.clone(),source,w,h)?};
+        let result=image.copy(self,w,h);if result.is_ok(){cache.push(image);}
+        while cache.len()>1&&(cache.len()>16||cache.iter().map(|v|v.bytes).sum::<usize>()>128*1024*1024){cache.remove(0);}
+        self.dml_shared_images=cache;result.map(|texture|(texture,fresh))
+    }
 }
