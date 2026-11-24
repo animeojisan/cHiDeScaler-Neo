@@ -1,0 +1,2 @@
+﻿NeoRTX Backend Packを展開し、このneortxフォルダ内へコピーしてください。
+neo_rtx_backend.dll、backend.json、modelsフォルダがこの場所に並ぶ構成です。
